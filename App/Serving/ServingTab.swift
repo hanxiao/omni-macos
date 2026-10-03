@@ -112,9 +112,7 @@ struct ServingTab: View {
                     .multilineTextAlignment(.trailing)
                     .frame(maxWidth: .infinity)
                 Button {
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setString(model.serving.bearerToken, forType: .string)
+                    OmniPasteboard.copy(model.serving.bearerToken, concealed: true)
                 } label: { Image(systemName: "doc.on.doc") }
                 .buttonStyle(.borderless).foregroundStyle(.secondary)
                 .help("Copy").disabled(model.serving.bearerToken.isEmpty)
@@ -199,9 +197,7 @@ struct ServingTab: View {
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 Button {
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setString(exampleCurl, forType: .string)
+                    OmniPasteboard.copy(exampleCurl)
                 } label: {
                     Image(systemName: "doc.on.doc")
                 }
@@ -499,8 +495,7 @@ struct ServingTab: View {
                     HStack(spacing: 8) {
                         Spacer()
                         Button("Copy Path") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(ServingLogFile.url.path, forType: .string)
+                            OmniPasteboard.copy(ServingLogFile.url.path)
                         }
                         Button("Show in Finder") {
                             NSWorkspace.shared.activateFileViewerSelecting([ServingLogFile.url])
@@ -629,9 +624,7 @@ private struct AgentConfigSheet: View {
             .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.primary.opacity(0.1)))
             HStack {
                 Button(copied ? "Copied" : "Copy") {
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setString(text, forType: .string)
+                    OmniPasteboard.copy(text)
                     copied = true
                     Task { try? await Task.sleep(for: .seconds(1.5)); copied = false }
                 }

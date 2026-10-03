@@ -58,6 +58,9 @@ struct FolderBrowser: View {
     /// are ranked by relevance and have no header to click. A Finder window sorts by its columns.
     @State private var sort: BrowserSort = .name
     @State private var ascending = true
+    /// The folder the sort was last set up for. The clipboard history opens newest first, which
+    /// for its time-stamped names is Name descending; leaving it puts Finder's default back.
+    @State private var sortFolder: URL?
     @State private var selected: URL?
 
     /// The listing in display order. STORED, and rebuilt only when the entries or the sort change:
@@ -245,6 +248,9 @@ struct FolderBrowser: View {
                 // `List(selection:)` needs - verified with a double-tap alone, which also selected
                 // nothing - so the selection is set and drawn here. Finder's treatment exactly:
                 // the whole row filled with the accent colour and every label turned white.
+                // Drags the file or folder out of Omni, Finder-style (see FileDrag). The browser
+                // selects one row, so a drag carries the row it starts on.
+                .fileDragSource { select(entry); return [entry.url.path] }
                 .onTapGesture(count: 2) { activate(entry) }
                 .simultaneousGesture(TapGesture().onEnded { select(entry) })
                 .contextMenu { menu(entry) }
@@ -454,6 +460,7 @@ struct FolderBrowser: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     .padding(6)
                     .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .fileDragSource { select(entry); return [entry.url.path] }
                     .onTapGesture(count: 2) { activate(entry) }
                     .simultaneousGesture(TapGesture().onEnded { select(entry) })
                     .contextMenu { menu(entry) }
@@ -614,6 +621,12 @@ struct FolderBrowser: View {
     /// listing that is already on screen.
     private func reload(quiet: Bool = false) async {
         if !quiet { loading = true }
+        if sortFolder != folder {
+            let clip = AppModel.clipboardDirectory
+            if folder == clip { sort = .name; ascending = false }
+            else if sortFolder == clip { sort = .name; ascending = true }
+            sortFolder = folder
+        }
         let url = folder
         // Membership AND the column facts come from the INDEX: this is a browser inside a search
         // app, and listing files it cannot find, rank or preview promises more than the index can

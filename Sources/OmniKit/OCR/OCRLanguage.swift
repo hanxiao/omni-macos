@@ -353,44 +353,30 @@ final class OCRBatchKVCache {
 @inline(__always)
 func ocrSiLU(_ x: MLXArray) -> MLXArray { x * sigmoid(x) }
 
-/// `DeepseekV2RMSNorm`. The fused Metal kernel is used where it is equivalent; on a bf16 build
-/// it is NOT equivalent to the reference, which upcasts to fp32 for the variance and rounds back
-/// once. That difference is small but it moves argmax on near-tie logits, so the explicit form
-/// is available and the choice is a measured one rather than a default.
+/// `cosf` and `sinf` kept as two separate calls. Swift 6.3 merges a `cosf`/`sinf` pair on one
+/// argument into `__sincosf_stret`, which differs from the separate calls by up to one ULP; in the
+/// rope table that moved the 40-page scan's digest (772db0f94e0ae106 -> a35ef0f9c8fe8ad, 3 chars).
+/// Out of line, the optimizer never sees the pair, so the table is the same on every toolchain.
+@inline(never) func ropeCos(_ x: Float) -> Float { cosf(x) }
+@inline(never) func ropeSin(_ x: Float) -> Float { sinf(x) }
+
+/// `DeepseekV2RMSNorm`, as MLX's fused kernel. On a bf16 build it is not bit-equivalent to the
+/// reference, which upcasts to fp32 for the variance and rounds back once; the difference can
+/// move argmax on a near-tie logit, and the fused kernel is the form the port is graded in.
 @inline(__always)
 func ocrRMSNorm(_ x: MLXArray, _ w: MLXArray, eps: Float = OCRLanguageConfig.rmsEps) -> MLXArray {
-    if OCRRuntime.fastRMSNorm { return MLXFast.rmsNorm(x, weight: w, eps: eps) }
-    let dt = x.dtype
-    let xf = x.asType(.float32)
-    let inv = rsqrt(mean(xf * xf, axis: -1, keepDims: true) + eps)
-    return (w.asType(.float32) * (xf * inv)).asType(dt)
+    MLXFast.rmsNorm(x, weight: w, eps: eps)
 }
 
-/// Runtime switches. Every one of these defaults to the configuration the port is certified in;
-/// they exist so a measurement can be reproduced, not because the non-defaults are useful.
+/// Diagnostic switches, off by default.
 enum OCRRuntime {
-    static let fastRMSNorm = ProcessInfo.processInfo.environment["OMNI_OCR_FAST_RMSNORM"] != "0"
-    static let fusedAttention = ProcessInfo.processInfo.environment["OMNI_OCR_LM_SDPA"] != "0"
-    /// Token count up to which the MoE uses the FUSED gather-matmul dispatch. Default: always.
-    ///
-    /// Measured on `doc_dense` (766 output tokens, one process per setting, two runs each):
-    ///     never fused    138.9 tok/s   ttft 666 ms
-    ///     fused at n<=16 152.3 tok/s   ttft 665 ms
-    ///     always fused   162.1 tok/s   ttft 736 ms
-    /// Fused computes `n * topK` expert rows where grouped computes `active * busiest`, so
-    /// fusing the ~1000-token prefill costs ~70 ms of TTFT. It buys 6.4% of decode back, and the
-    /// break-even is ~180 output tokens - below every real page in the reference set (215-766).
-    /// So it is on everywhere and the knob exists to reproduce the table, not because the other
-    /// settings are useful.
-    ///
-    /// One caveat kept honest: why the PREFILL dispatch changes DECODE throughput at all (both
-    /// settings decode at n = 1 through the same code) is not attributed. Allocator pool state
-    /// is the obvious suspect and it has not been measured, so it is not claimed.
     /// Force the in-place KV write to materialise before anything reads the view.
     static let evalCacheWrites = ProcessInfo.processInfo.environment["OMNI_OCR_EVAL_CACHE"] == "1"
     static let specDebug = ProcessInfo.processInfo.environment["OMNI_OCR_SPEC_DEBUG"] == "1"
-    static let fusedMoEMaxTokens = ProcessInfo.processInfo.environment["OMNI_OCR_FUSED_MOE"]
-        .flatMap { Int($0) } ?? Int.max
+    /// EXPERIMENT: dispatch every N decoder layers with asyncEval so the GPU runs layer i while
+    /// the host encodes layer i+1 (oMLX's eager per-layer dispatch). 0 = off.
+    static let eagerEvery = Int(ProcessInfo.processInfo.environment["OMNI_OCR_EAGER"] ?? "") ?? 0
+    static let eagerMaxRows = 64
 }
 
 // MARK: - attention
@@ -487,31 +473,15 @@ final class OCRAttention: @unchecked Sendable {
         }
 
         let scale = 1.0 / Float(d).squareRoot()
-        let nq = q.dim(1)
-        if OCRRuntime.fusedAttention {
-            // n == 1: the single query attends every cached key, so no mask is needed and the
-            // fused kernel takes its fastest path. n > 1: the engine's own causal mode, which
-            // never materialises an (n, n) score matrix.
-            let y = MLXFast.scaledDotProductAttention(
-                queries: q.expandedDimensions(axis: 0),
-                keys: keysAll.expandedDimensions(axis: 0),
-                values: valuesAll.expandedDimensions(axis: 0),
-                scale: scale, mask: nq == 1 ? .none : .causal)
-            let out = y[0].transposed(1, 0, 2).reshaped([n, h * d])
-            return ocrProj(out, wo).asType(x.dtype)
-        }
-
-        let nk = keysAll.dim(1)
-        let past = nk - nq
-        var scores = matmul(q.asType(.float32), keysAll.asType(.float32).swappedAxes(-1, -2)) * scale
-        if nq > 1 || past > 0 {
-            let idxQ = MLXArray(Int32(0) ..< Int32(nq)).reshaped([nq, 1]) + Int32(past)
-            let idxK = MLXArray(Int32(0) ..< Int32(nk)).reshaped([1, nk])
-            let causal = (idxK .<= idxQ).expandedDimensions(axis: 0)
-            scores = MLX.where(causal, scores, MLXArray(Float(-1e38)))
-        }
-        let p = softMax(scores, axis: -1).asType(x.dtype)
-        let out = matmul(p, valuesAll.asType(x.dtype)).transposed(1, 0, 2).reshaped([n, h * d])
+        // n == 1: the single query attends every cached key, so no mask is needed and the fused
+        // kernel takes its fastest path. n > 1: the engine's own causal mode, which never
+        // materialises an (n, n) score matrix.
+        let y = MLXFast.scaledDotProductAttention(
+            queries: q.expandedDimensions(axis: 0),
+            keys: keysAll.expandedDimensions(axis: 0),
+            values: valuesAll.expandedDimensions(axis: 0),
+            scale: scale, mask: q.dim(1) == 1 ? .none : .causal)
+        let out = y[0].transposed(1, 0, 2).reshaped([n, h * d])
         return ocrProj(out, wo).asType(x.dtype)
     }
 }
@@ -538,19 +508,15 @@ final class OCRDenseMLP: @unchecked Sendable {
 
 /// Sparse MoE layer: softmax router, greedy top-6 of 64, plus a shared expert every token uses.
 ///
-/// Two dispatch paths, and the difference between them is most of this model's decode speed:
-///   n == 1  gather ONLY the 6 routed packs and run them as a 6-row batch. The naive form pads
-///           the token across all 64 experts and reads ~36.7 MB of expert weights per layer per
-///           token to use ~2.6 MB of it.
-///   n > 1   group slots by expert, pad to the busiest, and run `(A, tmax, ·)` batched matmuls
-///           over only the A experts the batch actually touches.
+/// The routed experts run through a fused gather-matmul that reads ONLY the 6 routed packs per
+/// token. The naive form pads the token across all 64 experts and reads ~36.7 MB of expert
+/// weights per layer per token to use ~2.6 MB of it; this dispatch is most of the decode speed.
 final class OCRMoE: @unchecked Sendable {
     private let gate: MLXArray
     private let gateUp: OCRWeight
     private let down: OCRWeight
     private let sharedGateUp: OCRWeight
     private let sharedDown: OCRWeight
-    private let expertCount: Int
 
     init(_ w: OCRWeights, _ prefix: String) {
         gate = w.array("\(prefix).gate")
@@ -558,7 +524,6 @@ final class OCRMoE: @unchecked Sendable {
         down = w["\(prefix).down"]
         sharedGateUp = w["\(prefix).shared.gate_up"]
         sharedDown = w["\(prefix).shared.down"]
-        expertCount = gate.dim(-1)
     }
 
     /// The shared expert. Its intermediate width is `moe_intermediate * n_shared_experts`, i.e.
@@ -571,21 +536,11 @@ final class OCRMoE: @unchecked Sendable {
         return ocrProj(y, sharedDown).asType(x.dtype)
     }
 
-    /// Both expert projections over a stacked `(E, T, hidden)` batch.
-    private func experts(_ xs: MLXArray, gu w1: OCRWeight, dn w2: OCRWeight) -> MLXArray {
-        let gu = ocrProj(xs, w1)
-        let inter = gu.dim(-1) / 2
-        let y = ocrSiLU(gu[.ellipsis, 0 ..< inter]) * gu[.ellipsis, inter ..< gu.dim(-1)]
-        return ocrProj(y, w2)
-    }
-
     /// Set to capture the routed expert ids for one forward pass. Diagnostics only - a MoE
     /// divergence is either smooth rounding or a different expert set, and only the ids say which.
     nonisolated(unsafe) static var routerSink: ((MLXArray) -> Void)?
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let n = x.dim(0)
-        let hidden = x.dim(1)
         let k = OCRLanguageConfig.topK
 
         // MoEGate: raw fp32 router logits (no 1/sqrt(hidden)), softmax over experts, greedy
@@ -602,71 +557,18 @@ final class OCRMoE: @unchecked Sendable {
 
         Self.routerSink?(topIdx)
 
-        if n <= OCRRuntime.fusedMoEMaxTokens {
-            // One fused call per projection, for every n. The expert gather rides inside the
-            // matmul, so there is no sort, no padding to the busiest expert, and - the part that
-            // matters most - no host sync to size that padding. The grouped path below needs the
-            // expert assignment on the CPU, which at decode would be one GPU stall per layer per
-            // token, i.e. twelve per token.
-            let gu = ocrExpertMatmul(x, gateUp, indices: topIdx)          // (n, k, 2*inter)
-            let inter = gu.dim(-1) / 2
-            let act = ocrSiLU(gu[.ellipsis, 0 ..< inter]) * gu[.ellipsis, inter ..< gu.dim(-1)]
-            let routed = ocrExpertMatmulRows(act, down, indices: topIdx)  // (n, k, hidden)
-            let weighted = routed * selected.expandedDimensions(axis: -1).asType(routed.dtype)
-            return weighted.sum(axis: 1).asType(x.dtype) + shared(x)
-        }
-
-        if n == 1 { return decodeStep(x, topIdx: topIdx, selected: selected) }
-
-        // Grouped dispatch. The permutation is built on the HOST: the expert assignment has to
-        // be read back anyway to size the padded batch, and doing the bookkeeping in Swift turns
-        // what would be scatter-adds into two plain gathers.
-        let assignment = topIdx.asArray(Int32.self)                  // n * k, slot -> expert
-        var counts = [Int](repeating: 0, count: expertCount)
-        for e in assignment { counts[Int(e)] += 1 }
-        var activeExperts: [Int32] = []
-        var slotOfExpert = [Int](repeating: -1, count: expertCount)
-        for e in 0 ..< expertCount where counts[e] > 0 {
-            slotOfExpert[e] = activeExperts.count
-            activeExperts.append(Int32(e))
-        }
-        let a = activeExperts.count
-        let tmax = counts.max() ?? 0
-
-        // `n` indexes a zero row appended to x, so padded slots contribute zeros without a
-        // scatter and without their results ever being gathered back.
-        var gatherIn = [Int32](repeating: Int32(n), count: a * tmax)
-        var slotPosition = [Int32](repeating: 0, count: n * k)
-        var rank = [Int](repeating: 0, count: expertCount)
-        for slot in 0 ..< (n * k) {
-            let e = Int(assignment[slot])
-            let row = slotOfExpert[e] * tmax + rank[e]
-            gatherIn[row] = Int32(slot / k)
-            slotPosition[slot] = Int32(row)
-            rank[e] += 1
-        }
-
-        let padded = concatenated([x, MLXArray.zeros([1, hidden], dtype: x.dtype)], axis: 0)
-        let xs = padded[MLXArray(gatherIn)].reshaped([a, tmax, hidden])
-        let activeIdx = MLXArray(activeExperts)
-        let y = experts(xs, gu: ocrGatherExperts(gateUp, activeIdx), dn: ocrGatherExperts(down, activeIdx))
-        let picked = y.reshaped([a * tmax, hidden])[MLXArray(slotPosition)]
-        let weighted = picked.reshaped([n, k, hidden]) * selected.expandedDimensions(axis: -1).asType(x.dtype)
-        return weighted.sum(axis: 1) + shared(x)
-    }
-
-    /// n == 1. `topIdx` stays an MLXArray on purpose: reading it to the host would cost a GPU
-    /// sync per layer per token (12 per token), which inverts the sign of every kernel win in
-    /// this file.
-    private func decodeStep(_ x: MLXArray, topIdx: MLXArray, selected: MLXArray) -> MLXArray {
-        let ids = topIdx.reshaped([-1])
-        let k = ids.dim(0)
-        let guW = ocrGatherExperts(gateUp, ids)
-        let dnW = ocrGatherExperts(down, ids)
-        let rows = broadcast(x, to: [k, 1, x.dim(-1)])
-        let out = experts(rows, gu: guW, dn: dnW).reshaped([k, -1])
-        let weights = selected.asType(x.dtype).reshaped([-1, 1])
-        return (out * weights).sum(axis: 0, keepDims: true) + shared(x)
+        // One fused call per projection, for every n. The expert gather rides inside the matmul,
+        // so there is no sort, no padding to the busiest expert, and - the part that matters
+        // most - no host sync to size that padding. A grouped dispatch needs the expert
+        // assignment on the CPU, which at decode would be one GPU stall per layer per token.
+        // Measured on `doc_dense` (766 output tokens): 162.1 tok/s fused against 138.9 grouped.
+        // Fusing the ~1000-token prefill costs ~70 ms of TTFT, repaid after ~180 output tokens.
+        let gu = ocrExpertMatmul(x, gateUp, indices: topIdx)          // (n, k, 2*inter)
+        let inter = gu.dim(-1) / 2
+        let act = ocrSiLU(gu[.ellipsis, 0 ..< inter]) * gu[.ellipsis, inter ..< gu.dim(-1)]
+        let routed = ocrExpertMatmulRows(act, down, indices: topIdx)  // (n, k, hidden)
+        let weighted = routed * selected.expandedDimensions(axis: -1).asType(routed.dtype)
+        return weighted.sum(axis: 1).asType(x.dtype) + shared(x)
     }
 }
 
@@ -820,7 +722,7 @@ final class OCRLanguageModel: @unchecked Sendable {
         for (row, p) in positions.enumerated() {
             for j in 0 ..< half {
                 let angle = Float(p) * invFreq[j]
-                let c = cosf(angle), s = sinf(angle)
+                let c = ropeCos(angle), s = ropeSin(angle)
                 cosBuf[row * d + j] = c; cosBuf[row * d + half + j] = c
                 sinBuf[row * d + j] = s; sinBuf[row * d + half + j] = s
             }
@@ -840,8 +742,10 @@ final class OCRLanguageModel: @unchecked Sendable {
                       caches: [OCRBatchKVCache]) -> (hidden: MLXArray, logits: MLXArray) {
         let (cos, sin) = rope(positions: positions)
         var x = embeddings
-        for (layer, cache) in zip(layers, caches) {
+        let eager = OCRRuntime.eagerEvery > 0 && x.dim(0) <= OCRRuntime.eagerMaxRows
+        for (i, (layer, cache)) in zip(layers, caches).enumerated() {
             x = layer.callBatch(x, cos: cos, sin: sin, cache: cache)
+            if eager, (i + 1) % OCRRuntime.eagerEvery == 0, i + 1 < layers.count { asyncEval(x) }
         }
         let h = ocrRMSNorm(x, normW)
         let logits = ocrProj(h.asType(lmHead.computeDType), lmHead).asType(.float32)
@@ -855,8 +759,10 @@ final class OCRLanguageModel: @unchecked Sendable {
     func forward(_ embeddings: MLXArray, positions: [Int], caches: [OCRKVCache]) -> (hidden: MLXArray, logits: MLXArray) {
         let (cos, sin) = rope(positions: positions)
         var x = embeddings
-        for (layer, cache) in zip(layers, caches) {
+        let eager = OCRRuntime.eagerEvery > 0 && x.dim(0) <= OCRRuntime.eagerMaxRows
+        for (i, (layer, cache)) in zip(layers, caches).enumerated() {
             x = layer(x, cos: cos, sin: sin, cache: cache)
+            if eager, (i + 1) % OCRRuntime.eagerEvery == 0, i + 1 < layers.count { asyncEval(x) }
         }
         let h = ocrRMSNorm(x, normW)
         // No weight up-cast. `h.asType(.float32) @ lm_head` would materialise a full fp32 copy of
@@ -884,7 +790,6 @@ final class OCRLanguageModel: @unchecked Sendable {
     /// 32768 measured best on long_scan (199 aggregate against 185 at full vocabulary, 197 at
     /// 16384 and 192 at 8192): below it acceptance starts to cost more than the read saves.
     nonisolated(unsafe) static var draftVocab = 32768   // 0 = full vocabulary
-    nonisolated(unsafe) static var adaptiveDraft = false
 
     /// The shortlisted head, MATERIALISED so the read really is smaller.
     ///

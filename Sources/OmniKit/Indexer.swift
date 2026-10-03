@@ -300,9 +300,6 @@ public final class Indexer: @unchecked Sendable {
     private func noteDedupHit() { dedupLock.withLock { _dedupHits += 1 } }
     /// Dedup hits since the last call (concurrent decode threads increment).
     private func takeDedupHits() -> Int { dedupLock.withLock { let n = _dedupHits; _dedupHits = 0; return n } }
-    private var _chunkReuse = 0
-    private func noteChunkReuse(_ k: Int) { guard k > 0 else { return }; dedupLock.withLock { _chunkReuse += k } }
-    private func takeChunkReuse() -> Int { dedupLock.withLock { let n = _chunkReuse; _chunkReuse = 0; return n } }
 
     // CROSS-FILE CHUNK REUSE.
     //
@@ -365,11 +362,10 @@ public final class Indexer: @unchecked Sendable {
         var uniqTexts: [String] = []
         var uniqKeys: [String] = []
         var owners: [[(Int, Int)]] = []
-        var hits = 0
         chunkVecLock.lock()
         for (g, grp) in groups.enumerated() {
             for (i, e) in grp.enumerated() {
-                if !e.key.isEmpty, let v = chunkVecCache[e.key] { out[g][i] = v; hits += 1; continue }
+                if !e.key.isEmpty, let v = chunkVecCache[e.key] { out[g][i] = v; continue }
                 if !e.key.isEmpty, let s = slotOf[e.key] { owners[s].append((g, i)); continue }
                 if !e.key.isEmpty { slotOf[e.key] = uniqTexts.count }
                 uniqTexts.append(e.text); uniqKeys.append(e.key); owners.append([(g, i)])
@@ -398,7 +394,6 @@ public final class Indexer: @unchecked Sendable {
                     let key = uniqKeys[u]
                     if !key.isEmpty, let v = found[key] {
                         for (g, gi) in owners[u] { out[g][gi] = v }
-                        hits += owners[u].count
                         if chunkVecCache[key] == nil { chunkVecCache[key] = v; chunkVecOrder.append(key) }
                         continue
                     }
@@ -408,7 +403,6 @@ public final class Indexer: @unchecked Sendable {
                 uniqTexts = keptTexts; uniqKeys = keptKeys; owners = keptOwners
             }
         }
-        noteChunkReuse(hits)
         guard !uniqTexts.isEmpty else { return out }
 
         // Re-bucket by length, same discipline as the caller: padding is already ~0% because of it.
@@ -785,7 +779,8 @@ public final class Indexer: @unchecked Sendable {
             guard let self else { return }
             var counts: [String: Int] = [:]
             var crawler = FileCrawler(roots: roots, ignore: settings.ignore, enabledKinds: settings.enabledKinds,
-                                      ownDataPaths: settings.ownDataPaths)
+                                      ownDataPaths: settings.ownDataPaths,
+                                      ownDataExceptions: settings.ownDataExceptions)
             crawler.onPolicyFile = self.onPolicyFile
             crawler.walk(shouldContinue: { !self.isCancelled }) { f in
                     guard let r = rootOf(f.path) else { return }
@@ -1144,7 +1139,6 @@ public final class Indexer: @unchecked Sendable {
                                 pending.append((j, piece, keys[j]))
                             }
                         }
-                        self.noteChunkReuse(reused.count)
                         acc[fid] = (item.file, item.kind, pieces.count, reused)
                         if pending.isEmpty {
                             stageStore(path, reused)            // whole file served from the store
@@ -1417,7 +1411,8 @@ public final class Indexer: @unchecked Sendable {
         // The crawl's own admission rules, for paths that arrive one at a time (admitsEventPath).
         // Keyed on the deepest root holding the path; a path under no known root is not gated.
         let gate = FileCrawler(roots: [], ignore: settings.ignore, enabledKinds: settings.enabledKinds,
-                               ownDataPaths: settings.ownDataPaths)
+                               ownDataPaths: settings.ownDataPaths,
+                                      ownDataExceptions: settings.ownDataExceptions)
         func rootOf(_ p: String) -> String? {
             roots.filter { p == $0 || p.hasPrefix($0 + "/") }.max { $0.count < $1.count }
         }
@@ -1434,7 +1429,8 @@ public final class Indexer: @unchecked Sendable {
                 if let r = rootOf(path), !gate.admitsEventPath(path, isDir: true, size: 0, root: r) { continue }
                 var crawler = FileCrawler(roots: [URL(fileURLWithPath: path)], ignore: settings.ignore,
                                           enabledKinds: settings.enabledKinds,
-                                          ownDataPaths: settings.ownDataPaths)
+                                          ownDataPaths: settings.ownDataPaths,
+                                      ownDataExceptions: settings.ownDataExceptions)
                 crawler.onPolicyFile = onPolicyFile
                 crawler.walk(shouldContinue: { !self.isCancelled }) { files.append($0) }
             } else {
@@ -1501,7 +1497,7 @@ public final class Indexer: @unchecked Sendable {
             let kind = FileExtractor.kind(forExtension: crawled.ext)
             // Ancestor-aware: an explicit file event for `.../.build/x/y.json` must honor the
             // dirOnly rule on `.build/` - the crawl prunes at the directory, this path never sees it.
-            if kind == nil || settings.ignore.isIgnoredIncludingAncestors(path, isDir: false)
+            if kind == nil || settings.ignore.isIgnoredIncludingAncestors(path, isDir: false, root: rootOf(path))
                 || rootOf(path).map({ !gate.admitsEventPath(path, isDir: false, size: crawled.size, root: $0) }) == true {
                 if known[path] != nil { toDelete.insert(path) }   // now unsupported/excluded -> remove
                 continue
@@ -1665,7 +1661,6 @@ public final class Indexer: @unchecked Sendable {
                         pending.append((j, piece, key))
                     }
                 }
-                self.noteChunkReuse(reused.count)
                 if pending.isEmpty {
                     acceptCompleted(path, reused)          // whole file served from the store
                 } else {

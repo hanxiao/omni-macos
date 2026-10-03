@@ -82,12 +82,6 @@ public struct PaperCorpusSpec: Sendable, Equatable, Codable {
 
     public var totalFiles: Int { textFiles + wideFiles + images }
 
-    /// Exact, not estimated: the size table is indexed by `i % 100`, so the total is arithmetic.
-    public var expectedTextBytes: Int {
-        (0 ..< textFiles).reduce(0) { $0 + PaperCorpus.sizeTable[$1 % PaperCorpus.sizeTable.count] }
-    }
-    /// Every wide file is exactly `wideFileBytes` long by construction.
-    public var expectedWideBytes: Int { wideFiles * PaperCorpus.wideFileBytes }
 }
 
 /// Which edit p05 applies. Raw values match the catalog's `edits` parameter, so the arm name in the
@@ -119,8 +113,6 @@ public struct PaperCorpus: Sendable {
     /// p03's index pass and p05's edit sources. Text only, so a media file cannot change the
     /// token count or the batch composition.
     public var textRoot: URL { treeRoot.appendingPathComponent("text", isDirectory: true) }
-    /// Thousands of tiny files: the crawl case's cost is per-file, so it needs file count, not bytes.
-    public var wideRoot: URL { treeRoot.appendingPathComponent("wide", isDirectory: true) }
     /// p12 only.
     public var imagesRoot: URL { treeRoot.appendingPathComponent("images", isDirectory: true) }
 
@@ -199,8 +191,6 @@ public struct PaperCorpus: Sendable {
     /// The corpus is content-addressed by index, so a case body can name a file without walking the
     /// tree and without depending on enumeration order.
     public func textFileURL(_ i: Int) -> URL { root.appendingPathComponent(Self.textRelativePath(i)) }
-    public func wideFileURL(_ i: Int) -> URL { root.appendingPathComponent(Self.wideRelativePath(i)) }
-    public func imageURL(_ i: Int) -> URL { root.appendingPathComponent(Self.imageRelativePath(i)) }
 
     /// Byte size of text file `i`, exactly. Chosen from the fixed table, so this is arithmetic.
     public static func textFileBytes(_ i: Int) -> Int { sizeTable[i % sizeTable.count] }

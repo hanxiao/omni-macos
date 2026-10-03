@@ -4001,45 +4001,6 @@ if args.count >= 2 && args[1] == "concbench2" {
     exit(0)
 }
 
-// Store-memory benchmark: omni-verify storemem [N] [dim]
-// Builds an N-row store, folds (one search), and prints process phys_footprint - the real resident
-// memory of the vector store. Used to verify opt 4C removed the flat16/base duplication.
-if args.count >= 2 && args[1] == "storemem" {
-    let N = (args.count >= 3 ? Int(args[2]) : nil) ?? 420_000
-    let dim = (args.count >= 4 ? Int(args[3]) : nil) ?? 1024
-    func footprintMB() -> Double {
-        var info = task_vm_info_data_t()
-        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size)
-        let kr = withUnsafeMutablePointer(to: &info) { p in p.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) } }
-        return kr == KERN_SUCCESS ? Double(info.phys_footprint) / 1_048_576 : -1
-    }
-    let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("storemem-\(N)-\(dim).sqlite")
-    for e in ["","-wal","-shm"] { try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e)) }
-    func unit(_ i: Int) -> [Float] { var v = [Float](repeating: 0, count: dim); v[i % dim] = 1; return v }
-    let interleave = ProcessInfo.processInfo.environment["OMNI_STOREMEM_INTERLEAVE"] == "1"
-    let base0 = footprintMB()
-    let store = try VectorStore(dbURL: tmp)
-    // Realistic rows: ~110-char paths and 220-char snippets (the indexer's snippetLength cap), 2
-    // chunks per file - the resident-metadata cost is real Strings, not empty placeholders.
-    let snip = String(repeating: "The quarterly revenue report shows strong cloud growth across all regions this year. ", count: 3).prefix(220)
-    var batch: [(path: String, chunks: [IndexedChunk])] = []
-    for i in 0..<(N / 2) {
-        let p = "/Users/someone/Documents/projects/area-\(i % 97)/subfolder-with-a-name-\(i % 31)/document-file-number-\(i).md"
-        batch.append((p, [IndexedChunk(path: p, modified: 0, kind: "text", chunkIndex: 0, snippet: String(snip), embedding: unit(i)),
-                          IndexedChunk(path: p, modified: 0, kind: "text", chunkIndex: 1, snippet: String(snip), embedding: unit(i + 1))]))
-        if batch.count == 2000 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true)
-            if interleave { _ = store.search(unit(0), topK: 10) } } }   // periodic search -> folds keep the delta small
-    if !batch.isEmpty { try store.replaceMany(batch) }
-    _ = store.search(unit(0), topK: 10)   // folds delta into base
-    MLX.GPU.clearCache()                   // reclaim freed fold buffers so we measure live residency
-    let after = footprintMB()
-    print(String(format: "storemem N=%d dim=%d  vectors=%.0f MB (bf16 single copy)  phys_footprint: base %.0f MB -> %.0f MB (store = %.0f MB)",
-                 N, dim, Double(N*dim*2)/1_048_576, base0, after, after - base0))
-    for e in ["","-wal","-shm"] { try? FileManager.default.removeItem(at: URL(fileURLWithPath: tmp.path + e)) }
-    exit(0)
-}
-
 // Load benchmark: omni-verify loadbench [N] [dim]
 // Times VectorStore(dbURL) reopening an existing N-row index (loadIntoMemory) - the store load that
 // bootstrap now overlaps with the engine load (opt 2A), i.e. the wall-clock 2A removes from launch.
@@ -4208,10 +4169,10 @@ if args.count >= 2 && args[1] == "sidecarcheck" {
 // (a cold FS cache makes each directory walk far costlier).
 if args.count >= 2 && args[1] == "crawlbench" {
     let folder = URL(fileURLWithPath: args.count >= 3 ? args[2] : NSHomeDirectory() + "/Documents")
-    func collectWalk() -> [CrawledFile] { var f: [CrawledFile] = []; FileCrawler(roots: [folder], ignore: OmniIgnore(text: "")).walk { f.append($0) }; return f }
+    func collectWalk() -> [CrawledFile] { var f: [CrawledFile] = []; FileCrawler(roots: [folder], ignore: .hiddenOnly).walk { f.append($0) }; return f }
     _ = collectWalk()   // warm the FS cache (not timed)
     let t0 = Date()
-    var c = 0; FileCrawler(roots: [folder], ignore: OmniIgnore(text: "")).walk { _ in c += 1 }   // OLD pass 1: count
+    var c = 0; FileCrawler(roots: [folder], ignore: .hiddenOnly).walk { _ in c += 1 }   // OLD pass 1: count
     let files = collectWalk()                                                            // OLD pass 2: collect
     let twoPassMs = -t0.timeIntervalSinceNow * 1000
     let t1 = Date(); let files2 = collectWalk(); let onePassMs = -t1.timeIntervalSinceNow * 1000   // NEW: one walk
@@ -4416,6 +4377,7 @@ if args.count >= 4 && args[1] == "searchreal" {
     let qvecs = probes.map { engine.embedText($0, as: .query) }
     var digest: UInt64 = 0xcbf29ce484222325
     func mix(_ s: String) { for b in s.utf8 { digest = (digest ^ UInt64(b)) &* 0x100000001b3 } }
+    var dump: [String] = []
     // FILTERED QUERIES ARE IN THE DIGEST TOO, because they take different paths. A kind filter
     // masks CONTENTS (kind is a property of the content); a folder filter masks FILES and has to
     // reach the contents through the occurrence mirror - which is where a scope leak would live, a
@@ -4442,7 +4404,13 @@ if args.count >= 4 && args[1] == "searchreal" {
             let hits = store.search(q, filter: f, topK: 10)
             mix("\(name)/q\(i):")
             for h in hits { mix(h.path); mix(String(format: "%.5f", h.score)); mix(h.kind) }
+            dump += hits.enumerated().map { "\(name)/q\(i)\t\($0.offset)\t\($0.element.path)\t\(String(format: "%.7f", $0.element.score))" }
         }
+    }
+    // OMNI_SEARCHREAL_DUMP=<file>: every answer in full, so two builds whose digests differ can be
+    // compared for what actually moved (a rank, or a score's last bits).
+    if let out = ProcessInfo.processInfo.environment["OMNI_SEARCHREAL_DUMP"] {
+        try dump.joined(separator: "\n").write(toFile: out, atomically: true, encoding: .utf8)
     }
     var lat: [Double] = []
     for _ in 0 ..< reps {
@@ -4808,7 +4776,7 @@ if args.count >= 4 && args[1] == "cutgate" {
         let idx = Indexer(store: store, embedder: engine)
         var settings = IndexSettings(enabledKinds: [.text])
         let nonText = FileExtractor.imageExtensions.union(FileExtractor.videoExtensions).union(FileExtractor.audioExtensions)
-        settings.ignore = OmniIgnore(text: (FileCrawler.skipDirNames.map { "\($0)/" } + nonText.sorted().map { "*.\($0)" }).joined(separator: "\n"))
+        settings.ignore = OmniIgnore(text: ([OmniIgnore.hiddenRule] + FileCrawler.skipDirNames.map { "\($0)/" } + nonText.sorted().map { "*.\($0)" }).joined(separator: "\n"))
         let tok0 = engine.tokensProcessed
         let t0 = Date()
         _ = await withCheckedContinuation { (cont: CheckedContinuation<Int, Never>) in
@@ -4900,7 +4868,7 @@ if args.count >= 5 && args[1] == "reusebench" {
     let store = try VectorStore(dbURL: tmp)
     var settings = IndexSettings(enabledKinds: [.text])
     let nonText = FileExtractor.imageExtensions.union(FileExtractor.videoExtensions).union(FileExtractor.audioExtensions)
-    settings.ignore = OmniIgnore(text: (FileCrawler.skipDirNames.map { "\($0)/" } + nonText.sorted().map { "*.\($0)" }).joined(separator: "\n"))
+    settings.ignore = OmniIgnore(text: ([OmniIgnore.hiddenRule] + FileCrawler.skipDirNames.map { "\($0)/" } + nonText.sorted().map { "*.\($0)" }).joined(separator: "\n"))
     func onePass(_ label: String, _ root: URL) async {
         let idx = Indexer(store: store, embedder: engine)
         let tok0 = engine.tokensProcessed
@@ -4954,7 +4922,7 @@ if args.count >= 4 && args[1] == "sharebench" {
     let idx = Indexer(store: store, embedder: engine)
     var settings = IndexSettings(enabledKinds: [.text])
     let nonText = FileExtractor.imageExtensions.union(FileExtractor.videoExtensions).union(FileExtractor.audioExtensions)
-    settings.ignore = OmniIgnore(text: (FileCrawler.skipDirNames.map { "\($0)/" } + nonText.sorted().map { "*.\($0)" }).joined(separator: "\n"))
+    settings.ignore = OmniIgnore(text: ([OmniIgnore.hiddenRule] + FileCrawler.skipDirNames.map { "\($0)/" } + nonText.sorted().map { "*.\($0)" }).joined(separator: "\n"))
     let tok0 = engine.tokensProcessed
     let t0 = Date()
     let emb: Int = await withCheckedContinuation { cont in
@@ -5011,7 +4979,7 @@ if args.count >= 4 && args[1] == "indexbench" {
     // Text-only workload, noise dirs pruned - matches the pre-OmniIgnore crawl for this bench.
     var benchSettings = IndexSettings(enabledKinds: [.text])
     let nonText = FileExtractor.imageExtensions.union(FileExtractor.videoExtensions).union(FileExtractor.audioExtensions)
-    benchSettings.ignore = OmniIgnore(text: (FileCrawler.skipDirNames.map { "\($0)/" } + nonText.sorted().map { "*.\($0)" }).joined(separator: "\n"))
+    benchSettings.ignore = OmniIgnore(text: ([OmniIgnore.hiddenRule] + FileCrawler.skipDirNames.map { "\($0)/" } + nonText.sorted().map { "*.\($0)" }).joined(separator: "\n"))
     let result: (emb: Int, sec: Double) = await withCheckedContinuation { cont in
         let done = NSLock(); var fired = false
         idx.index(roots: [target], settings: benchSettings, force: true) { p in
@@ -6511,7 +6479,7 @@ if args.count >= 4 && args[1] == "editbench" {
     let store = try VectorStore(dbURL: tmp)
     let idx = Indexer(store: store, embedder: engine)
     var settings = IndexSettings(enabledKinds: [.text])
-    settings.ignore = OmniIgnore(text: FileCrawler.skipDirNames.map { "\($0)/" }.joined(separator: "\n"))
+    settings.ignore = OmniIgnore(text: ([OmniIgnore.hiddenRule] + FileCrawler.skipDirNames.map { "\($0)/" }).joined(separator: "\n"))
     let t0 = Date()
     let first: IndexProgress = await withCheckedContinuation { cont in
         let l = NSLock(); var fired = false
@@ -6844,6 +6812,40 @@ if args.count >= 2 && args[1] == "videosegcheck" {
     exit(try await videosegcheckRun(args.count >= 3 ? args[2] : nil))
 }
 
+// Old-versus-new vectors across a library change: omni-verify embeddump <modelDir> <out.json> <textDir> <imageDir> <audio>
+// Embeds a FIXED set - the text fixtures as query and passage, the first 40 text files of
+// <textDir> (first 1500 characters) as passages, every image in <imageDir>, one audio file - and
+// writes them as JSON. Run it on two builds and compare per input: an index built by one build is
+// searched with queries from the other, so this is what an upgrade does to every user's index.
+if args.count >= 7 && args[1] == "embeddump" {
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    var out: [String: [Float]] = [:]
+    let fx = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: "Fixtures/text_fixtures_nano.json"))) as? [String: Any]
+    for (i, r) in ((fx?["records"] as? [[String: Any]]) ?? []).enumerated() {
+        guard let t = r["text"] as? String else { continue }
+        out["fixq\(i)"] = engine.embedText(t, as: .query)
+        out["fixp\(i)"] = engine.embedText(t, as: .passage)
+    }
+    let fm = FileManager.default
+    let texts = (fm.enumerator(atPath: args[4])?.compactMap { $0 as? String } ?? [])
+        .filter { ["txt", "md", "swift", "tex"].contains(($0 as NSString).pathExtension) }.sorted().prefix(40)
+    for f in texts {
+        guard let s = try? String(contentsOfFile: args[4] + "/" + f, encoding: .utf8) else { continue }
+        out["doc:" + f] = engine.embedText(String(s.prefix(1500)), as: .passage)
+    }
+    for n in ((try? fm.contentsOfDirectory(atPath: args[5])) ?? []).sorted() {
+        let u = URL(fileURLWithPath: args[5]).appendingPathComponent(n)
+        guard let src = CGImageSourceCreateWithURL(u as CFURL, nil),
+              let img = CGImageSourceCreateImageAtIndex(src, 0, nil),
+              let v = engine.embedImages([OmniVisionPreprocess.preprocessRaw(img)])?.first else { continue }
+        out["img:" + n] = v
+    }
+    if let a = engine.embedAudio(URL(fileURLWithPath: args[6])) { out["audio"] = a }
+    try JSONSerialization.data(withJSONObject: out).write(to: URL(fileURLWithPath: args[3]))
+    print("EMBEDDUMP \(out.count) vectors -> \(args[3])")
+    exit(0)
+}
+
 // Per-process NaN sweep: omni-verify nansweep <modelDir> [imageDir] [reps]
 // Measures THIS process's non-finite embedding rate per modality. The cold-load weight-corruption
 // hypothesis predicts a bimodal distribution ACROSS processes (most runs 0, an occasional run
@@ -6855,6 +6857,12 @@ if args.count >= 3 && args[1] == "nansweep" {
         ? try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
         : try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
     let reps = (args.count >= 5 ? Int(args[4]) : nil) ?? 150
+    if let out = ProcessInfo.processInfo.environment["OMNI_WEIGHT_DIGEST"] {
+        let t0 = Date()
+        let lines = engine.weightDigests().map { "\($0.name)\t\(String($0.digest, radix: 16))\t\($0.nonFinite)\t\($0.gpuSum)" }
+        try lines.joined(separator: "\n").write(toFile: out, atomically: true, encoding: .utf8)
+        print(String(format: "NANSWEEP digest %d tensors in %.1fs", lines.count, Date().timeIntervalSince(t0)))
+    }
     // Real images when a dir is given (cycled), else the synthetic probe path only.
     var raws: [OmniVisionPreprocess.RawPatches] = []
     if args.count >= 4, let names = try? FileManager.default.contentsOfDirectory(atPath: args[3]) {
@@ -6889,6 +6897,31 @@ if args.count >= 3 && args[1] == "nansweep" {
     // Corrupted process caught in the act: this is the only place the recovery reload can be
     // validated end to end (corruption cannot be injected on demand). Recover, re-measure.
     if badImg + badTxt + badAud > 0 {
+        // The corrupted process's weights, BEFORE recovery replaces them: compare with a clean
+        // process's file to tell weight corruption from compute corruption.
+        if let out = ProcessInfo.processInfo.environment["OMNI_WEIGHT_DIGEST_ON_BAD"] {
+            let lines = engine.weightDigests().map { "\($0.name)\t\(String($0.digest, radix: 16))\t\($0.nonFinite)\t\($0.gpuSum)" }
+            try lines.joined(separator: "\n").write(toFile: out, atomically: true, encoding: .utf8)
+            print("NANSWEEP bad-digest written")
+        }
+        // Staged recovery (OMNI_STAGED=1): which per-process state holds the fault?
+        if ProcessInfo.processInfo.environment["OMNI_STAGED"] == "1" {
+            func measure(_ label: String) {
+                var bi = 0, ba = 0, ni = 0, na = 0
+                for k in 0 ..< reps {
+                    if !raws.isEmpty, let vs = engine.embedImages([raws[k % raws.count]]) {
+                        ni += 1; if !(vs.first?.allSatisfy { $0.isFinite } ?? true) { bi += 1 }
+                    }
+                    if engine.supportsAudio, let av = engine.embedAudioMel(melBuf, frames: 60) {
+                        na += 1; if !av.allSatisfy({ $0.isFinite }) { ba += 1 }
+                    }
+                }
+                print("NANSWEEP-STAGE \(label)  img \(bi)/\(ni)  audio \(ba)/\(na)")
+            }
+            measure("again")
+            MLX.GPU.clearCache(); measure("clearCache")
+            engine.rebuildEncodersForDiagnosis(); measure("rebuild-same-weights")
+        }
         let recovered = engine.recoverMediaPath()
         var rBadImg = 0, rBadAud = 0, rImgN = 0, rAudN = 0
         for k in 0 ..< reps {
@@ -7392,7 +7425,7 @@ if args.count >= 4 && args[1] == "audiobench" {
     // same call the streamed long-audio path uses per segment - so carving only changes WHEN a clip's
     // solo vector is produced, never its value. It differs from the idle mixed-length batch by the
     // block-diagonal numerical effect (cos ~0.9999), the batch-composition variance the index already
-    // carries. (Run with OMNI_MEDIA_CARVE=0 to confirm the carve path is the only difference.)
+    // carries.
     let allMels = mels.map { $0.mel }, allFrames = mels.map { $0.frames }
     let perClip = zip(allMels, allFrames).map { engine.embedAudioMel($0.0, frames: $0.1) ?? [] }
     let idleBatched = engine.embedAudioMelBatch(allMels, frames: allFrames) ?? []
@@ -7463,24 +7496,22 @@ if args.count >= 2 && args[1] == "xmodal" {
 }
 
 // Text-lever parity: omni-verify levercheck <modelDir> [count]
-// Verifies the two SAFE text levers (OMNI_ASYNC_EVAL pipeline, OMNI_COMPILE_BLOCK fused block)
-// produce vectors identical to the plain per-string encode. Run it with each flag set to confirm
-// the lever is output-neutral; run with both unset for the eager baseline self-check.
+// Verifies the OMNI_ASYNC_EVAL pipeline produces vectors identical to the plain per-string encode.
+// Run it with the flag set to confirm the lever is output-neutral; run unset for the eager
+// baseline self-check.
 //   OMNI_ASYNC_EVAL=1 swift run omni-verify levercheck <modelDir>
-//   OMNI_COMPILE_BLOCK=1 swift run omni-verify levercheck <modelDir>
 // Pass the small model dir AND the nano model dir separately (both must pass).
 if args.count >= 3 && args[1] == "levercheck" {
     let dir = URL(fileURLWithPath: args[2])
     let count = (args.count >= 4 ? Int(args[3]) : nil) ?? 96
     let asyncOn = ProcessInfo.processInfo.environment["OMNI_ASYNC_EVAL"] == "1"
-    let compileOn = ProcessInfo.processInfo.environment["OMNI_COMPILE_BLOCK"] == "1"
     let cfg = try OmniConfig(modelDir: dir)
     let weights = try WeightStore(modelDir: dir, loraScale: cfg.loraScale, keepVision: false)
     let enc = try await OmniTextEncoder(modelDir: dir, weights: weights, config: cfg)
     let para = "The quarterly revenue report shows strong cloud growth this year. Paris remains the capital of France."
     var corpus: [String] = []
     for i in 0 ..< count { corpus.append(String(repeating: para + " ", count: (i % 8) + 1)) }
-    print("levercheck \(dir.lastPathComponent)  async=\(asyncOn) compile=\(compileOn)  count=\(count)")
+    print("levercheck \(dir.lastPathComponent)  async=\(asyncOn)  count=\(count)")
 
     // Reference: plain single-string encode (the path the fixtures gate validates).
     let refs = corpus.map { enc.encode($0, as: .passage) }
@@ -7508,76 +7539,6 @@ if args.count >= 3 && args[1] == "levercheck" {
 }
 
 
-// ===== benchmark harness: compilebench (auto-integrated) =====
-// Compile-lever bench: omni-verify compilebench <modelDir> [nIters]
-// Settles whether mx.compile of the per-layer backbone block (OMNI_COMPILE_BLOCK=1, read once at
-// engine init in Qwen3Backbone) actually pays off. It times the two paths the lever can touch:
-//   (1) BATCH-1 query latency via engine.embedQuery  - high-priority interactive path, where
-//       per-op MLX dispatch overhead dominates and a fused compiled graph should help MOST.
-//   (2) BATCH-48 passage embedding via engine.embedTextBatch(.passage) - the indexing path, which
-//       is far more compute-bound, so any compile win there is expected to be small.
-// The flag is read at init, so ONE process can only measure ONE setting. The maintainer runs this
-// twice: once with the flag OFF, once with OMNI_COMPILE_BLOCK=1, then diffs batch1_ms / batch48_ms.
-// levercheck already proves bit-identical output across the flag, so this command only times.
-if args.count >= 3 && args[1] == "compilebench" {
-    let dir = URL(fileURLWithPath: args[2])
-    let nIters = (args.count >= 4 ? Int(args[3]) : nil) ?? 60
-    let compileOn = ProcessInfo.processInfo.environment["OMNI_COMPILE_BLOCK"] == "1"
-    let engine = try await OmniEngine(modelDir: dir)
-
-    print("compilebench \(dir.lastPathComponent)  OMNI_COMPILE_BLOCK=\(compileOn ? "1(ON)" : "unset(OFF)")  dim=\(engine.dim)  nIters=\(nIters)")
-    print("  NOTE: comparison needs TWO runs - once with the flag OFF, once with OMNI_COMPILE_BLOCK=1 - then diff batch1_ms / batch48_ms / tok_s.")
-
-    func pct(_ sorted: [Double], _ p: Double) -> Double {
-        if sorted.isEmpty { return 0 }
-        let idx = Swift.min(sorted.count - 1, Swift.max(0, Int((Double(sorted.count) * p).rounded(.down))))
-        return sorted[idx]
-    }
-
-    // --- Path 1: BATCH-1 query latency (engine.embedQuery, query prefix, high priority). ---
-    // A single short interactive query - the worst case for dispatch overhead, best case for compile.
-    let query = "quarterly cloud revenue growth across european regions"
-    // Warm up: the first forward of each shape bucket triggers the compile (when the flag is on) and
-    // the lazy MLX kernel build (always), so it must be excluded from the timed window.
-    for _ in 0 ..< 12 { _ = engine.embedQuery(query) }
-    var b1: [Double] = []; b1.reserveCapacity(nIters)
-    for _ in 0 ..< nIters {
-        let t = Date()
-        _ = engine.embedQuery(query)
-        b1.append(-t.timeIntervalSinceNow * 1000.0)   // ms
-    }
-    b1.sort()
-    let b1med = pct(b1, 0.50), b1p99 = pct(b1, 0.99)
-
-    // --- Path 2: BATCH-48 passage embedding (engine.embedTextBatch(.passage), indexing path). ---
-    // Varied-length chunks (1..8 paragraphs) to mimic a real folder, padded to the batch Lmax.
-    let para = "The quarterly revenue report shows strong cloud growth this year, with operating margins improving across every region as distributed systems work paid off. Paris remains the capital of France."
-    var corpus: [String] = []
-    for i in 0 ..< 48 { corpus.append(String(repeating: para + " ", count: (i % 8) + 1)) }
-    _ = engine.embedTextBatch(corpus, as: .passage)   // warm (compile + kernels for this batch shape)
-    // tokensProcessed counts backbone sequence positions for non-query embeds, so its delta over the
-    // timed window is the exact token count - used for an honest tok/s on the indexing path.
-    var b48: [Double] = []; b48.reserveCapacity(nIters)
-    let tok0 = engine.tokensProcessed
-    for _ in 0 ..< nIters {
-        let t = Date()
-        _ = engine.embedTextBatch(corpus, as: .passage)
-        b48.append(-t.timeIntervalSinceNow * 1000.0)   // ms
-    }
-    let tokTotal = engine.tokensProcessed - tok0
-    b48.sort()
-    let b48med = pct(b48, 0.50), b48p99 = pct(b48, 0.99)
-    // tok/s from the median batch latency (steady-state), tokens/batch from the measured delta.
-    let tokPerBatch = Double(tokTotal) / Double(nIters)
-    let tokS = b48med > 0 ? tokPerBatch / (b48med / 1000.0) : 0
-
-    print(String(format: "  batch1  query latency  median=%.3f ms  p99=%.3f ms", b1med, b1p99))
-    print(String(format: "  batch48 passage embed  median=%.2f ms  p99=%.2f ms  (%.0f tok/batch)", b48med, b48p99, tokPerBatch))
-    // Single grep-able result line.
-    print(String(format: "COMPILEBENCH compile=%@ batch1_ms=%.3f batch48_ms=%.2f tok_s=%.0f (b1_p99=%.3f b48_p99=%.2f n=%d)",
-                 compileOn ? "1" : "0", b1med, b48med, tokS, b1p99, b48p99, nIters))
-    exit(0)
-}
 
 
 // Does the text batch size change any vector? omni-verify batchidentity <modelDir>
@@ -8622,65 +8583,7 @@ if args.count >= 5 && args[1] == "quantlearn" {
     exit(0)
 }
 
-// WHY the Hadamard preconditioner does or does not help this data:
-//   omni-verify quantdist <modelDir> [nTexts]
-// The rotation earns its keep only when a 64-wide quantization group contains outliers - affine
-// quant spends its levels on [min, max], so one large coordinate costs the other 63 their
-// precision. That is the situation in LLM weights (the setting TurboQuant was written for). This
-// measures whether it is the situation in OUR embeddings, by reporting per-group crest factor
-// (max|x| / rms) and excess kurtosis before and after the rotation. A Gaussian group sits at
-// kurtosis 0 and crest ~3; if the raw vectors are already there, the rotation has nothing to fix.
-if args.count >= 3 && args[1] == "quantdist" {
-    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
-    let n = (args.count >= 4 ? Int(args[3]) : nil) ?? 256
-    let d = engine.dim, group = 64
-    guard VectorStore.hadamardCompatible(d) else { print("dim \(d) not Hadamard-compatible"); exit(1) }
-    // Real passages, not synthetic: the question is about the encoder's output distribution.
-    let seeds = ["The quarterly invoice was issued on the fifteenth.", "def forward(self, x): return self.norm(x)",
-                 "A photograph of a beach at sunset with long shadows.", "Memory profiling shows the fold dominates.",
-                 "SELECT path, score FROM chunks ORDER BY score DESC", "Meeting notes: roadmap, staffing, Q3 targets.",
-                 "The cat sat on the mat, unimpressed.", "Metal kernel dispatch overhead at small shapes."]
-    var texts: [String] = []
-    for i in 0 ..< n { texts.append(seeds[i % seeds.count] + " (\(i))") }
-    var vecs: [[Float]] = []
-    for b in stride(from: 0, to: n, by: 32) {
-        vecs.append(contentsOf: engine.embedTextBatch(Array(texts[b ..< Swift.min(b + 32, n)]), as: .passage))
-    }
-    var signs = [Float](repeating: 0, count: d)
-    var rng: UInt64 = 0x9E37_79B9_7F4A_7C15 &+ UInt64(d)
-    for i in 0 ..< d { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; signs[i] = (rng >> 40) & 1 == 0 ? -1 : 1 }
-    let sg = MLXArray(signs, [d])
-    let X = MLXArray(vecs.flatMap { $0 }, [vecs.count, d])
-    let R = MLX.hadamardTransform(X * sg, scale: 1.0 / Float(d).squareRoot())
-    MLX.eval(X, R)
-
-    func stats(_ a: MLXArray, _ label: String) {
-        let h = a.asArray(Float.self)
-        let rowsN = vecs.count, groups = d / group
-        var crest = [Double](), kurt = [Double]()
-        for r in 0 ..< rowsN {
-            for g in 0 ..< groups {
-                let lo = r * d + g * group
-                var s2 = 0.0, s4 = 0.0, mx = 0.0
-                for i in lo ..< lo + group { let v = Double(h[i]); s2 += v * v; s4 += v * v * v * v; mx = Swift.max(mx, abs(v)) }
-                let m2 = s2 / Double(group), m4 = s4 / Double(group)
-                guard m2 > 0 else { continue }
-                crest.append(mx / m2.squareRoot())
-                kurt.append(m4 / (m2 * m2) - 3.0)
-            }
-        }
-        crest.sort(); kurt.sort()
-        print(String(format: "  %-9@ crest(max/rms) p50=%.2f p99=%.2f max=%.2f     excess kurtosis p50=%+.2f p99=%+.2f",
-                     label, crest[crest.count/2], crest[Int(Double(crest.count) * 0.99)], crest.last ?? 0,
-                     kurt[kurt.count/2], kurt[Int(Double(kurt.count) * 0.99)]))
-    }
-    print("quantdist dim=\(d) group=\(group) rows=\(vecs.count)   (Gaussian reference: crest ~3.0, excess kurtosis 0)")
-    stats(X, "raw")
-    stats(R, "rotated")
-    exit(0)
-}
-
-// Is the Hadamard preconditioner actually inner-product preserving?
+// Is the Hadamard rotation (the 1-bit tier's) actually inner-product preserving?
 //   omni-verify hadamardcheck [dim]
 // Everything downstream assumes <Rx, Rq> == <x, q> for R = (H/sqrt(d)).diag(s). If MLX's transform
 // normalizes differently than assumed, recall numbers would silently be measuring a broken ranking

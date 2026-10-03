@@ -8,6 +8,7 @@ enum SidebarSelection: Hashable {
     case recents
     case folder(URL)
     case photos(String)   // a Photos source, by its root key
+    case clipboard
     case history(String)
 }
 
@@ -142,6 +143,8 @@ struct Sidebar: View {
                 // FIRST AND ALWAYS, where Finder puts its own Recents - a new install with nothing
                 // indexed has the row too, and it says so.
                 RecentsRow().sidebarRow(.recents)
+                // The other smart folder, beside Recents rather than among the user's sources.
+                ClipboardRow().sidebarRow(.clipboard)
                 // NESTED, the way Finder's sidebar nests. The user's folders are a tree - a parent
                 // and the folders they added inside it - and a flat list could not say so: after a
                 // parent absorbed six children the sidebar held seven rows with no sign that six
@@ -172,8 +175,18 @@ struct Sidebar: View {
                 photoRows
                 // One "Add", and one PICKER behind it - see pickFolder. Whether the place is a
                 // folder or the photo library falls out of what was selected.
-                Button { SourcePicker.add(to: model) } label: { Label("Add\u{2026}", systemImage: "plus") }
-                    .buttonStyle(.plain)
+                // The same icon column as every row above it (a 16pt slot, 7pt to the title): a
+                // `Label` lays its icon out on its own metrics and sat a few points to the right.
+                Button { SourcePicker.add(to: model) } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "plus").frame(width: 16)
+                        Text("Add\u{2026}")
+                        Spacer()
+                    }
+                    .foregroundStyle(.secondary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
             }
             .id(isNested)
     }
@@ -228,6 +241,7 @@ struct Sidebar: View {
             // filters first and clearing here would wipe them straight back out.
             if case .folder(let url) = sel { model.enterFolder(url) }
             else if sel == .recents { model.enterRecents() }
+            else if sel == .clipboard { model.enterClipboard() }
             else if case .photos(let key) = sel,
                     let source = model.photoSources.first(where: { $0.key == key }) {
                 // Was missing entirely: `.photos` fell into the else below, so clicking a photo
@@ -258,6 +272,7 @@ struct Sidebar: View {
         .onChange(of: model.fileQuery) { _, _ in reconcileSelection() }
         .onReceive(NotificationCenter.default.publisher(for: .omniPerfSidebarSelect)) { note in
             if let i = note.object as? Int, i == -1 { selection = .recents }
+            else if let i = note.object as? Int, i == -2 { selection = .clipboard }
             else if let i = note.object as? Int, model.roots.indices.contains(i) { selection = .folder(model.roots[i]) }
         }
         .sheet(isPresented: Binding(get: { model.showPhotoPicker }, set: { model.showPhotoPicker = $0 })) { PhotoSourcePicker() }
@@ -275,16 +290,17 @@ struct Sidebar: View {
             case .history(let id):
                 if let item = model.searchHistory.first(where: { $0.id == id }) { model.removeHistory(item) }
                 selection = nil
-            case .recents, .none: break
+            case .recents, .clipboard, .none: break
             }
         }
         // Drag a folder in from Finder to add it as a search root - the most natural gesture on
         // macOS, alongside the existing Add Folder button.
         .dropDestination(for: URL.self) { urls, _ in
+            guard !FileDrag.isActive else { return false }   // Omni's own drag: see FileDrag
             let dirs = urls.filter { $0.hasDirectoryPath }
             model.addRoots(dirs)
             return !dirs.isEmpty
-        } isTargeted: { dropTargeted = $0 }
+        } isTargeted: { dropTargeted = $0 && !FileDrag.isActive }
         .overlay {
             if dropTargeted {
                 DropRing()
@@ -525,7 +541,7 @@ private struct PhotoSourceRow: View {
                 Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary)
             } else if (RootIndexState.isActive(model, key: source.key) || model.isPhotoSourceQueued(source)) && !RootIndexState.isFinished(model, key: source.key) {
                 CloudSyncPie(fraction: RootIndexState.activeFraction(model, key: source.key))
-            } else if model.indexedFiles > 0, let c = model.folderFileCounts[source.key] {
+            } else if model.hasIndexedFiles, let c = model.folderFileCounts[source.key] {
                 Text(c.formatted())
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(c == 0 ? .tertiary : .secondary)
@@ -575,6 +591,54 @@ private struct PhotoSourceRow: View {
 /// control here would be describing the parent's state under this folder's name. What it keeps is
 /// the thing that makes it worth listing - selecting it browses it, and its context menu still
 /// offers "Add to Search Scope", which is how several folders get searched at once.
+/// The clipboard history: a folder of clips, drawn after the Photos rows. Always present, so
+/// capture can be found and turned on from here.
+private struct ClipboardRow: View {
+    @Environment(\.sidebarRowSelected) private var selected
+    @Environment(AppModel.self) private var model: AppModel
+
+    private var key: String { AppModel.clipboardDirectory.path }
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "list.clipboard").sidebarTint(selected, else: .secondary).frame(width: 16)
+            Text("Clipboard").sidebarTint(selected, else: .primary)
+            Spacer()
+            if model.clipboardEnabled, RootIndexState.isActive(model, key: key), !RootIndexState.isFinished(model, key: key) {
+                CloudSyncPie(fraction: RootIndexState.activeFraction(model, key: key))
+            } else if model.hasIndexedFiles, let c = model.folderFileCounts[key], c > 0 {
+                Text(c.formatted())
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(model.clipboardEnabled ? .secondary : .tertiary)
+            }
+        }
+        .help(model.clipboardEnabled ? "Clipboard history" : "Clipboard history is off")
+        .contextMenu {
+            Button { model.enterClipboard() } label: { Label("Open", systemImage: "arrow.up.forward.app") }
+            if model.clipboardEnabled || model.clipboardHasClips {
+                Button { model.enterClipboard(); SearchFieldFocus.focus() } label: {
+                    Label("Search in Clipboard", systemImage: "magnifyingglass")
+                }
+            }
+            Divider()
+            Toggle(isOn: Binding(get: { model.clipboardEnabled }, set: { model.setClipboardEnabled($0) })) {
+                Label("Save Clipboard History", systemImage: "list.clipboard")
+            }
+            if model.clipboardFolderExists {
+                Button { NSWorkspace.shared.activateFileViewerSelecting([AppModel.clipboardDirectory]) } label: {
+                    Label("Show in Finder", systemImage: "folder")
+                }
+            }
+            if model.clipboardHasClips {
+                Divider()
+                Button(role: .destructive) { ClipboardClear.confirm(model) } label: {
+                    Label("Clear Clipboard History\u{2026}", systemImage: "trash")
+                }
+            }
+        }
+    }
+}
+
 /// Finder's Recents row: its `clock` symbol, its name.
 private struct RecentsRow: View {
     @Environment(\.sidebarRowSelected) private var selected
@@ -631,7 +695,7 @@ private struct FolderRow: View {
             if model.isFolderPaused(url) {
                 // Paused: indexing skips this folder. Show the count it already has,
                 // plus a pause glyph so the stopped state is unambiguous.
-                if model.indexedFiles > 0, let c = model.folderFileCounts[url.path], c > 0 {
+                if model.hasIndexedFiles, let c = model.folderFileCounts[url.path], c > 0 {
                     Text(c.formatted()).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
                 }
                 // A WARNING, not a transport control. `pause.circle` read as a button that would
@@ -656,7 +720,7 @@ private struct FolderRow: View {
                 }
                 .buttonStyle(.plain)
                 .help("No permission to read this folder")
-            } else if model.indexedFiles > 0, let c = model.folderFileCounts[url.path] {
+            } else if model.hasIndexedFiles, let c = model.folderFileCounts[url.path] {
                 // Once anything is indexed, show every folder's real count - a
                 // plain "0" is an unambiguous "nothing here yet" rather than blank.
                 Text(c.formatted())

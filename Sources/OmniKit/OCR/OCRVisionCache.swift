@@ -106,14 +106,6 @@ final class OCRVisionCache: @unchecked Sendable {
         }
     }
 
-    func clear() {
-        lock.lock()
-        defer { lock.unlock() }
-        store.removeAll()
-        order.removeAll()
-        bytes = 0
-    }
-
     var report: String {
         lock.lock()
         defer { lock.unlock() }

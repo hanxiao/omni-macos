@@ -88,9 +88,7 @@ struct PaperResultSheet: View {
     @ViewBuilder private func footer(_ report: PaperReport) -> some View {
         HStack {
             Button(copied ? "Copied" : "Copy") {
-                let pb = NSPasteboard.general
-                pb.clearContents()
-                pb.setString(model.lastPaperReportText, forType: .string)
+                OmniPasteboard.copy(model.lastPaperReportText)
                 copied = true
                 Task { try? await Task.sleep(for: .seconds(1.5)); copied = false }
             }

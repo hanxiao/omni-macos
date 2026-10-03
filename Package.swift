@@ -16,7 +16,10 @@ let package = Package(
         .executable(name: "searchbench", targets: ["searchbench"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.31.3"),
+        // EXACT, not `from:`. 0.32.x makes the OCR model's routed-expert gather ~4 ms a step slower
+        // (`ocr-verify x --probe-gather`; CLAUDE.md, "MLX 0.32"), and `from:` would let a resolve
+        // update pull it in. Move only after that probe matches on the new version.
+        .package(url: "https://github.com/ml-explore/mlx-swift", exact: "0.31.3"),
         // Rust-backed tokenizer (HF `tokenizers` crate), ~6.5x faster than swift-transformers'
         // pure-Swift BPE. Loads the same tokenizer.json, so token ids stay identical (parity).
         .package(url: "https://github.com/DePasqualeOrg/swift-tokenizers", from: "0.5.0"),

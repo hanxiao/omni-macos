@@ -277,7 +277,8 @@ struct OmniApp: App {
             }
             // Cmd-V/C/A are routed: when a text field is being edited they do the standard text
             // paste/copy/select-all; otherwise they act on the search results - Cmd-V searches by a
-            // FILE or IMAGE on the clipboard, Cmd-C copies the selected result paths, Cmd-A selects
+            // FILE or IMAGE on the clipboard, Cmd-C copies the selected files (Finder-style, with
+            // their paths as text for a text field; see AppModel.copySelectedFiles), Cmd-A selects
             // every result. Replacing .pasteboard means re-declaring Cut too (plain responder forward).
             CommandGroup(replacing: .pasteboard) {
                 Button("Cut") { NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: nil) }
@@ -351,7 +352,9 @@ struct OmniApp: App {
                 // Open / Reveal / Copy / Move to Trash act on the WHOLE selection. Quick Look and
                 // Find similar are single-item, so they are disabled when several results are selected
                 // (the context menu hides them outright there).
-                let multi = model.selectedPaths.count > 1
+                // `menuSelection`, not the selection: see AppModel.MenuSelection.
+                let sel = model.menuSelection
+                let multi = sel.pathsCount > 1
                 // Cmd-O has one owner at a time: in OCR mode it opens a document to transcribe
                 // (above), so the results version gives the chord up - it does not merely disable
                 // itself. A DISABLED item still owns its key equivalent, and AppKit resolves the
@@ -359,32 +362,34 @@ struct OmniApp: App {
                 // "Open Document..." rendering with no shortcut at all and Cmd-O doing nothing.
                 Button("Open") { model.openSelected() }
                     .keyboardShortcut(model.ocrMode ? nil : KeyboardShortcut("o", modifiers: .command))
-                    .disabled(!model.hasSelection || model.ocrMode)
+                    .disabled(!sel.hasSelection || model.ocrMode)
                 Button("Quick Look") { model.toggleQuickLook() }
                     .keyboardShortcut("y", modifiers: .command)
-                    .disabled(!model.hasSelection || multi)
+                    .disabled(!sel.hasSelection || multi)
                 Button("Show in Finder") { model.revealSelected() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
-                    .disabled(!model.hasSelection)
+                    .disabled(!sel.hasSelection)
                 // The menu bar owns these shortcuts too: keyboard equivalents declared only
                 // inside a closed context menu never fire on macOS, so the app's own Shortcuts
                 // window was advertising a dead Option-Cmd-F. The context-menu items remain as
                 // click targets naming the same chords.
                 Button("Find Similar") { model.findSimilarSelected() }
                     .keyboardShortcut("f", modifiers: [.command, .option])
-                    .disabled(!model.hasSelection || multi)
-                Button(multi ? "Copy \(model.selectedPaths.count) Paths" : "Copy Path") { model.copySelectedPaths() }
+                    .disabled(!sel.hasSelection || multi)
+                Button(multi ? "Copy \(sel.pathsCount) Paths" : "Copy Path") { model.copySelectedPaths() }
                     .keyboardShortcut("c", modifiers: [.command, .option])
-                    .disabled(!model.hasSelection)
+                    .disabled(!sel.hasSelection)
                 // Native share picker over the whole selection, mirroring the context menu. Like
-                // Finder's Share it carries no key equivalent; disabled with nothing selected.
-                ShareLink(items: model.selectedURLsOrdered) { Text("Share\u{2026}") }
-                    .disabled(!model.hasSelection)
+                // Finder's Share it carries no key equivalent; disabled with nothing selected. A
+                // button, not a ShareLink: a ShareLink holds the selected URLs, so every arrow press
+                // rebuilt the menu bar to carry the new ones. The picker builds them when it opens.
+                Button("Share\u{2026}") { SelectionShare.present(model.selectedURLsOrdered) }
+                    .disabled(!sel.hasSelection)
                 // Move to Trash (reversible). Cmd-Delete is routed: in a text field it stays the
                 // editor's delete-to-line-start, so typing in the search box can never trash files.
-                Button(multi ? "Move \(model.selectedPaths.count) Items to Trash" : "Move to Trash") { moveToTrashCommand() }
+                Button(multi ? "Move \(sel.pathsCount) Items to Trash" : "Move to Trash") { moveToTrashCommand() }
                     .keyboardShortcut(.delete, modifiers: .command)
-                    .disabled(!model.hasSelection)
+                    .disabled(!sel.hasSelection)
                 Divider()
                 // Search-level actions in one group: start a search from a file, save the
                 // current one. (A lone item between two separators reads as over-separation.)
@@ -407,14 +412,14 @@ struct OmniApp: App {
                 // Both directions between the two modes, in the menu bar as well as in the
                 // context menus - a feature reachable only by right-click is one most people never
                 // find, and only the menu bar can carry a working key equivalent.
-                Button(Transcribe.title(Transcribe.candidates(model.selectedPathsForMenu).count)) {
+                Button(Transcribe.title(sel.transcribable)) {
                     Transcribe.send(model.selectedPathsForMenu, model: model, ocr: ocr)
                 }
                 .keyboardShortcut("t", modifiers: [.command, .option])
-                .disabled(Transcribe.candidates(model.selectedPathsForMenu).isEmpty)
+                .disabled(sel.transcribable == 0)
                 Divider()
                 Button("Generate Tags") { model.requestTags(Array(model.selectedPaths)) }
-                    .disabled(!model.hasSelection || !model.canGenerateTags || !model.selectionIsTaggable)
+                    .disabled(!sel.hasSelection || !model.canGenerateTags || !sel.taggable)
                 Button("Search in This Folder") { model.enterFolder(model.filterFolder) }
                     .disabled(model.filterFolder == nil)
                 Menu("Visualize") {
@@ -425,7 +430,7 @@ struct OmniApp: App {
                 Button(ignoreFolderTitle) {
                     if let p = model.selection { model.ignoreEnclosingFolder(ofPath: p) }
                 }
-                .disabled(model.selection.map { !model.canIgnoreEnclosingFolder(ofPath: $0) } ?? true)
+                .disabled(model.menuSelection.enclosingFolder.map { !model.canIgnoreFolder($0) } ?? true)
                 Divider()
                 // THE LIBRARY'S OWN COMMANDS, LAST. These two were attached after the View menu's
                 // toolbar group, which put "Index" and "Pause indexing" under Show Toolbar and
@@ -435,7 +440,7 @@ struct OmniApp: App {
                 //
                 // Cmd-Shift-I, not Cmd-R: in a file browser Cmd-R reads as Finder's Show Original /
                 // Reload, so it is reserved (Reveal uses Cmd-Shift-R above).
-                Button(model.isPaused ? "Resume Indexing" : (model.indexedFiles == 0 ? "Index" : "Update Index")) { model.startIndexing() }
+                Button(model.isPaused ? "Resume Indexing" : (!model.hasIndexedFiles ? "Index" : "Update Index")) { model.startIndexing() }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
                     .disabled(model.isIndexing || !model.canIndex)
                 Button("Pause Indexing") { model.pauseIndexing() }
@@ -553,10 +558,10 @@ struct OmniApp: App {
     /// Names the folder it would exclude, the way the context menu does, so the menu bar item is
     /// not a vague "Ignore folder" with no indication of which.
     private var ignoreFolderTitle: String {
-        guard let p = model.selection, model.canIgnoreEnclosingFolder(ofPath: p) else {
+        guard let folder = model.menuSelection.enclosingFolder, model.canIgnoreFolder(folder) else {
             return "Ignore Enclosing Folder"
         }
-        let name = (p as NSString).deletingLastPathComponent.components(separatedBy: "/").last ?? ""
+        let name = folder.components(separatedBy: "/").last ?? ""
         return "Ignore Folder \u{201C}\(name)\u{201D}"
     }
 
@@ -629,6 +634,8 @@ struct OmniApp: App {
         // gesture with two names, and the pane only decides what happens at the end.
         let ownsSearch = (NSApp.keyWindow?.toolbar?.items.contains { $0 is NSSearchToolbarItem }) ?? false
         if model.ocrMode || ownsSearch {
+            model.pastingFromClipboard = true
+            defer { model.pastingFromClipboard = false }
             if DropRouter.handle(pb, model: model, ocr: ocr) { return }
         }
         NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil)
@@ -637,7 +644,7 @@ struct OmniApp: App {
     /// Cmd-C: copy the selected result paths when the results have focus; otherwise the standard text
     /// copy (so copying inside the search field, Settings, etc. is unchanged).
     private func copyCommand() {
-        if !isTextResponderFocused(), model.hasSelection { model.copySelectedPaths() }
+        if !isTextResponderFocused(), model.hasSelection { model.copySelectedFiles() }
         else { NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil) }
     }
 

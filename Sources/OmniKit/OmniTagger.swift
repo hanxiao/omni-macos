@@ -371,8 +371,6 @@ public final class OmniTagger: @unchecked Sendable {
         return s   // label rows are L2-normalized at build time
     }
 
-    /// True once the prior has at least the seed images in it (safe to emit user-facing tags).
-    public var priorReady: Bool { lock.withLock { priorCount > 0 } }
     /// True while the prior is completely empty (fresh cache, no persisted prior): the caller
     /// should run the procedural seed images through the scoring path first.
     public var needsSeed: Bool { lock.withLock { priorCount == 0 } }

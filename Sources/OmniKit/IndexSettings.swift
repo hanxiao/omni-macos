@@ -24,11 +24,13 @@ public struct IndexSettings: Sendable, Equatable {
     /// indexes a file iff `FileExtractor.kind(for:) != nil` and `!ignore.isIgnored(path)`. Built by
     /// AppModel from the user's .omniignore file (which migration seeds from the legacy kind/extension
     /// settings). `.default`/`.profiling` leave it empty = index everything extractable.
-    public var ignore: OmniIgnore = OmniIgnore(text: "")
+    public var ignore: OmniIgnore = .hiddenOnly
     /// Omni's own data directories, never crawled. Runtime values (the index and model folders are
     /// relocatable in Settings), so they travel with the settings rather than living in the
     /// user-editable ignore text. See FileCrawler.ownDataPaths.
     public var ownDataPaths: [String] = []
+    /// User content inside `ownDataPaths` (the clipboard history). See FileCrawler.ownDataExceptions.
+    public var ownDataExceptions: [String] = []
 
     /// Order the modalities are indexed in (user-reorderable). A uniform phase per kind lets text
     /// chunks batch across files; the order sets which modality is embedded first. Text is last by
@@ -92,7 +94,7 @@ public struct IndexSettings: Sendable, Equatable {
         s.disabledExtensions = []
         // Seed the well-known noise dirs the old crawl always skipped, so the workload stays identical
         // to pre-OmniIgnore profiling runs (no per-extension/kind exclusion, but noise dirs still pruned).
-        s.ignore = OmniIgnore(text: FileCrawler.skipDirNames.map { "\($0)/" }.joined(separator: "\n"))
+        s.ignore = OmniIgnore(text: ([OmniIgnore.hiddenRule] + FileCrawler.skipDirNames.map { "\($0)/" }).joined(separator: "\n"))
         s.kindOrder = [.image, .audio, .video, .text]
         return s
     }()
@@ -111,7 +113,7 @@ public struct IndexSettings: Sendable, Equatable {
         s.disabledExtensions = []
         s.imageTags = false
         s.skipDataless = true
-        s.ignore = OmniIgnore(text: FileCrawler.skipDirNames.map { "\($0)/" }.joined(separator: "\n"))
+        s.ignore = OmniIgnore(text: ([OmniIgnore.hiddenRule] + FileCrawler.skipDirNames.map { "\($0)/" }).joined(separator: "\n"))
         s.kindOrder = [.text]
         return s
     }()
@@ -124,7 +126,7 @@ public struct IndexSettings: Sendable, Equatable {
         s.minImageDimension = 0; s.minAudioSeconds = 0; s.minVideoSeconds = 0; s.minTextChars = 0
         s.disabledExtensions = []
         s.skipDataless = true
-        s.ignore = OmniIgnore(text: FileCrawler.skipDirNames.map { "\($0)/" }.joined(separator: "\n"))
+        s.ignore = OmniIgnore(text: ([OmniIgnore.hiddenRule] + FileCrawler.skipDirNames.map { "\($0)/" }).joined(separator: "\n"))
         s.kindOrder = [.image]
         return s
     }()

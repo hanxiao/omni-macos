@@ -200,8 +200,6 @@ struct OCRView: View {
         }
     }
 
-    private func chooseFiles() { session.chooseAndOpen() }
-
     /// Space toggles; an arrow inside an open preview replaces it with the next page.
     private func previewCurrentPage(force: Bool = false) {
         if session.previewing != nil && !force { session.previewing = nil; return }
@@ -398,8 +396,7 @@ private struct PageThumb: View {
             Button { onPreview() } label: { Label("Quick Look", systemImage: "eye") }
             if page.state == .done {
                 Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(session.pageText(at: page.id), forType: .string)
+                    OmniPasteboard.copy(session.pageText(at: page.id))
                 } label: { Label("Copy Page as Markdown", systemImage: "doc.on.clipboard") }
             }
             if let url = session.sourceURL(for: page.id) {
@@ -407,8 +404,7 @@ private struct PageThumb: View {
                 Button { PhotoActions.open(url.path) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
                 Button { PhotoActions.reveal(paths: [url.path]) } label: { Label("Show in Finder", systemImage: "folder") }
                 Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(url.path, forType: .string)
+                    OmniPasteboard.copy(url.path)
                 } label: { Label("Copy Path", systemImage: "doc.on.doc") }
             }
         }
@@ -1439,11 +1435,15 @@ private struct DropOverlay: View {
 /// main-thread cost during a run: 19% of samples in `SystemSegmentedControl` sizing alone.
 struct TranscriptFile: Transferable {
     let name: String
-    let markdown: () -> String
+    /// Built only when a share happens, and on the MAIN ACTOR, where the transcript lives: the share
+    /// machinery exports on a background thread, and calling this there trapped in the isolation
+    /// check (found by the chaos run sharing a transcript).
+    let markdown: @MainActor @Sendable () -> String
 
     static var transferRepresentation: some TransferRepresentation {
         DataRepresentation(exportedContentType: OCRSession.markdownType) { file in
-            Data(file.markdown().utf8)
+            let text = await MainActor.run { file.markdown() }
+            return Data(text.utf8)
         }
         .suggestedFileName { $0.name }
     }

@@ -83,8 +83,6 @@ public final class OCRModel: @unchecked Sendable {
     /// Hit rate and size of the visual cache, for a harness that wants to report it.
     public var visionCacheReport: String { visionCache.report }
 
-    /// Drop every cached page's features. The workspace calls this when the model is unloaded.
-    public func clearVisionCache() { visionCache.clear() }
     let llm: OCRLanguageModel
     let tokenizer: Tokenizer
     private let imageNewline: MLXArray

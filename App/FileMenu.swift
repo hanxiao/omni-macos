@@ -76,8 +76,7 @@ struct FileMenuItems<Passages: View>: View {
         }
         .keyboardShortcut("r", modifiers: [.command, .shift])
         Button {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(path, forType: .string)
+            OmniPasteboard.copy(path)
         } label: { Label("Copy Path", systemImage: "doc.on.doc") }
         // Opt-Cmd-C, matching the File menu, because that is the chord that actually fires. A
         // chord declared inside a context menu never fires on macOS, so this label is decoration -
@@ -271,8 +270,7 @@ struct FolderMenuItems: View {
             Label("Show in Finder", systemImage: "folder")
         }
         Button {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(url.path, forType: .string)
+            OmniPasteboard.copy(url.path)
         } label: { Label("Copy Path", systemImage: "doc.on.doc") }
         ShareLink(item: url) { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
         // PAUSE IS ROOT-SCOPED IN THE ENGINE. `pausedRoots` is consulted when roots are collected
@@ -304,4 +302,26 @@ struct FolderMenuItems: View {
     }
 
     private var isRoot: Bool { model.roots.contains(url) }
+}
+
+/// The system share picker over files chosen when it opens, for the menu bar and the toolbar,
+/// which therefore never have to hold - and re-render for - the current selection.
+@MainActor
+enum SelectionShare {
+    static func present(_ urls: [URL]) {
+        guard !urls.isEmpty, let window = NSApp.keyWindow ?? NSApp.mainWindow,
+              let frame = window.contentView?.superview else { return }
+        // Anchored where the request came from: the click, for the toolbar button; the top of the
+        // window under the toolbar, for the menu item or its keyboard path.
+        let anchor: NSRect
+        if let e = NSApp.currentEvent, e.window === window,
+           [.leftMouseDown, .leftMouseUp].contains(e.type) {
+            let p = frame.convert(e.locationInWindow, from: nil)
+            anchor = NSRect(x: p.x - 1, y: p.y - 1, width: 2, height: 2)
+        } else {
+            let content = window.contentLayoutRect
+            anchor = NSRect(x: content.maxX - 60, y: content.maxY - 2, width: 2, height: 2)
+        }
+        NSSharingServicePicker(items: urls).show(relativeTo: anchor, of: frame, preferredEdge: .minY)
+    }
 }

@@ -91,6 +91,7 @@ struct PhotoSourceBrowser: View {
                     .background(selected == hit.path ? Color.accentColor.opacity(0.18) : .clear,
                                 in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                     .contentShape(.rect)
+                    .fileDragSource { select(hit.path); return [hit.path] }   // see FileDrag
                     .onTapGesture(count: 2) { PhotoActions.open(hit.path) }
                     .simultaneousGesture(TapGesture().onEnded { select(hit.path) })
                     .contextMenu { menu(hit) }
@@ -147,6 +148,7 @@ struct PhotoSourceBrowser: View {
                 .padding(.leading, BrowserMetrics.rowLead)
                 .padding(.trailing, BrowserMetrics.rowTrail)
                 .contentShape(RoundedRectangle(cornerRadius: BrowserMetrics.selectionRadius))
+                .fileDragSource { select(hit.path); return [hit.path] }   // see FileDrag
                 .onTapGesture(count: 2) { PhotoActions.open(hit.path) }
                 .simultaneousGesture(TapGesture().onEnded { select(hit.path) })
                 .contextMenu { menu(hit) }

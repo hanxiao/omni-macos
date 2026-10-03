@@ -28,9 +28,10 @@ final class Qwen3Backbone: @unchecked Sendable {
     /// dispatch is a ~15-17% latency win - larger on dispatch-bound low-end GPUs - and the (B,Lmax)
     /// cache is naturally bounded to ~one key per distinct query length (measured 8 keys for 8 queries).
     /// Batched INDEXING (B>1) stays EAGER: its (B,Lmax) space explodes (measured 45+ keys for 60 files),
-    /// so recompile churn + per-graph memory outweigh the ~4% throughput gain. nil = this default;
-    /// OMNI_COMPILE_BLOCK="1" forces compile for ALL batches (bench), "0" forces eager everywhere.
-    private let compileEnv: String?
+    /// so recompile churn + per-graph memory outweigh the ~4% throughput gain.
+    /// OMNI_COMPILE_BLOCK=0 forces eager everywhere: the compiled graphs are the other suspect for
+    /// the open media NaN (see OmniEngine.loadValidated), so this stays as that lever.
+    private let compileOff: Bool
     /// Compiled block cache keyed by the shape variant `(B, Lmax, hasArrayMask, causal)`. By default
     /// only B==1 forwards of <=512 tokens compile (see forward), so there is one key per distinct
     /// length: queries cluster in a few and reuse them, while each image under the cap with a new
@@ -54,7 +55,7 @@ final class Qwen3Backbone: @unchecked Sendable {
         case "bf16", "bfloat16": self.computeDType = .bfloat16
         default: self.computeDType = env["OMNI_BF16_COMPUTE"] == "0" ? .float32 : .bfloat16
         }
-        self.compileEnv = ProcessInfo.processInfo.environment["OMNI_COMPILE_BLOCK"]
+        self.compileOff = ProcessInfo.processInfo.environment["OMNI_COMPILE_BLOCK"] == "0"
     }
 
     /// Embed token ids -> [1, L, dim] (computeDType, batch 1).
@@ -129,7 +130,7 @@ final class Qwen3Backbone: @unchecked Sendable {
         // graph. Queries cluster in a handful of short lengths and reuse their graphs (measured
         // 8 keys, 15-17% win).
         let B = inputsEmbeds.dim(0)
-        let useCompiled = compileEnv == "1" || (compileEnv != "0" && B == 1 && inputsEmbeds.dim(1) <= 512)
+        let useCompiled = !compileOff && B == 1 && inputsEmbeds.dim(1) <= 512
         if useCompiled {
             h = forwardCompiled(h, mask: mask)
         } else {
@@ -162,11 +163,11 @@ final class Qwen3Backbone: @unchecked Sendable {
     /// (cos >= 0.999) and the reference fixtures, not by a bit compare.
     ///
     /// Falls back to the plain route when disabled OR when the compiled whole-block path would be
-    /// used (OMNI_COMPILE_BLOCK=1 forces compile for all batches; that graph is traced at full width
-    /// and must not be bypassed silently). OMNI_TAIL_ROWS=0 disables.
+    /// used (that graph is traced at full width and must not be bypassed silently).
+    /// OMNI_TAIL_ROWS=0 disables.
     func forwardPooled(inputsEmbeds: MLXArray, lengths: [Int]) -> MLXArray {
         let B = inputsEmbeds.dim(0)
-        let wouldCompile = compileEnv == "1" || (compileEnv != "0" && B == 1 && inputsEmbeds.dim(1) <= 512)
+        let wouldCompile = !compileOff && B == 1 && inputsEmbeds.dim(1) <= 512
         guard Self.tailRowsEnabled, !wouldCompile, cfg.text.numLayers > 1, B == lengths.count else {
             let hidden = forward(inputsEmbeds: inputsEmbeds, length: 0, lengths: lengths)
             return poolBatchGraph(hidden, lengths: lengths)
@@ -357,7 +358,7 @@ final class Qwen3Backbone: @unchecked Sendable {
     /// embed + search instead of two. nil when the ids exceed the largest bucket or compilation
     /// is disabled. OMNI_QUERY_WHOLE=0 disables (A/B + safety).
     func pooledQueryGraph(ids: [Int]) -> MLXArray? {
-        guard Self.queryWholeEnabled, compileEnv != "0", !ids.isEmpty,
+        guard Self.queryWholeEnabled, !compileOff, !ids.isEmpty,
               let L = Self.queryBuckets.first(where: { $0 >= ids.count }) else { return nil }
         let n = ids.count
         let f = cachedQueryWhole(L)
@@ -434,7 +435,9 @@ final class Qwen3Backbone: @unchecked Sendable {
     /// The fused kernel accumulates the variance in fp32 internally - the same numeric intent as the
     /// hand-rolled fp32 path - and it is what the Python reference itself runs (mlx nn.RMSNorm wraps
     /// mx.fast.rms_norm), so the fixture parity gate validates the swap directly. OMNI_FUSED_NORM=0
-    /// restores the hand-rolled chain for A/B.
+    /// restores the hand-rolled chain. KEPT DELIBERATELY: its off arm is also the only switch that
+    /// takes the towers' `compile(shapeless:)` kernels out of the media path, which is where the open
+    /// cold-launch NaN lives (see OmniEngine.loadValidated) - a lever for that, not a settled A/B.
     static let fusedNorm = ProcessInfo.processInfo.environment["OMNI_FUSED_NORM"] != "0"
 
     private func rmsNorm(_ x: MLXArray, _ key: String) -> MLXArray {

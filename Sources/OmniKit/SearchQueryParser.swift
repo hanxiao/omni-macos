@@ -42,25 +42,6 @@ public enum SearchQueryParser {
         }
     }
 
-    /// NSRanges (UTF-16, for AppKit text storage) of each `key:value` qualifier token in `raw`, for
-    /// inline tinting. Cosmetic-only and intentionally regex-based; it mirrors `parse`'s notion of a
-    /// qualifier (whitelisted key, value right after the colon, token-start), so any drift only
-    /// mis-tints, never mis-filters.
-    // Compiled once: regex compilation dwarfs matching, and this runs on the main thread per keystroke
-    // for inline tinting. NSRegularExpression is thread-safe for matching.
-    private static let qualifierRegex: NSRegularExpression? = {
-        // (start-of-string or whitespace) then an optional '-', a whitelisted key, ':', and a value
-        // that is either a quoted string or a run of non-space characters.
-        let pattern = #"(?:^|\s)(-?(?:type|kind|tag|tags|ext|extension|in|folder|path|filename|name|file|date|after|since|score|relevance|min|sort):(?:"[^"]*"|\S+))"#
-        return try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive])
-    }()
-
-    public static func qualifierNSRanges(_ raw: String) -> [NSRange] {
-        guard let re = qualifierRegex else { return [] }
-        let ns = raw as NSString
-        return re.matches(in: raw, range: NSRange(location: 0, length: ns.length)).map { $0.range(at: 1) }
-    }
-
     public static func parse(_ raw: String) -> ParsedQuery {
         let s = Array(raw)
         let n = s.count

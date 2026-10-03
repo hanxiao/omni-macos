@@ -103,7 +103,6 @@ enum ProfilingService {
     static var uploadsEnabled: Bool {
         UserDefaults.standard.bool(forKey: consentKey) && UserDefaults.standard.bool(forKey: uploadEnabledKey)
     }
-    static func setUploadsEnabled(_ on: Bool) { UserDefaults.standard.set(on, forKey: uploadEnabledKey) }
 
     /// Explicit user choice from Settings: records consent (so the dialog won't appear) and sets
     /// whether results upload.

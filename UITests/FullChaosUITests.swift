@@ -1,4 +1,5 @@
 import XCTest
+import AppKit
 
 /// Seeded chaos over every surface: the search box, the sidebar, the folder browser, results in both
 /// views, the OCR workspace, every toolbar control and the menu bar - against a prebuilt index while
@@ -44,12 +45,28 @@ final class FullChaosUITests: XCTestCase {
                                  // microphone dialog, and an opened or revealed file put Preview or
                                  // Finder over the window, after which every action missed the app.
                                  "dictation", "emoji", "autofill", "reveal", "open with",
+                                 "show in finder", "show in photos", "open in photos",
                                  // File panels: only ocr() opens one, because it also fills it in and
                                  // closes it. Left open, every accessibility query waits on the panel's
                                  // remote service - one run sat 413 s on a single click.
-                                 "open document", "search by", "choose", "website", "github"]
+                                 "open document", "search by", "choose", "website", "github",
+                                 // Clearing the clipboard raises a modal alert; `clipboard()` does it
+                                 // on purpose and answers the alert, random menu picks do not.
+                                 "clear clipboard",
+                                 // The Apple menu is in `app.menus` too. Nothing in it is a chaos
+                                 // run's business, and some of it would end the night.
+                                 "sleep", "restart", "shut down", "lock screen", "force quit",
+                                 "system settings", "app store", "about this mac",
+                                 "system information", "recent items",
+                                 // Window arrangement moves the window out from under the run, and
+                                 // Move & Resize leaves a submenu open that later clicks land in.
+                                 "move & resize", "full screen tile", "arrange in front", "tile window",
+                                 "bring all to front"]
 
     private func allowed(_ e: XCUIElement) -> Bool {
+        // A control that went away between listing and reading (the toolbar re-lays out often)
+        // fails the whole test on its identifier; it is simply not a candidate any more.
+        guard e.exists else { return false }
         let words = [e.identifier, e.title, e.label].map { $0.lowercased() }
         if e.identifier.hasPrefix("_XCUI") { return false }
         if e.title == "Open" { return false }   // the file's own app, not Omni
@@ -169,20 +186,163 @@ final class FullChaosUITests: XCTestCase {
     ///
     /// The OPEN menu's own items only. `app.menuItems` walks every item of every menu in the menu
     /// bar through accessibility - measured at 110 s with the menu held open the whole time.
+    /// The menu that is actually OPEN. `app.menus.firstMatch` is the Apple menu, which is always in
+    /// the tree. A closed menu's items have no frame; an open one's do. `isHittable` is no test:
+    /// it is false for the items of an open context menu too, which is why no run ever chose one.
+    private func openMenu() -> XCUIElement? {
+        // Bound to the element, not the index: a menu that closes mid-scan moves every index after
+        // it, and a query re-resolved by index then fails the run instead of reading as closed.
+        for m in app.menus.allElementsBoundByAccessibilityElement.reversed() where m.exists {
+            let first = m.children(matching: .menuItem).firstMatch
+            if first.exists, !first.frame.isEmpty { return m }
+        }
+        return nil
+    }
+
     private func chooseFromOpenMenu(_ menu: XCUIElement? = nil) {
-        let open = menu ?? app.menus.firstMatch
-        guard open.exists else { return }
+        guard let open = menu ?? openMenu(), open.exists else { app.typeKey(.escape, modifierFlags: []); return }
         let items = open.children(matching: .menuItem).allElementsBoundByIndex
             .filter { $0.exists && $0.isEnabled && !$0.title.isEmpty }
         let safe = items.filter(allowed)
-        if let m = safe.isEmpty ? nil : pick(safe), rng.int(3) != 0, m.isHittable {
-            note("menu item \(m.title)")
-            m.click()
+        if let m = safe.isEmpty ? nil : pick(safe), rng.int(3) != 0, !m.frame.isEmpty {
+            let title = m.title
+            // Looked up again by title at the click: a menu that re-lays out while open replaces
+            // its items, and clicking the stale one fails the whole run.
+            let target = open.menuItems.matching(NSPredicate(format: "title == %@", title)).firstMatch
+            guard open.exists, target.exists, target.isHittable else { app.typeKey(.escape, modifierFlags: []); return }
+            note("menu item \(title)")
+            target.click()
             settle(0.8)
             dismissStray()
         } else {
             app.typeKey(.escape, modifierFlags: [])
         }
+    }
+
+    // MARK: - clipboard history
+
+    private let clipTexts = ["porsche 911 service invoice, total due friday", "meeting moved to thursday 3pm",
+                             "https://example.com/quarterly-report.pdf", "func parse(_ json: Data) throws -> [Row]",
+                             "zebras crossing the mara river at dawn", "   \n  ", "sunset over the mountains, photo 12",
+                             String(repeating: "long clipboard passage about neural network training. ", count: 80)]
+
+    /// The sidebar's outline. It stopped answering to the label 'Sidebar', and every sidebar step
+    /// then found nothing and clicked nothing while the trail still said "sidebar"; it is found by
+    /// its Recents row, which is always there, with the label kept as the first choice.
+    private func sidebarOutline() -> XCUIElement {
+        let labelled = app.outlines.matching(NSPredicate(format: "label == 'Sidebar'")).firstMatch
+        if labelled.exists { return labelled }
+        let byRecents = app.outlines.containing(NSPredicate(format: "label == 'Recents' OR value == 'Recents'")).firstMatch
+        return byRecents.exists ? byRecents : app.outlines.firstMatch
+    }
+
+    /// The Clipboard row, or nil with the reason in the trail.
+    private func clipboardRow() -> XCUIElement? {
+        if sidebarRow("Clipboard") == nil {
+            // In the OCR workspace the sidebar is the page rail, so leave it first, as a person
+            // would; then show the sidebar only if it is actually hidden.
+            let inSearch = window.searchFields.firstMatch.placeholderValue?.contains("meaning") == true
+            let toggle = window.descendants(matching: .any)["ocr.toggle"]
+            if !inSearch, toggle.exists, toggle.isHittable { note("clipboard leave ocr"); toggle.click(); settle(1.5) }
+            if sidebarRow("Clipboard") == nil, !sidebarOutline().exists {
+                app.typeKey("s", modifierFlags: [.command, .control]); settle(0.8)
+            }
+        }
+        let outline = sidebarOutline()
+        if let row = sidebarRow("Clipboard") { return row }
+        note("clipboard row MISSING outline=\(outline.exists) rows=\(outline.exists ? outline.outlineRows.count : -1)")
+        return nil
+    }
+
+    /// A sidebar row reports itself NOT hittable (its hit point lands on a child view), so gating a
+    /// click on `isHittable` skipped every sidebar row, silently, in every run. The row's own text
+    /// is hittable; the row's centre is the fallback.
+    /// A row's text, read only if it has one: section headers and the Add row do not, and reading
+    /// the value of a missing element fails the whole test.
+    private func rowName(_ row: XCUIElement) -> String {
+        let text = row.staticTexts.firstMatch
+        guard row.exists, text.exists else { return "" }
+        return (text.value as? String) ?? text.label
+    }
+
+    private func clickRow(_ row: XCUIElement, right: Bool = false) {
+        guard row.exists else { return }
+        let text = row.staticTexts.firstMatch
+        // "Add..." opens a folder panel, which wedges every accessibility query while it is up.
+        if rowName(row).hasPrefix("Add") || row.buttons["Add\u{2026}"].exists {
+            note("sidebar skip Add"); return
+        }
+        if text.exists, text.isHittable { right ? text.rightClick() : text.click(); return }
+        let c = row.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+        right ? c.rightClick() : c.click()
+    }
+
+    private func sidebarRow(_ name: String) -> XCUIElement? {
+        let outline = sidebarOutline()
+        guard outline.exists else { return nil }
+        // By the row's text, as `sidebar()` reads it: the row's Text carries no identifier.
+        let row = outline.outlineRows.containing(NSPredicate(format: "label == %@ OR value == %@", name, name)).firstMatch
+        return row.exists ? row : nil
+    }
+
+    private func pngData() -> Data? {
+        let size = 64 + rng.int(400)
+        guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: size, pixelsHigh: size, bitsPerSample: 8,
+                                         samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                         colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        for i in 0 ..< 6 {
+            NSColor(calibratedHue: CGFloat(rng.int(360)) / 360, saturation: 0.7, brightness: 0.9, alpha: 1).setFill()
+            NSRect(x: i * size / 6, y: 0, width: size / 6 + 1, height: size).fill()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+        return rep.representation(using: .png, properties: [:])
+    }
+
+    /// Copies (text, duplicates, blank, concealed, images), the Clipboard row, its menu, and Clear
+    /// through its alert, answered either way.
+    private func clipboard() {
+        let pb = NSPasteboard.general
+        switch rng.int(9) {
+        case 0, 1, 2:
+            let t = pick(clipTexts) + (rng.int(2) == 0 ? " \(rng.int(50))" : "")
+            note("clipboard copy text")
+            pb.clearContents(); pb.setString(t, forType: .string)
+        case 3:
+            note("clipboard copy concealed")
+            let concealed = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
+            pb.clearContents(); pb.declareTypes([.string, concealed], owner: nil)
+            pb.setString("hunter2-\(rng.int(1000))", forType: .string); pb.setString("", forType: concealed)
+        case 4:
+            note("clipboard copy image")
+            if let png = pngData() { pb.clearContents(); pb.setData(png, forType: .png) }
+        case 5, 6:
+            guard let row = clipboardRow() else { return }
+            note("clipboard row click")
+            clickRow(row); settle(1)
+        case 7:
+            guard let row = clipboardRow() else { return }
+            note("clipboard row menu")
+            clickRow(row, right: true); settle(0.4); chooseFromOpenMenu()
+        default:
+            guard let row = clipboardRow() else { return }
+            clickRow(row, right: true); settle(0.4)
+            let menu = openMenu() ?? app.menus.firstMatch
+            let item = menu.menuItems["Clear Clipboard History\u{2026}"]
+            guard item.exists, item.isEnabled else {
+                let titles = menu.exists ? menu.children(matching: .menuItem).allElementsBoundByIndex.map { $0.title } : []
+                note("clipboard clear MISSING menu=\(menu.exists) items=\(titles)")
+                app.typeKey(.escape, modifierFlags: []); return
+            }
+            note("clipboard clear")
+            item.click(); settle(0.6)
+            let alert = app.dialogs.firstMatch.exists ? app.dialogs.firstMatch : app.sheets.firstMatch
+            let answer = rng.int(2) == 0 ? "Clear" : "Cancel"
+            if alert.buttons[answer].exists { note("clipboard clear \(answer)"); alert.buttons[answer].click() }
+            else { app.typeKey(.escape, modifierFlags: []) }
+        }
+        settle(0.8)
     }
 
     private func viewMode() {
@@ -201,22 +361,22 @@ final class FullChaosUITests: XCTestCase {
 
     private func sidebar() {
         note("sidebar")
-        let outline = app.outlines.matching(NSPredicate(format: "label == 'Sidebar'")).firstMatch
+        let outline = sidebarOutline()
         switch rng.int(5) {
         case 0: app.typeKey("s", modifierFlags: [.command, .control]); settle(0.6)     // toggle
         case 1:
             guard outline.exists else { return }
             let row = outline.outlineRows.element(boundBy: rng.int(10))
-            if row.exists, row.isHittable {
-                note("sidebar right-click \(row.staticTexts.firstMatch.value ?? "")")
-                row.rightClick(); settle(0.4); chooseFromOpenMenu()
+            if row.exists {
+                note("sidebar right-click \(rowName(row))")
+                clickRow(row, right: true); settle(0.4); chooseFromOpenMenu()
             }
         default:
             guard outline.exists else { return }
             let row = outline.outlineRows.element(boundBy: rng.int(12))
-            if row.exists, row.isHittable {
-                note("sidebar click \(row.staticTexts.firstMatch.value ?? "")")
-                row.click(); settle(1)
+            if row.exists {
+                note("sidebar click \(rowName(row))")
+                clickRow(row); settle(1)
             }
         }
     }
@@ -322,6 +482,9 @@ final class FullChaosUITests: XCTestCase {
 
     /// Sheets, panels and Quick Look left open by the step before.
     private func dismissStray() {
+        // A submenu item (Edit > Find) opens a menu instead of acting; left open, it holds menu
+        // tracking and the next synthesized click times out.
+        for _ in 0 ..< 3 where openMenu() != nil { app.typeKey(.escape, modifierFlags: []); settle(0.3) }
         for _ in 0 ..< 2 {
             if app.sheets.firstMatch.exists || app.dialogs.firstMatch.exists { app.typeKey(.escape, modifierFlags: []); settle(0.4) }
         }
@@ -471,13 +634,18 @@ final class FullChaosUITests: XCTestCase {
         let seed = UInt64(env["OMNI_CHAOS_SEED"] ?? "") ?? UInt64(Date().timeIntervalSince1970)
         rng = SeededRandom(seed: seed)
         print("CHAOS seed \(seed)")
-        app = XCUIApplication()
+        // By PATH when OMNI_CHAOS_APP names a copy of the build with its own bundle id: launching by
+        // the default bundle id terminates any running Omni first, including the user's own.
+        app = env["OMNI_CHAOS_APP"].flatMap { $0.isEmpty ? nil : XCUIApplication(url: URL(fileURLWithPath: $0)) }
+            ?? XCUIApplication()
         app.launchArguments = [
             "-omni.dbDir", env["OMNI_PERF_DB"]!,
             "-omni.addedFolders", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
             "-omni.roots", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
             "-omni.ephemeralUIState", "YES",
-            "-omni.serving.port", "51299",
+            // Not 51299: a user may well have configured that port for their own Omni.
+            "-omni.serving.port", "51399",
+            "-omni.clipboard.enabled", "YES",
             "-omni.hangwatch", "YES", "-omni.hangwatchMs", "250",
             "-omni.hangwatchFile", env["OMNI_PERF_HANG"] ?? "/tmp/omni-chaos-hang.log",
             "-omni.stderrFile", env["OMNI_PERF_STDERR"] ?? "/tmp/omni-chaos-stderr.log",
@@ -493,6 +661,7 @@ final class FullChaosUITests: XCTestCase {
             (4, "resultActions", resultActions), (2, "viewMode", viewMode), (3, "scroll", scroll),
             (3, "sidebar", sidebar), (3, "browse", browse), (3, "toolbar", toolbar),
             (2, "menuBar", menuBar), (2, "ocr", ocr), (1, "settings", settings),
+            (4, "clipboard", clipboard),
         ]
         let total = actions.reduce(0) { $0 + $1.0 }
         while Date() < deadline {

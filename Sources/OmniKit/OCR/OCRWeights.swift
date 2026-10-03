@@ -35,8 +35,6 @@ public enum OCRWeight: @unchecked Sendable {
         }
     }
 
-    public var isPacked: Bool { if case .pack = self { return true }; return false }
-
     /// Element dtype the activations should be cast to before the matmul. For a pack that is the
     /// scales' dtype: casting activations UP to fp32 against a 16-bit weight materialises a full
     /// fp32 copy of the weight every call, which measured slower than the fp32 build it was
@@ -138,23 +136,6 @@ func ocrExpertMatmulRows(_ rows: MLXArray, _ w: OCRWeight, indices: MLXArray) ->
                               groupSize: p.groupSize, bits: p.bits, sortedIndices: false)
     }
     return y.squeezed(axis: -2)
-}
-
-/// Slice a stacked-expert weight (or pack) down to the rows named by `idx`.
-///
-/// This is the whole point of the MoE decode path: the dense dispatch reads every expert's
-/// bytes, this reads `topK` of 64. Gathering the pack's three tensors along axis 0 is exactly
-/// what mlx-lm's `fused_moe` and llama.cpp's `mul_mat_id` do.
-@inline(__always)
-func ocrGatherExperts(_ w: OCRWeight, _ idx: MLXArray) -> OCRWeight {
-    switch w {
-    case .plain(let m):
-        return .plain(m[idx])
-    case .pack(let p):
-        return .pack(.init(w: p.w[idx], scales: p.scales[idx],
-                           biases: p.biases.map { $0[idx] },
-                           groupSize: p.groupSize, bits: p.bits))
-    }
 }
 
 /// The converted jina-ocr-v1 checkpoint: fused, MLX-oriented tensors plus per-tensor quant packs.

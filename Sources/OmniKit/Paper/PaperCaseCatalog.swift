@@ -265,19 +265,6 @@ public enum PaperCaseCatalog {
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
 
-    private static func tokShare(_ scale: Double) -> PaperCaseSpec {
-        let p = PaperParams([
-            PaperParameter("flush_chunks", .int(96), scaling: .scaled(minimum: 16)),
-            PaperParameter("reps", .int(5), scaling: .scaled(minimum: 2)),
-        ]).scaled(by: scale)
-        return PaperCaseSpec(
-            id: .p04_tokshare, title: "Tokenizer share of a flush",
-            deliverable: "Sec. 2 tokenizer share of a flush",
-            budgetSeconds: 40,
-            arms: [], params: p, arithmeticPeakMB: nil,
-            requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
-    }
-
     private static func editReuse(_ scale: Double) -> PaperCaseSpec {
         let p = PaperParams([
             PaperParameter("files", .int(24), scaling: .scaled(minimum: 4)),

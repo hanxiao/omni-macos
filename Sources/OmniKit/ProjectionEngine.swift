@@ -48,9 +48,6 @@ public final class ProjectionEngine: @unchecked Sendable {
     private static let smallN = 50          // below this, skip force (PCA-2D only)
     private static let batchEpochs = 10     // epochs per gated batch / eval barrier
     private static let initStd: Float = 5.0 // target std of the PCA-2D force init
-    /// Compute the all-points PCA fallback only on the branches that read it. OMNI_VIZ_LAZY_PCA=0
-    /// restores the eager pass for A/B.
-    static let lazyPCAFallback = ProcessInfo.processInfo.environment["OMNI_VIZ_LAZY_PCA"] != "0"
 
     // MARK: - Public entry (gated, async)
 
@@ -105,7 +102,6 @@ public final class ProjectionEngine: @unchecked Sendable {
         // throw them away. Byte-identical output; the fallback just pays for itself when it fires.
         var pcaPointsCache: [ProjectionPoint]?
         func pcaPointsAll() async -> [ProjectionPoint]? {
-            _ = Self.lazyPCAFallback   // referenced so the eager A/B path below stays honest
             if let c = pcaPointsCache { return c }
             var pcaAll = Y0host
             if L < n {
@@ -127,10 +123,6 @@ public final class ProjectionEngine: @unchecked Sendable {
             pcaPointsCache = pts
             return pts
         }
-
-        // A/B: OMNI_VIZ_LAZY_PCA=0 forces the pre-change behavior (compute the all-points PCA
-        // fallback up front even in UMAP mode, where nothing normally reads it).
-        if !Self.lazyPCAFallback { _ = await pcaPointsAll() }
 
         // PCA-only (default, light): stop here. UMAP refinement (better cluster separation + the
         // neighbor graph for click-to-spotlight) is opt-in via Settings.
@@ -299,10 +291,6 @@ public final class ProjectionEngine: @unchecked Sendable {
 
     // MARK: - Core MLX kernels (ported verbatim from the spike)
 
-    /// PCA via SVD: eigh is missing in MLXLinalg, so the top-2 components come from the SVD of the
-    /// d x d covariance. SVD only runs on the CPU stream (no GPU SVD). N-independent ~105ms cost.
-    static func pca2D(_ X: MLXArray) -> MLXArray { pca2DBasis(X).Y }
-
     /// pca2D plus the fitted basis (mean + top-2 components), so non-landmark rows can be projected
     /// EXACTLY through the same components later (the landmark placement path).
     ///
@@ -452,9 +440,8 @@ public final class ProjectionEngine: @unchecked Sendable {
     /// by nothing (1971 / 2031 / 1930 / 2002 MB - inside run-to-run spread) and cost ~15% wall time
     /// at 25 MB. The fit's peak is NOT made of placement tiles; it is the MLX buffer cache
     /// (omniCacheFraction of the user's memory cap) plus the landmark kNN, and those are the levers
-    /// that would move it. OMNI_VIZ_TILE_MB re-runs that sweep.
-    static let placementTileBytes =
-        (ProcessInfo.processInfo.environment["OMNI_VIZ_TILE_MB"].flatMap { Int($0) } ?? 200) * 1_000_000
+    /// that would move it.
+    static let placementTileBytes = 200_000_000
     /// Tile rows for the placement GEMM.
     public static func placementTileRows(_ landmarks: Int) -> Int {
         max(1, placementTileBytes / max(1, landmarks * 4))

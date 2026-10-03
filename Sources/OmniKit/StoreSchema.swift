@@ -45,7 +45,7 @@ enum StoreSchema {
     // caught by the test that exists for it: the file landed under the wrong directory row, so
     // deleting its folder left the vector file holding a slot no row owned and the next open
     // refused to load. Every other path comparison in the store is already byte-wise
-    // (pathUnderFolderBytes, SearchFilter.underFolderBytes); this one has to agree with them.
+    // (SearchFilter.underFolderBytes); this one has to agree with them.
     @inline(__always) static func splitPath(_ path: String) -> (dir: String, name: String) {
         let u = path.utf8
         guard let i = u.lastIndex(of: UInt8(ascii: "/")) else { return ("", path) }

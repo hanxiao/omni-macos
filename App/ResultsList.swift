@@ -15,15 +15,6 @@ struct ResultsList<Footer: View>: View {
     @State private var gridWidth: CGFloat = 0
     /// Grid counterpart of the list's inline expansion: the path whose passages popover is open.
     @State private var passagesPopover: String?
-    /// The result-set identity we have already scrolled to the top for: query AND filters, so a
-    /// toolbar filter change - which replaces every row without touching the query - resets too. Scrolling on the query
-    /// change alone fired before the new results arrived, so it scrolled to the OUTGOING first row
-    /// and the view stayed put - visible when replaying a history item from a scrolled list.
-    /// Scrolling when that identity is republished, which happens in the same block that assigns
-    /// the rows, fires once per new result set and never on a same-query refresh from live indexing.
-    /// A reference, not a value: it is only a gate, never drawn, and as `@State` its write on each
-    /// new result set re-rendered the list and every visible row once more.
-    @State private var scrollGate = ScrollGate()
     /// One name shared by the frame reporters, the drag gesture, and the rubber-band overlay. The list
     /// and gallery are never on screen together, so reusing the string is safe. The realized-item frames
     /// themselves live as @State INSIDE the marquee modifier - they refresh on every scroll tick
@@ -145,10 +136,10 @@ struct ResultsList<Footer: View>: View {
                                       stack: group.isStack ? (group.count, group.reason) : nil,
                                       stackOpen: model.expandedStacks.contains(group.id),
                                       onToggleStack: { toggleStack(group.id) })
-                                // Result rows are intentionally NOT draggable: an in-app row drag was
-                                // easy to misclick onto the search drop target. Drag-to-search is for
-                                // files coming from OUTSIDE the app (Finder); use Find similar / Reveal
-                                // in Finder for a result.
+                                .equatable()
+                                // Rows drag files OUT of the app from their icon and name (see
+                                // FileDrag). Never back in: an in-app drag was easy to misclick onto
+                                // the search drop target, so inside Omni the drag offers nothing.
                                 .contentShape(Rectangle())
                                 // Every other row on the system's own alternating colour - the same
                                 // banding `alternatingRowBackgrounds()` gives the browsers, which
@@ -168,7 +159,7 @@ struct ResultsList<Footer: View>: View {
                                 .resultClick { handleTap(hit.path) }
                                 .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                                 .lazyContextMenu(armed: model.selectedPaths.contains(hit.path)) { menu(hit) }
-                                .reportResultFrame(hit.path, in: marqueeSpace)
+                                .reportResultFrame(hit.path, in: marqueeSpace, view: "list")
                             // chunkCount guard: if a reindex turned the file single-chunk while its
                             // path sat in `expanded` (same result set, so the reset below does not
                             // fire), the chevron is gone - don't strand an open expansion either.
@@ -203,11 +194,12 @@ struct ResultsList<Footer: View>: View {
                                                   expandable: member.chunkCount > 1,
                                                   expanded: expanded.contains(member.path),
                                                   onToggle: { toggle(member.path) })
+                                            .equatable()
                                             .contentShape(Rectangle())
                                             .resultClick { handleTap(member.path) }
                                             .simultaneousGesture(TapGesture(count: 2).onEnded { open(member.path) })
                                             .lazyContextMenu(armed: model.selectedPaths.contains(member.path)) { menu(member) }
-                                            .reportResultFrame(member.path, in: marqueeSpace)
+                                            .reportResultFrame(member.path, in: marqueeSpace, view: "list")
                                         if expanded.contains(member.path), member.chunkCount > 1 {
                                             PassagesView(passages: passagesCache[member.path],
                                                          fileName: (member.path as NSString).lastPathComponent,
@@ -247,34 +239,11 @@ struct ResultsList<Footer: View>: View {
                 // arrow press made keyboard navigation jumpy.
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: nil) }
             }
-            // A NEW query reads top-down: jump back to the best hit once its results exist.
-            // Keyed on the result-set identity rather than on the path list, because the paths are
-            // not query identity: on a corpus where every hit fits under topK, in a content-derived
-            // sort order, two different queries can return a byte-identical array, and then this
-            // handler never ran at all - no jump to the best hit, and the gate was left holding the
-            // previous query while the model had moved on, so the next unrelated same-query refresh
-            // scrolled to the top out of nowhere. resultsToken is published inside the same
-            // synchronous block that assigns the rows, so it can never fire before they exist.
-            // initial: true seeds the gate at mount. ResultsList is only rendered when results are
-            // non-empty, so the view appears at the moment the FIRST result set lands and that
-            // landing never fires a plain onChange - the gate would stay nil for the whole first
-            // query, and the next same-query row change (a background reindex, "show N more", a
-            // trashed row) would yank a scrolled list back to the top.
-            .onChange(of: model.resultsToken, initial: true) { _, _ in
-                guard scrollGate.token != model.resultsToken else { return }
-                scrollGate.token = model.resultsToken
-                // Scrolled on the NEXT turn, not in this one. The token is published in the same
-                // synchronous block that assigns the rows, so this handler runs while the list is
-                // still laid out for the OUTGOING result set: the new first row has no frame yet,
-                // scrollTo has nothing to scroll to, and a new query silently kept the old offset.
-                // One hop lets the rows lay out first, and the gate above still limits this to one
-                // scroll per result set.
-                guard let first = results.first?.path else { return }
-                Task { @MainActor in proxy.scrollTo(first, anchor: .top) }
-            }
             .marqueeSelect(space: marqueeSpace)
-            // A new result set gets a NEW scroll view, which is what actually puts the top matches
-            // on screen. Scrolling the existing one to its first row is not enough: switching sets
+            // A new result set gets a NEW scroll view, which is what puts the top matches on screen,
+            // and the only thing that does: a new scroll view starts at the top. (It also used to be
+            // followed by a scroll to the first row on the next turn, a second layout of every
+            // visible row for nothing: ~30 ms a result set, measured.) Scrolling the existing one to its first row is not enough: switching sets
             // while scrolled (typing a query, or replaying one from the sidebar) keeps the content
             // offset, and the lazy stack re-fills at that offset with the new rows, so the list
             // opened somewhere down the middle of results the user had never seen. The identity is
@@ -334,6 +303,10 @@ struct ResultsList<Footer: View>: View {
                                        stack: group.isStack ? (group.count, group.reason) : nil,
                                        stackOpen: model.expandedStacks.contains(group.id),
                                        onToggleStack: { toggleStack(group.id) })
+                            .equatable()
+                            // The whole cell is the drag handle, as in Finder's icon view; a drag
+                            // that starts in the gaps between cells draws a marquee.
+                            .fileDragSource { [model, path = hit.path] in model.dragPaths(for: path) }
                             // Make the whole cell tappable, not just the opaque thumbnail/label - without
                             // this, clicking the transparent padding around a small item did nothing.
                             // (The list row already has this; the grid relied on .draggable's hit area,
@@ -342,7 +315,7 @@ struct ResultsList<Footer: View>: View {
                             .resultClick { handleTap(hit.path) }
                             .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
                             .lazyContextMenu(armed: model.selectedPaths.contains(hit.path)) { menu(hit) }
-                            .reportResultFrame(hit.path, in: marqueeSpace)
+                            .reportResultFrame(hit.path, in: marqueeSpace, view: "grid")
                             // The grid's counterpart of the list's inline expansion: a popover
                             // anchored to the cell (the Photos/Finder info pattern - cells stay
                             // uniform, the breakdown floats with system vibrancy). Passages are
@@ -374,7 +347,7 @@ struct ResultsList<Footer: View>: View {
                                     .resultClick { handleTap(member.path) }
                                     .simultaneousGesture(TapGesture(count: 2).onEnded { open(member.path) })
                                     .lazyContextMenu(armed: model.selectedPaths.contains(member.path)) { menu(member) }
-                                    .reportResultFrame(member.path, in: marqueeSpace)
+                                    .reportResultFrame(member.path, in: marqueeSpace, view: "grid")
                                     // Level 2 in the gallery: a copy opens its own passages popover,
                                     // anchored to its own cell, exactly like the representative.
                                     .popover(isPresented: Binding(
@@ -413,34 +386,11 @@ struct ResultsList<Footer: View>: View {
                 // arrow press made keyboard navigation jumpy.
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: nil) }
             }
-            // A NEW query reads top-down: jump back to the best hit once its results exist.
-            // Keyed on the result-set identity rather than on the path list, because the paths are
-            // not query identity: on a corpus where every hit fits under topK, in a content-derived
-            // sort order, two different queries can return a byte-identical array, and then this
-            // handler never ran at all - no jump to the best hit, and the gate was left holding the
-            // previous query while the model had moved on, so the next unrelated same-query refresh
-            // scrolled to the top out of nowhere. resultsToken is published inside the same
-            // synchronous block that assigns the rows, so it can never fire before they exist.
-            // initial: true seeds the gate at mount. ResultsList is only rendered when results are
-            // non-empty, so the view appears at the moment the FIRST result set lands and that
-            // landing never fires a plain onChange - the gate would stay nil for the whole first
-            // query, and the next same-query row change (a background reindex, "show N more", a
-            // trashed row) would yank a scrolled list back to the top.
-            .onChange(of: model.resultsToken, initial: true) { _, _ in
-                guard scrollGate.token != model.resultsToken else { return }
-                scrollGate.token = model.resultsToken
-                // Scrolled on the NEXT turn, not in this one. The token is published in the same
-                // synchronous block that assigns the rows, so this handler runs while the list is
-                // still laid out for the OUTGOING result set: the new first row has no frame yet,
-                // scrollTo has nothing to scroll to, and a new query silently kept the old offset.
-                // One hop lets the rows lay out first, and the gate above still limits this to one
-                // scroll per result set.
-                guard let first = results.first?.path else { return }
-                Task { @MainActor in proxy.scrollTo(first, anchor: .top) }
-            }
             .marqueeSelect(space: marqueeSpace)
-            // A new result set gets a NEW scroll view, which is what actually puts the top matches
-            // on screen. Scrolling the existing one to its first row is not enough: switching sets
+            // A new result set gets a NEW scroll view, which is what puts the top matches on screen,
+            // and the only thing that does: a new scroll view starts at the top. (It also used to be
+            // followed by a scroll to the first row on the next turn, a second layout of every
+            // visible row for nothing: ~30 ms a result set, measured.) Scrolling the existing one to its first row is not enough: switching sets
             // while scrolled (typing a query, or replaying one from the sidebar) keeps the content
             // offset, and the lazy stack re-fills at that offset with the new rows, so the list
             // opened somewhere down the middle of results the user had never seen. The identity is
@@ -607,9 +557,25 @@ extension View {
     }
 }
 
-/// See `ResultsList.scrollGate`.
-@MainActor
-final class ScrollGate { var token: String? }
+/// Rows and cells compare by what they SHOW. Their closures are left out: they capture only the
+/// row's path and group id, which `hit` and the stack already carry. Without this SwiftUI cannot tell
+/// an unchanged row from a changed one - closures do not compare - so every update of the list
+/// re-ran every visible row: ~150 row bodies per live refresh while indexing, measured, on rows
+/// whose file had not moved. A row still re-renders on its own when something it reads changes.
+extension ResultRow: Equatable {
+    nonisolated static func == (a: ResultRow, b: ResultRow) -> Bool {
+        a.hit == b.hit && a.selected == b.selected && a.expandable == b.expandable
+            && a.expanded == b.expanded && a.stack?.count == b.stack?.count
+            && a.stack?.reason == b.stack?.reason && a.stackOpen == b.stackOpen
+    }
+}
+
+extension ResultGridItem: Equatable {
+    nonisolated static func == (a: ResultGridItem, b: ResultGridItem) -> Bool {
+        a.hit == b.hit && a.selected == b.selected && a.stack?.count == b.stack?.count
+            && a.stack?.reason == b.stack?.reason && a.stackOpen == b.stackOpen
+    }
+}
 
 extension ResultsList: Equatable {
     nonisolated static func == (a: ResultsList, b: ResultsList) -> Bool { true }
@@ -638,10 +604,14 @@ struct ResultRow: View {
 
     var body: some View {
         HStack(alignment: .center, spacing: 12) {
+            // The icon and the name are the drag handles, as in Finder's list view: a drag that
+            // starts there lifts the files, one that starts anywhere else in the row draws a marquee.
             StackedThumbnail(path: hit.path, side: 40, corner: 6, depth: stack.map { min(2, $0.count - 1) } ?? 0)
+                .fileDragSource { [model, path = hit.path] in model.dragPaths(for: path) }
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(fileName).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
+                        .fileDragSource { [model, path = hit.path] in model.dragPaths(for: path) }
                     if let stack { stackBadge(stack) }
                 }
                 // The line is always there, blank when there is nothing to say: an image's tags are
@@ -1074,18 +1044,20 @@ private struct ReportResultFrame: ViewModifier {
     @Environment(\.resultFrames) private var frames
     let path: String
     let space: String
+    /// "list" or "grid": the same file is a different row in each, and a switch is not a resize.
+    let view: String
 
     func body(content: Content) -> some View {
         content
-            .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .named(space)) }) { [frames, path] r in
+            .onGeometryChange(for: CGRect.self, of: { $0.frame(in: .named(space)) }) { [frames, path, view] r in
                 frames?.frames[path] = r
                 // A row that changes size after it appears unsettles the lazy stack (see stackBadge);
                 // OMNI_PERF_LOG names any that do, once each.
                 if omniPerfEnabled {
-                    let h = Int(r.height.rounded())
-                    if let old = RowHeightProbe.first[path], old != h, RowHeightProbe.logged.insert(path).inserted {
-                        omniPerfLog("row-height-changed \(old)->\(h) \((path as NSString).lastPathComponent)")
-                    } else if RowHeightProbe.first[path] == nil { RowHeightProbe.first[path] = h }
+                    let h = Int(r.height.rounded()), key = view + "|" + path
+                    if let old = RowHeightProbe.first[key], old != h, RowHeightProbe.logged.insert(key).inserted {
+                        omniPerfLog("row-height-changed \(view) \(old)->\(h) \((path as NSString).lastPathComponent)")
+                    } else if RowHeightProbe.first[key] == nil { RowHeightProbe.first[key] = h }
                 }
             }
             // A row the lazy stack let go of is not where it last was.
@@ -1110,8 +1082,8 @@ private extension View {
     /// Replaces `onTapGesture` on a result row. See `ResultClick`.
     func resultClick(_ action: @escaping () -> Void) -> some View { modifier(ResultClick(action: action)) }
 
-    func reportResultFrame(_ path: String, in space: String) -> some View {
-        modifier(ReportResultFrame(path: path, space: space))
+    func reportResultFrame(_ path: String, in space: String, view: String) -> some View {
+        modifier(ReportResultFrame(path: path, space: space, view: view))
     }
 
     func marqueeSelect(space: String) -> some View {
@@ -1166,9 +1138,17 @@ private struct MarqueeSelect: ViewModifier {
                         .allowsHitTesting(false)
                 }
             }
-            .gesture(
+            // SIMULTANEOUS, not `.gesture`: every row carries its own DragGesture (ResultClick's
+            // click, minimum distance 0), and a child's gesture outranks a parent's plain one, so a
+            // drag that started on a row - which is nearly every drag, rows fill the list - never
+            // reached the marquee at all. Dead since ResultClick shipped (0.14.5 included); found
+            // by FileDragUITests. Running alongside the row's click is what clickSlop was written
+            // for: under it the click acts, from it the band does. A drag from a file's icon or name
+            // lifts the file at 4 pt (FileDrag), before this one starts, and it stands down for it.
+            .simultaneousGesture(
                 DragGesture(minimumDistance: MarqueeSelect.clickSlop, coordinateSpace: .named(space))
                     .updating($rect) { [box, model] v, state, _ in
+                        guard !FileDrag.isActive else { return }
                         if state == nil {
                             let m = NSEvent.modifierFlags
                             box.base = (m.contains(.shift) || m.contains(.command)) ? model.selectedPaths : []
@@ -1176,6 +1156,7 @@ private struct MarqueeSelect: ViewModifier {
                         state = Self.band(v)
                     }
                     .onChanged { [box] v in
+                        guard !FileDrag.isActive else { return }
                         let r = Self.band(v)
                         let hit = Set(box.frames.compactMap { $0.value.intersects(r) ? $0.key : nil })
                         model.applyMarqueeSelection(box.base.union(hit))

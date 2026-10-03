@@ -331,15 +331,20 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
 
     /// Build an engine whose media (image/audio/video) embedding path is verified NaN-free.
     ///
-    /// Weight loads intermittently read uninitialized GPU memory, corrupting the materialized
-    /// copies so media embeddings come out NaN. It is per-process and persistent (measured over
-    /// 12 cold processes: 4 corrupted, at per-embed NaN rates from 2% to 37%, deterministic per
-    /// input), media-only (the text path is force-evaluated and exercised at load). A freshly
-    /// reconstructed engine reloads clean weights, so we self-test the media paths on synthetic
-    /// inputs and rebuild until they are finite. Low-rate corruption can pass these probes; the
-    /// runtime backstop is recoverMediaPath(). We cap attempts and, in the event they all fail,
-    /// return the last
-    /// engine so the app still runs (media files just skip, as before) rather than failing to launch.
+    /// About one cold process in fifty computes NaN for media embeds (image, audio, video; text
+    /// never), measured with `omni-verify nansweep` over ~400 processes on 2026-10-02. It is NOT
+    /// corrupted weights, which is what this used to say: in caught processes, every one of the 751
+    /// tensors had the same bytes, the same GPU-computed sum and no non-finite value as in a clean
+    /// process. It is not unwritten memory either (a NaN-poisoned buffer cache changes nothing).
+    /// Two modes: a low rate (3-40% of embeds) that a cache clear or time often ends, and a total
+    /// one (60 of 60) that survives a cache clear and new encoders on the SAME arrays, and ends only
+    /// when the weights are loaded into NEW buffers. So the fault depends on which buffers hold the
+    /// weights, not on what they contain - below this code, in MLX 0.31.1's Metal backend; the
+    /// thread-safety fixes in MLX core 0.31.2 need mlx-swift 0.31.5, which needs Swift 6.3.
+    /// This self-test catches the total mode at launch (synthetic inputs, both towers) and loads
+    /// fresh buffers until it passes; a low rate can pass it, and recoverMediaPath() is the runtime
+    /// backstop. Attempts are capped: if every one fails the last engine is returned, so the app
+    /// still runs and media files skip rather than the launch failing.
     public static func loadValidated(modelDir: URL, gpuCacheBytes: Int = 0, keepVision: Bool = true, keepAudio: Bool = true, maxAttempts: Int = 4) async throws -> OmniEngine {
         var engine = try await OmniEngine(modelDir: modelDir, gpuCacheBytes: gpuCacheBytes, keepVision: keepVision, keepAudio: keepAudio)
         var attempt = 1
@@ -396,20 +401,16 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         return true
     }
 
-    /// Runtime backstop for the cold-load weight corruption that slips past the load-time probes.
+    /// Runtime backstop for the media NaN that slips past the load-time probes (see loadValidated
+    /// for what it is and is not). A low rate passes three probes most of the time, so a broken
+    /// process can reach indexing - where, without this, the same files fail every pass.
     ///
-    /// Measured (nansweep, 12 cold processes): 4 had per-process media corruption at per-embed
-    /// NaN rates of 2-37%, deterministic per input (re-embedding the same input reproduces the
-    /// same NaN), media-only (text is force-evaluated and exercised at load), persisting for the
-    /// process lifetime. Three identical load-time probes pass 78-91% of the time at the low
-    /// rates, so a corrupted process can reach indexing - where, without this, the same files
-    /// fail every pass until the app relaunches.
-    ///
-    /// Recovery = reload ALL weights from disk and swap in fresh encoders (the corruption is in
-    /// the materialized GPU copies, not the files), then re-probe both towers; up to two reload
-    /// attempts. Throttled to one recovery per 120s so a pass with many bad files pays it once.
-    /// Returns true if the media path probes finite afterwards. Thread-safe: the swap runs inside
-    /// the run() gate, serialized with every embed.
+    /// Recovery = load the weights into NEW buffers and swap in fresh encoders, then re-probe both
+    /// towers; up to two attempts. New buffers are the part that matters: a cache clear, or new
+    /// encoders over the same arrays, left a total-mode process at 60 of 60 (measured). Throttled
+    /// to one recovery per 120 s so a pass with many bad files pays it once. Returns true if the
+    /// media path probes finite afterwards. Thread-safe: the swap runs inside the run() gate,
+    /// serialized with every embed.
     public func recoverMediaPath() -> Bool {
         let now = Date()
         let admitted: Bool = recoverLock.withLock {
@@ -428,9 +429,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                     imageEncoder = OmniImageEncoder(weights: weights, config: config)
                     audioEncoder = OmniAudioEncoder(weights: weights, config: config)
                     // Adopt the freshly-loaded dict: the encoders now reference it, so the old
-                    // (corrupted) weightStore must be released, else it stays strong-referenced
-                    // (clearCache cannot reclaim it) AND a later setTowers() would rebuild surviving
-                    // encoders from the stale corrupted arrays, resurrecting the NaN. (self-review fix)
+                    // weightStore must be released, else it stays strong-referenced (clearCache
+                    // cannot reclaim it) AND a later setTowers() would rebuild surviving encoders on
+                    // the old buffers - the very thing that keeps the fault alive (measured).
                     self.weightStore = weights
                     return true
                 } catch {
@@ -439,13 +440,42 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                 }
             }
             guard rebuilt else { return false }
-            MLX.GPU.clearCache()   // drop the corrupted copies' buffers
+            MLX.GPU.clearCache()   // drop the old buffers
             if mediaPathFinite(probes: 5) {
                 FileHandle.standardError.write(Data("OmniEngine: media path recovered after weight reload (attempt \(attempt))\n".utf8))
                 return true
             }
         }
         return false
+    }
+    /// Diagnostic for the cold-load media NaN: rebuild every encoder on the SAME evaluated weight
+    /// arrays (new backbone instances, so new compiled-graph caches) without clearing MLX's buffer
+    /// cache, so a staged recovery can tell which per-process state the fault lives in.
+    public func rebuildEncodersForDiagnosis() {
+        run(highPriority: false) {
+            let same = weightStore
+            textEncoder = OmniTextEncoder(weights: same, config: config, tokenizer: tokenizer)
+            imageEncoder = keepVision ? OmniImageEncoder(weights: same, config: config) : nil
+            audioEncoder = keepAudio ? OmniAudioEncoder(weights: same, config: config) : nil
+        }
+    }
+
+    /// Diagnostic for the cold-load media NaN: a content digest (FNV-1a over the stored bytes) and
+    /// the count of non-finite values for every resident weight, sorted by name. Comparing a
+    /// corrupted process with a clean one says whether the fault is in the weights or downstream.
+    public func weightDigests() -> [(name: String, digest: UInt64, nonFinite: Int, gpuSum: Double)] {
+        run(highPriority: false) {
+            weightStore.weights.keys.sorted().map { key in
+                let a = weightStore.weights[key]!
+                var h: UInt64 = 0xcbf29ce484222325
+                for b in a.asData(access: .copy).data { h = (h ^ UInt64(b)) &* 0x100000001b3 }
+                let f = a.asType(.float32)
+                let bad = (isNaN(f) .|| isInf(f)).sum().item(Int.self)
+                // Read by the GPU, not the CPU: if the two disagree the GPU sees other memory.
+                let gpuSum = Double(MLX.abs(f).sum().item(Float.self))
+                return (key, h, bad, gpuSum)
+            }
+        }
     }
     private let recoverLock = NSLock()
     private var lastRecoverAt = Date.distantPast
@@ -855,9 +885,6 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     nonisolated(unsafe) public static var indexGateWindow: Int =
         (ProcessInfo.processInfo.environment["OMNI_INDEX_GATE_BATCHES"].flatMap { Int($0) })
         ?? defaultGateWindow(gpuCores: SystemProbe.gpuCores())
-    /// Carve a multi-image embed into one-image gate holds while a query is active (see embedImages).
-    /// OMNI_MEDIA_CARVE=0 reverts to one whole-batch hold (the old behavior) for A/B.
-    static let mediaCarve = ProcessInfo.processInfo.environment["OMNI_MEDIA_CARVE"] != "0"
 
 
     public func embedImage(_ image: CGImage) -> [Float]? {
@@ -905,7 +932,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         // Same interactive carve as embedImages: while the user is searching, ONE image per gate
         // hold so a query preempts after ~one image instead of waiting behind the whole batch.
         let groups: [[OmniVisionPreprocess.RawPatches]] =
-            (interactiveQueryActive && raws.count > 1 && Self.mediaCarve) ? raws.map { [$0] } : [raws]
+            (interactiveQueryActive && raws.count > 1) ? raws.map { [$0] } : [raws]
         for group in groups {
             let r = run(highPriority: false) { () -> ([[Float]], [[Float]]?) in
                 let inputs: [OmniImageEncoder.Preprocessed] = group.map { (pixelValues: $0.tensor(), gridTHW: $0.gridTHW) }
@@ -1019,7 +1046,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         // Block-diagonal image batching gives ~0 GPU throughput (the vision tower is saturated per
         // image - measured), so splitting it costs ~nothing; vectors are per-image independent (same
         // cu_seqlens forward), so bit-identical. Full batch when idle (max indexing pipeline overlap).
-        if interactiveQueryActive, raws.count > 1, Self.mediaCarve {
+        if interactiveQueryActive, raws.count > 1 {
             var out: [[Float]] = []; out.reserveCapacity(raws.count)
             for r in raws {
                 let v = run(highPriority: false) { () -> [[Float]] in
@@ -1095,8 +1122,8 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         // SAME call embedStreamedAudio uses per segment for long audio - so carved short-audio
         // vectors are computed identically to long-audio segments (a consistency win), differing
         // from the idle mixed-length batch only by the block-diagonal numerical effect (cos ~0.9999,
-        // the same batch-composition variance the index already carries). OMNI_MEDIA_CARVE=0 reverts.
-        if interactiveQueryActive, mels.count > 1, Self.mediaCarve {
+        // the same batch-composition variance the index already carries).
+        if interactiveQueryActive, mels.count > 1 {
             var out: [[Float]] = []; out.reserveCapacity(mels.count)
             for (mel, fr) in zip(mels, frames) {
                 let v = run(highPriority: false) { () -> [Float] in
@@ -1189,8 +1216,6 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
 
     /// Exposed for parity tests: embed already-preprocessed inputs.
     public func imageEncoderForTesting() -> OmniImageEncoder? { imageEncoder }
-    public func audioEncoderForTesting() -> OmniAudioEncoder? { audioEncoder }
     /// The Document: prefix / media suffix the indexer uses (parity tests reproduce the index path).
     public var docPrefixForTesting: [Int] { docPrefix }
-    public var mediaSuffixForTesting: [Int] { mediaSuffix }
 }

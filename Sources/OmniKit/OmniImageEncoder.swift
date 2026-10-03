@@ -9,8 +9,6 @@ import MLX
 public final class OmniImageEncoder: @unchecked Sendable {
     private let backbone: Qwen3Backbone
     private let tower: OmniVisionTower
-    /// Exposed for parity tests (single-image vs packed tower features).
-    public var towerForTesting: OmniVisionTower { tower }
     private let cfg: OmniConfig
     /// Sequence length (tokens: prefix + vision patches + wrappers) of the last encode.
     /// For a batched encode this is the SUM of the per-image sequence lengths (so the indexer's

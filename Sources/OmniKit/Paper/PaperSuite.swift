@@ -64,14 +64,6 @@ public protocol PaperCaseBodies: Sendable {
     func body(for id: PaperCaseID) -> PaperCaseBody?
 }
 
-/// No bodies at all: every case records `skipped:unimplemented` and the run still produces a
-/// complete, well-formed report. This is what makes the runner testable on its own, and it is the
-/// shape a partial port has while cases are being written one at a time.
-public struct PaperNoCaseBodies: PaperCaseBodies {
-    public init() {}
-    public func body(for id: PaperCaseID) -> PaperCaseBody? { nil }
-}
-
 /// Which invocation of a case this is. Only the thermal canary is invoked twice.
 public enum PaperRepetition: String, Sendable {
     case only, first, last

@@ -360,13 +360,28 @@ final class AppModel {
         /// `url.path`, but a Photos asset is materialised to a temp file first, so the file the
         /// user picked and the file we embed have different paths and only this knows the former.
         var sourcePath: String? = nil
+        /// Pasted from the clipboard (Cmd-V into the window). The clip holding the same content
+        /// is then not a result: it would always rank first, at the query's own score.
+        var fromPasteboard: Bool = false
     }
     var fileQuery: FileQuery? = nil { didSet { refreshSearchFlags() } }
+    /// Set by the paste command while the pasteboard is turned into a query.
+    @ObservationIgnored var pastingFromClipboard = false
     /// Presented by the sidebar, triggered from anywhere that can add a source (see SourcePicker).
     var showPhotoPicker = false
     var showPhotoDenied = false
     var queryError: String? = nil   // a file query that couldn't be embedded (decode/missing)
-    var rawResults: [SearchHit] = [] { didSet { recomputeResults() } }   // kind/folder/ext/date filtered, score-sorted
+    var rawResults: [SearchHit] = [] {   // kind/folder/ext/date filtered, score-sorted
+        didSet {
+            let has = !rawResults.isEmpty
+            if has != hasResults { hasResults = has }
+            recomputeResults()
+        }
+    }
+    /// `!rawResults.isEmpty`, STORED and written only when it changes. The toolbar, the window and
+    /// the menu bar ask only this, and each new result set is a new array: reading `rawResults`
+    /// itself re-ran all three on every search (~500 ms of main thread per result set, measured).
+    private(set) var hasResults = false
     var searching = false {
         // A stats refresh skipped for this search is owed, and the one-shot callers (pass end,
         // tag batch, purge, folder removal) have no next tick to pay it - see refreshIndexStats.
@@ -391,11 +406,12 @@ final class AppModel {
             if previewURL != nil {
                 if let p = selection { showPreview(path: p) } else { previewURL = nil }
             }
+            refreshSelectionOrdered()
         }
     }
     /// The full multi-selection (result paths). `selection` is the active item within it; the set
     /// drives the row highlight and a multi-path copy. A plain click collapses both to one item.
-    var selectedPaths: Set<String> = []
+    var selectedPaths: Set<String> = [] { didSet { refreshSelectionOrdered() } }
     /// Anchor for shift-click range selection (the last item picked by a plain or Cmd click).
     private var selectionAnchor: String?
     var previewURL: URL?               // drives Quick Look; set from the Space key and the menu
@@ -425,11 +441,7 @@ final class AppModel {
     /// anything real: a layout costs (points + k neighbors) per FILE, so six small folders retain a
     /// few MB and six 250k-file folders retain ~100x that. Scaled off the user's memory cap like
     /// every other budget here, with a floor so a tiny cap still keeps one map cached.
-    /// A/B lever, same idiom as OMNI_VIZ_LAZY_PCA: 0 restores the entry-count-only cache that never
-    /// released on leaving the map, so the two can be measured against each other in one build.
-    nonisolated static let vizCacheBounded = ProcessInfo.processInfo.environment["OMNI_VIZ_CACHE_BOUND"] != "0"
     private var projectionCacheByteBudget: Int {
-        guard Self.vizCacheBounded else { return .max }
         let capGB = maxMemoryGB > 0 ? maxMemoryGB : physicalMemoryGB
         return max(32 << 20, Int(capGB * 0.02 * 1_073_741_824))
     }
@@ -478,7 +490,6 @@ final class AppModel {
     /// that may never come. The SELECTED folder is kept because clearing the query is meant to put
     /// its map straight back with no refit - that promise is the whole reason the cache exists.
     func trimProjectionCacheToCurrent() {
-        guard Self.vizCacheBounded else { return }
         let keep = selectedFolderForViz
         guard projectionCacheOrder.contains(where: { $0 != keep }) else { return }
         for u in projectionCacheOrder where u != keep { projectionCache[u] = nil; projectionTotals[u] = nil }
@@ -558,7 +569,7 @@ final class AppModel {
         return max(mapPointBudget, n)
     }
 
-    var canIndex: Bool { phase == .ready && !(roots.isEmpty && photoSources.isEmpty) }
+    var canIndex: Bool { phase == .ready && !(crawlRoots.isEmpty && photoSources.isEmpty) }
 
     // MARK: - Selected-result actions (shared by the context menu, the File menu, and key handlers)
 
@@ -572,10 +583,47 @@ final class AppModel {
     /// the selected rows are adjacent.
     var selectedPathsForMenu: [String] { selectedPathsOrdered }
 
-    private var selectedPathsOrdered: [String] {
-        let ordered = results.filter { selectedPaths.contains($0.path) }.map { $0.path }
-        return ordered.isEmpty ? (selection.map { [$0] } ?? []) : ordered
+    private var selectedPathsOrdered: [String] { selectionOrdered }
+    /// The selection in result order, STORED. Derived from `results` on every read, it made the
+    /// Share button, its tooltip and the File menu depend on every new result set, selection or
+    /// not. Recomputed when the selection or the results change, and written only when it differs.
+    private(set) var selectionOrdered: [String] = []
+    private func refreshSelectionOrdered() {
+        let ordered = selectedPaths.isEmpty ? [] : results.filter { selectedPaths.contains($0.path) }.map(\.path)
+        let next = ordered.isEmpty ? (selection.map { [$0] } ?? []) : ordered
+        if next != selectionOrdered { selectionOrdered = next }
+        let menu = MenuSelection(
+            hasSelection: selection != nil,
+            count: next.count,
+            pathsCount: selectedPaths.count,
+            transcribable: Transcribe.candidates(next).count,
+            taggable: selectionIsTaggable,
+            enclosingFolder: selection.flatMap { PhotoLibrary.isPhotoPath($0) ? nil : ($0 as NSString).deletingLastPathComponent })
+        if menu != menuSelection { menuSelection = menu }
     }
+
+    /// What the menu bar and the toolbar SHOW about the selection, stored and written only when it
+    /// changes. They used to read the selection itself, so every arrow press rebuilt the whole menu
+    /// bar three times over (selection, selectedPaths, the ordered list - one notification each):
+    /// ~115 ms of the ~280 a press cost, measured. Moving between two files of the same kind in the
+    /// same folder changes nothing here, and so touches neither. Whatever needs the actual paths
+    /// (an action, the share picker) reads them when it runs.
+    struct MenuSelection: Equatable {
+        var hasSelection = false
+        /// The selection in result order (falls back to the active item), as Share and Open count it.
+        var count = 0
+        /// `selectedPaths.count`: what "Copy N Paths" and "Move N Items to Trash" name.
+        var pathsCount = 0
+        var transcribable = 0
+        var taggable = false
+        /// The active item's folder, nil for a Photos asset. Whether it can be ignored also depends
+        /// on the roots, which `canIgnoreFolder` reads when the menu is built.
+        var enclosingFolder: String?
+    }
+    private(set) var menuSelection = MenuSelection()
+
+    /// `canIgnoreEnclosingFolder` for a folder already known (see `MenuSelection.enclosingFolder`).
+    func canIgnoreFolder(_ folder: String) -> Bool { !roots.contains { $0.path == folder } }
     /// Every selected result as a file URL, in result order (falls back to the active item). The
     /// share picker shares the whole selection, the same set Open/Reveal/Copy/Trash act on.
     var selectedURLsOrdered: [URL] { selectedPathsOrdered.map { URL(fileURLWithPath: $0) } }
@@ -668,11 +716,28 @@ final class AppModel {
         let ordered = results.filter { selectedPaths.contains($0.path) }.map { $0.path }
         let paths = ordered.isEmpty ? (selection.map { [$0] } ?? []) : ordered
         guard !paths.isEmpty else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(paths.joined(separator: "\n"), forType: .string)
+        OmniPasteboard.copy(paths.joined(separator: "\n"))
     }
 
     // MARK: - Result selection (single + multi)
+
+    /// What a drag that starts on `path` carries, Finder's rule: the whole selection, in result
+    /// order, when `path` is part of it; otherwise `path` alone, which becomes the selection.
+    func dragPaths(for path: String) -> [String] {
+        if selectedPaths.contains(path) || selection == path, !selectionOrdered.isEmpty { return selectionOrdered }
+        selectSingle(path)
+        return [path]
+    }
+
+    /// Command-C on selected files, Finder-style: the files themselves, so a paste in a Finder
+    /// folder copies them, plus their paths as text for a paste into a text field. Copy Path
+    /// (Option-Command-C) stays text-only, like Finder's Copy as Pathname.
+    func copySelectedFiles() {
+        let paths = selectionOrdered
+        guard !paths.isEmpty else { return }
+        let files = paths.filter { !PhotoLibrary.isPhotoPath($0) }.map { URL(fileURLWithPath: $0) }
+        OmniPasteboard.copyFiles(files, text: paths.joined(separator: "\n"))
+    }
 
     /// Make `path` the sole selection - a plain click or an arrow-key move.
     func selectSingle(_ path: String) {
@@ -738,19 +803,27 @@ final class AppModel {
         /// Identity of the SEARCH alone (ignoring which result was selected within it).
         var searchKey: String { fileQuery.map { "f|\($0.url.path)|\($0.similar)" } ?? "q|\(rawQuery)" }
     }
-    private var navBack: [NavEntry] = []
-    private var navForward: [NavEntry] = []
-    private var navCurrent: NavEntry?
+    // The trail is bookkeeping no view reads, so it is NOT observed: every search appends to
+    // `navBack` and clears `navForward`, and an observed array notifies on every write - `removeAll()`
+    // on an empty one included - which re-ran the toolbar and rebuilt the whole menu bar on every
+    // result set. Views read `canGoBack` / `canGoForward`, stored and written only when they flip.
+    @ObservationIgnored private var navBack: [NavEntry] = [] {
+        didSet { if canGoBack != !navBack.isEmpty { canGoBack = !navBack.isEmpty } }
+    }
+    @ObservationIgnored private var navForward: [NavEntry] = [] {
+        didSet { if canGoForward != !navForward.isEmpty { canGoForward = !navForward.isEmpty } }
+    }
+    @ObservationIgnored private var navCurrent: NavEntry?
     // The searchToken of the in-flight back/forward re-run, or nil when not navigating. Tying it to the
     // token (not a bare bool) closes a race: if the user starts a new search before the navigated one
     // settles, search() bumps searchToken, the nav search's continuation bails its `token == searchToken`
     // guard and never reaches applyResults - so a bare flag would leak true and corrupt the trail. With a
     // token, applyResults only consumes the nav restore when the SETTLING search is the navigated one.
-    private var navApplyingToken: Int?
-    private var pendingNavSelection: String?    // selection to restore once that navigated search settles
+    @ObservationIgnored private var navApplyingToken: Int?
+    @ObservationIgnored private var pendingNavSelection: String?    // selection to restore once that navigated search settles
 
-    var canGoBack: Bool { !navBack.isEmpty }
-    var canGoForward: Bool { !navForward.isEmpty }
+    private(set) var canGoBack = false
+    private(set) var canGoForward = false
 
     /// The view the user is looking at right now, or nil if the box is empty (nothing to record).
     private func currentNavEntry() -> NavEntry? {
@@ -778,6 +851,7 @@ final class AppModel {
     /// without a second history. Selecting a folder used to only draw its embedding map, which
     /// left the search unscoped and told a reader nothing about the folder's contents.
     func enterFolder(_ url: URL?) {
+        showsClipboardOff = false
         selectFolderForVisualization(nil)        // browsing takes the empty-result region
         browsedPhotoSource = nil                 // one browser at a time
         setFilterRecentsQuietly(false)           // the assignment below rewrites the box once
@@ -804,6 +878,7 @@ final class AppModel {
     /// Browse a Photos source. Selecting one used to do NOTHING - the sidebar's `onChange` handled
     /// `.folder` and let `.photos` fall through - so the row highlighted and the pane did not move.
     func enterPhotoSource(_ source: PhotoLibrary.Source) {
+        showsClipboardOff = false
         selectFolderForVisualization(nil)
         setFilterRecentsQuietly(false)
         filterFolder = nil                 // the browsers share one region; the last click wins
@@ -838,6 +913,7 @@ final class AppModel {
     /// Browse Recents, which also scopes the search to it (`in:Recents` in the box), exactly as
     /// entering a folder does. Removing the chip searches everything.
     func enterRecents() {
+        showsClipboardOff = false
         selectFolderForVisualization(nil)
         browsedPhotoSource = nil
         suppressFilterEffects = true
@@ -845,6 +921,184 @@ final class AppModel {
         suppressFilterEffects = false
         filterRecents = true               // rewrites the box and re-runs a query that is there
         captureNavStop()
+    }
+
+    // MARK: - Clipboard history (docs/clipboard.md)
+
+    /// Where clips are written: Omni's Application Support folder, or beside the index for a run
+    /// isolated by `-omni.dbDir`, so a test never writes into the user's history.
+    /// Fixed for the process: it depends only on launch arguments.
+    nonisolated static let clipboardDirectory: URL = {
+        if isolatedByLaunchArgument, let index = try? indexURL() {
+            return index.deletingLastPathComponent().appendingPathComponent("Clipboard", isDirectory: true)
+        }
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return support.appendingPathComponent("Omni/Clipboard", isDirectory: true)
+    }()
+
+    @ObservationIgnored private lazy var clipboardHistory = ClipboardHistory(directory: Self.clipboardDirectory)
+    @ObservationIgnored private var clipboardMonitor: ClipboardMonitor?
+    @ObservationIgnored private var clipboardPruneTimer: Timer?
+
+    /// Capture is opt-in; a user who never turned it on has no clipboard folder at all.
+    var clipboardEnabled: Bool = UserDefaults.standard.bool(forKey: "omni.clipboard.enabled")
+
+    var clipboardRetentionDays: Int = {
+        let d = UserDefaults.standard
+        return d.object(forKey: "omni.clipboard.retentionDays") == nil ? 30 : d.integer(forKey: "omni.clipboard.retentionDays")
+    }() {
+        didSet {
+            if !isIsolatedRun { UserDefaults.standard.set(clipboardRetentionDays, forKey: "omni.clipboard.retentionDays") }
+            pruneClipboard()
+        }
+    }
+
+    /// Whether the clipboard folder exists. It is crawled while it does, on or off, so deleting a
+    /// clip in the browser or by retention always reaches the index.
+    private(set) var clipboardFolderExists = FileManager.default.fileExists(atPath: AppModel.clipboardDirectory.path)
+
+    /// The Clipboard row was clicked while there is nothing to show: capture off and no clips.
+    var showsClipboardOff = false
+
+    /// The folders the indexer crawls and the watcher follows: the user's, plus the clipboard.
+    /// `roots` stays the user's folders alone, which is what the sidebar, Settings, the Go menu
+    /// and the served root check list.
+    var crawlRoots: [URL] { clipboardFolderExists ? roots + [Self.clipboardDirectory] : roots }
+
+    /// Clips on disk. STORED, and recounted off the main thread when it can have changed: counting
+    /// lists the folder, 7 ms at 3,000 clips, and the sidebar row's context menu - which macOS builds
+    /// on every render - reads it twice.
+    private(set) var clipboardClipCount = 0
+    /// The clip holding what is on the clipboard now, if it was recorded.
+    var clipboardCurrentPath: String? { clipboardMonitor?.current?.url.path }
+
+    var clipboardHasClips: Bool { (folderFileCounts[Self.clipboardDirectory.path] ?? 0) > 0 || clipboardClipCount > 0 }
+
+    /// Recount the clips on disk. Called where the folder changes: launch, a stored clip, Clear,
+    /// retention, and whenever the indexed count under the folder moves (which is how a clip deleted
+    /// in the browser or the Finder reaches it).
+    private func recountClipboard() {
+        let history = clipboardHistory
+        Task.detached(priority: .utility) {
+            let n = history.count
+            await MainActor.run { if self.clipboardClipCount != n { self.clipboardClipCount = n } }
+        }
+    }
+
+    /// Launch: resume capture if it is on, and apply retention.
+    func startClipboard() {
+        if clipboardEnabled { startClipboardMonitor() }
+        pruneClipboard()
+        recountClipboard()
+        clipboardPruneTimer?.invalidate()
+        let t = Timer(timeInterval: 3600, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pruneClipboard() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        clipboardPruneTimer = t
+    }
+
+    func setClipboardEnabled(_ on: Bool) {
+        guard on != clipboardEnabled else { return }
+        clipboardEnabled = on
+        if !isIsolatedRun { UserDefaults.standard.set(on, forKey: "omni.clipboard.enabled") }
+        if on {
+            try? FileManager.default.createDirectory(at: Self.clipboardDirectory, withIntermediateDirectories: true)
+            startClipboardMonitor()
+            refreshClipboardFolder()
+            if showsClipboardOff { showsClipboardOff = false; enterFolder(Self.clipboardDirectory) }
+        } else {
+            clipboardMonitor?.stop()
+            clipboardMonitor = nil
+        }
+    }
+
+    private func startClipboardMonitor() {
+        guard clipboardMonitor == nil else { return }
+        let m = ClipboardMonitor(history: clipboardHistory)
+        m.onStored = { [weak self] _ in self?.refreshClipboardFolder(); self?.recountClipboard() }
+        m.start()
+        clipboardMonitor = m
+    }
+
+    /// The folder appeared or went away: the watcher and the next pass follow it.
+    private func refreshClipboardFolder() {
+        let exists = FileManager.default.fileExists(atPath: Self.clipboardDirectory.path)
+        guard exists != clipboardFolderExists else { return }
+        clipboardFolderExists = exists
+        restartWatcher()
+        if exists { requestIndexPass() }
+    }
+
+    private func pruneClipboard() {
+        let days = clipboardRetentionDays, history = clipboardHistory
+        guard days > 0 else { return }
+        Task.detached(priority: .utility) {
+            if history.prune(olderThanDays: days) > 0 { await MainActor.run { self.recountClipboard() } }
+        }
+    }
+
+    /// Delete every clip, its rows with it. The watcher would remove the rows as the files go, but
+    /// not once the folder has left the crawl, so they are deleted here the way a removed folder's
+    /// are.
+    func clearClipboardHistory() {
+        let dir = Self.clipboardDirectory
+        let history = clipboardHistory
+        let recreate = clipboardEnabled
+        clipboardClipCount = 0
+        // Delete and recreate IN ORDER, on one task. With the delete detached and the recreate on the
+        // main thread, the delete usually ran second and left capture on with no folder.
+        Task.detached(priority: .userInitiated) {
+            try? history.clear()
+            if recreate { try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
+            await MainActor.run { self.recountClipboard() }
+        }
+        if let store {
+            if indexState == .indexing || !activeRoots.isEmpty || fsReconcileInFlight {
+                pendingRootRemovals.insert(dir.path)
+                indexer?.cancel()
+            } else {
+                Task.detached {
+                    store.deleteUnderFolder(dir.path)
+                    await MainActor.run {
+                        self.refreshIndexStats(store)
+                        self.refreshSearchAfterBackgroundChange()
+                    }
+                }
+            }
+        }
+        if !clipboardEnabled {
+            clipboardFolderExists = false
+            restartWatcher()
+        }
+    }
+
+    /// A QUERY MADE FROM THE CLIPBOARD IS NEVER ANSWERED BY ITS OWN CLIP. Pasting text into the box
+    /// or an image into the window searches with exactly what the newest clip holds, so that clip
+    /// would rank first at the query's own score, above the document the text was copied from.
+    /// Excluded: the clip of the current clipboard content, when the query is a paste or its text
+    /// is that clip's text. Compared against what the monitor stored, never by reading the
+    /// pasteboard again, which macOS may gate behind a prompt.
+    private func clipboardSelfPath(resolved: String) -> String? {
+        guard let current = clipboardMonitor?.current else { return nil }
+        if let fq = fileQuery { return fq.fromPasteboard ? current.url.path : nil }
+        guard let text = current.text else { return nil }
+        func norm(_ s: String) -> String {
+            s.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        }
+        return norm(text) == norm(resolved) ? current.url.path : nil
+    }
+
+    /// The Clipboard row: browse the folder, or show that capture is off when there is nothing to
+    /// browse.
+    func enterClipboard() {
+        if clipboardEnabled || clipboardHasClips {
+            enterFolder(Self.clipboardDirectory)
+        } else {
+            enterFolder(nil)
+            showsClipboardOff = true
+        }
     }
 
     /// The newest `limit` files by index time, off the main thread on the browse connection.
@@ -1115,40 +1369,6 @@ final class AppModel {
         if let p = selection { showPreview(path: p) }
     }
 
-    /// Move the selection by `rowDelta` positions through the visible (filtered, sorted) results.
-    /// `rowDelta == ±1` is left/right in the gallery or up/down in the list; `±columns` is a grid
-    /// row. Lets the gallery share the list's arrow-key navigation instead of being click-only.
-    func moveSelection(rowDelta: Int, gridColumns: Int? = nil) {
-        let r = results
-        guard !r.isEmpty else { return }
-        guard let cur = selection.flatMap({ sel in r.firstIndex { $0.path == sel } }) else {
-            selectSingle(r[rowDelta >= 0 ? 0 : r.count - 1].path)
-            return
-        }
-        let target = cur + rowDelta
-        guard let cols = gridColumns, cols > 1 else {
-            // List: clamp to the ends, Finder-style.
-            selectSingle(r[max(0, min(r.count - 1, target))].path)
-            return
-        }
-        // Gallery, Finder rules: horizontal steps stay within their visual row (no wrapping to
-        // the next row's first cell), vertical steps stay in bounds (no clamping that silently
-        // changes column - Up from the top row previously jumped to item 0).
-        if abs(rowDelta) == 1 {
-            guard target >= 0, target < r.count, target / cols == cur / cols else { return }
-            selectSingle(r[target].path)
-        } else {
-            if target < 0 { return }
-            if target >= r.count {
-                // Down into a shorter last row lands on its last item (Finder behavior).
-                guard cur / cols < (r.count - 1) / cols else { return }
-                selectSingle(r[r.count - 1].path)
-                return
-            }
-            selectSingle(r[target].path)
-        }
-    }
-
     /// Matching passages (ranked chunks) of a file for the current query. Runs off the main actor:
     /// rankChunks does a queue.sync linear scan over all rows, which would stall the UI on a large
     /// index when a row is expanded.
@@ -1168,7 +1388,13 @@ final class AppModel {
     /// throughput readout follows this, not just the full pass.
     var isWorking: Bool { indexState == .indexing || !activeRoots.isEmpty }
     var progress = IndexProgress()
-    var indexedFiles = 0
+    var indexedFiles = 0 {
+        didSet { if hasIndexedFiles != (indexedFiles > 0) { hasIndexedFiles = indexedFiles > 0 } }
+    }
+    /// `indexedFiles > 0`, stored and written when it flips. The toolbar, the menu bar and every
+    /// sidebar row only ask whether there is an index; reading the count itself rebuilt all of them
+    /// on each 1.5 s stats tick of an indexing pass (measured: the whole menu bar 11 times in 10 s).
+    private(set) var hasIndexedFiles = false
     var indexedChunks = 0
     /// Live embedding throughput during indexing (smoothed): files (embeds) per second and
     /// tokens (backbone sequence positions) per second. Both exactly measured.
@@ -1376,7 +1602,7 @@ final class AppModel {
     /// the well-known noise dirs (see `OmniIgnore.synthesize`). Handed to the indexer via effectiveSettings.
     private(set) var ignoreText: String = ""
     /// Compiled form of `ignoreText`.
-    private(set) var ignore = OmniIgnore(text: "")
+    private(set) var ignore = OmniIgnore.hiddenOnly
     /// Whether a `.bak` from the last Apply exists (drives the Revert button). Cached so the Settings
     /// preview - re-rendered every keystroke - doesn't do FileManager IO (a mkdir + stat) per character.
     private(set) var ignoreHasBackup = false
@@ -1484,7 +1710,7 @@ final class AppModel {
         if let key = PhotoLibrary.sourceKey(ofPath: path) {
             return photoSources.contains { $0.key == key } ? key : nil
         }
-        return roots.first { path == $0.path || path.hasPrefix($0.path + "/") }?.path
+        return crawlRoots.first { path == $0.path || path.hasPrefix($0.path + "/") }?.path
     }
 
     // Search filters + presentation. NOT persisted across launches: a filter is a refinement of a live
@@ -1565,7 +1791,7 @@ final class AppModel {
 
     /// Content area shows the OCR workspace instead of search results. Not persisted: it is a
     /// mode you step into for a task, and a relaunch should land back in search.
-    var ocrMode = false
+    var ocrMode = false { didSet { if oldValue != ocrMode, omniPerfEnabled { omniPerfLog("mode ocr=\(ocrMode)") } } }
     /// Whether the window's sidebar is showing, mirrored from ContentView's split state so the View
     /// menu can say Show Sidebar or Hide Sidebar, as Finder's does.
     var sidebarShown = true
@@ -2406,7 +2632,7 @@ final class AppModel {
         }
         if groups != ordered { groups = ordered }
         let reps = ordered.map(\.representative)
-        if results != reps { results = reps }
+        if results != reps { results = reps; refreshSelectionOrdered() }
         // Drop expansion state for stacks that no longer exist, so the set cannot grow unbounded
         // across a session of typing.
         if !expandedStacks.isEmpty {
@@ -2532,10 +2758,19 @@ final class AppModel {
             ignoreText = text
             // Defaults shipped after this file was seeded, added once. A rule the user later
             // deletes stays deleted: the version is recorded, so this never runs again.
-            if defaults.integer(forKey: Self.ignoreDefaultsKey) < Self.ignoreDefaultsVersion {
-                let merged = OmniIgnore.withAddedDefaults(text)
-                if merged != text { ignoreText = merged; saveIgnoreText(); ignorePrunePending = true }
+            // One step per version, each run once: re-running an earlier step would put back a
+            // default the user deleted since.
+            let version = defaults.integer(forKey: Self.ignoreDefaultsKey)
+            var merged = text
+            if version < 2 { merged = OmniIgnore.withAddedDefaults(merged) }
+            if version < 3 {
+                merged = OmniIgnore.withAddedDefaults(merged, OmniIgnore.addedDefaultsV3)
+                merged = OmniIgnore.withHiddenRule(merged)
+                // The grammar became git's in full: a relative pattern that matched nothing may
+                // match now, so what it excludes is pruned once.
+                ignorePrunePending = true
             }
+            if merged != text { ignoreText = merged; saveIgnoreText(); ignorePrunePending = true }
         } else {
             ignoreText = OmniIgnore.synthesize(enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions)
             saveIgnoreText()
@@ -2547,8 +2782,9 @@ final class AppModel {
     }
 
     private static let ignoreDefaultsKey = "omni.ignoreDefaultsVersion"
-    /// 2: OmniIgnore.addedDefaults.
-    private static let ignoreDefaultsVersion = 2
+    /// 2: OmniIgnore.addedDefaults. 3: the hidden-name rule as a line in the file, the full
+    /// gitignore grammar (issue #24) and OmniIgnore.addedDefaultsV3.
+    private static let ignoreDefaultsVersion = 3
     /// The policy gained rules at launch; the indexed files they exclude are dropped once the
     /// store is open (bootstrap).
     @ObservationIgnored private var ignorePrunePending = false
@@ -2557,9 +2793,10 @@ final class AppModel {
     /// a file under an excluded folder is excluded (see OmniIgnore.excludesIndexedFile).
     private func pruneExcluded(_ store: VectorStore, policy: OmniIgnore, under folders: [String]? = nil,
                                then: (@MainActor () -> Void)? = nil) {
+        let rootPaths = crawlRoots.map(\.path)
         Task.detached(priority: .utility) {
             let t0 = Date()
-            let excluded = policy.excludesIndexedFile()
+            let excluded = policy.excludesIndexedFile(roots: rootPaths)
             // `under`: a folder's own policy changed, and nothing outside that folder can have.
             let drop = store.knownFiles().compactMap { path, _ -> String? in
                 if let folders, !folders.contains(where: { RootScope.covers($0, path) }) { return nil }
@@ -2595,18 +2832,31 @@ final class AppModel {
         }
     }
 
-    /// The policy the crawl runs on: the central file, then every folder's own `.omniignore`
-    /// rewritten to apply under that folder only. Parents before children, so a deeper folder's
-    /// rule is the later one and wins, as it does in git.
+    /// The policy the crawl runs on: the central file, its relative patterns applied under every
+    /// folder that is crawled, then every folder's own `.omniignore` rewritten to apply under that
+    /// folder only. Parents before children, so a deeper folder's rule is the later one and wins,
+    /// as it does in git.
     private func compiledIgnore(_ central: String) -> OmniIgnore {
-        guard !folderPolicies.isEmpty else { return OmniIgnore(text: central) }
-        var text = central
-        if !text.isEmpty, !text.hasSuffix("\n") { text += "\n" }
+        var folderRules = ""
         for dir in folderPolicies.keys.sorted() {
             let rules = OmniIgnore.scoped(folderPolicies[dir] ?? "", to: dir)
-            if !rules.isEmpty { text += rules + "\n" }
+            if !rules.isEmpty { folderRules += rules + "\n" }
         }
-        return OmniIgnore(text: text)
+        return OmniIgnore(text: central, bases: ignoreBases, folderRules: folderRules)
+    }
+
+    /// Every spelling of every crawled folder: FSEvents and the crawl report real paths
+    /// (`/private/var/...`, a symlinked root's target), and a relative rule has to match either.
+    private var ignoreBases: [String] {
+        Array(Set(crawlRoots.flatMap { u -> [String] in
+            [u.path, (realpath(u.path, nil).map { p in defer { free(p) }; return String(cString: p) }) ?? u.path]
+        })).sorted()
+    }
+
+    /// The crawled folders changed: a relative rule now applies under a different set of folders.
+    private func recompileIgnoreForRoots() {
+        let next = compiledIgnore(ignoreText)
+        if next != ignore { ignore = next }
     }
 
     /// The folder policies known last session, re-read from disk. One that changed or vanished
@@ -2710,11 +2960,11 @@ final class AppModel {
         let seq = ignorePreviewSeq
         guard let store else { ignorePreview = nil; return }
         let candidate = compiledIgnore(text)
-        let rootPaths = roots.map { $0.path }
+        let rootPaths = crawlRoots.map { $0.path }
         Task.detached(priority: .userInitiated) {
             // Iterated, not materialised: a path String exists only while it is being tested.
             var kept = 0, removed = 0, samples: [String] = []
-            let excluded = candidate.excludesIndexedFile()
+            let excluded = candidate.excludesIndexedFile(roots: rootPaths)
             store.knownFiles().forEach { path, _ in
                 if excluded(path) {
                     removed += 1
@@ -3028,9 +3278,12 @@ final class AppModel {
         // embed takes the GPU gate, so the search preempts sooner instead of waiting behind a full
         // in-flight indexing flush. Cheap (one lock); the gate-window cap bounds the in-flight flush.
         engine?.noteInteractive()
-        rawQuery = raw
-        suggestionsAllowed = false   // programmatic box write by default; handleQueryEdit re-arms it for real typing
-        if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { literalQuery = false }
+        // EVERY WRITE HERE IS GUARDED. An @Observable property notifies on every write, equal or
+        // not, and this runs on every search and every keystroke: the toolbar and the filter menu
+        // read these, and the unguarded writes rebuilt them twice per search for nothing.
+        assign(\.rawQuery, raw)
+        assign(\.suggestionsAllowed, false)   // programmatic box write by default; handleQueryEdit re-arms it for real typing
+        if raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { assign(\.literalQuery, false) }
         // minScore and sortOrder are CLIENT-SIDE post-filters whose only publish path is
         // recomputeResults, reached through their didSets - which the suppression below turns off.
         // The suppression is right for the re-search dimensions (one search instead of eight), but
@@ -3046,23 +3299,33 @@ final class AppModel {
             if minScore != priorMinScore || sortOrder != priorSortOrder { recomputeResults() }
         }
 
-        // The box string is the SINGLE source of truth for filters: reset to a clean slate every time,
-        // then set exactly what the string names. (No menu-vs-box ownership - a menu change rewrites
-        // the string via syncBoxFromFilters, so a filter only ever exists if the string spells it out.
+        // The box string is the SINGLE source of truth for filters: a clean slate every time, then
+        // exactly what the string names. (No menu-vs-box ownership - a menu change rewrites the
+        // string via syncBoxFromFilters, so a filter only ever exists if the string spells it out.
         // This is what makes each history item self-contained and kills cross-query filter leaks.)
-        resetAllFilters()
+        // Built in locals from the defaults and written once each, only where it changed: a reset
+        // followed by a re-set wrote every filter twice per keystroke even when nothing moved.
+        var kinds: Set<FileKind> = [], ext = "", filename = "", tags = "", tagsExclude = ""
+        var date = DateRange.any, score = Self.defaultMinScore, sort = SortOrder.relevance
+        func commitFilters(folders: [URL], recents: Bool) {
+            assign(\.filterKinds, kinds); assign(\.filterExt, ext); assign(\.filterFolders, folders)
+            assign(\.filterFilename, filename); assign(\.filterRecents, recents)
+            assign(\.filterTags, tags); assign(\.filterTagsExclude, tagsExclude)
+            assign(\.dateRange, date); assign(\.minScore, score); assign(\.sortOrder, sort)
+        }
 
         // Literal mode: embed the whole string verbatim, no qualifiers, no filters.
         guard !literalQuery else {
-            activeQualifiers = []
-            rawQueryHasQualifiers = !SearchQueryParser.parse(raw).qualifiers.isEmpty
+            commitFilters(folders: [], recents: false)
+            assign(\.activeQualifiers, [])
+            assign(\.rawQueryHasQualifiers, !SearchQueryParser.parse(raw).qualifiers.isEmpty)
             syncSearchTokens()
-            query = raw
+            assign(\.query, raw)
             return
         }
         let parsed = SearchQueryParser.parse(raw)
-        activeQualifiers = parsed.qualifiers
-        rawQueryHasQualifiers = !parsed.qualifiers.isEmpty
+        assign(\.activeQualifiers, parsed.qualifiers)
+        assign(\.rawQueryHasQualifiers, !parsed.qualifiers.isEmpty)
         syncSearchTokens()
         var includeKinds: Set<FileKind> = []
         var excludeKinds: Set<FileKind> = []
@@ -3082,21 +3345,21 @@ final class AppModel {
                 // Accumulate like type: does - "tag:beach tag:sunset" means any-of, matching
                 // what the qualifier chips display (last-one-wins would silently drop chips).
                 if qual.negated {
-                    filterTagsExclude = filterTagsExclude.isEmpty ? qual.value : filterTagsExclude + "," + qual.value
+                    tagsExclude = tagsExclude.isEmpty ? qual.value : tagsExclude + "," + qual.value
                 } else {
-                    filterTags = filterTags.isEmpty ? qual.value : filterTags + "," + qual.value
+                    tags = tags.isEmpty ? qual.value : tags + "," + qual.value
                 }
-            case "ext": filterExt = qual.value.hasPrefix(".") ? String(qual.value.dropFirst()) : qual.value
+            case "ext": ext = qual.value.hasPrefix(".") ? String(qual.value.dropFirst()) : qual.value
             // ACCUMULATES, like `tag:` above and unlike every other qualifier: `in:A in:B` means
             // both folders. Last-one-wins silently dropped A, which is the shape of issue #18.
             case "in":
                 if qual.value.lowercased() == "recents" { recents = true }
                 else if let url = Self.resolveFolder(qual.value), !folders.contains(url) { folders.append(url) }
-            case "filename": filterFilename = qual.negated ? "" : qual.value
-            case "date": if let d = DateRange(rawValue: qual.value.lowercased()) { dateRange = d }
-            case "after": if let d = Self.mapAfter(qual.value) { dateRange = d }
-            case "score": if let s = Self.mapScore(qual.value) { minScore = s }
-            case "sort": if let so = Self.mapSort(qual.value) { sortOrder = so }
+            case "filename": filename = qual.negated ? "" : qual.value
+            case "date": if let d = DateRange(rawValue: qual.value.lowercased()) { date = d }
+            case "after": if let d = Self.mapAfter(qual.value) { date = d }
+            case "score": if let s = Self.mapScore(qual.value) { score = s }
+            case "sort": if let so = Self.mapSort(qual.value) { sort = so }
             default: break
             }
         }
@@ -3108,12 +3371,11 @@ final class AppModel {
             let explicitScan = includeKinds.contains(.scan)
             if includeKinds.contains(.text) { includeKinds.insert(.scan) }
             if excludeKinds.contains(.text), !explicitScan { excludeKinds.insert(.scan) }
-            if !includeKinds.isEmpty { filterKinds = includeKinds.subtracting(excludeKinds) }
-            else if !excludeKinds.isEmpty { filterKinds = Set(FileKind.allCases).subtracting(excludeKinds) }  // -type:x = all but x
+            if !includeKinds.isEmpty { kinds = includeKinds.subtracting(excludeKinds) }
+            else if !excludeKinds.isEmpty { kinds = Set(FileKind.allCases).subtracting(excludeKinds) }  // -type:x = all but x
         }
-        if !folders.isEmpty { filterFolders = folders }
-        if recents { filterRecents = true }
-        query = parsed.semanticText
+        commitFilters(folders: folders, recents: recents)
+        assign(\.query, parsed.semanticText)
     }
 
     /// Reset every filter dimension to its default (caller holds the applyingParsedQuery guard).
@@ -3817,6 +4079,7 @@ final class AppModel {
             // A folder renamed or moved while Omni was closed. No pass of its own: the launch pass
             // below covers the new path, while the old rows are still there to reuse.
             followMovedFolders(kick: false)
+            startClipboard()
             restartWatcher()
             // Off the main thread: it lists the shared temporary directory, which measured 2.7 s of
             // main-thread block at 50k entries - the stall every launch showed right after ready.
@@ -3892,7 +4155,7 @@ final class AppModel {
         // scan in front of it would add tens of ms to that query's tail on a large index. Deferred
         // to the search's end, not dropped: a pass completion has no next tick to catch up on.
         if searching { statsRefreshOwed = true; return }
-        let rootPaths = roots.map(\.path) + photoSources.map(\.key)
+        let rootPaths = crawlRoots.map(\.path) + photoSources.map(\.key)
         let fp = fingerprint
         let dimReady = engineDim > 0
         Task.detached(priority: .utility) {
@@ -3942,7 +4205,10 @@ final class AppModel {
                         }
                     }
                 }
+                let clipKey = Self.clipboardDirectory.path
+                let clipMoved = self.folderFileCounts[clipKey] != folders[clipKey]
                 self.assign(\.folderFileCounts, folders)
+                if clipMoved { self.recountClipboard() }
                 self.refreshDeniedRoots()
                 self.assign(\.dbPath, path)
                 self.assign(\.dbSizeBytes, size)
@@ -3974,7 +4240,7 @@ final class AppModel {
         if self[keyPath: key] != value { self[keyPath: key] = value }
     }
 
-    static func indexURL() throws -> URL {
+    nonisolated static func indexURL() throws -> URL {
         let fm = FileManager.default
         // User-chosen database folder wins, so the index can live on another volume.
         if let custom = UserDefaults.standard.string(forKey: "omni.dbDir"), !custom.isEmpty {
@@ -4134,7 +4400,7 @@ final class AppModel {
 
     /// Has the user given Omni anywhere to look yet? Folders OR a photo library - either one means
     /// the app has work to do and the empty state should stop asking.
-    var hasSources: Bool { !addedFolders.isEmpty || !photoSources.isEmpty }
+    var hasSources: Bool { !addedFolders.isEmpty || !photoSources.isEmpty || clipboardEnabled }
 
     private func saveRoots() {
         guard !isIsolatedRun else { return }   // see isIsolatedRun
@@ -4180,7 +4446,7 @@ final class AppModel {
     /// reporter's own account pairs "I moved my location for the index" with "adding 30-40 folders
     /// every time you start". A launch argument lands in NSArgumentDomain and a setting does not,
     /// which is the difference the check has to read.
-    static var isolatedByLaunchArgument: Bool {
+    nonisolated static var isolatedByLaunchArgument: Bool {
         let args = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
         return !((args["omni.dbDir"] as? String)?.isEmpty ?? true)
     }
@@ -4472,20 +4738,6 @@ final class AppModel {
         DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
     }
 
-    /// Collapse roots so none is nested inside another - overlapping roots would crawl, embed, and
-    /// count the same files twice. Each root is first mapped to its filesystem canonical path (e.g.
-    /// /tmp -> /private/tmp) so it matches the paths the crawler indexes; otherwise per-folder counts
-    /// and every per-root op (remove, pause, ignore, folder map) prefix-match the wrong path and
-    /// silently miss. canonicalPath is required here, not resolvingSymlinksInPath - the latter strips
-    /// /private (it would leave /tmp as /tmp). Falls back to the given path when a root can't be
-    /// resolved (e.g. it no longer exists).
-    /// Resolve symlinks, then reduce to the crawl set. The RULE lives in `RootScope` (and is
-    /// tested there): it decides which of the user's folders disappear as roots, and the report
-    /// that it does so silently is issue #18's second half.
-    private func canonicalizeRoots(_ roots: [URL]) -> [URL] {
-        RootScope.canonical(resolvedRoots(roots))
-    }
-
     private func resolvedRoots(_ roots: [URL]) -> [URL] {
         roots.map { url in
             (try? url.resourceValues(forKeys: [.canonicalPathKey]))?.canonicalPath
@@ -4595,8 +4847,6 @@ final class AppModel {
     func isPhotoSourceQueued(_ source: PhotoLibrary.Source) -> Bool {
         pendingCatchUpPhotos.contains { $0.id == source.id }
     }
-
-    func addRoot(_ url: URL) { addRoots([url]) }
 
     /// Add one or more roots. Dropping several folders at once (or the file panel returning many)
     /// canonicalizes + persists + rebuilds the FSEvents watcher ONCE for the whole batch, then queues
@@ -4908,7 +5158,7 @@ final class AppModel {
 
     /// Use a file as the query (any supported modality). `similar` = doc-vs-doc "find similar".
     func setFileQuery(_ url: URL, similar: Bool = false, fromHistory: Bool = false,
-                      transient: Bool = false, sourcePath: String? = nil) {
+                      transient: Bool = false, sourcePath: String? = nil, fromPasteboard: Bool = false) {
         // Both guards clear rather than stamp: a file token published with no fileQuery behind it
         // claims the displayed (empty) results belong to a query that was never adopted, so
         // isResolving compared that token against the still-present typed text, and a later,
@@ -4941,7 +5191,7 @@ final class AppModel {
         // out of recents and routes its bookmark toggle to remove-not-demote, consistently.
         let ephemeral = transient || Self.isQueryImage(url)
         fileQuery = FileQuery(url: url, kind: kind, similar: similar, fromHistory: fromHistory,
-                              transient: ephemeral, sourcePath: sourcePath)
+                              transient: ephemeral, sourcePath: sourcePath, fromPasteboard: fromPasteboard)
         search()
     }
 
@@ -4982,7 +5232,7 @@ final class AppModel {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             let url = dir.appendingPathComponent("Dropped image.\(ext)")
             if !FileManager.default.fileExists(atPath: url.path) { try data.write(to: url) }
-            setFileQuery(url, transient: true)
+            setFileQuery(url, transient: true, fromPasteboard: pastingFromClipboard)
         } catch {
             queryError = "Couldn't read the dropped image."
         }
@@ -5255,7 +5505,12 @@ final class AppModel {
     /// while a refresh of the SAME query (live re-runs while indexing) keeps the selection if
     /// its row survived, so a watcher tick never yanks the user's focus.
     private func applyResults(_ hits: [SearchHit], resolved: String) {
+        var hits = hits
+        if let own = clipboardSelfPath(resolved: resolved) { hits.removeAll { $0.path == own } }
         let isNewQuery = resolvedQuery != resolved
+        if omniPerfEnabled {
+            omniPerfLog("results n=\(hits.count) was=\(rawResults.count) new=\(isNewQuery) view=\(viewMode.rawValue) sidebar=\(sidebarShown)")
+        }
         // A live refresh that found exactly what is on screen changes nothing; see recomputeResults.
         if rawResults != hits { rawResults = hits }
         if resolvedQuery != resolved { resolvedQuery = resolved }
@@ -5461,6 +5716,7 @@ final class AppModel {
         var s = settings
         s.ignore = ignore   // single source of truth for what the crawl excludes
         s.ownDataPaths = Self.ownDataPaths()
+        s.ownDataExceptions = [Self.clipboardDirectory.path]
         s.maxImageDimension = maxImageDimension
         s.maxVideoFrames = maxVideoFrames
         s.maxCharsPerChunk = maxTextChunkChars
@@ -5578,10 +5834,12 @@ final class AppModel {
     }
 
     private func restartWatcher() {
+        // Every change to the crawled folders passes through here.
+        recompileIgnoreForRoots()
         watcher?.stop(); watcher = nil
-        guard engine != nil, !roots.isEmpty else { return }
+        guard engine != nil, !crawlRoots.isEmpty else { return }
         let since = eventCheckpoint.flatMap { UInt64($0) }
-        let w = FSWatcher(paths: roots.map { $0.path }, since: since) { [weak self] paths in
+        let w = FSWatcher(paths: crawlRoots.map { $0.path }, since: since) { [weak self] paths in
             // Sorted into present and gone HERE, on the watcher's queue: a drag-in reports
             // thousands of paths and the main thread should not stat them.
             var here: [String] = [], gone: [String] = []
@@ -5666,7 +5924,7 @@ final class AppModel {
         }
         // Paused folders are excluded from the pass; if every folder is paused (or there are
         // none), there is nothing to index.
-        let activeRootsToIndex = roots.filter { !pausedRoots.contains($0.path) }
+        let activeRootsToIndex = crawlRoots.filter { !pausedRoots.contains($0.path) }
         let activePhotoSources = photoSources.filter { !pausedRoots.contains($0.key) }
         guard !activeRootsToIndex.isEmpty || !activePhotoSources.isEmpty else { return }
         // An out-of-date index is in a different vector space: rebuild it, don't top up.
@@ -6054,7 +6312,7 @@ final class AppModel {
         startRateSampler()   // show throughput during the background reconcile too, not only full passes
         // Both spellings: FSEvents reports real paths (/private/var/..., a symlinked root's
         // target), and a root that matched neither would lose update()'s root protections.
-        let rootPaths = Array(Set(roots.flatMap { u -> [String] in
+        let rootPaths = Array(Set(crawlRoots.flatMap { u -> [String] in
             [u.path, u.resolvingSymlinksInPath().path, (realpath(u.path, nil).map { p in defer { free(p) }; return String(cString: p) }) ?? u.path]
         }))
         Task.detached(priority: .utility) {

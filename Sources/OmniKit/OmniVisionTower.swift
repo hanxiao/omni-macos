@@ -24,20 +24,6 @@ public final class OmniVisionTower: @unchecked Sendable {
     private let gridSide: Int          // sqrt(num_position_embeddings) = 48
     private let ropeDim: Int           // (headDim / 2) -- VisionRotaryEmbedding.dim
     private let lnEps: Float = 1e-6
-    /// Run the WHOLE vision tower in fp32 (matmuls + SDPA). The small-mlx checkpoint stores
-    /// vision/merger weights in bf16. Two problems follow from bf16 tower compute:
-    ///   1. NaN: the attention softmax occasionally overflows to NaN on real photos (~7% drop).
-    ///   2. Packing noise: a bf16 matmul over the PACKED `[sum_i N_i, *]` tensor rounds each row
-    ///      slightly differently than over a single image's `[N_i, *]` tensor (different GPU
-    ///      tiling/accumulation per shape). That bf16-level noise is benign for the causal Small
-    ///      backbone but the bidirectional Nano backbone amplifies it near the pooled token, so
-    ///      batched vs single-image vectors drift to cos~0.97 (fails the >=0.99999 batch gate).
-    /// Upcasting tower compute to fp32 fixes BOTH: fp32 is shape-stable (single==packed to ~1e-7)
-    /// and NaN-free. It is parity-safe: fp32 is strictly more precise than the bf16 reference, and
-    /// image_ref.safetensors parity stays cos>=0.999. Default ON; OMNI_VISION_BF16_SDPA=1 forces
-    /// the legacy bf16 tower (bit-identical to pre-batch behavior, single-image only).
-    private let fp32Compute: Bool
-    private var matmulDtype: DType { fp32Compute ? .float32 : w["vision_tower.patch_embed.proj.weight"].dtype }
 
     public init(weights: WeightStore, config: OmniConfig) {
         self.w = weights
@@ -48,27 +34,31 @@ public final class OmniVisionTower: @unchecked Sendable {
         self.mergeSize = config.vision.spatialMergeSize
         self.gridSide = Int(Double(config.vision.numPositionEmbeddings).squareRoot().rounded())
         self.ropeDim = (config.vision.hiddenSize / config.vision.numHeads) / 2
-        self.fp32Compute = ProcessInfo.processInfo.environment["OMNI_VISION_BF16_SDPA"] != "1"
     }
 
-    /// SDPA i/o precision. The steel flash kernel accumulates in fp32 internally regardless of the
-    /// i/o dtype, and measured at the tower's shape ([1, heads, ~4.9k, 64]) the bf16-i/o variant is
-    /// ~18% faster (3.68 vs 4.50 ms; the win is bandwidth/registers - Apple GPUs run fp32 and half
-    /// ALUs at the same rate). Casting q/k/v per element is packing-shape-INVARIANT (unlike bf16
-    /// matmuls, whose tiling noise broke the batched-vs-single gate), so the strict batch-parity
-    /// gates still hold. Everything around the SDPA stays fp32 (reference-faithful).
-    /// OMNI_VISION_SDPA_FP32=1 restores full-fp32 SDPA i/o.
-    static let sdpaBF16IO = ProcessInfo.processInfo.environment["OMNI_VISION_SDPA_FP32"] != "1"
+    // THE WHOLE VISION TOWER RUNS IN fp32 (SDPA i/o is the one exception, below). The small-mlx
+    // checkpoint stores vision/merger weights in bf16. Two problems follow from bf16 tower compute:
+    //   1. NaN: the attention softmax occasionally overflows to NaN on real photos (~7% drop).
+    //   2. Packing noise: a bf16 matmul over the PACKED `[sum_i N_i, *]` tensor rounds each row
+    //      slightly differently than over a single image's `[N_i, *]` tensor (different GPU
+    //      tiling/accumulation per shape). That bf16-level noise is benign for the causal Small
+    //      backbone but the bidirectional Nano backbone amplifies it near the pooled token, so
+    //      batched vs single-image vectors drift to cos~0.97 (fails the >=0.99999 batch gate).
+    // Upcasting tower compute to fp32 fixes BOTH: fp32 is shape-stable (single==packed to ~1e-7)
+    // and NaN-free. It is parity-safe: fp32 is strictly more precise than the bf16 reference, and
+    // image_ref.safetensors parity stays cos>=0.999.
+    //
+    // SDPA i/o precision. The steel flash kernel accumulates in fp32 internally regardless of the
+    // i/o dtype, and measured at the tower's shape ([1, heads, ~4.9k, 64]) the bf16-i/o variant is
+    // ~18% faster (3.68 vs 4.50 ms; the win is bandwidth/registers - Apple GPUs run fp32 and half
+    // ALUs at the same rate). Casting q/k/v per element is packing-shape-INVARIANT (unlike bf16
+    // matmuls, whose tiling noise broke the batched-vs-single gate), so the strict batch-parity
+    // gates still hold. Everything around the SDPA stays fp32 (reference-faithful).
 
-    /// Batch the uniform-size attention windows (video: grid_t windows of grid_h*grid_w; or a
-    /// same-size image batch) into ONE block-diagonal SDPA instead of a per-window Swift loop -
-    /// bit-identical, far fewer kernel launches (F2). OMNI_VIZ_SDPA_LOOP=1 forces the old loop (A/B).
-    static let sdpaWindowLoop = ProcessInfo.processInfo.environment["OMNI_VIZ_SDPA_LOOP"] == "1"
-
-    /// Weight cast to the tower compute dtype (fp32 by default). Hoisting the cast here keeps every
+    /// Weight cast to the tower compute dtype (fp32). Hoisting the cast here keeps every
     /// matmul in one dtype so packing is shape-invariant.
     ///
-    /// BUDGET-GATED CACHE: in fp32 mode every weight access otherwise builds a fresh bf16->fp32
+    /// BUDGET-GATED CACHE: every weight access otherwise builds a fresh bf16->fp32
     /// cast node - 147 cast kernels and ~352MB of fp32 temporaries PER packed forward (the single
     /// biggest per-forward overhead found by the dtype audit). When the user's memory cap affords
     /// it, cache the fp32 copies once (~352MB resident for the nano vision tower) and never cast
@@ -85,10 +75,10 @@ public final class OmniVisionTower: @unchecked Sendable {
     ///   applyMemoryLimit(), never a reload - so the cache stayed off until the next launch on a
     ///   machine that could easily afford it.
     /// Computed and decimal fixes both. Unchanged for 8GB machines, whose cap is 3.
-    private var cacheFP32Weights: Bool { fp32Compute && OmniMemoryBudget.capBytes >= 4_000_000_000 }
+    private var cacheFP32Weights: Bool { OmniMemoryBudget.capBytes >= 4_000_000_000 }
     private func wc(_ key: String) -> MLXArray {
         let a = w[key]
-        guard fp32Compute, a.dtype != .float32 else { return a }
+        guard a.dtype != .float32 else { return a }
         if cacheFP32Weights {
             if let c = fp32WeightCache[key] { return c }
             let c = a.asType(.float32)
@@ -192,7 +182,7 @@ public final class OmniVisionTower: @unchecked Sendable {
             .reshaped([n, c, t, p, p])         // [N, c, t, h, w]
             .movedAxis(source: 1, destination: 4) // [N, t, h, w, c]
             .reshaped([n, t * p * p * c])       // flatten over (t, h, w, c)
-        if fp32Compute { x = x.asType(.float32) }
+        x = x.asType(.float32)
 
         // weight [out, t, h, w, c] -> [out, t*h*w*c]; matmul x @ W^T.
         let weight = wc("vision_tower.patch_embed.proj.weight")
@@ -357,15 +347,9 @@ public final class OmniVisionTower: @unchecked Sendable {
         var kh = k.transposed(1, 0, 2)
         var vh = v.transposed(1, 0, 2)
         // The residual stream is fp32 (reference-faithful). For the SDPA call itself, bf16 i/o is
-        // ~18% faster with identical fp32 accumulation inside the steel kernel (see sdpaBF16IO);
-        // the output is cast straight back to fp32 below.
-        let attnDtype = qh.dtype
-        if attnDtype != .float32 {
-            qh = qh.asType(.float32); kh = kh.asType(.float32); vh = vh.asType(.float32)
-        }
-        if Self.sdpaBF16IO {
-            qh = qh.asType(.bfloat16); kh = kh.asType(.bfloat16); vh = vh.asType(.bfloat16)
-        }
+        // ~18% faster with identical fp32 accumulation inside the steel kernel (see the note above
+        // `wc`); the output is cast straight back to fp32 below.
+        qh = qh.asType(.bfloat16); kh = kh.asType(.bfloat16); vh = vh.asType(.bfloat16)
         let scale = Float(pow(Double(headDim), -0.5))
 
         var out: MLXArray
@@ -382,7 +366,7 @@ public final class OmniVisionTower: @unchecked Sendable {
             let win = cuSeqlens[1] - cuSeqlens[0]
             // All windows the same size? (Video: grid_t windows of grid_h*grid_w; or a same-size image
             // batch.) Then batch them into ONE block-diagonal SDPA instead of numWin launches.
-            let uniform = !Self.sdpaWindowLoop && win > 0
+            let uniform = win > 0
                 && (1 ..< numWin).allSatisfy { cuSeqlens[$0 + 1] - cuSeqlens[$0] == win }
             if uniform {
                 // n = numWin*win is contiguous and window-major, so reshape the seq axis to
@@ -414,7 +398,7 @@ public final class OmniVisionTower: @unchecked Sendable {
             }
         }
         // Cast the attention output back to the residual-stream dtype before the proj matmul.
-        if out.dtype != attnDtype { out = out.asType(attnDtype) }
+        out = out.asType(.float32)
         return MLX.addMM(wc(p + "attn.proj.bias"), out, wc(p + "attn.proj.weight").transposed(1, 0))
     }
 

@@ -232,10 +232,10 @@ needed. Measured on 3 pages it looked like +5%; on the full corpora it is **+1.8
 on easy**, with acceptance falling 0.55 -> 0.50. The three-page sample was the misleading part.
 Default off.
 
-**Adaptive draft length** (`--adaptive-draft`). Acceptance is a property of content, not the
+**Adaptive draft length.** Acceptance is a property of content, not the
 model - 0.89 on a repetitive ledger page against 0.46 on cursive - so a fixed k must be wrong for
 one of them. Growing k after a fully accepted block and shrinking it after a full rejection gives
-**+0.8% and moves mean CER 0.0044 -> 0.0086**. Default off.
+**+0.8% and moves mean CER 0.0044 -> 0.0086**. Rejected and removed.
 
 **mlx-swift 0.31.4.** Tested specifically for the quantized-matmul defect below: it is still
 wrong at M=2 and M=3. 0.31.5+ needs a Swift 6.3 toolchain (this machine has 6.2.3), and its
@@ -333,7 +333,7 @@ setting):
 
 Fused computes `n * topK` expert rows where grouped computes `active * busiest`, so fusing the
 ~1000-token prefill costs ~70 ms of TTFT and buys 6.4% of decode; break-even is ~180 output
-tokens, below every page in the reference set. `OMNI_OCR_FUSED_MOE` sets the crossover.
+tokens, below every page in the reference set. The grouped dispatch has been removed.
 
 One thing is deliberately not claimed: why the PREFILL dispatch changes DECODE throughput at all,
 when both settings decode at n = 1 through the same code. Allocator pool state is the obvious

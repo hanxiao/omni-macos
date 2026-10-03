@@ -238,6 +238,10 @@ final class HoleReclaimTests: XCTestCase {
         do {
             let s = try VectorStore(dbURL: dbURL)
             XCTAssertFalse(s.reclaimVectorHolesForTest(), "a below-threshold reclaim ran anyway")
+            for _ in 0 ..< 3 { s.stampCoverageForTest() }
+            // The audit walks every position under the store queue; a stamp follows every write.
+            // Below the threshold the hole count alone answers, so the walk must not happen.
+            XCTAssertEqual(s.holeAuditsForTest, 0, "the full audit ran for a reclaim that could not happen")
             s.close()
         }
 

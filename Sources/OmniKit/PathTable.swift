@@ -96,9 +96,6 @@ struct PathTable: Sendable {
         return (dirEnd[d] - dirStart(d)) + (nameEnd[i] - nameStart(i))
     }
 
-    /// The canonical hash of path `i` - equal for any two paths that compare equal as Strings.
-    @inline(__always) func hashOf(_ i: Int) -> Int { fileHash[i] }
-
     /// Does path `i` equal `s` under Swift's String equality? No allocation unless the hashes agree
     /// and one side is not ASCII.
     func equals(_ i: Int, _ s: String, hash: Int) -> Bool {

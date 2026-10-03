@@ -402,6 +402,9 @@ struct FolderEmbeddingVisualization: View {
         } else {
             resolve()
         }
+        // Frozen once resolved: the off-main build below reads it, and a `var` the main actor wrote
+        // through `resolve` is not something Swift 6.3 lets another task share.
+        let palette = baseHSB
         let alpha = Self.dotAlpha
         // The per-point loop (positions + per-ext shading + bbox over up to 60k points, each with an
         // NSString ext alloc + FNV hash + HSB->RGB) is tens of ms - run it OFF the main actor and hop the
@@ -435,7 +438,7 @@ struct FolderEmbeddingVisualization: View {
                     if p.position.x.isFinite, p.position.y.isFinite {
                         mn = pointwiseMin(mn, p.position); mx = pointwiseMax(mx, p.position)
                     }
-                    guard let base = baseHSB[p.kind] else { col.append(fallback); continue }
+                    guard let base = palette[p.kind] else { col.append(fallback); continue }
                     // Extension without NSString: walk the UTF-8 back to the dot, stopping at the
                     // last path separator so a dotted directory name cannot be read as one.
                     let u = p.path.utf8

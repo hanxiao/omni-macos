@@ -7,7 +7,8 @@ import ImageIO
 /// Smoke test: does the Nano model embed media (image/audio) without crashing, at the right
 /// dim? Diagnoses why media indexing fails on Nano. Fixed nano path; skips if absent.
 final class NanoMediaSmokeTests: XCTestCase {
-    private let nano = URL(fileURLWithPath: "/private/tmp/omni-nano")
+    private let nano = URL(fileURLWithPath:
+        ProcessInfo.processInfo.environment["OMNI_NANO_MODEL_DIR"] ?? "/private/tmp/omni-nano")
 
     private func haveNano() -> Bool {
         FileManager.default.fileExists(atPath: nano.appendingPathComponent("model.safetensors").path)

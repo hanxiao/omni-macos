@@ -81,30 +81,6 @@ public enum OCRBatchPlan {
 
 extension OCRModel {
 
-    /// Does the vision tower amortise across tiles, or is it flat out compute-bound?
-    ///
-    /// A page carries a handful of tiles. If four times the tiles cost four times the time there
-    /// is nothing to win by pushing several pages' tiles through the tower together; if they cost
-    /// less, batching the tower is a real lever on the prefill half of a run.
-    public func probeVisionScaling(counts: [Int] = [1, 2, 4, 8, 16, 32], reps: Int = 3,
-                                   side: Int = OCRPreprocess.tileSize) -> String {
-        var lines: [String] = []
-        var perTileAtOne = 0.0
-        for n in counts {
-            let x = MLX.zeros([n, side, side, 3], dtype: .float32) + 0.5
-            eval(x)
-            eval(vision(x))                                  // warm the kernels for this shape
-            let t = Date()
-            for _ in 0 ..< reps { eval(vision(x)) }
-            let ms = Date().timeIntervalSince(t) * 1000 / Double(reps)
-            let per = ms / Double(n)
-            if n == counts.first { perTileAtOne = per }
-            lines.append(String(format: "tiles %2d  %8.1f ms  %7.1f ms/tile  %4.2fx",
-                                n, ms, per, perTileAtOne / per))
-        }
-        return lines.joined(separator: "\n")
-    }
-
     /// What does ONE decode step cost as a function of how many rows are live?
     ///
     /// This is the crux for continuous batching. Batch occupancy on a real document is 45% -
@@ -673,10 +649,7 @@ extension OCRModel {
     public func transcribeBatched(pdfAt url: URL, prompt: String? = nil, maxNewTokens: Int = 0,
                                   pageRange: Range<Int>? = nil, dpi: Int = 200, width: Int? = nil,
                                   loopGuard: Bool = true, loopReps: Int = 24,
-                                  loopGrace: Int = 96,
-                                  pipelined: Bool = false,
-                                  pipelineHostOnly: Bool = false,
-                                  opener: Int = 0) throws -> DocumentResult {
+                                  loopGrace: Int = 96) throws -> DocumentResult {
         guard let document = PDFDocument(url: url) else {
             throw OmniError.model("cannot open PDF \(url.lastPathComponent)")
         }
@@ -695,20 +668,13 @@ extension OCRModel {
         // Continuous batching schedules ROWS, not groups: it needs every page in one call so a
         // finished row has something to be refilled with. Slicing into groups of exactly `width`
         // leaves it nothing to admit and it silently degenerates to the static path.
-        // A narrow OPENING group, matching what the app does: every page of a group is prefilled
-        // before the group's first token exists, so a full-width opener means no text at all for
-        // width x ~650 ms. This measures what that costs in throughput.
         func planned(_ all: [Int]) -> [[Int]] {
             var out: [[Int]] = []
             var rest = all[...]
-            if opener > 0, opener < width, rest.count > opener {
-                out.append(Array(rest.prefix(opener)))
-                rest = rest.dropFirst(opener)
-            }
             // BALANCED, not greedy. Greedy packing leaves a stub - 36 pages at width 32 becomes
             // 32 and 4 - and a 4-row group costs nearly as much per step as a 32-row one. Split
-            // the remainder into equal groups instead: 18 and 18.
-            guard !rest.isEmpty else { return out }
+            // the pages into equal groups instead: 18 and 18.
+            guard !rest.isEmpty else { return [] }
             let count = (rest.count + width - 1) / width
             let base = rest.count / count
             let extra = rest.count % count
@@ -721,33 +687,7 @@ extension OCRModel {
         }
         let groups = OCRRuntimeFlags.continuousBatch ? [indices] : planned(indices)
 
-        // GROUP-AHEAD PREFETCH. Prefill is fixed per page and now the larger half of a batched
-        // run, so the question is not how to make it cheaper but where to hide it. The decode of a
-        // wide group is long, and it is launch- and bandwidth-bound rather than compute-bound, so
-        // the compute-bound prefill of the NEXT group should have room to run underneath it. Its
-        // own PDF handle and its own MLX stream; at most one is in flight.
         let renderer = PageRenderer(url: url, maxDimension: maxDimension)
-        let model = self
-        // Two depths, because they are different bets. HOST ahead moves only the rasterise and
-        // the fixed-point resample, which are pure CPU and cannot contend with the GPU at all.
-        // FULL also runs the vision tower ahead on its own MLX stream, which can only pay if the
-        // decode leaves the GPU's compute units idle.
-        let hostOnly = pipelineHostOnly
-        func prefetch(_ g: [Int]) -> Task<[PreparedPage], Never> {
-            Task.detached(priority: .userInitiated) {
-                if hostOnly {
-                    return g.compactMap { i -> PreparedPage? in
-                        renderer.render(i).map { PreparedPage(pending: $0) }
-                    }
-                }
-                return Stream.withNewDefaultStream(device: .gpu) {
-                    g.compactMap { i -> PreparedPage? in
-                        guard let image = renderer.render(i) else { return nil }
-                        return try? model.preparePage(image: image, prompt: prompt)
-                    }
-                }
-            }
-        }
 
         func prepareHere(_ g: [Int]) throws -> [PreparedPage] {
             try g.compactMap { i -> PreparedPage? in
@@ -758,29 +698,16 @@ extension OCRModel {
             }
         }
 
-        let pipelined = pipelined || pipelineHostOnly
-        var ahead: Task<[PreparedPage], Never>? = pipelined && !groups.isEmpty
-            ? prefetch(groups[0]) : nil
-
-        for (gi, g) in groups.enumerated() {
+        for g in groups {
             let waitStart = Date()
-            var prepared: [PreparedPage]
-            if let ahead {
-                prepared = await_(ahead)
-            } else if OCRRuntimeFlags.continuousBatch, width > 1 {
+            let prepared: [PreparedPage]
+            if OCRRuntimeFlags.continuousBatch, width > 1 {
                 // Rendered as each page is admitted, the way the app runs it.
                 prepared = g.map { i in PreparedPage(source: { renderer.render(i) }, prompt: prompt) }
             } else {
                 prepared = try prepareHere(g)
             }
-            // Host-ahead hands back pixels; the tower still has to run, here, on the main stream.
-            for i in prepared.indices where prepared[i].pending != nil {
-                prepared[i] = try preparePage(image: prepared[i].pending!, prompt: prompt)
-            }
             stalled += Date().timeIntervalSince(waitStart)
-
-            // Start the next group's pixels and vision BEFORE decoding this one.
-            ahead = (pipelined && gi + 1 < groups.count) ? prefetch(groups[gi + 1]) : nil
 
             guard !prepared.isEmpty else { continue }
             let out = try decodeBatch(prepared, width: min(width, prepared.count),

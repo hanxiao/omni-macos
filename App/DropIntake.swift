@@ -33,7 +33,7 @@ enum DropIntake {
     static func read(_ pb: NSPasteboard,
                      accepts: @escaping (URL) -> Bool,
                      wantsText: Bool,
-                     handle: @escaping (DroppedItem) -> Void) -> Bool {
+                     handle: @escaping @MainActor (DroppedItem) -> Void) -> Bool {
         // 1) Local file (Finder, Mail attachment).
         if let url = (pb.readObjects(forClasses: [NSURL.self],
                                      options: [.urlReadingFileURLsOnly: true]) as? [URL])?
@@ -88,7 +88,7 @@ enum DropIntake {
     static func read(providers: [NSItemProvider],
                      accepts: @escaping (URL) -> Bool,
                      wantsText: Bool,
-                     handle: @escaping (DroppedItem) -> Void) -> Bool {
+                     handle: @escaping @MainActor (DroppedItem) -> Void) -> Bool {
         if let p = providers.first(where: { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }) {
             _ = p.loadObject(ofClass: NSURL.self) { obj, _ in
                 guard let url = obj as? URL, url.isFileURL, accepts(url) else { return }
@@ -142,7 +142,7 @@ enum DropIntake {
     /// Download a remote URL and hand back the bytes if they decode as an image; otherwise, if a
     /// text fallback was given (a bare hyperlink), hand back that instead.
     private static func download(_ url: URL, textFallback: String?,
-                                 handle: @escaping (DroppedItem) -> Void) {
+                                 handle: @escaping @MainActor (DroppedItem) -> Void) {
         URLSession.shared.dataTask(with: url) { data, response, _ in
             guard let data, NSImage(data: data) != nil else {
                 if let textFallback { Task { @MainActor in handle(.text(textFallback)) } }
@@ -175,7 +175,9 @@ enum DropRouter {
         // means anything, and what happens to the result - nothing else differs.
         let toOCR = model.ocrMode
         let accepts: (URL) -> Bool = toOCR ? OCRSession.isSupported : AppModel.searchableFile
-        let handle: (DroppedItem) -> Void = toOCR ? { ocr.accept($0) } : { model.accept($0) }
+        let handle: @MainActor @Sendable (DroppedItem) -> Void = { [model, ocr] item in
+            if toOCR { ocr.accept(item) } else { model.accept(item) }
+        }
         // EVERY file, for the transcription pane. `read` takes one file, which is right for a
         // search (one query) and was silently wrong here: a drop of three PDFs and two images
         // opened one tab and ignored four files. `open(urls:)` makes a tab per file.

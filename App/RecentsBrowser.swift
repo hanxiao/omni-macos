@@ -114,6 +114,7 @@ struct RecentsBrowser: View {
                                 in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                     .contentShape(.rect)
                     .help(item.path)
+                    .fileDragSource { select(item.path); return [item.path] }   // see FileDrag
                     .onTapGesture(count: 2) { PhotoActions.open(item.path) }
                     .simultaneousGesture(TapGesture().onEnded { select(item.path) })
                     .contextMenu { FileMenuItems(path: item.path, kind: item.kind) }
@@ -168,6 +169,7 @@ struct RecentsBrowser: View {
             }
             .contentShape(RoundedRectangle(cornerRadius: BrowserMetrics.selectionRadius))
             .help(item.path)
+            .fileDragSource { select(item.path); return [item.path] }   // see FileDrag
             .onTapGesture(count: 2) { PhotoActions.open(item.path) }
             .simultaneousGesture(TapGesture().onEnded { select(item.path) })
             .contextMenu { FileMenuItems(path: item.path, kind: item.kind) }

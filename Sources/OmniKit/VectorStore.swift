@@ -236,6 +236,14 @@ public struct SearchFilter: Sendable {
     /// Resolved by the store at search entry into the same allow set tag terms use, so every
     /// search route honours it the way it honours `tag:`; nil means no such scope.
     public var recentsLimit: Int? = nil
+    /// Folders whose files never appear: the served surfaces pass the clipboard history here, so an
+    /// agent on the machine cannot search what the user copied. Resolved at search entry into the
+    /// same deny set `-tag:` uses, so every search route honours it.
+    public var excludeFolders: [String] = []
+    /// A clause the store resolves into a path set at search entry.
+    var needsPathSets: Bool {
+        !tagTerms.isEmpty || !tagExcludeTerms.isEmpty || recentsLimit != nil || !excludeFolders.isEmpty
+    }
     // Resolved by the store at search entry from tagTerms/tagExcludeTerms; per-row checks
     // then cost one Set lookup on the resident canonical path.
     var tagAllow: Set<String>? = nil
@@ -244,7 +252,7 @@ public struct SearchFilter: Sendable {
     /// No constraints set - the common plain-query case (enables the GPU candidate fast path).
     var isEmpty: Bool {
         kinds.isEmpty && folderPrefixes.isEmpty && (ext?.isEmpty ?? true) && since == nil
-            && tagTerms.isEmpty && tagExcludeTerms.isEmpty && recentsLimit == nil
+            && !needsPathSets
     }
 
     public init() {}
@@ -406,12 +414,9 @@ final class Vec16Buffer {
     // MADV_WILLNEED is deliberately not used anywhere - on Darwin it faults the range in
     // synchronously (measured in SECONDS for multi-GB ranges), which is a stall, not a hint.
     enum PageAdvice { case random, normal }
-    /// OMNI_VECS_MADVISE=0 disables, for A/B against the pre-advice behavior.
-    nonisolated(unsafe) static let madviseEnabled =
-        ProcessInfo.processInfo.environment["OMNI_VECS_MADVISE"] != "0"
     private var currentAdvice: PageAdvice = .normal
     func advise(_ mode: PageAdvice) {
-        guard Self.madviseEnabled, let base, fileBytes > 0 else { return }
+        guard let base, fileBytes > 0 else { return }
         madvise(base, fileBytes, mode == .random ? MADV_RANDOM : MADV_NORMAL)
         currentAdvice = mode
     }
@@ -902,76 +907,6 @@ public final class VectorStore: @unchecked Sendable {
     /// A/B lever: 0 skips the exact rerank so the coarse scores are final. See search().
     static let quantRerank = ProcessInfo.processInfo.environment["OMNI_QUANT_RERANK"] != "0"
 
-    /// EXACT-TIER PRECISION EXPERIMENT. The rerank reads bf16 rows out of `flat16`, and `flat16`
-    /// has to cover EVERY row (any row can become a candidate) even though one query gathers ~0.09%
-    /// of them - which is what makes it 6.46 GB on a 258k-file index. The open question is whether
-    /// that tier has to be bf16 at 1536 B/row, or would hold at 8 bits and ~816 B/row.
-    ///
-    /// Set OMNI_RERANK_BITS to simulate it: the gathered candidate tile is round-tripped through
-    /// group-64 affine quantization at that width before the rescore matmul. Recall-equivalent to
-    /// actually storing the tier at those bits - the round trip is the only thing that changes the
-    /// numbers - so the quality question can be answered before building a second sidecar. Latency
-    /// is NOT representative (it adds a quantize the real thing would not do).
-    ///
-    /// MEASURED, 4.51M rows, 200 queries, against a bf16-exact ground truth (`quantrecall`):
-    ///
-    ///   tier    B/row   .vecs    recall@10   top1-exact
-    ///   bf16     1536   6.46 GB    1.0000       1.000
-    ///   8-bit     816   3.43 GB    0.9885       0.965
-    ///   6-bit     624   2.62 GB    0.9780       0.930
-    ///   5-bit     528   2.22 GB    0.9560       0.900
-    ///   4-bit     432   1.82 GB    0.9410       0.885
-    ///
-    /// So the answer is no: 8 bits does NOT hold the exact tier. Halving the file costs 3.5% of
-    /// first results, which is a visible quality change, not a rounding one. (The 4-bit rung lands
-    /// on 0.9410 against the no-rerank arm's 0.9425 - they are the same representation, so that
-    /// agreement is what says the simulation is faithful.)
-    ///
-    /// Where it could still pay: the tier only has to be bf16 on a machine that can CACHE 6.46 GB.
-    /// Below that it thrashes, and a 3.43 GB tier that stays cached would beat a bf16 one that does
-    /// not - the same reasoning `quantBitsFor` already applies to the scan replica. That would be a
-    /// memory-cap-driven mode, never a default.
-    static let rerankBits: Int? = ProcessInfo.processInfo.environment["OMNI_RERANK_BITS"].flatMap(Int.init)
-    /// Round-trip a gathered candidate tile through `rerankBits`, or return it untouched.
-    private static func exactTile(_ m: MLXArray, group: Int) -> MLXArray {
-        guard let b = rerankBits else { return m }
-        let q = MLX.quantized(m, groupSize: group, bits: b)
-        return MLX.dequantized(q.wq, scales: q.scales, biases: q.biases,
-                               groupSize: group, bits: b).asType(.bfloat16)
-    }
-
-    // RANDOMIZED HADAMARD PRECONDITIONER (TurboQuant, Zandieh et al. 2025, arXiv 2504.19874).
-    //
-    // R = (H / sqrt(d)) . diag(s), s in {-1,+1}, is ORTHOGONAL, so <Rx, Rq> == <x, q>: rotating both
-    // the stored rows and the query leaves every inner product the ranking is built on unchanged.
-    // What it changes is the DISTRIBUTION each 64-wide quantization group sees. Affine group quant
-    // spends its 16 levels on [min, max] of the group, so one outlier coordinate costs every other
-    // coordinate in that group its precision. After the rotation each coordinate is a normalized
-    // sum of all d, i.e. near-Gaussian and outlier-free, which is the shape affine quant handles
-    // best.
-    //
-    // This is the half of TurboQuant that costs nothing: the paper's other half swaps the affine
-    // codebook for a Lloyd-Max one, which MLX's quantizedMM cannot consume - that would need a
-    // custom Metal kernel, or a dequantize-then-matmul that gives back the bandwidth win the
-    // replica exists for. The rotation alone keeps quantizedMM untouched and adds one transform per
-    // query (microseconds at d=768) plus one per row at index time.
-    //
-    // MEASURED, AND IT DOES NOT HELP THIS DATA - kept behind the lever so the result is reproducible
-    // and nobody spends the idea twice. On the real 4.5M-row index, 200 queries, coarse scores taken
-    // as final (OMNI_QUANT_RERANK=0, i.e. the arm where quantization error is actually visible):
-    //
-    //   affine (today)          recall@10 = 0.9425   top1 = 0.880
-    //   Hadamard + affine       recall@10 = 0.9275   top1 = 0.850
-    //
-    // The reason is in `omni-verify quantdist`: the rotation exists to Gaussianize, and these
-    // vectors already are. Per 64-wide group the RAW embeddings measure crest 2.60 / excess
-    // kurtosis -0.12 (Gaussian is ~3.0 / 0), i.e. already outlier-free and slightly LIGHTER-tailed
-    // than Gaussian - the best case affine group quant can be handed. Rotating mixes them toward
-    // Gaussian from the good side: crest p99 3.61 -> 3.88, kurtosis p99 +1.79 -> +2.49. TurboQuant
-    // is written for LLM weights, whose outlier channels this fixes; an L2-normalized encoder output
-    // is already the thing it is trying to produce.
-    static let quantRotate = ProcessInfo.processInfo.environment["OMNI_QUANT_ROTATE"] == "1"
-    private var quantSigns: MLXArray? = nil
     /// mx.hadamard_transform supports n = m * 2^k for m in {1, 12, 20, 28}. 768 = 12 * 64 and 1024 =
     /// 2^10, so both shipped model dims qualify; anything else silently keeps the plain quantizer.
     public static func hadamardCompatible(_ d: Int) -> Bool {
@@ -980,27 +915,6 @@ public final class VectorStore: @unchecked Sendable {
             while n <= d { if n == d { return true }; n <<= 1 }
         }
         return false
-    }
-    /// Deterministic +-1 signs. Host xorshift rather than MLX.random so the vector cannot change
-    /// under an MLX version bump - a different sign vector silently mis-scores an existing replica.
-    private func quantSignsLocked() -> MLXArray? {
-        guard Self.quantRotate, dim > 0, Self.hadamardCompatible(dim) else { return nil }
-        if let s = quantSigns { return s }
-        var rng: UInt64 = 0x9E37_79B9_7F4A_7C15 &+ UInt64(dim)
-        var s = [Float](repeating: 0, count: dim)
-        for i in 0 ..< dim {
-            rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17
-            s[i] = (rng >> 40) & 1 == 0 ? -1 : 1
-        }
-        let a = MLXArray(s, [dim])
-        MLX.eval(a)
-        quantSigns = a
-        return a
-    }
-    /// Rotate rows (last axis == dim) in fp32. Returns the input untouched when rotation is off.
-    private func rotateForQuantLocked(_ x: MLXArray) -> MLXArray {
-        guard let s = quantSignsLocked() else { return x }
-        return MLX.hadamardTransform(x.asType(.float32) * s, scale: 1.0 / Float(dim).squareRoot())
     }
     private static let quantGroup = 64
     /// PAPER LEVER: forces the base representation regardless of the auto policy. The auto rule below
@@ -1579,7 +1493,6 @@ public final class VectorStore: @unchecked Sendable {
     private var liveFiles = 0                          // distinct files with >=1 live chunk
     private var kindFileCounts: [String: Int] = [:]    // kind -> file count (keys = the kinds present)
     private var extFileCounts: [String: Int] = [:]     // ext  -> file count (keys = the extensions present)
-    @inline(__always) private func extOf(_ p: String) -> String { (p as NSString).pathExtension.lowercased() }
     private func resetAggregatesLocked() { liveFiles = 0; kindFileCounts.removeAll(keepingCapacity: true); extFileCounts.removeAll(keepingCapacity: true) }
     /// Add one chunk for file `fid`; on the file's first live chunk (0->1) bump the aggregates.
     ///
@@ -1663,28 +1576,6 @@ public final class VectorStore: @unchecked Sendable {
         if fileRowLo[Int(fid)] > Int32(i) { fileRowLo[Int(fid)] = Int32(i) }
         if fileRowHi[Int(fid)] < Int32(i) + 1 { fileRowHi[Int(fid)] = Int32(i) + 1 }
         rowWindowCovered += 1
-    }
-
-    /// Does `path` sit under `folder`, judged the way SQLITE judges it?
-    ///
-    /// deleteUnderFolder removes rows with a byte range (`path >= folder||'/' AND path < folder||'0'`,
-    /// BINARY collation) and then removes the same rows from memory with a Swift predicate. Those
-    /// two do not always agree: Swift compares GRAPHEME CLUSTERS, so a path whose first character
-    /// after the separator is a combining mark - "/b/" + U+0301 - clusters that mark onto the "/"
-    /// and `hasPrefix("/b/")` is FALSE while the byte range is TRUE. macOS normalizes filenames to
-    /// NFD, so combining marks in paths are ordinary here, not exotic.
-    ///
-    /// The row would then be deleted from SQLite and kept in memory, with no hole recorded for a
-    /// slot that no longer has a row - the exact divergence coverage cannot survive. Comparing
-    /// UTF-8 bytes makes the in-memory side answer the same question the DELETE asked.
-    @inline(__always) static func pathUnderFolderBytes(_ path: String, _ folder: String) -> Bool {
-        if path == folder { return true }
-        var f = Array(folder.utf8)
-        f.append(UInt8(ascii: "/"))
-        let p = Array(path.utf8)
-        guard p.count > f.count else { return false }
-        for i in 0 ..< f.count where p[i] != f[i] { return false }
-        return true
     }
 
     /// The live row indices a removal of `paths` is about to take out.
@@ -2084,10 +1975,8 @@ public final class VectorStore: @unchecked Sendable {
         // SQLite's automatic checkpoint fires inside whatever write txn crosses the page threshold -
         // measured 40-70ms stalls on the serial queue every ~32MB of WAL, landing directly in a
         // concurrent search's lockwait tail. Disable it (0) and checkpoint via checkpointIfDueLocked
-        // instead: same cadence, but scheduled AWAY from active-search windows. OMNI_WAL_AUTOCKPT
-        // restores the automatic mode for A/B.
-        let autoCkpt = ProcessInfo.processInfo.environment["OMNI_WAL_AUTOCKPT"].flatMap { Int($0) } ?? 0
-        exec("PRAGMA wal_autocheckpoint=\(autoCkpt);")
+        // instead: same cadence, but scheduled AWAY from active-search windows.
+        exec("PRAGMA wal_autocheckpoint=0;")
         exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
         // The index is a rebuildable cache: on a schema change, drop and recreate.
         if !Self.compatibleSchemaVersions.contains(userVersion()) {
@@ -5477,8 +5366,7 @@ public final class VectorStore: @unchecked Sendable {
         // admitted every name match.
         let denseSet = Set(dense.map { $0.path })
         let extra = names.filter { !denseSet.contains($0) }
-        let resolved = filter.tagTerms.isEmpty && filter.tagExcludeTerms.isEmpty && filter.recentsLimit == nil
-            ? filter : queue.sync { resolveTagFilterLocked(filter) }
+        let resolved = !filter.needsPathSets ? filter : queue.sync { resolveTagFilterLocked(filter) }
         let materialized = hitsForPaths(extra, query: denseQuery)
             .filter { resolved.accepts(path: $0.path, kind: $0.kind, modified: $0.modified) }
         // Scope: only files the clause names. Boost: the dense list plus what the name found.
@@ -5578,13 +5466,7 @@ public final class VectorStore: @unchecked Sendable {
                 if let tDead { print(String(format: "[search] bitscan+dead graph %.1fms", -tDead.timeIntervalSinceNow * 1000)) }
                 if let r = coarseFastPathLocked(baseScore) { return r }
             } else if let qb = quantBase {
-                // The replica is stored rotated when the preconditioner is on, so the query must be
-                // rotated by the SAME orthogonal R to score against it. `qv` stays unrotated - every
-                // exact path below reads the untouched bf16 rows and must not see a rotated query.
-                // With the lever off this is the original `qv.transposed`, allocation for
-                // allocation: a disabled experiment must not cost the shipped path anything.
-                let qRow = Self.quantRotate ? rotateForQuantLocked(MLXArray(query, [1, dim])).asType(.bfloat16)
-                                            : qv.transposed(1, 0)
+                let qRow = qv.transposed(1, 0)
                 baseScore = patchScoresLocked(maskDeadLocked(
                     MLX.quantizedMM(qRow, qb.wq, scales: qb.scales, biases: qb.biases,
                                     transpose: true, groupSize: Self.quantGroup, bits: quantBits)
@@ -5921,7 +5803,7 @@ public final class VectorStore: @unchecked Sendable {
             let exact: MLXArray = packed.withUnsafeBytes { raw in
                 let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
                                 count: cand.count * dim * MemoryLayout<UInt16>.size, deallocator: .none)
-                let tile = Self.exactTile(MLXArray(data, [cand.count, dim], dtype: .bfloat16), group: Self.quantGroup)
+                let tile = MLXArray(data, [cand.count, dim], dtype: .bfloat16)
                 return MLX.matmul(tile, qv)
             }
             mark("gather")
@@ -6102,7 +5984,7 @@ public final class VectorStore: @unchecked Sendable {
         let exact: MLXArray = packed.withUnsafeBytes { raw in
             let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
                             count: hIdx.count * dim * MemoryLayout<UInt16>.size, deallocator: .none)
-            let tile = Self.exactTile(MLXArray(data, [hIdx.count, dim], dtype: .bfloat16), group: Self.quantGroup)
+            let tile = MLXArray(data, [hIdx.count, dim], dtype: .bfloat16)
             return MLX.matmul(tile, MLXArray(query, [dim, 1]).asType(.bfloat16))
         }
         MLX.eval(exact)
@@ -6345,8 +6227,7 @@ public final class VectorStore: @unchecked Sendable {
         let nGlobal = max(1, fileChunkCount.count)
         guard nGlobal > 1, filePaths.count >= nGlobal else { return nil }
         let cacheKey = Self.pathAllowKey(f, nGlobal: nGlobal)
-        let tagFree = f.tagAllow == nil && f.tagDeny == nil
-            && f.tagTerms.isEmpty && f.tagExcludeTerms.isEmpty && f.recentsLimit == nil
+        let tagFree = f.tagAllow == nil && f.tagDeny == nil && !f.needsPathSets
         if let key = cacheKey {
             if tagFree, key == pathAllowPureKey, let g = pathAllowPureGPU { return g }
             if !tagFree, key == pathAllowKey, let g = pathAllowGPU { return g }
@@ -6374,8 +6255,7 @@ public final class VectorStore: @unchecked Sendable {
     /// Identity of the path table `f` produces, or nil when it cannot be identified - which happens
     /// only for resolved tag sets with no terms behind them (see above), and means "do not cache".
     static func pathAllowKey(_ f: SearchFilter, nGlobal: Int) -> String? {
-        if (f.tagAllow != nil || f.tagDeny != nil), f.tagTerms.isEmpty, f.tagExcludeTerms.isEmpty,
-           f.recentsLimit == nil {
+        if (f.tagAllow != nil || f.tagDeny != nil), !f.needsPathSets {
             return nil
         }
         let terms = f.tagTerms.map { $0.lowercased() }.sorted().joined(separator: ",")
@@ -6384,7 +6264,7 @@ public final class VectorStore: @unchecked Sendable {
         // mask built for `in:A` to a later `in:A in:B`, silently dropping B's files from the
         // results, and the bug would only appear once a second folder was scoped.
         return "\(f.folderPrefixes.joined(separator: ">"))|\(f.ext ?? "")|\(terms)|\(exTerms)"
-            + "|\(f.recentsLimit.map { "recents\($0)" } ?? "")"
+            + "|\(f.recentsLimit.map { "recents\($0)" } ?? "")|\(f.excludeFolders.joined(separator: ">"))"
             + "|\(f.tagAllow?.count ?? -1)|\(f.tagDeny?.count ?? -1)|\(nGlobal)"
     }
     /// Called on every row mutation (through `invalidateTagFilterCacheLocked`). It deliberately
@@ -6413,9 +6293,6 @@ public final class VectorStore: @unchecked Sendable {
     /// Measured on M2 at 1M rows, filtered p50 against plain 9.2 ms: kind 14.1, folder 18.3,
     /// ext 17.6, since 18.2 - i.e. the rebuild, not the scan, was most of a filtered query's cost
     /// on a narrow GPU. (On an M3 Ultra every arm already read ~4 ms, which is why it never showed.)
-    /// A/B lever: 0 rebuilds the mask on every query (the pre-cache behavior), so the cache can be
-    /// measured in one process instead of across two builds.
-    static let selectMaskCache = ProcessInfo.processInfo.environment["OMNI_SELECT_MASK_CACHE"] != "0"
     private var selectMaskKey: String? = nil
     private var selectMaskGPU: MLXArray? = nil
     /// Flat [baseRows] Float32, 1 = keep. Nil when `f` has no GPU-maskable clause.
@@ -6460,7 +6337,7 @@ public final class VectorStore: @unchecked Sendable {
         let sinceCut = f.since.map { Int32(clamping: Int(($0 - Self.modifiedEpochBase).rounded(.down))) }
         // A nil path key means "not identifiable", so this mask must not be cached either.
         let pathKey: String? = pathFilter ? Self.pathAllowKey(f, nGlobal: max(1, fileChunkCount.count)) : ""
-        let key: String? = (!Self.selectMaskCache || (pathFilter && pathKey == nil)) ? nil
+        let key: String? = (pathFilter && pathKey == nil) ? nil
             : "\(f.kinds.sorted().joined(separator: ","))|\(sinceCut.map(String.init) ?? "")"
               + "|\(pathKey ?? "")|\(baseRows)|\(baseOccCount)"
         if let key, key == selectMaskKey, let m = selectMaskGPU { return m }
@@ -6524,11 +6401,10 @@ public final class VectorStore: @unchecked Sendable {
         mlxModifiedRows = f
         return m
     }
-    private func invalidateModifiedGPULocked() { mlxModified = nil; mlxModifiedRows = 0 }
 
     private func onlyKindFiltered(_ f: SearchFilter) -> Bool {
         f.folderPrefixes.isEmpty && (f.ext?.isEmpty ?? true) && f.since == nil
-            && f.tagTerms.isEmpty && f.tagExcludeTerms.isEmpty && f.recentsLimit == nil
+            && !f.needsPathSets
     }
 
     // MARK: - Tag-term filter resolution
@@ -6550,7 +6426,7 @@ public final class VectorStore: @unchecked Sendable {
     /// rows: snippet normalized to ",a,b,c," then LIKE '%,term,%' - no partial-word hits
     /// ("cat" never matches "scattered"). One indexed scan per distinct term list, cached.
     private func resolveTagFilterLocked(_ f: SearchFilter) -> SearchFilter {
-        guard !f.tagTerms.isEmpty || !f.tagExcludeTerms.isEmpty || f.recentsLimit != nil else { return f }
+        guard f.needsPathSets else { return f }
         var out = f
         if !f.tagTerms.isEmpty { out.tagAllow = pathsMatchingTagTermsLocked(f.tagTerms) }
         if let n = f.recentsLimit {
@@ -6567,6 +6443,29 @@ public final class VectorStore: @unchecked Sendable {
             out.tagAllow = out.tagAllow.map { $0.intersection(recents) } ?? recents
         }
         if !f.tagExcludeTerms.isEmpty { out.tagDeny = pathsMatchingTagTermsLocked(f.tagExcludeTerms) }
+        if !f.excludeFolders.isEmpty {
+            let key = "\u{1}exclude:" + f.excludeFolders.joined(separator: ">")
+            let under: Set<String>
+            if let cached = tagFilterCache[key] { under = cached }
+            else {
+                under = pathsUnderFoldersLocked(f.excludeFolders)
+                if tagFilterCache.count >= Self.tagFilterCacheCap { tagFilterCache.removeAll(keepingCapacity: true) }
+                tagFilterCache[key] = under
+            }
+            out.tagDeny = out.tagDeny.map { $0.union(under) } ?? under
+        }
+        return out
+    }
+
+    /// Every indexed file at or under any of `folders`, from the resident path table. The folder
+    /// test runs on bytes (`filesUnder`); a String is built only for the files that match, which
+    /// for the clipboard history is a few thousand against millions.
+    private func pathsUnderFoldersLocked(_ folders: [String]) -> Set<String> {
+        var out = Set<String>()
+        for folder in folders {
+            let under = filePaths.filesUnder(folder, semantics: .bytes)
+            for i in under.indices where under[i] { out.insert(filePaths[i]) }
+        }
         return out
     }
 
@@ -6999,10 +6898,10 @@ public final class VectorStore: @unchecked Sendable {
         var scShape: [Int], scDType: String, scBytes: Int, scSum: String
         var biShape: [Int]?, biDType: String?, biBytes: Int?, biSum: String?
         var checksum: String
-        /// Whether the rows were Hadamard-rotated before quantizing. Optional so replicas written
-        /// before the preconditioner existed decode as nil == false. A replica whose rotation does
-        /// not match the running build must be REJECTED, not adopted: the scores would be a rotated
-        /// query against unrotated rows, which is not wrong-ish, it is noise.
+        /// Whether the rows were Hadamard-rotated before quantizing: always for the 1-bit tier, never
+        /// for the affine replica. Optional so older replicas decode as nil == false. A replica
+        /// whose rotation does not match must be REJECTED, not adopted: the scores would be a
+        /// rotated query against unrotated rows, which is not wrong-ish, it is noise.
         var rotate: Bool?
     }
 
@@ -7164,7 +7063,7 @@ public final class VectorStore: @unchecked Sendable {
             scShape: qb.scales.shape, scDType: scTag, scBytes: scData.count, scSum: Self.blobChecksum(scData),
             biShape: qb.biases?.shape, biDType: biTag, biBytes: biData?.count, biSum: biData.map { Self.blobChecksum($0) },
             checksum: String(prefixChecksumLocked(rows: baseRows), radix: 16),
-            rotate: Self.quantRotate)
+            rotate: false)
         lastPersistedBaseRows = baseRows
         let url = quantReplicaURL
         let tmp = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp")
@@ -7230,7 +7129,7 @@ public final class VectorStore: @unchecked Sendable {
         guard header.magic == "omni-quant-1", header.rows > 0, header.rows <= n,
               header.dim == dim, header.group == Self.quantGroup,
               isBitTier || [2, 3, 4, 5, 6, 8].contains(header.bits),
-              isBitTier || (header.rotate ?? false) == (Self.quantRotate && Self.hadamardCompatible(dim)),
+              isBitTier || !(header.rotate ?? false),
               !isBitTier || ((header.rotate ?? false) && Self.hadamardCompatible(dim) && dim % 32 == 0),
               header.rows == baseRows || baseRows == 0,   // baseRows is 0 fresh out of loadIntoMemory
               flat16.count >= header.rows * dim,
@@ -7315,8 +7214,6 @@ public final class VectorStore: @unchecked Sendable {
     // the sole source of truth. Gated to quant-mode indexes; OMNI_ROW_SIDECAR=0 disables.
 
     private static let rowSidecarEnabled = ProcessInfo.processInfo.environment["OMNI_ROW_SIDECAR"] != "0"
-    /// Test switch only: 0 reproduces the pre-fix stamp that outran the vector file.
-    private static let sidecarCoverEnabled = ProcessInfo.processInfo.environment["OMNI_SIDECAR_COVER"] != "0"
     // PAPER LEVERS (var, not let): the in-app paper suite A/Bs these in one process. setenv() after
     // first touch is either a no-op or a permanent change to the live app, and spawning omni-verify
     // is not an option (it is not in the app bundle, and a second process loads a second model).
@@ -9679,19 +9576,37 @@ public final class VectorStore: @unchecked Sendable {
               // switch is two writes to `meta` instead of an UPDATE over millions of rows.
               coveredRows == units, !vecHoles.isEmpty
         else { return false }
+        // THE THRESHOLD FIRST. The audit below walks every position and hashes every row (515 ms on
+        // the 10M-position bench index, under the store queue), and the stamp that asks runs two
+        // seconds after every write. Asked in the other order it paid that cost on every write to
+        // reach a "no" the hole count alone gives: a live index whose watched folders take steady
+        // writes held a core at 100% for days, 15,877 holes against a threshold of 420,820.
+        let threshold = Swift.max(Self.holeReclaimFloor, Int(Double(units) * Self.holeReclaimFraction))
+        guard vecHoles.count >= threshold else { return false }
+        // An audit that disagrees is not repeated on the next write: nothing about the next write
+        // makes it more likely to agree, and the reclaim is never urgent.
+        if let retry = holeAuditRetryAt, Date() < retry { return false }
         // The hole list has to account for every position nothing owns, or the copy below would
         // keep bytes it thinks are live. A tombstone releases a POINTER, not a position, so the
         // question is asked of the positions.
+        holeAuditsForTest += 1
         ensureSlotRowsLocked()
         let dead = deadRows
         var unowned = 0
         for sl in 0 ..< units where !rowsOfSlotLocked(sl).contains(where: { !dead.contains($0) }) {
             unowned += 1
         }
-        guard vecHoles.count == unowned else { return false }
-        let threshold = Swift.max(Self.holeReclaimFloor, Int(Double(units) * Self.holeReclaimFraction))
-        return vecHoles.count >= threshold
+        guard vecHoles.count == unowned else {
+            holeAuditRetryAt = Date().addingTimeInterval(600)
+            return false
+        }
+        holeAuditRetryAt = nil
+        return true
     }
+    /// When a hole audit that disagreed may run again.
+    private var holeAuditRetryAt: Date?
+    /// How many times the audit walked every position.
+    private(set) var holeAuditsForTest = 0
 
     /// One chunk of the copy, under the queue: verify nothing has moved, then write it.
     ///
@@ -10202,11 +10117,7 @@ public final class VectorStore: @unchecked Sendable {
         // quiet was the common case, and the sidecar was discarded on essentially every launch.
         // Extend coverage first, and if that fails, skip the stamp rather than write a header that
         // is guaranteed to be rejected.
-        // OMNI_SIDECAR_COVER=0 restores the pre-fix behaviour so the regression test can A/B the
-        // bug inside one binary; it is a test switch, not a tuning knob.
-        if Self.sidecarCoverEnabled {
-            guard flat16.extendFileCoverage() else { omniPerfLog("row-stamp SKIPPED: coverage"); return }
-        }
+        guard flat16.extendFileCoverage() else { omniPerfLog("row-stamp SKIPPED: coverage"); return }
         flat16.msyncFile()
         let n = rows.count
         // Pre-sized [UInt8] buffers, not Data: appending millions of few-byte chunks through
@@ -10594,8 +10505,7 @@ public final class VectorStore: @unchecked Sendable {
     /// searchGraphDense to skip a fused attempt that cannot succeed.
     private let quantizedHint = OSAllocatedUnfairLock(initialState: false)
     private var bitWords: Int { dim / 32 }
-    /// Signs for the 1-bit tier's rotation. Independent of `quantSignsLocked`, which is gated on an
-    /// off-by-default experiment; this tier always rotates, so it always has them.
+    /// Signs for the 1-bit tier's rotation. This tier always rotates, so it always has them.
     private var bitSigns: MLXArray? = nil
 
     private func bitSignsLocked() -> MLXArray? {
@@ -10768,7 +10678,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func quantizeSlabsLocked(_ range: Range<Int>, bits: Int) -> (wqs: [MLXArray], scs: [MLXArray], bss: [MLXArray]) {
-        let slab = Self.quantRotate ? 65_536 : 131_072
+        let slab = 131_072
         var wqs: [MLXArray] = [], scs: [MLXArray] = [], bss: [MLXArray] = []
         var off = range.lowerBound
         flat16.withUnsafeBytes { raw in
@@ -10776,7 +10686,7 @@ public final class VectorStore: @unchecked Sendable {
                 let count = Swift.min(slab, range.upperBound - off)
                 let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!.advanced(by: off * dim * MemoryLayout<UInt16>.size)),
                                 count: count * dim * MemoryLayout<UInt16>.size, deallocator: .none)
-                let part = rotateForQuantLocked(MLXArray(data, [count, dim], dtype: .bfloat16))
+                let part = MLXArray(data, [count, dim], dtype: .bfloat16)
                 let q = MLX.quantized(part, groupSize: Self.quantGroup, bits: bits)
                 var toEval = [q.wq, q.scales]
                 if let b = q.biases { toEval.append(b) }
@@ -11516,7 +11426,7 @@ public final class VectorStore: @unchecked Sendable {
         /// `mlxDeadOcc`, `deadIdxCache`, `orphanCache`.
         public var gpuMirrors = 0
         /// Cached filter tables and sign scratch: `pathAllowGPU`, `pathAllowPureGPU`,
-        /// `selectMaskGPU`, `quantSigns`, `bitSigns`.
+        /// `selectMaskGPU`, `bitSigns`.
         public var gpuFilters = 0
 
         public var cpu: Int {
@@ -11748,7 +11658,6 @@ public final class VectorStore: @unchecked Sendable {
         var filters = nb(pathAllowGPU)
         filters += nb(pathAllowPureGPU)
         filters += nb(selectMaskGPU)
-        filters += nb(quantSigns)
         filters += nb(bitSigns)
         m.gpuFilters = filters
         return m
@@ -12763,17 +12672,6 @@ public final class VectorStore: @unchecked Sendable {
     func aggregatesForTest() -> (live: Int, kinds: [String: Int], exts: [String: Int]) {
         queue.sync { (liveFiles, kindFileCounts, extFileCounts) }
     }
-    /// Forget that the slot column is complete, so a fixture that has written more rows behind the
-    /// store's back can have them filled in. The real upgrade path reaches that state on its own -
-    /// every row has a slot before the fold ever runs - and a fixture that cannot is measuring
-    /// something else.
-    func clearSlotBackfillFlagForTest() {
-        queue.sync {
-            exec("DELETE FROM meta WHERE key = '\(Self.slotsBackfilledKey)';")
-            slotsBackfilled = false
-            slotBackfillCursor = -1
-        }
-    }
 
 
     // MARK: - Layout, and the v3 -> v4 conversion
@@ -13654,7 +13552,6 @@ public final class VectorStore: @unchecked Sendable {
     /// are dropped on the queue once the tables are, rather than discovering it later.
     @discardableResult
     func dropV4TablesLocked() -> Bool {
-        defer { Self.releaseFreedHeap("v4-drop") }
         guard splitBuilt, !Self.legacyWriteForTest, dbOpen(), !v4DropInFlight else { return false }
         guard hasTableLocked("chunks") || hasTableLocked("chunk_text") else { return false }
         // NOT WHILE v3 IS STILL BEING STAGED. `chunks` is the v3 -> v4 conversion's landing
@@ -13723,6 +13620,10 @@ public final class VectorStore: @unchecked Sendable {
                 sqlite3_finalize(self.snippetStmt); self.snippetStmt = nil
                 self.v4Dropped = true
                 self.exec("PRAGMA wal_checkpoint(TRUNCATE);")
+                // Once, when the drop has happened. It was a `defer` on the entry, so every coverage
+                // stamp on a v5 index - where the guards return at once - walked the malloc zones:
+                // about 200 times in 15 minutes of use, measured in the chaos run's perf log.
+                Self.releaseFreedHeap("v4-drop")
                 FileHandle.standardError.write(Data(String(format:
                     "[omni] dropped chunk_text and chunks in %.1fs; the index is v5 only\n", secs).utf8))
                 // NOW, not at the next launch, for the reason the coverage migration gives: the
@@ -13902,18 +13803,6 @@ public final class VectorStore: @unchecked Sendable {
         return true
     }
 
-    /// The files a set of v4 chunk rows belong to.
-    func filesOfChunkRowsLocked(_ ids: [Int64]) -> [Int64] {
-        guard dbOpen(), !ids.isEmpty else { return [] }
-        var out: [Int64] = []
-        var st: OpaquePointer?
-        defer { sqlite3_finalize(st) }
-        let sql = "SELECT DISTINCT file_id FROM chunks WHERE id IN (\(ids.map(String.init).joined(separator: ",")));"
-        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return [] }
-        while sqlite3_step(st) == SQLITE_ROW { out.append(sqlite3_column_int64(st, 0)) }
-        return out
-    }
-
     /// Build the chunk/occurrence split in this database, once, when it is enabled and possible.
     ///
     /// It is deliberately downstream of the slot backfill and INDEPENDENT of the fold: the split
@@ -13922,10 +13811,12 @@ public final class VectorStore: @unchecked Sendable {
     /// contents to produce.
     @discardableResult
     func buildChunkSplitLocked(highWaterOverride: Int64? = nil) -> Bool {
-        defer { Self.releaseFreedHeap("split-build") }
         guard !Self.legacyWriteForTest, dbOpen() else { return false }
         guard scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.chunkSplitDoneKey)'") != 1
         else { return false }
+        // Registered past the guards: a finished index returns above on every stamp, and relief
+        // there would walk the malloc zones for nothing (the v4 drop did exactly that).
+        defer { Self.releaseFreedHeap("split-build") }
         // AN EMPTY INDEX IS ALREADY MIGRATED, and saying so is what lets a new user be born v5.
         // There is nothing to derive, so the backfill has no work to do - but every guard below
         // reads "no rows yet" as "not ready": `dim` is 0 until the first vector arrives and
@@ -14168,13 +14059,6 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    /// The two numbers whose disagreement makes the store refuse to open: how many rows have no
-    /// pending blob, and how many the coverage claim accounts for. Exposed so a test can ask after
-    /// each operation which one moved them apart, rather than only learning at the next open.
-    public func coverageAccountingForTest() -> (cleared: Int, accounted: Int) {
-        queue.sync { (clearedRowsLocked(), coveredRows - vecHoles.count) }
-    }
-
     /// Empty chunk_text entirely, which is what dropping it will do. Cached statements go with
     /// it, so the next read re-prepares against whatever is left.
     public func emptyV4TextForTest() {
@@ -14269,18 +14153,6 @@ public final class VectorStore: @unchecked Sendable {
     @discardableResult
 
 
-
-    /// The row -> position mirror changed, but the POSITIONS did not move: every vector is still
-    /// where it was, so the resident scan copy is untouched and only the things that translate a
-    /// score per position into a score per file are stale. Rebuilding the base here instead would
-    /// cost a 30-second requantize per slice on a large index, for nothing.
-    private func invalidateOccurrenceMirrorsLocked() {
-        bumpGenLocked()                 // slotRow, orphan and identity caches are keyed on this
-        mlxOccSlot = nil; mlxOccSlotRows = 0
-        mlxDeadOcc = nil; mlxDeadOccRows = 0
-        deadIdxCache = nil
-        baseOccCount = occCountCoveringSlotsLocked(baseRows)
-    }
 
     func backfillSlotsLocked(budget: Int = VectorStore.slotBackfillSlice) {
         guard dbOpen(), !slotsBackfilled, !rows.isEmpty else { return }
@@ -15098,26 +14970,6 @@ public final class VectorStore: @unchecked Sendable {
             )
             """)
         return mismatches == 0
-    }
-
-    /// The row id `files` holds for this path, creating it if new.
-    ///
-    /// Resolved ONCE PER FILE by the insert paths, never per chunk: a file averages 17 chunks, and
-    /// paying an index probe for each of them would hand back the write cost that interning is
-    /// supposed to save. Rows for a deleted file keep their entry, which is deliberate - a re-added
-    /// path reuses its id, exactly as the in-memory intern table already does.
-    private func fileRowIDLocked(_ path: String) -> Int64? {
-        var ins: OpaquePointer?
-        if sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO files(path) VALUES(?);", -1, &ins, nil) == SQLITE_OK {
-            sqlite3_bind_text(ins, 1, path, -1, SQLITE_TRANSIENT)
-            sqlite3_step(ins)
-        }
-        sqlite3_finalize(ins)
-        var sel: OpaquePointer?
-        defer { sqlite3_finalize(sel) }
-        guard sqlite3_prepare_v2(db, "SELECT id FROM files WHERE path = ?;", -1, &sel, nil) == SQLITE_OK else { return nil }
-        sqlite3_bind_text(sel, 1, path, -1, SQLITE_TRANSIENT)
-        return sqlite3_step(sel) == SQLITE_ROW ? sqlite3_column_int64(sel, 0) : nil
     }
 
     private func hasColumnLocked(_ table: String, _ column: String) -> Bool {

@@ -43,11 +43,6 @@ public enum GPUInteractive {
         busline.leave()
     }
 
-    /// A decode step that gave way to interactive work and has to be taken again. Counted because
-    /// yielding is only correct while it stays rare: a lane that yields on every step is not
-    /// arbitrating, it is starving.
-    public static func noteYielded() { busline.noteWasted() }
-
     public static func around<T>(_ work: () throws -> T) rethrows -> T {
         enter(); defer { leave() }
         return try work()

@@ -51,14 +51,6 @@ public enum PaperCasesCompute {
     }
 }
 
-/// `PaperCasesCompute` as the runner's protocol, for a suite run that wants these cases and nothing
-/// else (the sub-minute `--scale` smoke test, or a build where the store cases are not compiled in).
-/// A full run composes this with the store provider rather than replacing it.
-public struct PaperComputeCaseBodies: PaperCaseBodies {
-    public init() {}
-    public func body(for id: PaperCaseID) -> PaperCaseBody? { PaperCasesCompute.body(for: id) }
-}
-
 // MARK: - p01 / p11: fused attention
 
 extension PaperCasesCompute {

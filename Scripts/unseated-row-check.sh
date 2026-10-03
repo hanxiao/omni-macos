@@ -10,8 +10,7 @@
 #
 # WHY THIS IS A SCRIPT AND NOT A UNIT TEST: the loader only runs on an index with a real coverage
 # claim, and a claim only advances into the NAMED vector sidecar - which a small fixture never
-# gets, whatever it is built with. `UnseatedRowTests` skips for exactly that reason and points
-# here. This runs against an index big enough to be real.
+# gets, whatever it is built with. This runs against an index big enough to be real.
 #
 # It only READS the index it is given. Point it at a COPY if you care about the original.
 set -u

@@ -13,7 +13,7 @@ import OmniKit
 /// `wait:<seconds>`. For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
 /// (window size, centered), `front`, `appearance:light|dark`, `history:<n>`, `sort:<order>`,
-/// `bsort:<name|column rawValue>`, `settings:<tab>`, `sidebarselect:<n>`, `dumpui:<path>`, `recents`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
+/// `bsort:<name|column rawValue>`, `settings:<tab>`, `sidebarselect:<n>`, `dumpui:<path>`, `recents`, `clipboard:on|off`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
 enum PerfScript {
@@ -73,6 +73,20 @@ enum PerfScript {
             model.setSemanticText(arg); model.search()
         case "clear": model.clearSearch()
         case "wait": break   // the wait is the sleep after the step
+        case "share": SelectionShare.present(model.selectedURLsOrdered)   // what File > Share does
+        case "cliptest":   // the clipboard history must never record Omni's own file copies
+            let pb = NSPasteboard(name: .init("io.hanxiao.omni.cliptest"))
+            let files = (model.selectionOrdered.isEmpty ? [arg] : model.selectionOrdered).map { URL(fileURLWithPath: $0) }
+            OmniPasteboard.copyFiles(files, text: files.map(\.path).joined(separator: "\n"), to: pb)
+            let own = ClipboardMonitor.clip(from: pb) == nil
+            pb.clearContents()   // a Finder-style copy: file URLs, no marker
+            pb.writeObjects(files.map { $0 as NSURL })
+            let finder = ClipboardMonitor.clip(from: pb) == nil
+            pb.clearContents()   // positive control: plain text the user copied is recorded
+            pb.setString("hello from a person", forType: .string)
+            let text = ClipboardMonitor.clip(from: pb) != nil
+            pb.releaseGlobally()
+            omniPerfLog("cliptest files=\(files.count) ownCopySkipped=\(own) finderCopySkipped=\(finder) textRecorded=\(text)")
         case "similar": model.searchBySimilar(to: arg)
         case "select":
             if let i = Int(arg), model.results.indices.contains(i) { model.selectSingle(model.results[i].path) }
@@ -102,7 +116,7 @@ enum PerfScript {
                 menu.performActionForItem(at: i)
             }
             NotificationCenter.default.post(name: .omniPerfSettingsTab, object: arg)
-        case "sidebarselect":   // select the n-th indexed folder in the sidebar (-1: Recents), as a click would
+        case "sidebarselect":   // select the n-th indexed folder in the sidebar (-1: Recents, -2: Clipboard), as a click would
             NotificationCenter.default.post(name: .omniPerfSidebarSelect, object: Int(arg) ?? 0)
         case "sidebarfocus":    // give the sidebar keyboard focus, which a click on a row does
             if let w = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil }),
@@ -117,10 +131,17 @@ enum PerfScript {
                 "selection": model.selection ?? "",
                 "browseFolder": model.browserListingForPerf.folder,
                 "browse": model.browserListingForPerf.paths,
+                "clipboardOff": model.showsClipboardOff,
+                "clipboardEnabled": model.clipboardEnabled,
+                "clipboardCurrent": model.clipboardCurrentPath ?? "",
+                "clipboardClips": model.clipboardClipCount,
+                "clipboardHasClips": model.clipboardHasClips,
             ]
             if let data = try? JSONSerialization.data(withJSONObject: payload) {
                 try? data.write(to: URL(fileURLWithPath: arg), options: .atomic)
             }
+        case "clipboard":   // on | off | clear (Clear without its confirmation)
+            if arg == "clear" { model.clearClipboardHistory() } else { model.setClipboardEnabled(arg == "on") }
         case "appearance": NSApp.appearance = NSAppearance(named: arg == "dark" ? .darkAqua : .aqua)
         default: omniPerfLog("script: unknown step \(step)")
         }

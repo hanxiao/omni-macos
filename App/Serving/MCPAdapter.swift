@@ -950,26 +950,6 @@ enum MCPAdapter {
         return "index: empty - no folders or photo sources are indexed yet (see list_sources / add_source)."
     }
 
-    private enum DiskState { case upToDate, changed, missing }
-
-    /// Whether the file on disk still matches the version the index holds. Same comparison as
-    /// file_status's `up_to_date`, so the two tools can never disagree. One stat per returned hit
-    /// (at most top_k, capped at 50); Photos assets go through PhotoKit rather than the filesystem.
-    private static func diskState(of hit: SearchHit) -> DiskState {
-        if let ref = PhotoLibrary.Ref(hit.path) {
-            guard let info = PhotoLibrary.assetSignature(ref) else { return .missing }
-            return (info.modified == hit.modified && info.size == hit.size) ? .upToDate : .changed
-        }
-        guard let vals = try? URL(fileURLWithPath: hit.path).resourceValues(
-                forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey]),
-              vals.isRegularFile == true else { return .missing }
-        let mtime = vals.contentModificationDate?.timeIntervalSince1970 ?? 0
-        let bytes = vals.fileSize ?? 0
-        // A row written before the size column exists carries size 0; do not call that a change.
-        if hit.size > 0 && bytes != hit.size { return .changed }
-        return mtime == hit.modified ? .upToDate : .changed
-    }
-
     private static func toolError(id: Any, _ message: String) -> HTTPResponse {
         result(id: id, ["content": [["type": "text", "text": message]], "isError": true])
     }

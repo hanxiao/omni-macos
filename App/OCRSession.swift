@@ -1645,10 +1645,6 @@ final class OCRSession {
         currentTokensPerSecond = Double(settledTokens + liveTokens.values.reduce(0, +)) / seconds
     }
 
-    private func documents_indexOfDocument(containing page: Int) -> Int? {
-        documents.firstIndex { $0.pageIDs.contains(page) }
-    }
-
     /// Thumbnails are rendered off the main actor and land as they finish, so a long document
     /// fills its sidebar progressively instead of blocking the drop.
     private func renderThumbnails(from start: Int, token: Int) {
@@ -1767,8 +1763,7 @@ final class OCRSession {
     }
 
     func copyMarkdownToPasteboard() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(documentMarkdown, forType: .string)
+        OmniPasteboard.copy(documentMarkdown)
         post(notice: "Copied", symbol: "checkmark.circle.fill", seconds: 1.6)
     }
 

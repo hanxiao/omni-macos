@@ -905,6 +905,7 @@ private struct MinimumField: View {
 private struct HistoryTab: View {
     @Environment(AppModel.self) private var model: AppModel
     @State private var confirmClear = false
+    @State private var confirmClearClips = false
     var body: some View {
         // TWO GROUPS: what the sidebar shows of the index (Recents), and what Omni remembers of
         // searches. No paragraphs between them - each row's detail is in its tooltip.
@@ -945,8 +946,45 @@ private struct HistoryTab: View {
                         .help("Bookmarks are kept")
                 }
             }
+            Section("Clipboard") {
+                Toggle("Save clipboard history", isOn: Binding(get: { model.clipboardEnabled },
+                                                              set: { model.setClipboardEnabled($0) }))
+                .help("Copied text and images, searchable in Clipboard")
+                if model.clipboardEnabled, ClipboardMonitor.accessDenied {
+                    LabeledContent("Pasting from other apps is denied") {
+                        Button("Open Privacy Settings") {
+                            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Pasteboard") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                        .controlSize(.small)
+                    }
+                    .foregroundStyle(.secondary)
+                }
+                Picker("Keep clips for", selection: Binding(get: { model.clipboardRetentionDays },
+                                                           set: { model.clipboardRetentionDays = $0 })) {
+                    Text("7 days").tag(7)
+                    Text("30 days").tag(30)
+                    Text("90 days").tag(90)
+                    Text("Forever").tag(0)
+                }
+                HStack(spacing: 10) {
+                    Text("Saved clips")
+                    Spacer()
+                    Text(model.clipboardClipCount.formatted()).foregroundStyle(.secondary)
+                    Button("Clear\u{2026}", role: .destructive) { confirmClearClips = true }
+                        .controlSize(.small)
+                        .disabled(!model.clipboardHasClips)
+                }
+            }
         }
         .formStyle(.grouped)
+        .confirmationDialog("Clear clipboard history?", isPresented: $confirmClearClips) {
+            Button("Clear clipboard history", role: .destructive) { model.clearClipboardHistory() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("\(model.clipboardClipCount.formatted()) clips will be deleted.")
+        }
         .confirmationDialog("Clear all recent searches?", isPresented: $confirmClear) {
             Button("Clear search history", role: .destructive) { model.clearSearchHistory() }
             Button("Cancel", role: .cancel) {}

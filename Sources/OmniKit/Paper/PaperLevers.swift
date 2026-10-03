@@ -226,7 +226,6 @@ public final class PaperLeverController: @unchecked Sendable {
     }
 
     public var levers: PaperLevers { pinned }
-    public var activeArm: String? { activeArmName }
 
     /// Suite-wide pin. Legal only between cases, with no arm scope open.
     public func pin(_ set: PaperLeverSet) {

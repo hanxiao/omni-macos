@@ -30,7 +30,7 @@ final class CrawlerParityTests: XCTestCase {
         try text.write(to: u, atomically: true, encoding: .utf8)
     }
 
-    private func crawl(legacy: Bool, ignore: OmniIgnore = OmniIgnore(text: ""),
+    private func crawl(legacy: Bool, ignore: OmniIgnore = .hiddenOnly,
                        kinds: Set<FileKind> = [.text, .image, .video, .audio],
                        caps: [FileKind: Int] = FileCrawler.defaultMaxFileSize) -> [String: CrawledFile] {
         setenv("OMNI_CRAWLER", legacy ? "legacy" : "bulk", 1)
@@ -41,7 +41,7 @@ final class CrawlerParityTests: XCTestCase {
         return out
     }
 
-    private func assertParity(_ label: String, ignore: OmniIgnore = OmniIgnore(text: ""),
+    private func assertParity(_ label: String, ignore: OmniIgnore = .hiddenOnly,
                               kinds: Set<FileKind> = [.text, .image, .video, .audio],
                               caps: [FileKind: Int] = FileCrawler.defaultMaxFileSize,
                               file: StaticString = #filePath, line: UInt = #line) {
@@ -63,8 +63,8 @@ final class CrawlerParityTests: XCTestCase {
         }
     }
 
-    /// The ordinary tree, plus the two the walk has to actively exclude: hidden files and hidden
-    /// directories. The enumerator gets those from .skipsHiddenFiles; the fast walk has to know.
+    /// The ordinary tree, plus hidden files and hidden directories. Both engines exclude them through
+    /// the policy's `.*` line and nothing else (issue #24), so without it both index them.
     func testOrdinaryTreeAndHiddenEntries() throws {
         try write("a.txt")
         try write("nested/b.txt")
@@ -78,6 +78,10 @@ final class CrawlerParityTests: XCTestCase {
         XCTAssertFalse(seen.keys.contains { $0.contains("/.hidden") || $0.contains("/.also-hidden") },
                        "a hidden file was indexed")
         XCTAssertEqual(seen.count, 3, "expected exactly the three visible files")
+
+        assertParity("no hidden rule", ignore: OmniIgnore(text: ""))
+        XCTAssertEqual(crawl(legacy: false, ignore: OmniIgnore(text: "")).count, 6,
+                       "without the line nothing else in the crawl excludes them")
     }
 
     /// A PACKAGE is a directory the user thinks of as one file. Walking into it indexes hundreds of

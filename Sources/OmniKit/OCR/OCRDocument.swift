@@ -26,9 +26,6 @@ import PDFKit
 /// Test-only switch so the page loop's loop-guard cost can be A/B'd from the CLI.
 public enum OCRRuntimeFlags {
     nonisolated(unsafe) public static var loopGuardForPDF = true
-    /// Run the vision tower a page ahead on its own MLX stream. Measured worth ~0 over host-only
-    /// prefetch, because total GPU work is conserved - kept switchable so that stays checkable.
-    nonisolated(unsafe) public static var visionPrefetch = false
     /// Print the prefill breakdown (prompt embed, language prefill, draft-head priming) per page.
     /// TTFT is dead time before a single character appears, and on a laptop it is the part of the
     /// wall clock a reader actually feels.
@@ -43,11 +40,6 @@ public enum OCRRuntimeFlags {
     nonisolated(unsafe) public static var forceBatchMask = false
     /// FR-Spec shortlist size for the draft head; 0 = full vocabulary. See
     /// `OCRLanguageModel.draftVocab` for why a prefix of the id space is the right shortlist.
-    /// Let the draft length follow measured acceptance instead of being fixed.
-    public static var adaptiveDraft: Bool {
-        get { OCRLanguageModel.adaptiveDraft }
-        set { OCRLanguageModel.adaptiveDraft = newValue }
-    }
     public static var draftVocab: Int {
         get { OCRLanguageModel.draftVocab }
         set { OCRLanguageModel.draftVocab = newValue }
@@ -67,14 +59,10 @@ public enum OCRRuntimeFlags {
         rowLock.lock(); rowSteps[rows, default: 0] += 1; rowLock.unlock()
     }
 
-    /// Steps per live-row count, ascending. Cleared by the caller between runs.
+    /// Steps per live-row count, ascending.
     public static func occupancy() -> [(rows: Int, steps: Int)] {
         rowLock.lock(); defer { rowLock.unlock() }
         return rowSteps.sorted { $0.key < $1.key }.map { (rows: $0.key, steps: $0.value) }
-    }
-
-    public static func resetOccupancy() {
-        rowLock.lock(); rowSteps.removeAll(); rowLock.unlock()
     }
 
     /// The largest shared-cursor position and buffer length a batch KV cache reached in this
@@ -153,11 +141,9 @@ extension OCRModel {
     /// Transcribe every page of a PDF.
     ///
     /// - Parameters:
-    ///   - pipelined: run page n+1's rasterisation AND vision tower ahead of page n's decode.
-    ///     The pixel side is pure Swift; the vision half runs on its own MLX stream, which is
-    ///     worth doing because decode is bound by per-launch latency and leaves the GPU idle
-    ///     between kernels - a compute-heavy vision pass fills exactly that gap. Measured, not
-    ///     assumed: see the numbers in docs/OCR.md.
+    ///   - pipelined: rasterise and resample page n+1 ahead of page n's decode. Pure CPU, so it
+    ///     cannot contend with the GPU. Running the vision tower ahead as well was measured at
+    ///     ~0 (docs/OCR.md) and is not done.
     ///   - onPage: called as each page finishes, so a caller can stream results instead of
     ///     waiting for a 200-page document.
     public func transcribe(pdfAt url: URL, prompt: String? = nil, maxNewTokens: Int = 0,
@@ -193,23 +179,10 @@ extension OCRModel {
             return try? OCRPreprocess.rgb(from: cg)
         }
 
-        // The prefetch produces a fully prepared page - pixels AND visual features - so the only
-        // work left on the main stream is the language model.
-        // Two prefetch depths, so the GPU-side half can be measured rather than assumed:
-        //   host   rasterise + resample ahead; the vision tower stays on the main stream
-        //   vision also run the vision tower ahead, on its own MLX stream
-        let model = self
-        let visionAhead = OCRRuntimeFlags.visionPrefetch
+        // The prefetch hands back pixels; the vision tower runs on the main stream.
         func prefetch(_ index: Int) -> Task<PreparedPage?, Never> {
             Task.detached(priority: .userInitiated) {
-                if visionAhead {
-                    return Stream.withNewDefaultStream(device: .gpu) {
-                        guard let image = renderer.render(index) else { return nil }
-                        return try? model.preparePage(image: image, prompt: prompt)
-                    }
-                }
-                guard let image = renderer.render(index) else { return nil }
-                return PreparedPage(pending: image)
+                renderer.render(index).map { PreparedPage(pending: $0) }
             }
         }
 
@@ -228,7 +201,7 @@ extension OCRModel {
             let waited = Date().timeIntervalSince(waitStart)
             stalled += waited
 
-            // Start the NEXT page's pixels and vision before decoding this one.
+            // Start the NEXT page's pixels before decoding this one.
             if pipelined, offset + 1 < range.count {
                 let next = range[range.index(range.startIndex, offsetBy: offset + 1)]
                 lookahead = prefetch(next)

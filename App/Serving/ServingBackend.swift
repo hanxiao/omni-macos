@@ -92,6 +92,9 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     func search(_ query: String, topK: Int, filter: SearchFilter, surface: ServedSurface) -> [SearchHit] {
         let vec = engine.embedQuery(query)
         onSearch?(query, surface)
+        // The clipboard history is the user's alone: no served surface returns it.
+        var filter = filter
+        filter.excludeFolders.append(AppModel.clipboardDirectory.path)
         let hits = store.search(vec, filter: filter, topK: topK, textQuery: query)
         // The SAME cut the window applies, so an agent and a human asking one question see one
         // answer. Per kind, because the score scale is per kind - see VectorStore.relevanceFloor.

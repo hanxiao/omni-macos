@@ -63,6 +63,10 @@ public struct FileCrawler: Sendable {
     /// The index files themselves survived only by luck - `.sqlite`, `.vecs`, `.quant` and `.rows`
     /// are not indexable extensions - which is not a property to keep relying on.
     public var ownDataPaths: [String] = []
+    /// Folders inside `ownDataPaths` that hold USER content and are crawled like any other: the
+    /// clipboard history lives in Omni's Application Support folder but is the user's text and
+    /// images, indexed so they can be searched.
+    public var ownDataExceptions: [String] = []
     /// Per-kind file-size ceiling in bytes; a kind with NO entry is uncapped. Video and audio stream
     /// in bounded 240 s segments (embedStreamedVideo/Audio), so a multi-GB file is memory-safe - only
     /// slower to index - and is left uncapped. Text reads only the first maxTextBytes (2 MB) regardless
@@ -88,10 +92,10 @@ public struct FileCrawler: Sendable {
         "Caches", ".Trash", "vendor", "dist", "build", "_build", ".next", "target",
     ]
 
-    public init(roots: [URL], ignore: OmniIgnore = OmniIgnore(text: ""),
+    public init(roots: [URL], ignore: OmniIgnore = .hiddenOnly,
                 enabledKinds: Set<FileKind> = [.text, .image, .video, .audio],
                 maxFileSize: [FileKind: Int] = FileCrawler.defaultMaxFileSize,
-                ownDataPaths: [String] = []) {
+                ownDataPaths: [String] = [], ownDataExceptions: [String] = []) {
         self.roots = roots
         self.ignore = ignore
         self.enabledKinds = enabledKinds
@@ -101,25 +105,29 @@ public struct FileCrawler: Sendable {
         // /private/var/...). Standardizing without resolving left the two spellings unequal and
         // the exclusion silently matched nothing - which the tests caught only because they run
         // under a temp directory, where that difference is real.
-        self.ownDataPaths = ownDataPaths.map { p in
-            var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
-            if realpath(p, &buf) != nil { return String(cString: buf) }
-            return URL(fileURLWithPath: p).standardizedFileURL.path
-        }
+        self.ownDataPaths = ownDataPaths.map(Self.realPath)
+        self.ownDataExceptions = ownDataExceptions.map(Self.realPath)
+    }
+
+    private static func realPath(_ p: String) -> String {
+        var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
+        if realpath(p, &buf) != nil { return String(cString: buf) }
+        return URL(fileURLWithPath: p).standardizedFileURL.path
     }
 
     /// Is this path Omni's own data? Boundary-aware, so a sibling that merely starts with the same
     /// characters ("/data/omni-index2" under "/data/omni-index") is not swallowed.
     @inline(__always) func isOwnData(_ path: String) -> Bool {
         guard !ownDataPaths.isEmpty else { return false }
+        for p in ownDataExceptions where path == p || path.hasPrefix(p + "/") { return false }
         for p in ownDataPaths where path == p || path.hasPrefix(p + "/") { return true }
         return false
     }
 
     /// Whether a crawl from `root` would reach `path`: the rules `walkBulk` applies on the way
-    /// down, for a path that arrives on its own (a watcher event). No hidden component below the
-    /// root, no package on the way, not Omni's own data, and a file within its kind's size cap.
-    /// The ignore rules are checked by the caller (isIgnoredIncludingAncestors). Without this the
+    /// down, for a path that arrives on its own (a watcher event). No package on the way, not Omni's
+    /// own data, and a file within its kind's size cap. The ignore rules - hidden names included -
+    /// are checked by the caller (isIgnoredIncludingAncestors). Without this the
     /// watcher indexed what the crawl refuses - the contents of a .app unzipped into a root, files
     /// under .vscode or .mypy_cache - and the next full pass swept them out again, so every save
     /// paid an embed that was always going to be deleted.
@@ -128,20 +136,18 @@ public struct FileCrawler: Sendable {
         if path == root { return true }                       // a root is always descended into
         guard path.hasPrefix(root + "/") else { return true } // not under this root: nothing to add
         var comps = path.dropFirst(root.count + 1).split(separator: "/")
-        guard let last = comps.popLast() else { return true }
+        guard comps.popLast() != nil else { return true }
         var dir = root
         for c in comps {
             dir += "/" + c
-            if c.hasPrefix(".") || PackageProbe.isPackage(dir) { return false }
+            if PackageProbe.isPackage(dir) { return false }
         }
-        if last.hasPrefix(".") { return false }
         if isDir { return !PackageProbe.isPackage(path) }
         if let kind = FileExtractor.kind(forExtension: (path as NSString).pathExtension),
            let cap = maxFileSize[kind], size > cap { return false }
         return true
     }
 
-    /// Default user folders to index.
     /// Engine selector. OMNI_CRAWLER=legacy restores the FileManager enumerator, so the two can be
     /// A/B'd in one build - and so a user who hits trouble with the fast walk has a way back.
     static var useLegacyEngine: Bool {
@@ -205,8 +211,7 @@ public struct FileCrawler: Sendable {
             shouldDescend: { dir, entry in
                 // A root itself is always descended into: the user chose it, hidden or not.
                 if rootDevice[dir] != nil { return true }
-                let name = (dir as NSString).lastPathComponent
-                if name.hasPrefix(".") { return false }            // matches .skipsHiddenFiles
+                // Hidden folders are the policy's first rule, so a `!` line can re-include one.
                 if ignore.isIgnored(dir, isDir: true) { return false }
                 if isOwnData(dir) { return false }
                 // The volume check reads the id the SAME syscall already returned. A mount point
@@ -224,7 +229,7 @@ public struct FileCrawler: Sendable {
                     onPolicyFile?(dir)
                     return nil
                 }
-                guard !e.isDir, !e.isSymlink, !e.name.hasPrefix(".") else { return nil }
+                guard !e.isDir, !e.isSymlink else { return nil }
                 // The extension comes from the name the syscall returned - no URL is built.
                 guard let kind = FileExtractor.kind(forExtension: (e.name as NSString).pathExtension),
                       enabledKinds.contains(kind) else { return nil }
@@ -241,7 +246,7 @@ public struct FileCrawler: Sendable {
         let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .contentModificationDateKey, .fileSizeKey, .isPackageKey, .isHiddenKey]
         for root in roots {
             guard let en = fm.enumerator(at: root, includingPropertiesForKeys: keys,
-                                         options: [.skipsHiddenFiles], errorHandler: { _, _ in true })
+                                         options: [], errorHandler: { _, _ in true })
             else { continue }
             let keySet = Set(keys)
             for case let url as URL in en {

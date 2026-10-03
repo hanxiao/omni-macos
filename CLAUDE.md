@@ -51,6 +51,10 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
 - Retrieval LoRA: alpha=32, r=32 -> scale 1.0, targets all 7 linear modules in `language_model`.
 
 ## OCR add-on (OmniKit/OCR/, docs/OCR.md)
+- RETIRED 2026-10-02, once their results were recorded below: `--vision-prefetch`, `--probe-vision`,
+  `--pipeline`, `--pipeline-host`, `--opener`, `--adaptive-draft`, `--probe-gemm`, `--probe-ane` and
+  the OMNI_OCR_FUSED_MOE / FAST_RMSNORM / LM_SDPA arms. The notes below still name them; the code is
+  in git history before that date. `--probe-qmm` stays (it reproduces a live MLX bug).
 - Optional jina-ocr-v1 port. NOT downloaded unless the user asks, NOT on the index/search path.
 - The numeric oracle is the ORIGINAL HF checkpoint at its shipped bfloat16, via torch/MPS - not
   the MLX python port and not an fp32 upcast. `Tools/ocr/ref_dump.py` produces it.
@@ -309,8 +313,8 @@ MLX-Swift port of `jinaai/jina-embeddings-v5-omni-small-mlx`.
   target, so the resample DOWNSAMPLES. At 150 it is 1240x1754 and starts upsampling the long edge.
   Digests agree at 150/200/300 and diverge at 120, which is where the detail loss first shows.
   Do not lower it for speed - there is none to win.
-- Measured and rejected, do not re-derive: mlx-swift 0.31.4 (same qmm bug; 0.31.5+ needs
-  Swift 6.3). DFlash/EAGLE trees need a draft model we cannot train here; ViT token merging breaks
+- Measured and rejected, do not re-derive: mlx-swift 0.31.4 (same qmm bug) and 0.32.x (fixes the
+  qmm bug, costs ~4 ms a decode step - see "MLX 0.32"). DFlash/EAGLE trees need a draft model we cannot train here; ViT token merging breaks
   the fixed visual-token/prompt-slot contract.
 - The OCR model does NOT live inside the app's MLX memory cap. It is loaded when the OCR toggle
   goes on and dropped when it goes off, and while it is loaded the compute cap is lifted. Charging
@@ -2342,8 +2346,11 @@ shape, SSE streaming), `POST /v1/ocr` (Mistral OCR shape, 0-based `pages`), MCP 
 - Served decode footprint matches the workspace: the 0.13.6 control reads 22-23 GB during and
   48 GB after a 40-page run (MLX buffer cache with the cap lifted); a served 10-page request reads
   24 GB and returns to 2.6 GB when the linger ends.
+- QUIT EVERY ISOLATED INSTANCE WHEN ITS CHECK IS DONE, and look with `pgrep -x Omni` before calling
+  anything finished. Four were found still running after two days: they held GPU and memory, and
+  the two with clipboard capture on had recorded the user's clipboard into scratch folders.
 - Test the server ISOLATED: `-omni.dbDir`, `-omni.addedFolders`/`-omni.roots` on a scratch corpus,
-  `-omni.ephemeralUIState YES`, `-omni.serving.port 51299`, `-omni.ocr.cache.dir <scratch>`. A dev
+  `-omni.ephemeralUIState YES`, `-omni.serving.port 51399`, `-omni.ocr.cache.dir <scratch>`. A dev
   build on the real roots raises folder prompts that must not be answered for the user.
 
 Serving review fixes in the same change: every embedding schema honours the query/document role
@@ -2545,6 +2552,59 @@ reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` 
   row sidecar first or the launch's scan lands inside the typing phase. A missing base index opens
   an empty one and every search returns 0 hits - `perf-tour.sh` now refuses to run without it.
 
+## Dragging files out (owner's decisions, 2026-10-02)
+
+- A FILE DRAGGED OUT OF OMNI IS NEVER MOVED. The drag offers copy, link and generic, never move, so
+  a drop in a Finder folder on the same disk copies (Option-Command still makes an alias). Omni is a
+  view onto files that live elsewhere; a drag must not take one out of its folder.
+- COMMAND-C ON SELECTED FILES PUTS THE FILES ON THE CLIPBOARD, Finder-style, together with their
+  paths as text: Command-V in a Finder folder copies the files, Command-V in a text field pastes the
+  paths as before. Through `OmniPasteboard.copyFiles`, like every copy Omni makes. Copy Path
+  (Option-Command-C) stays text-only, as Finder's Copy as Pathname does.
+- HOW (App/FileDrag.swift): an AppKit dragging session begun from a SwiftUI `DragGesture`'s first
+  movement (`fileDragSource`), not `.draggable` - SwiftUI drags one item before macOS 26 and cannot
+  restrict the operation. Finder's handles: a list row's icon and name, a grid cell's thumbnail and
+  label; a drag that starts anywhere else still draws the marquee (the handle's gesture outranks
+  the container's). Grabbing a selected item drags the selection in result order, an unselected one
+  selects it and drags it alone (`AppModel.dragPaths`). Photos assets go as `NSFilePromiseProvider`s,
+  exported only when dropped. Inside the app the operation mask is empty and both drop targets (the
+  search area, the sidebar's add-a-folder) check `FileDrag.isActive`, so a result is never taken
+  back in - the misclick that once made rows non-draggable.
+- THE CLIPBOARD HISTORY NEVER SEES ANY OF IT, three ways: a drag travels on the drag pasteboard,
+  which the history never polls; a copy carries a file URL on every item, which the history skips;
+  and its first item carries `ownType` too. Checked by PerfScript `cliptest` on a PRIVATE named
+  pasteboard (Omni's 3-file copy skipped, a Finder copy skipped, typed text recorded as the positive
+  control; the real clipboard's changeCount did not move).
+- THE TEST: `Scripts/drag-test.sh` runs `FileDragUITests` - real XCUITest mouse drags from a renamed
+  copy of the app (never the real bundle id: launch() would quit the user's Omni) onto DropProbe
+  (`Tools/dropprobe`, built by `Scripts/drop-probe.sh`), a floating window in another process that
+  reports what arrived and which operations the SOURCE offered, in the accessibility value of
+  `probe.report` (the runner is sandboxed; it reads the probe's UI, not a file). Six cases, ALL
+  PASSING 2026-10-02 (228 s): a list row and a gallery cell each arrive as their file, with move not
+  offered and the source still in place; a selected result drags the selection in result order;
+  Omni refuses its own drag; a drag from a row's blank area is a marquee (3 rows selected) and lifts
+  nothing; Command-C leaves file URLs + path text + the own marker (the user's clipboard is saved and
+  restored around it). Needs an unlocked screen and automation mode.
+- THE MARQUEE HAD BEEN DEAD SINCE ResultClick SHIPPED, 0.14.5 included, and this test is what found
+  it. Every row carries a `DragGesture(minimumDistance: 0)` for its click, a child's gesture outranks
+  a parent's plain `.gesture`, and rows fill the list - so the container's marquee never recognized,
+  from anywhere. Shown with raw CGEvent drags and an accessibility readout of each row's selected
+  state (positive control: a click reads as selected): no rectangle, nothing selected, in the release
+  and in the build with the file-drag handles switched off. It is a `.simultaneousGesture` now, and
+  `clickSlop` (16 pt) decides between click and band as it was written to; it stands down while a
+  file drag is active (that one lifts at 4 pt).
+- THREE TRAPS THAT COST A RUN EACH, so they are not paid again:
+  - The test's files must live OUTSIDE the runner's sandbox container. The app under test writing
+    into `~/Library/Containers/<runner>/...` is "data from other apps": its first `open()` blocks on
+    a privacy prompt (main thread in `saveIgnoreText`), the app never becomes ready, and XCUITest
+    reports "does not have a process ID" while the process sits there. The script makes the corpus
+    and index in /private/tmp and passes the path as TEST_RUNNER_OMNI_DRAG_ROOT.
+  - A SwiftUI `Text` reaches accessibility as a static text whose VALUE is the string; its
+    description and title - what XCUITest calls `label` - are empty. Match `value`, not `label`.
+  - A fresh copy opens in the GALLERY, whose cells are `result.item`, not `result.row`; set the view
+    (Command-1/2). And near-identical corpus files stack as duplicates and leave too few rows.
+
+
 ## Chaos over every surface (2026-09-23, Scripts/chaos-run.sh, UITests/FullChaosUITests)
 - THE TOOL: seeded chaos over the search box, qualifier chips, the sidebar, the folder browser,
   results in both views, the OCR workspace (it opens one-page corpus files through its own panel),
@@ -2611,6 +2671,8 @@ reader. `FolderMapSharedContentTests` fails without the fix. All other `flat16` 
 - NO PROSE WHERE macOS HAS NONE. Open panels set no `message` (a verb `prompt` at most); alerts
   are a title plus one factual clause; launch screens, empty states and Settings footers do not
   explain internals or restate their control. Tooltips name the thing, not how to use it.
+  The one exception is the Clipboard-off screen: it asks the user to turn a feature on, so it
+  carries one line saying what that gets them (asked for on 2026-10-02).
 - MENUS ARE TITLE CASE, context menus included ("Find Similar", "Copy Path", "Show in Finder").
   Reveal is "Show in Finder" / "Show in Photos" everywhere. An ellipsis only where a panel or
   dialog follows. Destructive items are the last group; one trash item per menu (a stack's
@@ -2714,3 +2776,299 @@ nothing (`update ... dedup=112 tokens=0` for 112 files).
   then. Combined with `in:<folder>` it is the intersection.
 - PerfScript `edit:<text>` is what the search field does with typed text (chips stay); `type:`
   and `search:` rebuild the whole box, so they drop a scope a click put there.
+
+## Clipboard history (2026-09-29, docs/clipboard.md)
+
+Opt-in. Each accepted clipboard change is a `.txt` or `.png` in `Application Support/Omni/Clipboard`
+(beside the index under `-omni.dbDir`), and that folder is crawled like any root: no schema change.
+The design, the rules and the four things building it found are in docs/clipboard.md; the ones that
+bite are here.
+
+- `roots` IS THE USER'S FOLDERS, `crawlRoots` ADDS THE CLIPBOARD. Anything that indexes or watches
+  reads `crawlRoots`; anything a user sees as "my folders", and the served root check, reads `roots`.
+- EVERY COPY OMNI MAKES GOES THROUGH `OmniPasteboard.copy`. A bare `NSPasteboard.general.setString`
+  puts Omni's own output (a path, a transcript, the serving token) into the user's clipboard history.
+- IGNORE RULES STOP AT THE ROOT. `isIgnoredIncludingAncestors(root:)`, `excludesIndexedFile(roots:)`:
+  without the bound, the default `Library/` rule deleted watcher events under any root in
+  `~/Library` (iCloud Drive, the clipboard).
+- A QUERY MADE FROM THE CLIPBOARD IS NEVER ANSWERED BY ITS OWN CLIP (`clipboardSelfPath`).
+- CHAOS RUNS USE A COPY OF THE APP: `Scripts/chaos-app.sh <dest.app>` re-bundles the build as
+  `io.hanxiao.omni.chaos`, and `OMNI_CHAOS_APP=<dest.app> Scripts/chaos-run.sh ...` launches it by
+  path and quits only it. By the real bundle id, `XCUIApplication.launch()` terminates whatever Omni
+  the user has running, and chaos-run.sh used to `pkill -x Omni` besides.
+- SERVING PORT FOR TESTS IS 51399, NOT 51299: 51299 is a port a real install here listens on, and an
+  isolated run silently failed to bind while `curl` answered from the user's own index.
+
+## What the overnight chaos run found (2026-09-30)
+
+- A CRASH: sharing an OCR transcript (File > Share...) trapped in the main-actor isolation check.
+  `TranscriptFile.markdown` is built lazily for performance, and the share machinery calls it on a
+  background thread. The closure is `@MainActor` now and the export hops to the main actor. It only
+  fires when a share service actually asks for the data, so 28 earlier shares had not shown it.
+- THE CHAOS SUITE HAD NEVER DRIVEN THREE SURFACES, while its trail said it had:
+  - sidebar rows: they matched an outline labelled 'Sidebar' (it has no label) and required
+    `isHittable` (a SwiftUI sidebar row is never hittable; its text is). Found by its Recents row
+    now, clicked through its text.
+  - context menus: `app.menus.firstMatch` is the APPLE MENU, always in the tree. Closed, its items
+    were not hittable, so every "choose from the context menu" pressed Escape - and the same lookup
+    could have reached Sleep or Restart. The open menu is the one whose items have a frame, and the
+    Apple menu's items are denied by name.
+  - the four OCR documents it opens by path must exist in the corpus; without them the step only
+    held a file panel open, which stalls every accessibility query.
+- HEAP RELIEF RAN ON EVERY COVERAGE STAMP. `dropV4TablesLocked` and `buildChunkSplitLocked` put
+  `releaseFreedHeap` in a `defer` at their entry, so on a v5 index, where both return at their first
+  guard, every stamp walked the malloc zones: ~200 times in 15 minutes of chaos. Relief now runs
+  only once a drop or a build has actually happened (8 calls in the next run, all real).
+- THE CLIP COUNT LISTED THE FOLDER ON THE MAIN THREAD. `clipboardHasClips` counted files on disk,
+  and the Clipboard row's context menu, which macOS builds on every sidebar render, reads it twice:
+  7 ms a listing at 3,000 clips. It is a stored count now, recounted off the main thread on launch,
+  on a stored clip, after Clear and retention, and whenever the folder's indexed count moves.
+- CLEAR DELETED THE FOLDER AFTER RECREATING IT. The delete ran detached and the recreate on the main
+  thread, so the delete usually won and capture was left on with no folder. One task, in order.
+- SUGGESTIONS CARRIED DUPLICATE IDS. The list is keyed by completion, and a past search can equal a
+  completion offered above it (`type:image`); SwiftUI logged "the ID type:image occurs multiple
+  times". Deduplicated, first wins.
+- A CHAOS RUN WITH 102 STALLS had them in one two-minute burst of back-to-back ~300 ms blocks at
+  90-100% CPU, starting at a confirmed Clear. The action trail never went quiet, so the stuck
+  sampler never fired and there is no stack. chaos-run.sh now also samples a burst of 8+ CPU-bound
+  stalls in 10 s (`hot-<time>.txt`). The first one it caught (34 hot stalls, max 731 ms) was
+  XCTest: 42% of the main thread in `XCTElementSnapshotRequest` -> `AXUIElementCopyHierarchy`, 42%
+  idle in the event loop, no app frame among the heavy ones. So a hot burst in a chaos run is the
+  harness until a sample shows app code; the Clear burst was most likely the same, not proven.
+  The sampler names the main thread "Main Thread", not "com.apple.main-thread" - match both.
+- DO NOT LAUNCH A SECOND APP WHILE A CHAOS RUN IS GOING. Its window takes focus from the suite and
+  its pasteboard poll records the suite's copies; one run failed that way. Check between runs.
+- THE RARE LAZY-STACK HANG (results list, `LazyLayoutViewCache.signalPrefetch`), what is now known.
+  The loop is SwiftUI's run-loop observer flushing transactions that never drain
+  (`GraphHost.flushTransactions` -> `runTransaction`, prefetch enqueuing the next). Seen 5 times in
+  ~40 chaos runs; seed 761840 reproduces it in 1 of 5 two-minute replays, always in LIST view. The
+  only app frame inside the loop is `ReportResultFrame`'s `onGeometryChange` measuring a row in the
+  marquee's coordinate space, which sits OUTSIDE the scroll view, so every row's frame changes on
+  every scroll and every placement; about 3.5% of the samples. Suspect, not proven.
+  RULED OUT, measured: rows changing height (the probe keys on view and path and logs nothing before
+  a hang); accessibility traversal in the hang samples (none).
+  DOES NOT REPRODUCE IN PROCESS (2026-10-01, `OMNI_PERF_SCRIPT` with a POPULATED list): 400 result
+  sets under 534 posted trackpad scroll gestures with momentum; 200 rounds of new result set,
+  sidebar toggle twice, window resize, end/home, select, Settings every tenth round, with scroll
+  gestures, both with and without a Swift walker reading the whole accessibility tree every 0.3 s.
+  No block over one second in any of them. So whatever starts it is something only XCUITest does.
+  The next experiment needs the UI harness: A/B a candidate against seed 761840 with ~15 replays an
+  arm to separate 1-in-5 from 0 (~90 min; needs the automation password, drives the real cursor).
+  2026-10-02: the duplicate scroll-to-top Task (the leading candidate) was removed for speed, so the
+  replays now test it for free: 761840 hanging again means it was not the cause.
+- A STRESS SCRIPT ON THE SCRATCH CORPUS MUST USE `score:1%`. Queries with a counter appended score
+  under the default 50% threshold there, the results region shows "No results above 50%", and the
+  list under test never exists. Two stress runs (150 and 200 rounds) "passed" that way before a
+  screenshot showed it. Capture the window once before believing a stress result.
+- THE BURST OF STALLS AFTER A CLEAR is not Clear. In process, with 60 clips browsed and then
+  cleared: Clear costs 477 ms of main thread, the minute after it 283 ms in total and no block over
+  100 ms. The one burst the hot sampler caught in a chaos run was XCTest's snapshot requests.
+- A SEARCH COSTS ABOUT ONE SECOND OF MAIN THREAD on the scratch corpus (1694 / 1088 ms for two
+  consecutive `score:1%` searches, Release). Sampled: 759 of 2162 samples in window layout, 343 of
+  them `NSToolbarView layout` (the toolbar's items change with the result state), and CoreText.
+  Taken down 19% on 2026-10-02: see "A RESULT SET COSTS 19% LESS" under the speed review.
+## The policy file is the only exclusion rule (issue #24, 2026-10-02)
+
+- `.omniignore` DECIDES WHAT IS SKIPPED, and nothing in the code adds to it. Hidden names were a check
+  in the crawl, the watcher and the legacy enumerator (`.skipsHiddenFiles`) that ran BEFORE the
+  policy, so no `!` line could re-include a dotted folder and a `.omniignore` inside one was never
+  read. They are now the `.*` line of the file: the default file has it as its first rule, and
+  migration 3 (`withHiddenRule`) inserts it above the first rule of an existing file, so every line
+  the user wrote comes after it and wins. Deleting it indexes hidden files; `!.obsidian/` re-includes
+  one folder. A crawl with no policy file (tests, benchmarks, omni-verify) uses `.hiddenOnly`.
+- WHAT STAYS IN CODE IS SAFETY, NOT PREFERENCE: Omni's own data (indexing the index feeds on itself),
+  symlinked files and other volumes mounted inside a root, and packages (macOS decides what is one by
+  registered type, which a name pattern cannot say). Type toggles and size caps are settings.
+- THE GRAMMAR IS gitignore(5) IN FULL (`GitignoreGrammarTests`): trailing spaces dropped unless
+  escaped, leading spaces kept, `\` escapes, `[...]` with ranges, `!`/`^` and POSIX classes,
+  `**/x`, `a/**/b`, and `a/**` matching what is INSIDE `a` and not `a` itself (so `a/**` +
+  `!a/keep.md` works). A pattern with a slash is relative to EACH indexed folder (it was matched from
+  `/` and silently never matched) and still matches as an absolute path. The bases are recompiled in
+  `restartWatcher`, which every change of crawled folders passes through. Migration 3 prunes once,
+  since a relative line may match now. Migration steps run per version (`version < 2`, `< 3`):
+  re-running step 2 would restore defaults the user deleted.
+- Verified in the app on an old-style policy (`!.obsidian/`, `sub/readme.md`, no `.*`): the line was
+  inserted above both, `.obsidian` and a folder-level `!.config/` were crawled, `.git` and `.cache`
+  were not, `sub/readme.md` was excluded, and a file written into `.obsidian` was indexed by the
+  watcher. 677 tests pass; `HiddenFolderPolicyTests` failed 10 assertions against the old checks.
+- A DOT INSIDE A NAME IS NOT HIDDEN: `github.com`, `v1.2`, `node.js` are plain folders.
+- DEFAULTS ADDED IN MIGRATION 3 (`addedDefaultsV3`), each measured on the real 377k-file index for
+  what it removes and checked for anything a person searches: `*.xcassets/` (7,189 files of icon
+  renders), `_build/` (1,837; already a new-file default, never reached old files), `CMakeFiles/`,
+  `wandb/`, and Chromium/Electron profile insides - `**/Default/Extensions/`,
+  `**/Profile */Extensions/`, `Web Applications/` and LevelDB's `[0-9]x6.log` (12,198 files). 21,922
+  files in all, 5.8% of that index; `.*` removes none (hidden names were never indexed). REJECTED on
+  the same data: `*.log` (6,065 files, 430k chunks, includes agent runs people do search),
+  `Extensions/` alone (a Swift codebase has 6,442 real files under one), `out/`, `runs/`, `bin/`,
+  `tmp/` (too generic), lockfiles (their extensions are not indexed at all).
+- THE MATCHER RUNS ON UNICODE SCALARS, NOT `Character`s. Splitting a path into grapheme clusters,
+  rebuilding Strings and hashing them was most of a check. Paths and patterns are folded the same
+  way: ASCII lowercased as bytes, anything else composed (NFC) then lowercased, so a decomposed name
+  on disk equals the composed one typed in the policy (`testDecomposedNamesMatchComposedPatterns`).
+  Plain-name rules sit in a hash table keyed by the hash of the name's scalars; the rest are tried
+  last first and stop at the first match. `omni-verify`-free benchmark: `IgnoreBenchTests` with
+  `OMNI_IGNORE_BENCH=<dir>` (policy.txt + paths.txt). On the real index's 427,440 paths, decisions
+  identical, per path: crawl check 4.3 -> 1.5 us, watcher check (ancestors) 35 -> 13 us, prune check
+  3.5 -> 1.5 us.
+- NO INPUT CAN HANG IT (`IgnoreRobustnessTests`): two or more `**` are memoised (six against a
+  60-deep path was exponential), `**/**` collapses, a `[` with no `]` after it is a literal without a
+  rescan, a pattern over 4,096 scalars is no rule (PATH_MAX is 1,024), and 3,000 random patterns from
+  glob and escape characters run through all three checks without a crash.
+- THE WATCHER DEFERS TO A FULL PASS. Events that arrive while a pass runs are buffered and applied
+  when it ends, and a policy change (a folder's `.omniignore` edited) restarts the pass. A save in a
+  folder the pass has already crawled waits for the whole pass. The likeliest reading of "the
+  watcher sometimes does not kick in"; not reproduced, and changing it means running a reconcile
+  beside a pass on one Indexer.
+
+## Speed review, all paths (2026-10-02)
+
+- A CORE PINNED BY A CHECK THAT COULD NOT SUCCEED. `shouldReclaimHolesLocked` walked every
+  position and hashed every row against `deadRows` (an audit that the hole list is exact), THEN
+  compared the hole count with the reclaim threshold. The caught-up coverage stamp asks it, and that
+  stamp runs two seconds after every write, under the store queue. On the live index (15,877 holes,
+  threshold 420,820) a watched folder taking steady writes kept a core at 100% for days and queued
+  searches behind each stamp. Threshold first, and an audit that disagrees waits 10 minutes.
+  `StampBenchTests` (OMNI_STAMP_BENCH=<clone>, OMNI_HOLE_RECLAIM=0.5 to sit below the threshold) on
+  the migrated 10M-position bench index, back to back: 247-495 ms per stamp before, 0.1 ms after,
+  same decision. `HoleReclaimTests.testFewHolesAreLeftAlone` asserts the audit does not run.
+- A LIVE INDEX CANNOT BE CLONED FOR A BENCHMARK while the app writes it: the clone opened as
+  "slot bookkeeping off by 278 rows" and was refused. Use /Volumes/han2tb/bench-index, and run
+  `runMigrationStampsForTest` first (OMNI_STAMP_MIGRATE=1): unmigrated, a stamp is migration work.
+  `swift test -c release` needs `mlx.metallib` and `default.metallib` copied into
+  `.build/arm64-apple-macosx/release/OmniPackageTests.xctest/Contents/MacOS/` to open a store.
+- MEASURED AND LEFT ALONE: search p50 4.2 / p90 5.3 / p99 6.2 ms over 9,729,693 chunks, digest
+  134b9ff183fd2f29 (unchanged); text embedding 83,085 tok/s (the paper's 83,105); end-to-end
+  indexing of a 78-file text corpus 82,558 tok/s, under 1% below the encoder, so indexing is
+  encoder-bound and the host side has nothing to give.
+- A RESULT SET COSTS 19% LESS MAIN THREAD (963 -> ~780 ms list, 1021 -> ~838 ms gallery, medians of
+  15 searches, `score:1%` on the scratch corpus, Release, `OMNI_PERF_SCRIPT` main-cpu per step).
+  The causes were writes that notify observers of state that did not change, found by logging the
+  values a body reads each time it runs (all unchanged, body re-ran anyway):
+  - THE BACK/FORWARD TRAIL WAS OBSERVED. Every search appends to `navBack` and calls
+    `navForward.removeAll()`, which notifies even on an empty array, and `canGoBack` /
+    `canGoForward` were computed from them - so the toolbar (the chevrons) and the WHOLE MENU BAR
+    (Go > Back) rebuilt on every result set. The trail is `@ObservationIgnored` and the two Bools
+    are stored, written when they flip. Over 32 searches: menu bar 39 -> 8 evaluations, toolbar
+    37 -> 7; list 882 -> 752 ms on its own.
+  - The toolbar lived in `ContentView.body`, which runs two or three times per search
+    (`isResolving` alone), and every run rebuilt the platform toolbar items. It is the
+    `SearchToolbar` modifier now (App/SearchToolbar.swift), the shape `OCRToolbar` already had.
+  - `rawResults.isEmpty` in the toolbar and window conditions is the stored `hasResults`; the
+    selection in result order (Share, its tooltip, the File menu) is the stored `selectionOrdered`,
+    no longer a filter over `results` on every read; `applyParsedQuery` builds the filters in locals
+    and assigns each once and only if it changed (a reset then a re-set wrote all ten twice).
+  - The scroll-to-first-row Task on a new result set is GONE: `.id(resultsToken)` already gives a
+    new result set a new scroll view, which starts at the top, so the Task was a second layout of
+    every visible row (~30 ms, two interleaved A/B rounds). Verified by screenshot in both views:
+    scrolled to the end, new query, opens at the best hit. It was also the next suspect for the
+    rare lazy-stack hang below, so a chaos run without it is now evidence either way.
+  MEASURED AND NOT DONE: stable search-field bindings (an `@Bindable` proxy instead of
+  `Binding(get:set:)`) changed nothing - the field's cost (~170-210 ms, measured by removing
+  `.searchable`) is showing the new text, which a keystroke pays too. The toolbar items still cost
+  ~150-200 ms (removing every item: 755 -> 605) with NO body re-running and no observed property
+  reaching them in Instruments' causes - it is AppKit re-laying out their hosting views inside the
+  window layout. `.id(resultsToken)` is ~170 ms and stays, for the scroll-position bug it fixes.
+- REDRAW AUDIT (2026-10-02): each common state traced 8 s with Instruments' SwiftUI template while
+  nothing visible changes (results list and gallery, folder browser, Recents, Clipboard, OCR,
+  Settings): ZERO view-body updates in every one. The waste was in states that change NARROWLY:
+  - AN ARROW PRESS COST ~280 ms OF MAIN THREAD, ~115 of it the menu bar rebuilt three times (it read
+    `selection`, `selectedPaths` and the ordered list, one notification each) and ~30 the toolbar's
+    Share holding the selected URLs. Both now read `menuSelection` (AppModel.MenuSelection: count,
+    transcribable, taggable, enclosing folder), written only when it changes, and Share builds its
+    items when clicked (`SelectionShare`). 278 -> 146 ms a press in the list; presses that stay on
+    screen are 15-20 ms. What remains is SCROLLING the selection into view (100-370 ms a press past
+    the fold): SwiftUI laying out the lazy stack under the glass toolbar. Measured and ruled out:
+    the scroll animation (254 -> 219 ms, not worth a jumpy scroll) and the marquee's per-row frame
+    reports (no difference).
+  - WHILE INDEXING, `indexedFiles` moved on every 1.5 s stats tick and the toolbar, the whole menu
+    bar and every sidebar row read it only to ask "is there an index" - the menu bar rebuilt 11
+    times in 10 s. `hasIndexedFiles` is stored and written when it flips.
+  - EVERY LIST UPDATE RE-RAN EVERY VISIBLE ROW: `ResultRow` and `ResultGridItem` take closures, which
+    do not compare, so SwiftUI could never skip an unchanged row. They are Equatable on what they
+    show and `.equatable()` at the call sites. Live refresh while indexing (300 matching files
+    landing): 2,404 -> 1,374 view bodies in 10 s, ResultRow 894 -> 372.
+  - The harness: a scratch `scen.sh` launches an isolated instance, drives it with OMNI_PERF_SCRIPT,
+    attaches `xctrace record --template SwiftUI` for 8 s, and exports `swiftui-updates` (bodies by
+    view) and `swiftui-causes` (which @Observable property invalidated what). The positive control
+    is five typed edits: 840 bodies. PerfScript `share` calls what File > Share does.
+  - NOT VERIFIED VISUALLY: the share picker's placement - the screen was locked when it was built.
+    It anchors at the click for the toolbar button and under the toolbar for the menu item.
+- RETIRED 2026-10-02 (the owner's call: settled A/B arms, dead code, tests that test nothing), each
+  verified by grep to have no caller and by the gates below to change no output:
+  - OMNI_QUANT_ROTATE (randomized Hadamard before affine quant, TurboQuant's free half): MEASURED
+    WORSE on this data, 4.5M rows, coarse-only arm: recall@10 0.9425 -> 0.9275, top1 0.880 -> 0.850.
+    Our L2-normalized embeddings are already Gaussian per 64-wide group (crest 2.60, excess kurtosis
+    -0.12), so there is nothing to Gaussianize. `quantdist` went with it; `hadamardcheck` stays for
+    the 1-bit tier, which does rotate.
+  - OMNI_RERANK_BITS (an 8-bit exact tier instead of bf16): recall@10 0.9885 / top1 0.965 at 8 bits,
+    0.978 at 6, 0.941 at 4 against bf16's 1.0 - halving the file costs 3.5% of first results. Only
+    worth revisiting as a memory-cap mode on machines that cannot cache the bf16 tier.
+  - OMNI_VISION_BF16_SDPA, OMNI_VISION_SDPA_FP32, OMNI_VIZ_SDPA_LOOP, OMNI_SELECT_MASK_CACHE,
+    OMNI_VIZ_LAZY_PCA, OMNI_VIZ_CACHE_BOUND, OMNI_VIZ_TILE_MB, OMNI_MEDIA_CARVE, OMNI_VECS_MADVISE,
+    OMNI_WAL_AUTOCKPT, OMNI_SIDECAR_COVER, OMNI_COMPILE_BLOCK=1 (and `compilebench`): each comment
+    said the other arm was measured and rejected.
+  - KEPT ON PURPOSE: OMNI_FUSED_NORM and OMNI_COMPILE_BLOCK=0 (the only switches that take the
+    shapeless-compiled tower kernels and the compiled blocks out of the media path - levers for the
+    open NaN below), OMNI_ASYNC_EVAL / TOK_OVERLAP / QUERY_WHOLE (`levercheck` gates), the fp16
+    backbone arm (`dumpbackbone`), every escape hatch and benchmark-suite lever.
+  - ~40 functions with no caller, `ThroughputTests` (timings, no assertions), `UnseatedRowTests` and
+    `BrowseChaosUITests` (always skipped), the unreachable second `storemem`, the stray `s4` binary.
+- THE COLD-LAUNCH MEDIA NaN IS NOT CORRUPTED WEIGHTS, and every comment that said so was wrong
+  (2026-10-02, `omni-verify nansweep` over ~400 cold processes). ~1 process in 50 computes NaN for
+  image/audio embeds, text never. `OMNI_WEIGHT_DIGEST(_ON_BAD)` digests all 751 tensors three ways -
+  CPU bytes (FNV), a GPU-computed sum, a non-finite count - and caught processes, including one at
+  60 of 60, match a clean one exactly. Ruled out, each measured: a load race (reading every tensor
+  before any GPU work exists still broke a process), unwritten memory (a buffer cache filled with
+  all-0xFF NaN buffers changed nothing), the compiled-graph cache (`OMNI_STAGED=1` rebuilds the
+  encoders on the SAME arrays: no cure). Two modes: a low rate that `clearCache()` or time ends,
+  and a total one cured ONLY by loading the weights into NEW buffers. So it depends on which buffers
+  hold the weights, not what is in them: MLX 0.31.1's Metal backend, below this code. An MLX
+  upgrade does NOT cure it: core 0.32.2 (mlx-swift 0.32.3), interleaved with 0.31.1 over 150 cold
+  processes each, broke 2 against 5 (2026-10-03) - within chance, and still present.
+  So `loadValidated` / `recoverMediaPath` are the right remedy, NOT dead defensive code: the
+  reload is exactly the step that cures the total mode. Rates swing between sessions (0 in 74, then
+  2 in 30, same binary); concurrency does not raise them (1 in 80 with two processes at a time).
+
+## MLX 0.32: measured, held back (2026-10-03)
+
+mlx-swift is pinned `exact: "0.31.3"` in Package.swift. 0.32.3 (core 0.32.2, needs Swift 6.3,
+i.e. Xcode 26.6 at /Applications/Xcode-26.6.0.app via DEVELOPER_DIR) was built and graded end to
+end: embeddings and search unchanged (fixtures 0.99992 worst, search digest moved only by exact
+ties), OCR CER on hard2 8/10 exact against 7/10, the M=2/3 qmm bug fixed upstream (`--probe-qmm`
+all OK). It was NOT taken because it makes the OCR decode step ~4 ms slower at every width:
+5.7 -> 9.8 ms at 1 row, 33.7 -> 37.9 at 32, so the single-page path drops 194 -> 155 tok/s.
+
+- THE COST IS MLX's ROUTED-EXPERT GATHER, isolated by removing parts of the real step under both
+  versions: without attention or the LM head the gap stays; without the MoE it is gone (3.39 vs
+  3.48 ms); without the routed experts it is gone; without the shared expert it stays.
+  `ocr-verify x --probe-gather` reproduces it with no model: 12 chained MoE layers, router computed
+  in the graph, 1.67 ms on 0.31.1 against 5.6-5.9 ms on 0.32.2 (13.0 against 17.5 at 32 rows);
+  2.15 vs 1.15 even with constant indices. Each op ALONE times the same on both versions, so it
+  is latency in a dependent chain, not kernel throughput. Re-run that probe on every MLX release
+  and move the pin only when it matches.
+- RULED OUT, each measured: the command-buffer caps (MLX_MAX_OPS/MB_PER_BUFFER up to 1,000,000,
+  including oMLX's 200/512 - no change or worse), transposed expert weights (same +4 ms), the new
+  write-after-read barrier in `register_output_array` (removed in a local build: no change), the
+  JIT/metallib setup, and host-side encoding (the main thread is ~70% in the GPU completion wait in
+  both). The Metal System Trace shows the new build splitting a command buffer into up to five
+  compute encoders and the GPU 67% busy against 86%. Root cause inside MLX not found.
+- SWIFT 6.3 CHANGES OCR OUTPUT BY ITSELF, independent of MLX: it merges `cosf`/`sinf` on one
+  argument into `__sincosf_stret`, which differs by up to one ULP, and the rope table moved the
+  40-page digest 772db0f94e0ae106 -> a35ef0f9c8fe8ad (3 chars). Same source with Swift 6.2 gives
+  the baseline. `ropeCos`/`ropeSin` are `@inline(never)` so the pair is never seen; with them the
+  Swift 6.3 build gives 772db0f94e0ae106 (single, 196 tok/s) and b16f69c903bb21cd (width 32, 460),
+  both identical to the 6.2 baseline. ANY new toolchain: re-run the digest before trusting it.
+  (The folder map's UMAP rotation has the same pair; it only moves a layout, so it was left.)
+- OMNI_OCR_EAGER=N (off): `asyncEval` every N decoder layers in a decode forward, so the GPU runs
+  layer i while the host encodes i+1 (oMLX's eager dispatch). Scheduling only. On 0.31.3, N=1:
+  5.5 -> 5.05 ms at 1 row, 9.4 -> 8.85 at 4, 22.1 -> 21.7 at 32. Not adopted yet: it needs the
+  end-to-end digest and throughput run first.
+- TRANSPOSED EXPERT WEIGHTS ARE FASTER ON 0.31.x: the probe's MoE chain 1.67 -> 1.43 ms at 1 row,
+  13.0 -> 10.1 at 32 rows; the shared expert's matmul 20 -> 8.4 us. Means repacking at load (the
+  checkpoint stores them (E, K, N)); not done.
+- FROM oMLX (read at 5dcfe24, mlx 0.32.2): speculative output equals greedy byte for byte there
+  because every verify row runs MLX's ONE-ROW kernel arithmetic (`omlx/patches/row_exact_qmv.py`,
+  `moe_verify_gather.py`, `qwen35_verify_sdpa_split.py`, as custom Metal kernels), and verify rows
+  are chunked so each gets the attention plan its one-row call would. That is the fix for the k=5
+  digest anomaly above and what would make an adaptive draft length reproducible. Not ported.
+

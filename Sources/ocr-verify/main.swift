@@ -1,8 +1,6 @@
 import Foundation
 import MLX
 import MLXRandom
-import Metal
-import MetalPerformanceShadersGraph
 import OmniKit
 import PDFKit
 
@@ -104,66 +102,12 @@ while i < args.count {
     case "--horizon": i += 1; horizonRoot = args[i]
     case "--spec": i += 1; specK = Int(args[i]) ?? 0
     case "--draft-vocab": i += 1; OCRRuntimeFlags.draftVocab = Int(args[i]) ?? 0
-    case "--adaptive-draft": OCRRuntimeFlags.adaptiveDraft = true
     case "--probe-chunk": i += 1; probeChunk = i < args.count ? (Int(args[i]) ?? 0) : 0
     case "--repeat": i += 1; repeats = max(1, Int(args[i]) ?? 1)
     default: positional.append(args[i])
     }
     i += 1
 }
-// Minimal, model-free check of MLX's quantized matmul across batch sizes. It exists because a
-// whole-model symptom (speculative verification wrong at some batch sizes and right at others)
-// has to be reduced to one op before it can be called an upstream bug rather than a port bug.
-// Is there a faster GEMM than MLX's for the shapes prefill uses? BaseRT (arXiv 2607.00501)
-// reports uzu beating it on prefill and attributes that to MPSGraph, which can in principle
-// dispatch to the Neural Engine. Prefill is exactly that GEMM and the ANE is idle, so the
-// question is worth one measurement even though our weights are quantized and MPSGraph would
-// need them dequantized.
-if args.contains("--probe-gemm") {
-    let shapes: [(Int, Int, Int)] = [(1007, 1280, 1280), (1007, 1280, 5120),
-                                     (1007, 2048, 2048), (4096, 1280, 1280)]
-    guard let dev = MTLCreateSystemDefaultDevice(), let queue = dev.makeCommandQueue() else {
-        fatalError("no Metal device")
-    }
-    let reps = 20
-    for (m, k, n) in shapes {
-        // --- MLX, fp16 and fp32 ---
-        var mlxMs: [String: Double] = [:]
-        for (name, dtype) in [("f16", DType.float16), ("f32", DType.float32)] {
-            let a = MLXRandom.normal([m, k]).asType(dtype)
-            let b = MLXRandom.normal([k, n]).asType(dtype)
-            eval(a, b); eval(matmul(a, b))
-            let t = Date()
-            for _ in 0 ..< reps { eval(matmul(a, b)) }
-            mlxMs[name] = Date().timeIntervalSince(t) * 1000 / Double(reps)
-        }
-
-        // --- MPSGraph, fp16 ---
-        let graph = MPSGraph()
-        let ta = graph.placeholder(shape: [m, k].map(NSNumber.init), dataType: .float16, name: nil)
-        let tb = graph.placeholder(shape: [k, n].map(NSNumber.init), dataType: .float16, name: nil)
-        let tc = graph.matrixMultiplication(primary: ta, secondary: tb, name: nil)
-        let ba = dev.makeBuffer(length: m * k * 2, options: .storageModeShared)!
-        let bb = dev.makeBuffer(length: k * n * 2, options: .storageModeShared)!
-        let da = MPSGraphTensorData(ba, shape: [m, k].map(NSNumber.init), dataType: .float16)
-        let db = MPSGraphTensorData(bb, shape: [k, n].map(NSNumber.init), dataType: .float16)
-        _ = graph.run(with: queue, feeds: [ta: da, tb: db], targetTensors: [tc], targetOperations: nil)
-        let tg = Date()
-        for _ in 0 ..< reps {
-            _ = graph.run(with: queue, feeds: [ta: da, tb: db], targetTensors: [tc],
-                          targetOperations: nil)
-        }
-        let mpsMs = Date().timeIntervalSince(tg) * 1000 / Double(reps)
-
-        let flops = 2.0 * Double(m) * Double(k) * Double(n)
-        print(String(format: "M%-5d K%-5d N%-5d  mlx-f16 %6.2f ms (%5.1f TF)  mlx-f32 %6.2f ms  mpsgraph-f16 %6.2f ms (%5.1f TF)  %.2fx",
-                     m, k, n, mlxMs["f16"]!, flops / (mlxMs["f16"]! / 1000) / 1e12,
-                     mlxMs["f32"]!, mpsMs, flops / (mpsMs / 1000) / 1e12,
-                     mlxMs["f16"]! / mpsMs))
-    }
-    exit(0)
-}
-
 if args.contains("--probe-decode-width") {
     let modelPath = args.first { !$0.hasPrefix("--") }
     guard let modelPath else { fatalError("--probe-decode-width needs a model dir") }
@@ -183,25 +127,56 @@ if args.contains("--probe-decode-width") {
     exit(0)
 }
 
-if args.contains("--probe-ane") {
-    let dir = args.firstIndex(of: "--probe-ane").map { args[$0 + 1] } ?? "build/ane"
-    let tokens = args.firstIndex(of: "--tokens").map { Int(args[$0 + 1]) ?? 4096 } ?? 4096
-    let secs = args.firstIndex(of: "--seconds").map { Double(args[$0 + 1]) ?? 4.0 } ?? 4.0
-    print(ProbeANE.run(dir: dir, tokens: tokens, seconds: secs))
+// Model-free: routed gather_qmm whose indices come from an in-graph router (argSort -> slice -> int32).
+if args.contains("--probe-gather") {
+    func bench(_ name: String, _ f: () -> MLXArray) {
+        for _ in 0 ..< 10 { eval(f()) }
+        let n = 200; let t = Date()
+        for _ in 0 ..< n { eval(f()) }
+        print(String(format: "%-46@ %8.1f us/step", name as NSString, Date().timeIntervalSince(t) * 1e6 / Double(n)))
+    }
+    let K = 1280
+    let (gw, gs, gb) = quantized(MLXRandom.normal([64, K, 1792]) * 0.02, groupSize: 64, bits: 8)
+    let (dw, ds, db) = quantized(MLXRandom.normal([64, 896, K]) * 0.02, groupSize: 64, bits: 8)
+    let gate = MLXRandom.normal([K, 64]) * 0.05
+    eval(gw, gs, gb, dw, ds, db, gate)
+    for rows in [1, 32] {
+        let x0 = MLXRandom.normal([rows, K]); eval(x0)
+        let constIdx = MLXArray((0 ..< rows * 6).map { Int32(($0 * 7) % 64) }).reshaped([rows, 6]); eval(constIdx)
+        func moe(_ x: MLXArray, _ idxOf: (MLXArray) -> MLXArray) -> MLXArray {
+            let idx = idxOf(x)
+            let g = gatherQuantizedMM(x.reshaped([rows, 1, 1, K]), gw, scales: gs, biases: gb, rhsIndices: idx, transpose: false, groupSize: 64, bits: 8, sortedIndices: false).squeezed(axis: -2)
+            let m = g[.ellipsis, 0 ..< 896] * sigmoid(g[.ellipsis, 896...])
+            let d = gatherQuantizedMM(m.expandedDimensions(axis: -2), dw, scales: ds, biases: db, rhsIndices: idx, transpose: false, groupSize: 64, bits: 8, sortedIndices: false).squeezed(axis: -2)
+            return x + d.sum(axis: 1) * 0.01
+        }
+        let routerIdx: (MLXArray) -> MLXArray = { x in argSort(-softmax(matmul(x, gate), axis: -1), axis: -1)[0..., 0 ..< 6].asType(.int32) }
+        let routerIdxContig: (MLXArray) -> MLXArray = { x in MLX.contiguous(argSort(-softmax(matmul(x, gate), axis: -1), axis: -1)[0..., 0 ..< 6]).asType(.int32) }
+        let partIdx: (MLXArray) -> MLXArray = { x in argPartition(-softmax(matmul(x, gate), axis: -1), kth: 5, axis: -1)[0..., 0 ..< 6].asType(.int32) }
+        bench("rows \(rows): 12 MoE, const idx") { var x = x0; for _ in 0 ..< 12 { x = moe(x) { _ in constIdx } }; return x }
+        bench("rows \(rows): 12 MoE, router argSort idx") { var x = x0; for _ in 0 ..< 12 { x = moe(x, routerIdx) }; return x }
+        bench("rows \(rows): 12 MoE, router argSort contiguous") { var x = x0; for _ in 0 ..< 12 { x = moe(x, routerIdxContig) }; return x }
+        bench("rows \(rows): 12 MoE, router argPartition idx") { var x = x0; for _ in 0 ..< 12 { x = moe(x, partIdx) }; return x }
+        // transpose:true variant: weights stored (E, N, K)
+        let (gwt, gst, gbt) = quantized(MLXRandom.normal([64, 1792, K]) * 0.02, groupSize: 64, bits: 8)
+        let (dwt, dst, dbt) = quantized(MLXRandom.normal([64, K, 896]) * 0.02, groupSize: 64, bits: 8)
+        eval(gwt, gst, gbt, dwt, dst, dbt)
+        func moeT(_ x: MLXArray, _ idxOf: (MLXArray) -> MLXArray) -> MLXArray {
+            let idx = idxOf(x)
+            let g = gatherQuantizedMM(x.reshaped([rows, 1, 1, K]), gwt, scales: gst, biases: gbt, rhsIndices: idx, transpose: true, groupSize: 64, bits: 8, sortedIndices: false).squeezed(axis: -2)
+            let m = g[.ellipsis, 0 ..< 896] * sigmoid(g[.ellipsis, 896...])
+            let d = gatherQuantizedMM(m.expandedDimensions(axis: -2), dwt, scales: dst, biases: dbt, rhsIndices: idx, transpose: true, groupSize: 64, bits: 8, sortedIndices: false).squeezed(axis: -2)
+            return x + d.sum(axis: 1) * 0.01
+        }
+        bench("rows \(rows): 12 MoE T=true, const idx") { var x = x0; for _ in 0 ..< 12 { x = moeT(x) { _ in constIdx } }; return x }
+        bench("rows \(rows): 12 MoE T=true, router idx") { var x = x0; for _ in 0 ..< 12 { x = moeT(x, routerIdx) }; return x }
+    }
     exit(0)
 }
 
-if args.contains("--probe-vision") {
-    let modelPath = args.first { !$0.hasPrefix("--") }
-    guard let modelPath else { fatalError("--probe-vision needs a model dir") }
-    let model = try await OCRModel(modelDir: URL(fileURLWithPath: modelPath))
-    print("-- local tiles, 640 --")
-    print(model.probeVisionScaling())
-    print("-- global view, 1024 --")
-    print(model.probeVisionScaling(counts: [1, 2, 4, 8, 16], side: 1024))
-    exit(0)
-}
-
+// Minimal, model-free check of MLX's quantized matmul across batch sizes. It exists because a
+// whole-model symptom (speculative verification wrong at some batch sizes and right at others)
+// has to be reduced to one op before it can be called an upstream bug rather than a port bug.
 if args.contains("--probe-qmm") {
     let K = 1280, N = 896
     for bits in [4, 8] {
@@ -319,7 +294,6 @@ if let i = args.firstIndex(of: "--pdf") {
                  Double(OCRTokenBudget.bytesPerToken) / 1024,
                  Double(model.weightBytes) / 1e9))
     OCRRuntimeFlags.loopGuardForPDF = !args.contains("--no-loop-guard")
-    OCRRuntimeFlags.visionPrefetch = args.contains("--vision-prefetch")
     OCRRuntimeFlags.reportPrefill = args.contains("--report-prefill")
     OCRRuntimeFlags.reportOccupancy = args.contains("--report-occupancy")
     let workers = intAfter("--workers", in: args) ?? 1
@@ -341,10 +315,7 @@ if let i = args.firstIndex(of: "--pdf") {
             out = try model.transcribeBatched(pdfAt: pdf, maxNewTokens: cap,
                                               pageRange: limit.map { 0 ..< $0 },
                                               dpi: intAfter("--dpi", in: args) ?? 200,
-                                              width: batchWidth,
-                                              pipelined: args.contains("--pipeline"),
-                                              pipelineHostOnly: args.contains("--pipeline-host"),
-                                              opener: intAfter("--opener", in: args) ?? 0)
+                                              width: batchWidth)
             elapsed = Date().timeIntervalSince(started)
             if passes > 1 {
                 print(String(format: "pass %d: %.1f s, %.0f aggregate tok/s, stalled %.1f s  [%@]",
