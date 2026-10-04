@@ -381,7 +381,7 @@ struct ContentView: View {
         } else if model.hiddenByThreshold > 0 {
             // The count sits in the BUTTON, the only thing that acts on it. As a subtitle it
             // restated the title and then named the mechanism doing it.
-            CenteredStatus(symbol: "line.3.horizontal.decrease.circle",
+            CenteredStatus(symbol: CenteredStatus.moleSad,
                            title: "No results above \(Int(model.minScore * 100))%",
                            subtitle: "", showSpinner: false,
                            action: (Self.weakerMatchesTitle(model.hiddenByThreshold),
@@ -390,13 +390,13 @@ struct ContentView: View {
             // Filters can hide every result; the empty state is the only place left to escape
             // them. The cause goes in the TITLE - as a subtitle it was a sentence explaining the
             // button underneath it.
-            CenteredStatus(symbol: "line.3.horizontal.decrease.circle", title: "No matches with these filters",
+            CenteredStatus(symbol: CenteredStatus.moleSad, title: "No matches with these filters",
                            subtitle: "", showSpinner: false,
                            action: ("Clear Filters", { model.clearFilters() }))
         } else {
             // No subtitle. "Try a different phrase" is the only thing anyone could do here, so
             // saying it adds a line and no information.
-            CenteredStatus(symbol: "magnifyingglass", title: "No matches", subtitle: "", showSpinner: false)
+            CenteredStatus(symbol: CenteredStatus.moleSad, title: "No matches", subtitle: "", showSpinner: false)
         }
     }
 
@@ -679,7 +679,8 @@ struct StatusGlyph: View {
 struct CenteredStatus: View {
     /// The Omni mole glyphs (asset names), for `symbol`.
     static let mole = "MoleGlyph", moleSearch = "MoleSearch", moleOCR = "MoleOCR", moleSleep = "MoleSleep",
-               moleSerious = "MoleSerious", moleEmpty = "MoleEmpty", moleCurious = "MoleCurious"
+               moleSerious = "MoleSerious", moleEmpty = "MoleEmpty", moleCurious = "MoleCurious",
+               moleSad = "MoleSad"
     let symbol: String
     let title: String
     let subtitle: String

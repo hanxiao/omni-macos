@@ -38,6 +38,13 @@ def svg(v):
         extra_fill = ('<path d="M81,17.5 Q81,11.5 87,11.5 Q93,11.5 93,17 Q93,21 87.5,23.5 L87.5,26.5" '
                       'fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>'
                       '<circle cx="87.5" cy="32" r="1.8"/>')
+    elif v == "sad":
+        # worried brows (inner ends up), a tear down each cheek, one more falling: no matches
+        eyes = ('<circle cx="40" cy="40" r="3.2" fill="black"/><circle cx="60" cy="40" r="3.2" fill="black"/>'
+                '<path d="M34.6,33.6 L44.6,30.2 M65.4,33.6 L55.4,30.2" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>'
+                '<path d="M37,44.6 Q33.2,50.6 37,53.2 Q40.8,50.6 37,44.6 Z" fill="black"/>'
+                '<path d="M63,44.6 Q59.2,50.6 63,53.2 Q66.8,50.6 63,44.6 Z" fill="black"/>')
+        extra_fill = '<path d="M82,47 Q77.4,54.4 82,58 Q86.6,54.4 82,47 Z"/>'
     elif v == "welcome":
         eyes = ('<path d="M36.2,41 Q40,36.5 43.8,41" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>'
                 '<path d="M56.2,41 Q60,36.5 63.8,41" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>')
@@ -68,5 +75,5 @@ def svg(v):
  <path mask="url(#mound)" d="M9,89 C9,79 27,75 50,75 C73,75 91,79 91,89 C91,92 89,94 86,94 L14,94 C11,94 9,92 9,89 Z"/>
  {pawfill}{extra_fill}
 </svg>'''
-for v in ["base", "search", "ocr", "sleep", "serious", "empty", "curious"]:
+for v in ["base", "search", "ocr", "sleep", "serious", "empty", "curious", "sad"]:
     open(f"fam-{v}.svg", "w").write(svg(v))
