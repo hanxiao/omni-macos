@@ -117,7 +117,7 @@ struct OCRView: View {
     /// file. The Raw pane shows only transcribed text, so it was simply blank.
     private var visibleDocumentUnreadable: Bool {
         guard let doc = session.visibleDocument, !doc.pageIDs.isEmpty else { return false }
-        return doc.pageIDs.allSatisfy { session.pages.indices.contains($0) && session.pages[$0].state == .failed }
+        return doc.pageIDs.allSatisfy { session.pageState($0) == .failed }
     }
 
     @ViewBuilder private var content: some View {
@@ -196,7 +196,7 @@ struct OCRView: View {
     private var visibleDocumentIsRunning: Bool {
         guard let doc = session.visibleDocument else { return false }
         return doc.pageIDs.contains {
-            session.pages.indices.contains($0) && session.pages[$0].state == .running
+            session.pageState($0) == .running
         }
     }
 
@@ -268,14 +268,14 @@ private struct OCRToolbar: ViewModifier {
                     Label("Save Markdown\u{2026}", systemImage: "square.and.arrow.down")
                 }
                 .help("Save as Markdown  \u{2318}S")
-                .disabled(session.completedPages == 0)
+                .disabled(!session.hasCompletedPages)
             }
             ToolbarItem(id: "ocr.copy", placement: .primaryAction) {
                 Button { session.copyMarkdownToPasteboard() } label: {
                     Label("Copy Markdown", systemImage: "doc.on.doc")
                 }
                 .help("Copy as Markdown  \u{21e7}\u{2318}C")
-                .disabled(session.completedPages == 0)
+                .disabled(!session.hasCompletedPages)
             }
             ToolbarItem(id: "ocr.share", placement: .primaryAction) {
                 // The system share sheet, not a menu of our own: AirDrop, Mail, Messages, Notes
@@ -285,7 +285,7 @@ private struct OCRToolbar: ViewModifier {
                           preview: SharePreview(session.documentName,
                                                 image: Image(systemName: "doc.plaintext")))
                     .help("Share the transcription")
-                    .disabled(session.completedPages == 0)
+                    .disabled(!session.hasCompletedPages)
             }
         }
     }
@@ -298,7 +298,7 @@ private struct OCRToolbar: ViewModifier {
     }
 
     private var hasDocument: Bool {
-        session.phase != .empty && session.phase != .needsModel && !session.pages.isEmpty
+        session.phase != .empty && session.phase != .needsModel && session.hasPages
     }
 
 }
@@ -319,9 +319,8 @@ struct PageRail: View {
                 // towards. One small view per page is tens of views, not thousands.
                 VStack(spacing: 2) {
                     ForEach(session.visiblePages) { page in
-                        PageThumb(page: page,
-                                  selected: session.railSelection == page.id,
-                                  onPreview: { session.previewing = session.previewURL(for: page.id) })
+                        PageThumb(page: page, selected: session.railSelection == page.id)
+                            .equatable()
                             .id(page.id)
                     }
                 }
@@ -354,12 +353,18 @@ struct PageRail: View {
     }
 }
 
-private struct PageThumb: View {
+/// Equatable on what it draws, and with no closure parameter: a closure never compares equal, so
+/// every write to `pages` - a state change, a token counter, a thumbnail landing - re-ran all forty
+/// rows of the rail and redrew their images, for a change to one of them.
+private struct PageThumb: View, Equatable {
     let page: OCRSession.Page
     let selected: Bool
-    /// Open the page itself, the way double-clicking a Finder icon does.
-    var onPreview: () -> Void
     @Environment(OCRSession.self) private var session
+
+    nonisolated static func == (a: Self, b: Self) -> Bool { a.page == b.page && a.selected == b.selected }
+
+    /// Open the page itself, the way double-clicking a Finder icon does.
+    private func onPreview() { session.previewing = session.previewURL(for: page.id) }
 
     var body: some View {
         VStack(spacing: 5) {
@@ -399,7 +404,7 @@ private struct PageThumb: View {
                     OmniPasteboard.copy(session.pageText(at: page.id))
                 } label: { Label("Copy Page as Markdown", systemImage: "doc.on.clipboard") }
             }
-            if let url = session.sourceURL(for: page.id) {
+            if let url = OCRSession.fileURL(of: page.source) {
                 Divider()
                 Button { PhotoActions.open(url.path) } label: { Label("Open", systemImage: "arrow.up.forward.app") }
                 Button { PhotoActions.reveal(paths: [url.path]) } label: { Label("Show in Finder", systemImage: "folder") }
@@ -604,7 +609,6 @@ private struct RenderedDocument: View {
                     .id(id)
                 }
             }
-            .textSelection(.enabled)
         }
     }
 }
@@ -639,6 +643,12 @@ private struct RenderedSection: View {
                         block.view(highlighting: session.find)
                     }
                 }
+                // SELECTABLE ONCE FINISHED, not while streaming. A selectable `Text` on macOS is a
+                // platform view drawn on the CPU, and a page being written redraws on every token:
+                // with the page in flight selectable, a 40-page run blocked the main thread
+                // 10.2-11.0 s; with only finished pages selectable, 8.6-8.9 s. A page still being
+                // written is not something to select across, and it is selectable when it stops.
+                .textSelection(.enabled)
             }
             if state == .running { TypingCaret() }
             if state == .failed { PageFailed() }
@@ -666,7 +676,7 @@ private struct RawDocument: View {
     /// read-only form: the editor is an `NSTextView` with no sections to report a scroll position
     /// from or scroll to, so a split with the editor in it could not keep its halves together.
     /// Editing the transcript is what the single Raw Text view is for.
-    private var editable: Bool { side == nil && !session.isBusy && session.completedPages > 0 }
+    private var editable: Bool { side == nil && !session.isBusy && session.hasCompletedPages }
 
     var body: some View {
         Group {
@@ -933,27 +943,106 @@ private struct RawSection: View {
 
     var body: some View {
         let text = session.sectionText(id)
-        Group {
-            if session.sectionState(id) == .running {
-                // WHILE A PAGE STREAMS, one Text per line, the way RenderedSection splits by block.
-                // As one Text the whole page's highlighted source was re-measured and redrawn on
-                // every update, 24 a second: measured on a 3,702-token page, the main thread was
-                // busy 93% of the decode, three quarters of it laying out and drawing that string.
-                // Split, only the line still being written changes; the others compare equal and
-                // are left alone. A running page is not something to select across, and once it
-                // finishes it is one Text again, so a drag still selects the whole section.
-                VStack(alignment: .leading, spacing: 0) {
-                    ForEach(Array(MarkdownSource.lines(text).enumerated()), id: \.offset) { _, part in
-                        RawLine(text: part, find: session.find).equatable()
-                    }
-                }
-            } else {
-                Text(FindHighlight.mark(session.find, in: MarkdownSource.highlighted(text)))
+        // WHILE A PAGE STREAMS only its last line changes, so the lines already written are one
+        // `SourceSection` - which compares its text and does nothing when a token lands on the
+        // line below it - and the line being written is the only SwiftUI text. When the page
+        // finishes, the tail joins the same text view: nothing is rebuilt, and nothing moves.
+        //
+        // This replaces one `Text` per line. That kept a token from re-measuring the whole page,
+        // but following a batched run lands on pages that have been decoding out of sight, and
+        // arriving on one built its ~150 lines as ~150 views at once.
+        let (settled, tail) = session.sectionState(id) == .running ? Self.split(text) : (text, nil)
+        VStack(alignment: .leading, spacing: 0) {
+            if !settled.isEmpty { SourceSection(text: settled, find: session.find) }
+            if let tail {
+                RawLine(text: tail, find: session.find, inFence: Self.fenceIsOpen(settled)).equatable()
             }
         }
         .font(.system(.body, design: .monospaced))
-        .textSelection(.enabled)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// The finished lines, and the line still being written.
+    private static func split(_ text: String) -> (String, String?) {
+        guard let newline = text.lastIndex(of: "\n") else { return ("", text) }
+        return (String(text[..<newline]), String(text[text.index(after: newline)...]))
+    }
+
+    /// Whether the settled lines leave a code fence open, so the tail is code. The fence rule
+    /// colours an open fence to the end of the text it is given, and a tail highlighted alone would
+    /// flash uncoloured until its newline arrived.
+    private static func fenceIsOpen(_ text: String) -> Bool {
+        var open = false
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) where line.hasPrefix("```") {
+            open.toggle()
+        }
+        return open
+    }
+}
+
+/// A finished section of the source: highlighted, selectable, read-only - as an `NSTextView`.
+///
+/// Not a `Text`. SwiftUI measures and draws a long styled string far more slowly than AppKit's text
+/// system does, and a finished page of source is exactly that: a 151-line page of HTML table, as one
+/// highlighted `Text`, cost ~250 ms to build, and following a batched run builds two or three of
+/// them at every jump - the per-page stalls in the OCR workspace. The same page as a non-editable
+/// `NSTextView` builds in ~12 ms, draws the same pixels (32 of 1.26 M differ, at glyph edges), and
+/// brings AppKit's own selection, Look Up and the transcript's "Search for" item with it.
+private struct SourceSection: NSViewRepresentable {
+    let text: String
+    let find: String
+    @Environment(OCRSession.self) private var session
+
+    final class Coordinator {
+        var shown: (text: String, find: String)?
+        /// Height per width, for the text on screen. A layout pass asks more than once - an ideal
+        /// size at an unbounded width as well as the real one - and each answer is a full layout.
+        var heights: [CGFloat: CGFloat] = [:]
+        var lastWidth: CGFloat?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> OCRSourceTextView {
+        let view = OCRSourceTextView(usingTextLayoutManager: false)
+        view.textContainer?.lineFragmentPadding = 0
+        view.textContainer?.widthTracksTextView = true
+        view.isEditable = false
+        view.isSelectable = true
+        view.drawsBackground = false
+        view.textContainerInset = .zero
+        view.isVerticallyResizable = false
+        view.isHorizontallyResizable = false
+        view.onFiles = { [weak session] urls in session?.open(urls: urls) }
+        return view
+    }
+
+    func updateNSView(_ view: OCRSourceTextView, context: Context) {
+        guard context.coordinator.shown.map({ $0.text != text || $0.find != find }) ?? true else { return }
+        context.coordinator.shown = (text, find)
+        context.coordinator.heights = [:]
+        view.textStorage?.setAttributedString(NSAttributedString(
+            FindHighlight.mark(find, in: MarkdownSource.highlighted(text))))
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView view: OCRSourceTextView, context: Context) -> CGSize? {
+        guard let layout = view.layoutManager, let container = view.textContainer else { return nil }
+        let coordinator = context.coordinator
+        // An unbounded proposal is the ideal-size question, and a block of text has no ideal width
+        // of its own here: answer it with the last real width, which is what it will be placed at.
+        let proposed = proposal.width.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        let width = proposed ?? coordinator.lastWidth ?? 600
+        if proposed != nil { coordinator.lastWidth = width }
+        if let height = coordinator.heights[width] { return CGSize(width: width, height: height) }
+        container.size = NSSize(width: width, height: .greatestFiniteMagnitude)
+        layout.ensureLayout(for: container)
+        let height = ceil(layout.usedRect(for: container).height)
+        coordinator.heights[width] = height
+        // Measuring resized the container; it has to wrap at the width the view is drawn at.
+        if view.bounds.width > 0, view.bounds.width != width {
+            container.size = NSSize(width: view.bounds.width, height: .greatestFiniteMagnitude)
+        }
+        return CGSize(width: width, height: height)
     }
 }
 
@@ -962,9 +1051,18 @@ private struct RawSection: View {
 private struct RawLine: View, Equatable {
     let text: String
     let find: String
+    let inFence: Bool
     var body: some View {
         // A blank line as an empty Text has no height; a space keeps the line's.
-        Text(text.isEmpty ? AttributedString(" ") : FindHighlight.mark(find, in: MarkdownSource.highlighted(text)))
+        Text(text.isEmpty ? AttributedString(" ") : FindHighlight.mark(find, in: highlighted))
+    }
+
+    /// Inside an open fence, highlighted as the fence's continuation - the opening line is put
+    /// back for the highlighter and its characters dropped from the result.
+    private var highlighted: AttributedString {
+        guard inFence else { return MarkdownSource.highlighted(text) }
+        let whole = MarkdownSource.highlighted("```\n" + text)
+        return AttributedString(whole[whole.index(whole.startIndex, offsetByCharacters: 4)...])
     }
 }
 
@@ -1627,6 +1725,9 @@ private struct CenteredHint: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
+
+
+
 
 
 

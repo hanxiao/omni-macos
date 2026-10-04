@@ -157,7 +157,15 @@ final class OCRSession {
     }
 
     private(set) var phase: Phase = .empty
-    private(set) var pages: [Page] = []
+    private(set) var pages: [Page] = [] {
+        didSet {
+            syncSources(states: oldValue)
+            if hasPages == pages.isEmpty { hasPages = !pages.isEmpty }
+        }
+    }
+    /// `!pages.isEmpty`, for the window: reading `pages` to ask that re-ran the whole window body
+    /// - and rebuilt the OCR workspace under it - on every page state change and thumbnail.
+    private(set) var hasPages = false
     private(set) var documents: [Document] = []
     /// Which tab is on screen. Follows the file being transcribed until the user picks one.
     /// The id of the tab on screen, never its index. The two used to be conflated: the tab bar
@@ -166,7 +174,7 @@ final class OCRSession {
     private(set) var selectedDocumentID = 0
     private(set) var userPinnedDocument = false
     /// Decoded Markdown per page, parallel to `pages`.
-    private(set) var texts: [String] = []
+    private(set) var texts: [String] = [] { didSet { syncSources(texts: oldValue) } }
     private(set) var documentName: String = ""
 
     /// Source first. What comes out of a transcription run is Markdown, and the thing a person
@@ -228,7 +236,12 @@ final class OCRSession {
     private var settledTokens = 0
     private var liveTokens: [Int: Int] = [:]
     private(set) var elapsed: Double = 0
-    private(set) var completedPages: Int = 0
+    private(set) var completedPages: Int = 0 {
+        didSet { if hasCompletedPages != (completedPages > 0) { hasCompletedPages = completedPages > 0 } }
+    }
+    /// `completedPages > 0`, for the toolbar and the menus that gate Copy, Save and Share on it:
+    /// read as the count, they re-rendered - and AppKit re-laid out the toolbar - once per page.
+    private(set) var hasCompletedPages = false
     /// The readout is a status toast, not permanent chrome: it stays for the run and a few seconds
     /// after, then gets out of the way of the text it was reporting on.
     private(set) var readoutVisible = false
@@ -341,7 +354,60 @@ final class OCRSession {
     /// One page's Markdown as the model produced it. Used by the panes, which render pages as
     /// sections of one document, and by a page's drag payload.
     func pageText(at index: Int) -> String {
-        texts.indices.contains(index) ? texts[index] : ""
+        if sources.indices.contains(index) { return sources[index].text }
+        return texts.indices.contains(index) ? texts[index] : ""
+    }
+
+    // MARK: - One page, observed on its own
+    //
+    // Observation tracks a stored property as a whole, so `texts` being a separate array (above)
+    // kept streaming off the RAIL but not off the transcript: every section read `texts[id]` and
+    // `pages[id].state`, and so every built section - and every thumbnail, through its drag
+    // payload - was invalidated by every token of every page in flight, 24 times a second, and by
+    // each thumbnail landing. Measured on a 40-page document: re-evaluating the built sections cost
+    // 60-80 ms per invalidation, and the 40 thumbnails alone kept the main thread busy for three
+    // seconds after the document opened. Each page's text and state are mirrored here, one
+    // observable object per page, so a view that reads one page depends on that page only.
+    // `texts` and `pages` stay the record; these follow them in `didSet`, and only what changed is
+    // written. Pages that did not change still share their string's storage with the old array,
+    // so finding the changed one is a pointer comparison per page.
+
+    @MainActor @Observable final class SectionSource {
+        fileprivate(set) var text = "" {
+            didSet { if hasText == text.isEmpty { hasText = !text.isEmpty } }
+        }
+        fileprivate(set) var state: PageState = .pending
+        /// Whether any text has arrived: flips once per page, where `text` changes per token.
+        fileprivate(set) var hasText = false
+    }
+
+    @ObservationIgnored private var sources: [SectionSource] = []
+
+    /// A page's state, depending on that page alone - for views that ask about several pages and
+    /// must not re-render whenever any page's counters or thumbnail change.
+    func pageState(_ index: Int) -> PageState? {
+        if sources.indices.contains(index) { return sources[index].state }
+        return pages.indices.contains(index) ? pages[index].state : nil
+    }
+
+    private func syncSources(texts old: [String]) {
+        guard old.count == texts.count, sources.count == pages.count else { return resizeSources() }
+        for i in texts.indices where i < sources.count && texts[i] != old[i] { sources[i].text = texts[i] }
+    }
+
+    private func syncSources(states old: [Page]) {
+        guard old.count == pages.count, sources.count == pages.count else { return resizeSources() }
+        for i in pages.indices where pages[i].state != old[i].state { sources[i].state = pages[i].state }
+    }
+
+    private func resizeSources() {
+        if sources.count > pages.count { sources.removeLast(sources.count - pages.count) }
+        while sources.count < pages.count { sources.append(SectionSource()) }
+        for i in sources.indices {
+            let text = texts.indices.contains(i) ? texts[i] : ""
+            if sources[i].text != text { sources[i].text = text }
+            if sources[i].state != pages[i].state { sources[i].state = pages[i].state }
+        }
     }
 
     // MARK: - The document, as sections
@@ -368,10 +434,15 @@ final class OCRSession {
         // A page that is decoding but has produced nothing yet is NOT a section. With one page in
         // flight that was a single empty gap; with a group of eight it is eight page rules and no
         // text, which reads as a broken document rather than a starting one.
+        // Through the per-page sources, and through `hasText` rather than the text: this list is
+        // what the whole transcript scroller is built from, and reading `texts` here made it depend
+        // on every token of every page in flight.
         return visibleDocument?.pageIDs.filter {
-            switch pages[$0].state {
+            // Read `pages` when a page has no source yet, so the dependency exists either way.
+            guard sources.indices.contains($0) else { return pages.indices.contains($0) && pages[$0].state == .done }
+            switch sources[$0].state {
             case .done, .failed: return true
-            case .running: return !texts[$0].isEmpty
+            case .running: return sources[$0].hasText
             case .pending, .stopped: return false
             }
         } ?? []
@@ -483,6 +554,7 @@ final class OCRSession {
             guard !editSections.indices.contains(id) else { return .done }
             page = id - editSections.count
         }
+        if sources.indices.contains(page) { return sources[page].state }
         guard pages.indices.contains(page) else { return .done }
         return pages[page].state
     }
@@ -1613,6 +1685,10 @@ final class OCRSession {
         if completedPages == 1, let decodeStart {
             omniPerfLog(String(format: "ocr-first-page-done %.1fs", Date().timeIntervalSince(decodeStart)))
         }
+        if omniPerfEnabled, let decodeStart {
+            omniPerfLog(String(format: "ocr-page-done page=%d chars=%d %.2fs", index + 1, result.text.count,
+                               Date().timeIntervalSince(decodeStart)))
+        }
         settledTokens += result.tokens.count
         liveTokens[index] = nil
         // Following moves on with the run. In continuous decoding `runningIndex` was the group's
@@ -1804,7 +1880,13 @@ final class OCRSession {
     /// else in the app.
     func sourceURL(for id: Int) -> URL? {
         guard pages.indices.contains(id) else { return nil }
-        switch pages[id].source {
+        return Self.fileURL(of: pages[id].source)
+    }
+
+    /// The file a page came from, from the page itself - for a view that already holds the page
+    /// and must not depend on the whole `pages` array to find it.
+    nonisolated static func fileURL(of source: Source) -> URL? {
+        switch source {
         case .none: return nil
         case .file(let url): return url
         case .pdfPage(let url, _): return url

@@ -209,10 +209,47 @@ day later the same tour measured ZERO blocks over 250 ms (see "UI tests").
   main-actor hop count (coalescing 768 per-row hops a second into 24 changed nothing), and the
   stream flush rate (24 Hz against 4 Hz is worth ~15% of the total, not the 45% the percentage
   metric suggested). Both speculative fixes were reverted rather than shipped unproven.
-- WHAT IS LEFT POINTING AT. ~40 pages, ~45 stalls, ~150 ms each: the shape says per-PAGE
+- (Resolved 2026-10-03, below.) WHAT IS LEFT POINTING AT. ~40 pages, ~45 stalls, ~150 ms each: the shape says per-PAGE
   completion, not per-token streaming. `settle` itself is a handful of assignments, so the cost is
   the SwiftUI update its `state = .done` and final text assignment provoke, once per page. That is
   where to look next; do not re-litigate the four above.
+- FIXED 2026-10-03: THE PER-PAGE STALL, AND WHAT IT WAS. Each finished or followed page cost
+  ~150-350 ms of main thread on a quiet machine, and 1-2 s per jump once the window was in front
+  and the GPU busy. Four causes, each found by counting what ran inside a stall (`UIProbe.count` in
+  the bodies, hangwatch prints the tallies per stall) and `Self._printChanges()`, not by profile
+  shape alone - the profile only ever said "layout and CoreAnimation commit":
+  - A FINISHED SOURCE PAGE WAS ONE SwiftUI `Text`. Offscreen harness, the 151-line table page, three
+    sections the way a follow jump builds them: one `Text` each ~760 ms, one `Text` per line ~170,
+    an `NSTextView` (TextKit 1) ~40. `textSelection` itself costs nothing there; long attributed
+    text in SwiftUI does. Source sections are `SourceSection` now (non-editable `OCRSourceTextView`,
+    sized in `sizeThatFits` from its layout manager, height cached per width); a streaming page is
+    one for its settled lines plus one `Text` for the line being written, and the same text view
+    takes the tail when the page finishes. Pixel diff against the `Text` rendering: 32 of 1.26 M
+    pixels, glyph edges. TRAPS: a text system built by hand loses an unretained `NSTextStorage` and
+    every section sizes to zero (verify by screenshot, not by stall counts - zero-height sections
+    are fast); `sizeThatFits` is asked at an infinite width for the ideal size.
+  - EVERY SECTION AND THUMBNAIL OBSERVED EVERY PAGE. Observation tracks a stored property whole, so
+    `texts[id]` / `pages[id].state` made each built section, the section list and every thumbnail's
+    drag payload depend on every token of every page and every thumbnail landing. Per-page
+    `SectionSource` objects mirror text and state from `didSet` and the views read those.
+  - THE RAIL RE-RAN ALL 40 ROWS per `pages` write: `PageThumb` took a closure and read
+    `sourceURL(for:)` (all of `pages`). Equatable now, no closure, URL from its own page: ~4,500
+    thumbnail bodies a run -> ~100.
+  - THE WINDOW RE-RAN PER PAGE: `ContentView.ocrDrawerWanted` read `pages.isEmpty`, the OCR toolbar
+    and the File menu read `pages.isEmpty` and `completedPages == 0`. Stored `hasPages` /
+    `hasCompletedPages`, written when they flip: `OCRView` re-creations 229 -> 6 a run.
+  Measured, 40-page scan, window visible, interleaved with HEAD (4fcd539) built the same way:
+  Raw (the default) 11.8-14.5 s blocked, worst 2.2 s -> 3.0-3.3 s, worst 0.75-0.98; Markdown
+  11.7-12.7 s, worst 1.4 s -> 7.3-8.4 s, worst 0.75-1.0; Dual 21.4-21.7 s, worst 3.4-3.5 s ->
+  9.2-9.5 s, worst 0.85-1.0. Twelve page jumps in Dual on a finished transcript: 6.1-6.4 s of the
+  session blocked -> 1.7-1.8 s. Same tok/s. The SAME HEAD binary read 2.8 s earlier in the day: an
+  occluded window does far less work, so the absolute numbers only compare within one sitting.
+  MEASURED AND NOT DONE: the readout's numeric-roll transitions (no change), the stream fade
+  animation (no change), baseline vs leading grid alignment in tables (3.3 vs 3.1 ms a streamed
+  update - tables stream cheaply in isolation). The Markdown pane's remaining cost is SwiftUI
+  selectable text: with selection off pane-wide a run blocks ~5.2 s against ~8.4 s; finished pages
+  stay selectable, the page being written no longer is (8.6-8.9 s against 10.2-11.0 s). Going
+  further means prose and tables in TextKit (NSTextTable), a visual change not yet made.
 - Where it stands, measured with verified coordinates on an 11-document chaotic drop: decode 1
   stall, tab switches 0, and mode switches / thumbnail clicks / OCR toggles about two stalls each
   at a median of 184 ms, p90 242, max 296. Perceptible stutter, no freezes, nothing over 300 ms.
@@ -306,7 +343,8 @@ day later the same tour measured ZERO blocks over 250 ms (see "UI tests").
     reference (`ResultFrames`); the band is `@GestureState`, which cancellation resets.
   - `PhotoLibrary.cleanExportScratch()` listed $TMPDIR on the main thread at every launch: 2.7 s.
   - `refreshDeniedRoots` assigned `deniedRoots` every stats tick; the sidebar reads it.
-  - OCR source pane while streaming: one Text of the whole page's highlighted source, re-measured
+  - (Superseded 2026-10-03 by `SourceSection`, see "THE PER-PAGE STALL" above.)
+    OCR source pane while streaming: one Text of the whole page's highlighted source, re-measured
     and redrawn 24 times a second - main thread 93% busy on a 3,702-token page. One Text per line
     while a page runs (a fence stays whole; HTML tables have no blank lines, so paragraphs were not
     enough), one Text when it finishes: 45%. Same tok/s (362 against 364 with one Text, interleaved).

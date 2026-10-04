@@ -297,7 +297,7 @@ struct OmniApp: App {
                     Divider()
                     Button("Copy Markdown") { ocr.copyMarkdownToPasteboard() }
                         .keyboardShortcut("c", modifiers: [.command, .shift])
-                        .disabled(ocr.completedPages == 0)
+                        .disabled(!ocr.hasCompletedPages)
                 }
             }
             // The primary actions on the selected result, reachable from the menu bar and keyboard
@@ -319,11 +319,11 @@ struct OmniApp: App {
                         .keyboardShortcut("o", modifiers: .command)
                     Button("Close Document") { ocr.clear() }
                         .keyboardShortcut("w", modifiers: [.command, .shift])
-                        .disabled(ocr.pages.isEmpty)
+                        .disabled(!ocr.hasPages)
                     Divider()
                     Button("Save Markdown\u{2026}") { ocr.exportMarkdown() }
                         .keyboardShortcut("s", modifiers: .command)
-                        .disabled(ocr.completedPages == 0)
+                        .disabled(!ocr.hasCompletedPages)
                     // Same system share sheet the results carry, and like Finder's Share it takes
                     // no key equivalent.
                     ShareLink(item: TranscriptFile(name: ocr.suggestedFileName,
@@ -332,7 +332,7 @@ struct OmniApp: App {
                                                     image: Image(systemName: "doc.plaintext"))) {
                         Text("Share\u{2026}")
                     }
-                    .disabled(ocr.completedPages == 0)
+                    .disabled(!ocr.hasCompletedPages)
                     Divider()
                     // Pause had no menu item and no key equivalent - it existed only as a button
                     // on the floating readout, which is the chrome that withdraws a few seconds

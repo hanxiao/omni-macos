@@ -24,7 +24,7 @@ struct ContentView: View {
 
     /// Whether the drawer has anything to show: the search sidebar always does, the page rail only
     /// once a document is open.
-    private var ocrDrawerWanted: Bool { !model.ocrMode || !ocr.pages.isEmpty }
+    private var ocrDrawerWanted: Bool { !model.ocrMode || ocr.hasPages }
 
     /// Apply a user edit of the search box: parse it into the semantic query + qualifiers, apply the
     /// filters, clear a file query if real text was typed, and schedule the (debounced) search. The
