@@ -32,7 +32,9 @@ be persisted somewhere anyway. Files are that storage.
    otherwise exclude it.
 4. UX: a "Clipboard" row under the Photos rows in the Index section, ALWAYS present. With capture
    off (never opted in, or turned off) clicking it shows the standard empty-state screen: the
-   monochrome mole through `StatusGlyph`, a title, and one button that turns capture on. With
+   monochrome mole through `StatusGlyph`, a title, and one button that turns capture on. The search
+   is scoped to the clipboard folder there too (`in:Clipboard`), so a query typed on that screen
+   finds nothing and the screen stays; it used to clear the scope and search every folder. With
    capture on it is a regular folder in every respect: the folder browser (list and gallery,
    columns, sort, selection, context menus), search scoped to it, filters and chips, back/forward.
    Newest first by default. Context menu: Pause capture, Clear clipboard history..., Show in

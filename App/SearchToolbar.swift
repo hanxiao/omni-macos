@@ -381,7 +381,7 @@ struct SearchToolbar: ViewModifier {
         // true, so this menu used to appear over a browser whose listing it cannot change - the
         // browser lists indexed children, not filtered results. Inert chrome. (The star stays:
         // bookmarking a browsed folder saves a state you can actually return to.)
-        if model.phase == .ready, !model.ocrMode, !showsBrowser,
+        if model.phase == .ready, !model.ocrMode, !showsBrowser, browse != .clipboardOff,
            model.hasResults || model.filtersActive {
         // Filter joins sort/view in the trailing placement so on Tahoe the three result controls
         // share ONE Liquid Glass pill (search-by-file + bookmark form the other). filterPlacement

@@ -1093,12 +1093,12 @@ final class AppModel {
     /// The Clipboard row: browse the folder, or show that capture is off when there is nothing to
     /// browse.
     func enterClipboard() {
-        if clipboardEnabled || clipboardHasClips {
-            enterFolder(Self.clipboardDirectory)
-        } else {
-            enterFolder(nil)
-            showsClipboardOff = true
-        }
+        // SCOPED EITHER WAY. With capture off this used to clear the scope and only raise the
+        // off screen, so the row stayed selected while a query searched EVERYTHING - session logs
+        // under ~/.openclaw answering a search "in" the Clipboard. Scoped to the folder, a query
+        // finds what the clipboard holds, which is nothing.
+        enterFolder(Self.clipboardDirectory)
+        if !(clipboardEnabled || clipboardHasClips) { showsClipboardOff = true }
     }
 
     /// The newest `limit` files by index time, off the main thread on the browse connection.

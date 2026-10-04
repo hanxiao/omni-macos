@@ -261,10 +261,13 @@ struct ContentView: View {
             && !model.hasResults && model.queryError == nil && !model.isResolving
     }
 
-    /// The Clipboard row was clicked with capture off and nothing to browse.
+    /// The Clipboard row was clicked with capture off and nothing to browse. With a query too: the
+    /// search is scoped to the clipboard and finds nothing, and this says why where "No matches"
+    /// would not. Only while the scope is still exactly the clipboard.
     private var showsClipboardOff: Bool {
-        model.showsClipboardOff && model.filterFolders.isEmpty && !model.hasQuery && model.fileQuery == nil
-            && !model.hasResults && model.queryError == nil && !model.isResolving
+        model.showsClipboardOff && model.fileQuery == nil && !model.hasResults
+            && model.queryError == nil && !model.isResolving
+            && model.filterFolders.map(\.standardizedFileURL.path) == [AppModel.clipboardDirectory.standardizedFileURL.path]
     }
 
     private var showsPhotoBrowser: Bool {
