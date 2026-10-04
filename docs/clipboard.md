@@ -10,7 +10,7 @@ be persisted somewhere anyway. Files are that storage.
 
 ## Decisions
 
-- Opt-in. Off until enabled from the sidebar or Settings > Content.
+- Opt-in. Off until enabled from the sidebar or Settings > Files.
 - Text and images. Plain and rich text stored as `.txt`, images as `.png`, URLs as text. Finder
   file copies are skipped: they are already files.
 - Always skipped: items marked `org.nspasteboard.ConcealedType` or `org.nspasteboard.TransientType`
@@ -38,7 +38,8 @@ be persisted somewhere anyway. Files are that storage.
    capture on it is a regular folder in every respect: the folder browser (list and gallery,
    columns, sort, selection, context menus), search scoped to it, filters and chips, back/forward.
    Newest first by default. Context menu: Pause capture, Clear clipboard history..., Show in
-   Finder. Settings > Content: the toggle, retention, and Clear. UI text follows the UI rules in
+   Finder. Settings > Files, ahead of the folders: "Index clipboard content" and "Keep content for";
+   Clear is on the sidebar row's context menu only. UI text follows the UI rules in
    CLAUDE.md: a title and one factual clause at most, no explanation of internals.
 5. Serving: served search drops hits under the clipboard folder.
 

@@ -186,7 +186,6 @@ private struct IndexStatusRow: View {
 /// What Omni watches: which file types are indexed, tagging, and the folder list.
 private struct ActivityTab: View {
     @Environment(AppModel.self) private var model: AppModel
-    @State private var confirmClearClips = false
 
     var body: some View {
         Form {
@@ -209,6 +208,34 @@ private struct ActivityTab: View {
                                                                  set: { model.skipDatalessFiles = $0 })) {
                     Text("Skip").tag(true)
                     Text("Download and index").tag(false)
+                }
+            }
+
+            // WITH THE OTHER SOURCES, ahead of the folders. The clipboard is indexed like a folder -
+            // it has a row under Index in the sidebar - so whether it is captured belongs with what is
+            // indexed, not with search history. No clip count or Clear here: Clear is on the sidebar
+            // row's context menu, next to the clips it deletes.
+            Section("Clipboard") {
+                Toggle("Index clipboard content", isOn: Binding(get: { model.clipboardEnabled },
+                                                              set: { model.setClipboardEnabled($0) }))
+                .help("Copied text and images, searchable in Clipboard")
+                if model.clipboardEnabled, ClipboardMonitor.accessDenied {
+                    LabeledContent("Pasting from other apps is denied") {
+                        Button("Open Privacy Settings") {
+                            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Pasteboard") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                        .controlSize(.small)
+                    }
+                    .foregroundStyle(.secondary)
+                }
+                Picker("Keep content for", selection: Binding(get: { model.clipboardRetentionDays },
+                                                           set: { model.clipboardRetentionDays = $0 })) {
+                    Text("7 days").tag(7)
+                    Text("30 days").tag(30)
+                    Text("90 days").tag(90)
+                    Text("Forever").tag(0)
                 }
             }
 
@@ -262,48 +289,8 @@ private struct ActivityTab: View {
                 }
             }
 
-            // WITH THE OTHER SOURCES. The clipboard is indexed like a folder - it has a row under
-            // Index in the sidebar beside Recents and the folders - so whether it is captured belongs
-            // with what is indexed, not with search history.
-            Section("Clipboard") {
-                Toggle("Save clipboard history", isOn: Binding(get: { model.clipboardEnabled },
-                                                              set: { model.setClipboardEnabled($0) }))
-                .help("Copied text and images, searchable in Clipboard")
-                if model.clipboardEnabled, ClipboardMonitor.accessDenied {
-                    LabeledContent("Pasting from other apps is denied") {
-                        Button("Open Privacy Settings") {
-                            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Pasteboard") {
-                                NSWorkspace.shared.open(url)
-                            }
-                        }
-                        .controlSize(.small)
-                    }
-                    .foregroundStyle(.secondary)
-                }
-                Picker("Keep clips for", selection: Binding(get: { model.clipboardRetentionDays },
-                                                           set: { model.clipboardRetentionDays = $0 })) {
-                    Text("7 days").tag(7)
-                    Text("30 days").tag(30)
-                    Text("90 days").tag(90)
-                    Text("Forever").tag(0)
-                }
-                HStack(spacing: 10) {
-                    Text("Saved clips")
-                    Spacer()
-                    Text(model.clipboardClipCount.formatted()).foregroundStyle(.secondary)
-                    Button("Clear\u{2026}", role: .destructive) { confirmClearClips = true }
-                        .controlSize(.small)
-                        .disabled(!model.clipboardHasClips)
-                }
-            }
         }
         .formStyle(.grouped)
-        .confirmationDialog("Clear clipboard history?", isPresented: $confirmClearClips) {
-            Button("Clear clipboard history", role: .destructive) { model.clearClipboardHistory() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("\(model.clipboardClipCount.formatted()) clips will be deleted.")
-        }
         // The kind on/off toggles live in THIS tab (orderRow). A confirmationDialog only presents
         // while its host view is on screen, so the disable-confirmation must be attached HERE, next
         // to the toggles - when it lived on the Content tab, disabling a kind-with-files from the
@@ -400,10 +387,15 @@ private struct ContentTypesTab: View {
 
             // The folders' own files, which the rules above do not show. Edited where they live.
             if !model.folderPolicies.isEmpty {
-                Section("Folder ignore files") {
+                Section {
                     ForEach(model.folderPolicies.keys.sorted(), id: \.self) { dir in
-                        FolderPolicyRow(dir: dir)
+                        FolderPolicyRow(dir: dir, rules: FolderPolicyRow.ruleCount(model.folderPolicies[dir] ?? ""))
                     }
+                } header: {
+                    Text("Rules in folders")
+                } footer: {
+                    Text("These folders have their own .omniignore file, which adds rules for that folder.")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
             }
         }
@@ -1381,6 +1373,15 @@ private struct OCRCacheSection: View {
 /// The reveal arrow is the one action people want; the rest is in the context menu.
 private struct FolderPolicyRow: View {
     let dir: String
+    let rules: Int
+
+    /// Lines that are rules: not blank, not a `#` comment.
+    static func ruleCount(_ text: String) -> Int {
+        text.split(separator: "\n").filter {
+            let t = $0.trimmingCharacters(in: .whitespaces)
+            return !t.isEmpty && !t.hasPrefix("#")
+        }.count
+    }
 
     private var file: URL { URL(fileURLWithPath: dir).appendingPathComponent(OmniIgnore.fileName) }
     private func reveal() { NSWorkspace.shared.activateFileViewerSelecting([file]) }
@@ -1397,6 +1398,7 @@ private struct FolderPolicyRow: View {
                     .lineLimit(1).truncationMode(.head)
             }
             Spacer(minLength: 8)
+            Text("\(rules) rule\(rules == 1 ? "" : "s")").foregroundStyle(.secondary)
             Button(action: reveal) {
                 Image(systemName: "arrow.forward.circle.fill").foregroundStyle(.secondary)
             }
