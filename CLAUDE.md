@@ -57,8 +57,8 @@ codebase were already measured there, and many were rejected.
 
 ## Build, test, measure
 
-- Toolchain: Xcode 26.6 (Swift 6.3) via `DEVELOPER_DIR=/Applications/Xcode-26.6.0.app/Contents/Developer`;
-  `xcode-select` stays on 26.2, which release CI falls back to - both must build. mlx-swift is pinned
+- Toolchain: Xcode 26.6 (Swift 6.3) via `DEVELOPER_DIR=/Applications/Xcode-26.6.0.app/Contents/Developer`,
+  and release CI selects the same app by name (`Xcode[-_]26*`). `xcode-select` stays on 26.2. mlx-swift is pinned
   `exact: "0.31.3"` (0.32.x is ~4 ms a decode step slower: ocr.md, "MLX 0.32").
 - App: `OMNI_TEAM_ID=<team> ./Scripts/build-app.sh Release`, never a bare `xcodebuild`. Then
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the

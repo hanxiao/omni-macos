@@ -51,12 +51,13 @@ jobs:
 
       # The app needs Xcode 26 (Swift 6.2 + the swift-tokenizers SE-0482 artifact). Select it via
       # DEVELOPER_DIR (written to the job env) instead of `sudo xcode-select` - the self-hosted
-      # runner has no passwordless sudo. Falls back to the active toolchain if no Xcode_* is found
-      # (the dev box's default is already Xcode 26).
+      # runner has no passwordless sudo. Both spellings: this box's 26.6 is `Xcode-26.6.0.app`, which
+      # `Xcode_26*` never matched, so releases were quietly built with the 26.2 that xcode-select
+      # points at - not the toolchain everything was measured on. Falls back to the active one.
       - name: Select Xcode 26
         run: |
-          XC=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
-          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1 || true)
+          XC=$(ls -d /Applications/Xcode[-_]26*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode[-_]*.app 2>/dev/null | sort -V | tail -1 || true)
           if [ -n "$XC" ]; then echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"; echo "Using $XC"; fi
           xcodebuild -version
 
