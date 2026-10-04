@@ -665,3 +665,32 @@ bite are here.
   So `loadValidated` / `recoverMediaPath` are the right remedy, NOT dead defensive code: the
   reload is exactly the step that cures the total mode. Rates swing between sessions (0 in 74, then
   2 in 30, same binary); concurrency does not raise them (1 in 80 with two processes at a time).
+
+## Upgrade check for the release after 0.14.7 (2026-10-04)
+
+What an existing index meets on first open: the filename sidecar's new table (`layout` cd1,
+contentless_delete) and ignore defaults step 3 (the hidden-name rule as a line, `addedDefaultsV3`,
+one prune). `index.sqlite` is unchanged - still v5 - so Settings > Storage keeps saying "Format v5".
+- The standing bench index is v4 (user_version 4, 2,677,260 files). Through the new app: v4 -> v5
+  split 145 s, filename sidecar rebuilt once (54 s, no stall over 250 ms), digest 134b9ff183fd2f29
+  before and after, every file kept. SIGKILL at 30 s, at 90 s (mid split) and at the v4 drop, then
+  a clean run: same digest, same counts. A v5 index written by 0.14.5: sidecar rebuilt once (0.01 s
+  at 240 files), digest identical before and after.
+- BACK TO 0.14.5 WORKS. It keeps an existing `names` table, so it reads the new layout as current
+  (store 1.4 s, same top results for a filename query), and its stale-sidecar reset (`delete-all`)
+  is accepted on a contentless_delete table (checked in SQLite 3.51). Coming forward again, the
+  `layout` key it leaves in place is still right.
+- THE UPGRADE PRUNE ON THE OWNER'S POLICY AND ROOTS, computed over the bench index's 2.68M paths:
+  9,777 files - `.xcassets` icon renders (backup 5,764, Documents ~3,600, ~/.openclaw 399), a few
+  genuinely hidden files (`.pr_body_808.md`), Chromium leveldb logs. An explicitly added hidden root
+  (~/.openclaw, 179,303 files) is exempt: roots are, and `roots` keeps a folder whose volume is
+  unmounted, so an unplugged drive's files are judged the same way.
+- FIXED, found here: an isolated run took the ignore-defaults VERSION from the user's real
+  defaults (2) while its policy file lived beside the test index, so every isolated launch after
+  the first re-ran step 3 and pruned with the test's roots - 800,000 rows of a benchmark clone
+  opened with no folders, hidden root included. Isolated runs are current now unless
+  `-omni.ignoreDefaultsVersion N` is passed. Real installs were never affected: they write the
+  version after the step.
+- HARNESS TRAP: SIGTERM is not Quit. The row sidecar is stamped on Quit or after 90 quiet seconds;
+  an instance stopped with `kill` before that relaunches through the full SQLite scan (18-32 s on
+  this index against 1.7 s adopted) and reads as a regression.

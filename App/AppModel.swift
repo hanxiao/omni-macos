@@ -2769,7 +2769,14 @@ final class AppModel {
             // deletes stays deleted: the version is recorded, so this never runs again.
             // One step per version, each run once: re-running an earlier step would put back a
             // default the user deleted since.
-            let version = defaults.integer(forKey: Self.ignoreDefaultsKey)
+            // AN ISOLATED RUN IS CURRENT unless a test says otherwise (`-omni.ignoreDefaultsVersion N`
+            // to exercise an upgrade). Its policy file lives beside its index, but the version came
+            // from the user's own defaults - which an isolated run never writes - so every isolated
+            // launch after the first re-ran the last step and pruned with ITS roots: on a benchmark
+            // clone opened with no folders, 800,000 of 2.68M files, hidden-root contents included.
+            let passed = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)[Self.ignoreDefaultsKey]
+            let version = Self.isolatedByLaunchArgument && passed == nil
+                ? Self.ignoreDefaultsVersion : defaults.integer(forKey: Self.ignoreDefaultsKey)
             var merged = text
             if version < 2 { merged = OmniIgnore.withAddedDefaults(merged) }
             if version < 3 {
