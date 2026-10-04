@@ -213,6 +213,10 @@ public func omniClearGPUCache() { MLX.Memory.clearCache() }
 /// those two take different branches in omniSetMemoryLimit.
 public func omniMemoryLimitBytes() -> Int { OmniMemoryBudget.capBytes }
 
+/// MLX's compute limit as MLX holds it right now - what a run actually executes under, which is
+/// what a perf log needs when the question is whether someone put the cap back.
+public func omniLiveMemoryLimitMB() -> Int { MLX.Memory.memoryLimit >> 20 }
+
 /// Physical RAM in bytes (for choosing a sensible memory-limit slider range).
 public func omniPhysicalMemory() -> Int { Int(ProcessInfo.processInfo.physicalMemory) }
 
@@ -355,7 +359,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         }
         // Flush load-time temporaries (dequant scratch, self-test activations, and on a retry the
         // discarded first engine's buffers) from the buffer cache before steady state.
-        MLX.GPU.clearCache()
+        MLX.Memory.clearCache()
         return engine
     }
 
@@ -440,7 +444,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                 }
             }
             guard rebuilt else { return false }
-            MLX.GPU.clearCache()   // drop the old buffers
+            MLX.Memory.clearCache()   // drop the old buffers
             if mediaPathFinite(probes: 5) {
                 FileHandle.standardError.write(Data("OmniEngine: media path recovered after weight reload (attempt \(attempt))\n".utf8))
                 return true
@@ -506,7 +510,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             weightStore = filtered
             keepVision = newKeepVision
             keepAudio = newKeepAudio
-            MLX.GPU.clearCache()   // release the dropped tower's buffers so VRAM falls to the surviving set
+            MLX.Memory.clearCache()   // release the dropped tower's buffers so VRAM falls to the surviving set
         }
     }
 
@@ -622,7 +626,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                 // untouched; its next allocations just miss the cache once. The tagger's
                 // resident label matrix goes with it (rebuilt from its mmap on next use).
                 self.tagger?.releaseMatrix()
-                MLX.GPU.clearCache()
+                MLX.Memory.clearCache()
             } else {
                 self.scheduleTrim(gen: gen, delay: delay)   // GPU active again - check back later
             }

@@ -3630,7 +3630,7 @@ final class AppModel {
             applyMemoryLimit()
             // Off the main thread for the same reason the weights are: reclaiming the buffer cache
             // is measurable work and the click that asked for it is not waiting on the result.
-            DispatchQueue.global(qos: .utility).async { MLX.GPU.clearCache() }
+            DispatchQueue.global(qos: .utility).async { MLX.Memory.clearCache() }
         }
     }
     /// True for the whole of an OCR run. A one-shot `pauseIndexing()` is not enough: a run
@@ -3673,6 +3673,13 @@ final class AppModel {
     }
 
     private func applyMemoryLimit() {
+        // NOT WHILE OCR HOLDS THE MEMORY. bootstrap() and loadPerf() both apply the user's cap, and
+        // when OCR mode was entered first - a launch straight into OCR, a relaunch restoring it -
+        // they put the 6 GB cap back underneath the run, which then spent its time in MLX's
+        // over-the-limit backpressure: 40 pages in 136.9 s against 57.0 s, a race whose outcome
+        // flipped with the compiler (Xcode 26.6 lost it every time, 26.2 happened not to).
+        // setOCRResident(false) restores the user's cap when OCR lets go.
+        if ocrHoldsMemory { omniSetOCRMemory(); return }
         omniSetMemoryLimit(maxMemoryGB > 0 ? Int(maxMemoryGB * 1_000_000_000) : 0)
     }
 

@@ -751,7 +751,7 @@ public final class Indexer: @unchecked Sendable {
         // here, so this only ever showed up for a caller that did not.
         let filePaths: [String] = roots.map { r in
             var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
-            return realpath(r.path, &buf) != nil ? String(cString: buf) : r.path
+            return realpath(r.path, &buf) != nil ? String(decoding: buf.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self) : r.path
         }
         // Photos sources are roots too - the same `perRoot` progress, the same containment test,
         // the same stale sweep. Their keys are not filesystem paths, so they are never realpath'd.
@@ -1374,7 +1374,7 @@ public final class Indexer: @unchecked Sendable {
     static func isStaleCaseSpelling(_ path: String) -> Bool {
         var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
         guard realpath(path, &buf) != nil else { return false }
-        let stored = (String(cString: buf) as NSString).lastPathComponent
+        let stored = (String(decoding: buf.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self) as NSString).lastPathComponent
         let given = (path as NSString).lastPathComponent
         return stored != given && stored.lowercased() == given.lowercased()
     }

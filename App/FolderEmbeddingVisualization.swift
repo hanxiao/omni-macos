@@ -219,7 +219,7 @@ struct FolderEmbeddingVisualization: View {
                 scroller.onScroll = { loc, f, sz in zoomAt(loc, factor: f, size: sz) }
                 scroller.install()
             }
-            .onChange(of: geo.frame(in: .global)) { scroller.vizFrame = $0 }
+            .onChange(of: geo.frame(in: .global)) { _, frame in scroller.vizFrame = frame }
             .onDisappear { scroller.remove() }
             // The cloud itself isn't individually navigable, but expose a container summary + the
             // interaction model so VoiceOver users aren't met with an opaque canvas.

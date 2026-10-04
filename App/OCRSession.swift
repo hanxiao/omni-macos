@@ -1499,7 +1499,7 @@ final class OCRSession {
                             // every row of the rail - `PageThumb.body` was all over the profile.
                             self.liveTokens[index] = update.tokens
                         }
-                        if self.firstTokenPending { self.firstTokenPending = false; omniPerfLog("ocr-first-token") }
+                        if self.firstTokenPending { self.firstTokenPending = false; omniPerfLog("ocr-first-token memoryLimit=\(omniLiveMemoryLimitMB()) MB") }
                         // Guarded: the workspace's body reads it, and this runs on every update.
                         if self.prefillTarget != 0 { self.prefillTarget = 0 }
                         self.noteRate()

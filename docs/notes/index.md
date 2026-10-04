@@ -258,6 +258,9 @@ because its resolved path sets genuinely do depend on row content. All three pla
 `idPath` wholesale (the wipe, and the quant-replica adoption) call `resetPathAllowCachesLocked`.
 After: 8 builds for 8 distinct searches, and a second keystroke on the same folder costs nothing.
 
+OBSOLETE (re-measured 2026-10-03): since the path table answers folder tests per directory
+(`filesUnder`), the build is 6.5 ms on the 2.68M-file bench index (`path-allow build=` in the
+perf log), so a second cache slot is not worth its 10 MB. Original note:
 STILL OPEN, deliberately not done: the tag-free slot holds ONE entry, so browsing A -> B -> A
 rebuilds. A small LRU would fix it at ~10.6 MB per entry (2.66M floats), and making the build
 itself fast would need a per-file dir id in memory so the test becomes an array lookup instead of

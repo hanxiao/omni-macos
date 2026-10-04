@@ -827,6 +827,19 @@ all OK). It was NOT taken because it makes the OCR decode step ~4 ms slower at e
   both identical to the 6.2 baseline. ANY new toolchain: re-run the digest before trusting it.
   (The folder map's UMAP rotation has the same pair; it only moves a layout, so it was left.)
 
+THE CAP CAME BACK UNDER A RUNNING OCR (fixed 2026-10-03). `bootstrap()` and `loadPerf()` applied
+the user's 6 GB cap with no regard for an OCR hold, so a launch straight into OCR mode (or a
+relaunch restoring it) ran the whole transcription under the cap: the decode thread sampled at
+~75% in MLX's over-the-limit backpressure (`get_active_memory`/`get_memory_limit` around
+`scheduler::wait_for_one`, under mutex traffic). It is a RACE, which is why it hid: the same source
+(9252fdc) built with Xcode 26.2 ran the 40 pages in the app in 57.0 s (418 tok/s), built with
+26.6 in 136.9 s (174). `applyMemoryLimit` now keeps OCR's settings while OCR holds the memory.
+In the app, isolated, window not raised, back to back: shipped 0.14.5 73.9 s / 322 tok/s, first
+page 20.5 s; HEAD with the fix 47.5 s / 501 tok/s, first page 12.5 s. `ocr-first-token` logs
+the live limit now (OMNI_PERF_LOG) so this can be read rather than inferred.
+- A STOP DURING MODEL LOAD (the "~13 s, not fixed" note above) is obsolete: a cold load from a
+  fresh APFS clone of the weights is 1.1 s, warm 0.6 s, the load-time re-grouping included.
+
 TWO MORE, 2026-10-03, after validating the old notes' premises:
 
 - THE NEXT PAGE'S CPU HALF IS PREFETCHED in continuous batching (`preparePageHost` on a background

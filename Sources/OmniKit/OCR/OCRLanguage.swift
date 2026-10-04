@@ -679,7 +679,7 @@ final class OCRMoE: @unchecked Sendable {
         // top-k, and `norm_topk_prob = false` so the selected probabilities are used AS-IS.
         // Renormalising them is the single most common way to get this family subtly wrong.
         let logits = ocrProjRowInvariant(x.asType(.float32), .plain(gate.asType(.float32)))
-        let probs = softMax(logits, axis: -1)
+        let probs = softmax(logits, axis: -1)
         let order = argSort(-probs, axis: -1)
         let topIdx = order[0..., 0 ..< k].asType(.int32)
         var selected = takeAlong(probs, topIdx, axis: -1)

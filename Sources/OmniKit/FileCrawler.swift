@@ -111,7 +111,7 @@ public struct FileCrawler: Sendable {
 
     private static func realPath(_ p: String) -> String {
         var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
-        if realpath(p, &buf) != nil { return String(cString: buf) }
+        if realpath(p, &buf) != nil { return String(decoding: buf.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self) }
         return URL(fileURLWithPath: p).standardizedFileURL.path
     }
 
@@ -177,7 +177,7 @@ public struct FileCrawler: Sendable {
         // machine look new, and re-embed all of it. Once per root, not per entry.
         var resolved: [(url: URL, path: String)] = roots.map { r in
             var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
-            if realpath(r.path, &buf) != nil { return (r, String(cString: buf)) }
+            if realpath(r.path, &buf) != nil { return (r, String(decoding: buf.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)) }
             return (r, r.path)
         }
         // DEFENCE IN DEPTH AGAINST OVERLAPPING ROOTS. AppModel already reduces the user's folders

@@ -1858,7 +1858,7 @@ if args.count >= 2 && args[1] == "foldbench" {
     flush()
     let q = vec()
     _ = store.search(q, topK: 20)   // build the base over baseRows
-    print(String(format: "  GPU peak after base build: %.0f MB", Double(MLX.GPU.peakMemory) / 1_048_576))
+    print(String(format: "  GPU peak after base build: %.0f MB", Double(MLX.Memory.peakMemory) / 1_048_576))
     // Optional background GPU load (OMNI_FOLD_LOAD=1): a thread submitting continuous bf16 matmuls
     // to keep the MLX stream busy, the same contention domain the rebuild's eval competes in when a
     // fold fires WHILE the indexer's embed kernels are in flight (rebuild runs on the store queue,
@@ -1895,9 +1895,9 @@ if args.count >= 2 && args[1] == "foldbench" {
             if batch.count >= 8192 { flush() }
         }
         flush()
-        let peak0 = Double(MLX.GPU.peakMemory) / 1_048_576
+        let peak0 = Double(MLX.Memory.peakMemory) / 1_048_576
         let tFold = Date(); _ = store.search(q, topK: 20); let foldMs = -tFold.timeIntervalSinceNow * 1000
-        let peak1 = Double(MLX.GPU.peakMemory) / 1_048_576
+        let peak1 = Double(MLX.Memory.peakMemory) / 1_048_576
         let warmMs = median(9) { _ = store.search(q, topK: 20) }
         print(String(format: "  round %d  rows=%d  FOLD search=%.1f ms   warm search=%.1f ms   rebuild spike=%.1f ms   GPU peak %.0f->%.0f MB%@",
                      r, counter, foldMs, warmMs, foldMs - warmMs, peak0, peak1, loaded ? "  [under GPU load]" : ""))
@@ -2307,14 +2307,14 @@ if args.count >= 3 && args[1] == "mediamem" {
             // segment (would burst on a long video). active = live buffers; peak = high-water mark.
             if engine != nil {
                 print(String(format: "  seg %2d/%d  frames=%2d  GPU active=%.0fMB peak=%.0fMB  RSS=%.0fMB",
-                             s, segCount, fs.count, Double(MLX.GPU.activeMemory) / 1_048_576,
-                             Double(MLX.GPU.peakMemory) / 1_048_576, churnFootprintMB()))
+                             s, segCount, fs.count, Double(MLX.Memory.activeMemory) / 1_048_576,
+                             Double(MLX.Memory.peakMemory) / 1_048_576, churnFootprintMB()))
             }
         }
         peakRSS = Swift.max(peakRSS, churnFootprintMB())
     }
     let secs = -t0.timeIntervalSinceNow
-    let gpuPeak = engine != nil ? Double(MLX.GPU.peakMemory) / 1_048_576 : 0
+    let gpuPeak = engine != nil ? Double(MLX.Memory.peakMemory) / 1_048_576 : 0
     print(String(format: "mediamem  file=%.0fMB  duration=%.0fs  segments=%d  frames=%d  embed=%@  %.1fs",
                  Double(fileSize) / 1_048_576, dur, segCount, frames, engine != nil ? "yes" : "no", secs))
     print(String(format: "  HOST phys_footprint: base=%.0fMB  peak=%.0fMB  delta=%.0fMB", base, peakRSS, peakRSS - base))
@@ -2386,18 +2386,18 @@ if args.count >= 4 && args[1] == "towerbench" {
     var hold: OmniEngine? = nil
     for (label, kv, ka) in configs {
         hold = nil                       // release the prior engine before measuring a clean baseline
-        MLX.GPU.clearCache(); MLX.GPU.resetPeakMemory()
-        let base = MLX.GPU.activeMemory
+        MLX.Memory.clearCache(); MLX.GPU.resetPeakMemory()
+        let base = MLX.Memory.activeMemory
         let t0 = Date()
         let e = try await OmniEngine(modelDir: modelDir, keepVision: kv, keepAudio: ka)
         let loadMs = -t0.timeIntervalSinceNow * 1000
-        let afterLoad = MLX.GPU.activeMemory - base
+        let afterLoad = MLX.Memory.activeMemory - base
         _ = e.embedText("a quick search query about quarterly reports", as: .query)
         if kv, let img { _ = e.embedFileQuery(img) }
         if kv, let vid { _ = e.embedFileQuery(vid) }
         if ka, let aud { _ = e.embedFileQuery(aud) }
-        let afterUse = MLX.GPU.activeMemory - base
-        let peak = MLX.GPU.peakMemory - base
+        let afterUse = MLX.Memory.activeMemory - base
+        let peak = MLX.Memory.peakMemory - base
         print(String(format: "%-24@  %6.0f   %10.0f   %10.0f   %6.0f   img=%@ aud=%@",
                      label, loadMs, mb(afterLoad), mb(afterUse), mb(peak),
                      e.supportsImages ? "y" : "n", e.supportsAudio ? "y" : "n"))
@@ -2429,27 +2429,27 @@ if args.count >= 3 && args[1] == "towerdropbench" {
     func mb(_ b: Int) -> Double { Double(b) / 1_048_576 }
     // Reference: a fresh text-only load, scoped so its engine (and weights) release before the subject.
     func freshTextOnly() async throws -> (mb: Double, ms: Double) {
-        MLX.GPU.clearCache(); MLX.GPU.resetPeakMemory()
-        let base = MLX.GPU.activeMemory
+        MLX.Memory.clearCache(); MLX.GPU.resetPeakMemory()
+        let base = MLX.Memory.activeMemory
         let t = Date()
         let e = try await OmniEngine(modelDir: modelDir, keepVision: false, keepAudio: false)
         let ms = -t.timeIntervalSinceNow * 1000
         _ = e.embedText("warm", as: .query)
-        return (mb(MLX.GPU.activeMemory - base), ms)   // e released at return
+        return (mb(MLX.Memory.activeMemory - base), ms)   // e released at return
     }
     let ref = try await freshTextOnly()
-    MLX.GPU.clearCache()
+    MLX.Memory.clearCache()
     // Subject: full engine, then drop both towers in place.
     MLX.GPU.resetPeakMemory()
-    let base = MLX.GPU.activeMemory
+    let base = MLX.Memory.activeMemory
     let engine = try await OmniEngine(modelDir: modelDir, keepVision: true, keepAudio: true)
     _ = engine.embedText("warm", as: .query)
-    let fullMB = mb(MLX.GPU.activeMemory - base)
+    let fullMB = mb(MLX.Memory.activeMemory - base)
     let t0 = Date()
     engine.setTowers(keepVision: false, keepAudio: false)
     let dropMs = -t0.timeIntervalSinceNow * 1000
-    MLX.GPU.clearCache()
-    let afterDropMB = mb(MLX.GPU.activeMemory - base)
+    MLX.Memory.clearCache()
+    let afterDropMB = mb(MLX.Memory.activeMemory - base)
     print("towerdropbench model=\(modelDir.lastPathComponent)")
     print(String(format: "  full engine resident:         %.0f MB", fullMB))
     print(String(format: "  after setTowers(text-only):   %.0f MB   (in-place drop %.0f ms)", afterDropMB, dropMs))
@@ -2506,8 +2506,8 @@ if args.count >= 4 && args[1] == "stressbench" {
                    "quarterly earnings report 2024 q3 revenue", "photo of the whiteboard", "a"]
     let mapSizes = [4_000, 11_000, 7_000, 14_000, 9_000]   // varying shape per iter -> cache churn
 
-    MLX.GPU.clearCache(); MLX.GPU.resetPeakMemory()
-    let base = MLX.GPU.activeMemory
+    MLX.Memory.clearCache(); MLX.GPU.resetPeakMemory()
+    let base = MLX.Memory.activeMemory
     print(String(format: "stressbench dim=%d cap=%.0fGB store=%d iters=%d  baseline active=%.0fMB cacheLimit=%.0fMB",
                  dim, capGB, store.count, iters, mb(base), mb(MLX.Memory.cacheLimit)))
     var maxActive = base, maxPeak = 0
@@ -2518,14 +2518,14 @@ if args.count >= 4 && args[1] == "stressbench" {
         _ = ProjectionEngine.layout(unit(mapSizes[it % mapSizes.count]), k: 15, epochs: 60)
         // 3. search over the resident index
         _ = store.search(qv, topK: 50)
-        let a = MLX.GPU.activeMemory, p = MLX.GPU.peakMemory
+        let a = MLX.Memory.activeMemory, p = MLX.Memory.peakMemory
         maxActive = max(maxActive, a); maxPeak = max(maxPeak, p)
         if it % 8 == 0 || it == iters - 1 {
-            print(String(format: "  iter %2d  active=%.0fMB  peak=%.0fMB  cache=%.0fMB", it, mb(a), mb(p), mb(MLX.GPU.cacheMemory)))
+            print(String(format: "  iter %2d  active=%.0fMB  peak=%.0fMB  cache=%.0fMB", it, mb(a), mb(p), mb(MLX.Memory.cacheMemory)))
         }
     }
-    MLX.GPU.clearCache()
-    let endActive = MLX.GPU.activeMemory
+    MLX.Memory.clearCache()
+    let endActive = MLX.Memory.activeMemory
     print(String(format: "RESULT base=%.0fMB  maxActive=%.0fMB  maxPeak=%.0fMB  endActive(after clearCache)=%.0fMB  growth=%.0fMB",
                  mb(base), mb(maxActive), mb(maxPeak), mb(endActive), mb(endActive - base)))
     let leaked = mb(endActive - base) > 200   // resident model + base matrix only; >200MB extra = leak
@@ -3121,7 +3121,7 @@ if args.count >= 5 && args[1] == "foldermapbench" {
     for arm in ["eager", "stream"] where armFilter == nil || armFilter == arm {
         let streaming = arm == "stream"
         for pass in 1 ... 2 {
-            MLX.GPU.clearCache()
+            MLX.Memory.clearCache()
             let base = churnFootprintMB()
             peak.reset(base)
             let t0 = Date()
@@ -3191,7 +3191,7 @@ if args.count >= 5 && args[1] == "foldermapcachebench" {
     // Each arm re-fits from scratch and retains NOTHING outside its own cache, so the footprint
     // reading reflects what that policy is holding rather than what a shared fixture kept alive.
     for bounded in [false, true] {
-        MLX.GPU.clearCache()
+        MLX.Memory.clearCache()
         let base = churnFootprintMB()
         var cache: [String: ProjectionResult] = [:]
         var order: [String] = []
@@ -3212,7 +3212,7 @@ if args.count >= 5 && args[1] == "foldermapcachebench" {
                 cache[e] = nil
             }
         }
-        MLX.GPU.clearCache()
+        MLX.Memory.clearCache()
         let browseEntries = order.count
         let browseHeld = cache.values.reduce(0) { $0 + bytesOf($1) }
         let afterBrowse = churnFootprintMB()
@@ -3384,7 +3384,7 @@ if args.count >= 2 && args[1] == "searchbench" {
 if args.count >= 3 && args[1] == "qcachebench" {
     let dir = URL(fileURLWithPath: args[2])
     let engine = try await OmniEngine(modelDir: dir)
-    func mb() -> Double { Double(MLX.GPU.activeMemory) / 1_048_576 }
+    func mb() -> Double { Double(MLX.Memory.activeMemory) / 1_048_576 }
     let word = "revenue"
     // 1..60 words -> ~60 distinct query token lengths -> up to 60 distinct compiled graphs.
     func query(_ n: Int) -> String { Array(repeating: word, count: n).joined(separator: " ") }
@@ -3564,7 +3564,7 @@ if args.count >= 3 && args[1] == "embbench" {
     }
     var ticket: WiredMemoryTicket? = nil
     if ProcessInfo.processInfo.environment["OMNI_BENCH_WIRED"] == "1" {
-        let bytes = MLX.GPU.activeMemory           // post-load = weights + tokenizer residency
+        let bytes = MLX.Memory.activeMemory           // post-load = weights + tokenizer residency
         ticket = WiredSumPolicy().ticket(size: bytes)
         _ = await ticket!.start()
         print("  wired \(bytes >> 20) MB")
@@ -3575,7 +3575,7 @@ if args.count >= 3 && args[1] == "embbench" {
     print(String(format: "embbench batch=%d qos=%@ wired=%@ opsbuf=%@  %.0f tok/s  %.1f chunks/s  (%d chunks in %.1fs)  GPU peak %.0f MB",
                  batchSize, qosName, ticket != nil ? "1" : "0", opsBuf,
                  Double(r.toks) / r.wall, Double(r.chunks) / r.wall, r.chunks, r.wall,
-                 Double(MLX.GPU.peakMemory) / 1_048_576))
+                 Double(MLX.Memory.peakMemory) / 1_048_576))
     exit(0)
 }
 
@@ -3989,9 +3989,9 @@ if args.count >= 2 && args[1] == "concbench2" {
         return (lat, embeds, foldHit, alive)
     }
 
-    let memBefore = Double(MLX.GPU.activeMemory) / 1_048_576
+    let memBefore = Double(MLX.Memory.activeMemory) / 1_048_576
     let r = loadedPhase()
-    let peakMB = Double(MLX.GPU.peakMemory) / 1_048_576
+    let peakMB = Double(MLX.Memory.peakMemory) / 1_048_576
 
     print(String(format: "\n  search IDLE (no load):     median %.1f ms   p95 %.1f ms", med(idle), p95(idle)))
     print(String(format: "  search UNDER INDEXING:     median %.1f ms   p95 %.1f ms   (embeds=%d, fold=%@, alive=%@)", med(r.lat), p95(r.lat), r.embeds, r.foldHit ? "yes":"no", r.alive ? "yes":"NO-HANG"))
@@ -6844,7 +6844,7 @@ func videosegcheckRun(_ modelDir: String?) async throws -> Int32 {
         for _ in 0 ..< 3 { _ = engine.embedVideoFrames(frames) }
         let ms = -t0.timeIntervalSinceNow * 1000 / 3
         print(String(format: "  SWEEP frames=%-3d  %.0f ms/video  %d tokens  GPU peak %.0f MB", n, ms,
-                     (engine.tokensProcessed - tok0) / 3, Double(MLX.GPU.peakMemory) / 1_048_576))
+                     (engine.tokensProcessed - tok0) / 3, Double(MLX.Memory.peakMemory) / 1_048_576))
     }
     store.close()
     print("  RESULT: \(fails == 0 ? "PASS" : "FAIL (\(fails))")")
@@ -6961,7 +6961,7 @@ if args.count >= 3 && args[1] == "nansweep" {
                 print("NANSWEEP-STAGE \(label)  img \(bi)/\(ni)  audio \(ba)/\(na)")
             }
             measure("again")
-            MLX.GPU.clearCache(); measure("clearCache")
+            MLX.Memory.clearCache(); measure("clearCache")
             engine.rebuildEncodersForDiagnosis(); measure("rebuild-same-weights")
         }
         let recovered = engine.recoverMediaPath()
@@ -7170,7 +7170,7 @@ if args.count >= 3 && args[1] == "trimcheck" {
     let batches = (0 ..< 12).map { k in (0 ..< 16).map { String(repeating: sentence, count: ($0 + k) % 10 + 1) } }
     _ = engine.embedTextBatches(batches, as: .passage)
     let cacheBefore = MLX.Memory.cacheMemory
-    print(String(format: "post-burst:  cache %.0f MB  active %.0f MB", Double(cacheBefore) / 1_048_576, Double(MLX.GPU.activeMemory) / 1_048_576))
+    print(String(format: "post-burst:  cache %.0f MB  active %.0f MB", Double(cacheBefore) / 1_048_576, Double(MLX.Memory.activeMemory) / 1_048_576))
     engine.indexingIdle()
     let delay = ProcessInfo.processInfo.environment["OMNI_IDLE_TRIM"].flatMap { Double($0) } ?? 60
     let deadline = Date().addingTimeInterval(delay * 3 + 5)
@@ -7178,7 +7178,7 @@ if args.count >= 3 && args[1] == "trimcheck" {
         try await Task.sleep(nanoseconds: 200_000_000)
     }
     let cacheAfter = MLX.Memory.cacheMemory
-    print(String(format: "after trim:  cache %.0f MB  active %.0f MB", Double(cacheAfter) / 1_048_576, Double(MLX.GPU.activeMemory) / 1_048_576))
+    print(String(format: "after trim:  cache %.0f MB  active %.0f MB", Double(cacheAfter) / 1_048_576, Double(MLX.Memory.activeMemory) / 1_048_576))
     print("RESULT: \(cacheAfter < cacheBefore ? "PASS (trim fired)" : "FAIL (no trim within window)")")
     exit(cacheAfter < cacheBefore ? 0 : 1)
 }
@@ -8494,7 +8494,7 @@ if args.count >= 2 && args[1] == "qmmbench" {
         print(String(format: "  %d-bit  %6.2f ms   %5.0f B/row  %6.2f GB read  ->  %5.0f GB/s",
                      bits, best, Double(bytes) / Double(rowsN), Double(bytes) / 1_073_741_824,
                      Double(bytes) / 1_073_741_824 / (best / 1000)))
-        MLX.GPU.clearCache()
+        MLX.Memory.clearCache()
     }
     exit(0)
 }

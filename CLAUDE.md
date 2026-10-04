@@ -77,6 +77,9 @@ codebase were already measured there, and many were rejected.
   234 tok/s single, digest a35ef0f9c8fe8ad (identical at greedy `--draft 1` and every k); 595 at
   width 32 (40 s), digest f1ed744e12ae453 or a35ef0f9c8fe8ad - ramp pacing admits by elapsed time,
   so the batched digest is a near-tie variant from run to run. `--draft 0` is not greedy.
+- OCR in the app: an isolated instance launched with `-omni.ocrOpen <long_scan.pdf>` and
+  `OMNI_PERF_LOG=1` logs `ocr-first-token memoryLimit=...`, `ocr-first-page-done` and
+  `ocr-run-done`. Current: 47.5 s, 501 tok/s, first page 12.5 s, limit = physical RAM.
 - Model-free probes for MLX regressions: `ocr-verify x --probe-qmm | --probe-gather |
   --probe-rowexact [--causal-sweep]`. Re-run them on any MLX or toolchain change.
 
@@ -87,7 +90,9 @@ codebase were already measured there, and many were rejected.
 - POSITIVE CONTROLS. A detector that reports nothing looks exactly like one that is not running
   (hangwatch, stall logs, stress runs that never reached the list under test). Prove the probe fires.
 - A NEW TOOLCHAIN OR MLX CAN CHANGE OUTPUT BY ITSELF (Swift 6.3 merged `cosf`/`sinf` and moved the
-  OCR digest). Re-run the digests before trusting anything built with it.
+  OCR digest) AND FLIP A RACE (Xcode 26.6 lost the OCR memory-cap race every time; 26.2 never
+  did). Re-run the digests AND an in-app OCR run before trusting a build from it - headless
+  numbers cannot see app-only races.
 - ISOLATED RUNS ONLY: `-omni.dbDir`, `-omni.addedFolders` (not `-omni.roots`),
   `-omni.ephemeralUIState YES`, serving port 51399 (51299 is a real install's), `-omni.ocr.cache.dir
   <scratch>`. Never touch the user's running Omni; never activate Omni by NAME (it launches a second

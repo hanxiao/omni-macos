@@ -72,9 +72,9 @@ public func runProfilingPass(engine: OmniEngine, targetURL: URL, settings: Index
 
             // VRAM baseline: drop recyclable buffers and reset the high-water mark to the current
             // (loaded-model) residency, so peakMemory afterwards reflects only what THIS pass added.
-            MLX.GPU.clearCache()
+            MLX.Memory.clearCache()
             MLX.GPU.resetPeakMemory()
-            let baseActive = MLX.GPU.activeMemory
+            let baseActive = MLX.Memory.activeMemory
             let tok0 = engine.tokensProcessed
             let t0 = Date()
 
@@ -92,7 +92,7 @@ public func runProfilingPass(engine: OmniEngine, targetURL: URL, settings: Index
 
             let seconds = max(0.0001, Date().timeIntervalSince(t0))
             let tokens = max(0, engine.tokensProcessed - tok0)
-            let peakDelta = max(0, MLX.GPU.peakMemory - baseActive)
+            let peakDelta = max(0, MLX.Memory.peakMemory - baseActive)
             let p = box.p
             return ProfilingMetrics(
                 files: p.embedded,
