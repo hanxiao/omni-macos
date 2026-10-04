@@ -8380,7 +8380,7 @@ public final class VectorStore: @unchecked Sendable {
         // 6.55M-content index), the probe uses the partial slot index per hole (0.005 s).
         if scalarQuery("SELECT COUNT(*) FROM vec_holes h WHERE h.slot < \(coveredRows) AND EXISTS "
                        + "(SELECT 1 FROM \(slotTable) c WHERE c.slot = h.slot AND c.slot >= 0)") > 0 {
-            return declineBySlot("a recorded hole still has a live row on it")
+            return declineBySlot(Self.holeOwnedDecline)
         }
         // `WHERE slot >= 0` reaches the partial slot index: 0.18 s scan -> 0.000 s, same answer.
         let maxSlot = scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM \(slotTable) WHERE slot >= 0")
@@ -9241,6 +9241,70 @@ public final class VectorStore: @unchecked Sendable {
         recordHolesLocked(missing)
         guard execChecked("COMMIT;") else { rollbackTxnLocked(); return nil }
         return missing.count
+    }
+
+    static let holeOwnedDecline = "a recorded hole still has a live row on it"
+
+    /// Positions recorded as free that a live content still points at - the contradiction the
+    /// by-slot loader declines on - put right without trusting the bytes at those positions.
+    ///
+    /// Seen on a real 4.2M-content index after a long session: 148 holes, each owned by exactly one
+    /// content with live occurrences in 31 files, content ids and positions ascending together (one
+    /// write batch), every vector unit-length. The shape of a delete that recorded its holes and was
+    /// overtaken by a re-add of the same content before its row removal committed. Both the
+    /// released build and this one refused the index, and the only offer on the screen was a
+    /// re-index of everything.
+    ///
+    /// The ownership is unambiguous - one content per position - so the holes are wrong and go.
+    /// Whether the position still holds THAT content's vector is likely but not provable from the
+    /// index (no staged copy survives to compare), so it is not assumed: the contents' keys are
+    /// retired, which stops a re-embed from sharing back onto them, and their files are marked
+    /// changed, so the next pass embeds them afresh and the old contents are freed by the ordinary
+    /// delete path. Until then search reads what is there, for these few chunks only.
+    ///
+    /// Returns how many holes were released, or nil when this is not that shape: any position held
+    /// by more than one content, a content with no occurrence, or anything at all on a legacy index.
+    private func releaseHolesOwnedByLiveContentsLocked() -> Int? {
+        guard dbOpen(), splitBuilt, coveredRows > 0 else { return nil }
+        var contents: [(id: Int64, slot: Int32)] = []
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, """
+            SELECT c.id, c.slot, (SELECT COUNT(*) FROM chunk c2 WHERE c2.slot = c.slot AND c2.slot >= 0),
+                   EXISTS (SELECT 1 FROM occurrence o WHERE o.chunk_id = c.id)
+              FROM vec_holes h JOIN chunk c ON c.slot = h.slot
+             WHERE c.slot >= 0 AND h.slot < \(coveredRows);
+            """, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        var ambiguous = false
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if sqlite3_column_int64(stmt, 2) != 1 || sqlite3_column_int64(stmt, 3) != 1 { ambiguous = true; break }
+            contents.append((sqlite3_column_int64(stmt, 0), Int32(sqlite3_column_int64(stmt, 1))))
+        }
+        sqlite3_finalize(stmt)
+        guard !ambiguous else {
+            FileHandle.standardError.write(Data("[omni] holes owned by live contents left alone: a position is shared or a content has no file\n".utf8))
+            return nil
+        }
+        guard !contents.isEmpty else { return 0 }
+        let ids = contents.map { String($0.id) }.joined(separator: ",")
+        let slots = contents.map { String($0.slot) }.joined(separator: ",")
+        let files = scalarQuery("SELECT COUNT(DISTINCT file_id) FROM occurrence WHERE chunk_id IN (\(ids))")
+        guard execChecked("BEGIN IMMEDIATE;"),
+              execChecked("DELETE FROM vec_holes WHERE slot IN (\(slots));"),
+              // Four 0xFF bytes in front of the key's own bytes: unique because the original was,
+              // and no key the store writes starts that way. On the BYTES - some keys are text
+              // that starts with NUL, which `length()` calls empty and which are still shared.
+              execChecked("UPDATE chunk SET key = CAST(X'FFFFFFFF' || CAST(key AS BLOB) AS BLOB) WHERE id IN (\(ids));"),
+              execChecked("UPDATE files SET modified = -1 WHERE id IN (SELECT DISTINCT file_id FROM occurrence WHERE chunk_id IN (\(ids)));"),
+              // A NEW GENERATION, so the row sidecar - which carries every file's old `modified` -
+              // is not adopted over these rows and the pass sees the files as changed.
+              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('mutation_gen','\(mutationGen + 1)');"),
+              execChecked("COMMIT;")
+        else { rollbackTxnLocked(); return nil }
+        mutationGen += 1
+        for c in contents { vecHoles.remove(c.slot) }
+        FileHandle.standardError.write(Data(("[omni] repaired: \(contents.count) recorded holes were still owned by live contents; "
+            + "released them, and \(files) file(s) will be re-embedded on the next pass\n").utf8))
+        return contents.count
     }
 
     /// The coverage claim could not be read. Says so loudly and changes NOTHING on disk.
@@ -12289,6 +12353,10 @@ public final class VectorStore: @unchecked Sendable {
         // different things, and this is what makes them agree again.
         resumeVectorCompactionLocked()
         loadCoverageLocked()
+        // BEFORE ANY LOADER, so every one of them reads bookkeeping that agrees with itself. The
+        // by-slot loader refuses this contradiction; the sidecar adopt never asks, and an index
+        // that opens with it keeps handing an owned position to the free list.
+        if splitBuilt, coveredRows > 0, !vecHoles.isEmpty { _ = releaseHolesOwnedByLiveContentsLocked() }
         if tryAdoptRowSidecarLocked() {
             omniPerfLog("store adopted row sidecar")
             // Arm the coverage stamp HERE too. It used to be armed only at the end of the scan path

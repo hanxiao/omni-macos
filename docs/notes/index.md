@@ -694,3 +694,38 @@ one prune). `index.sqlite` is unchanged - still v5 - so Settings > Storage keeps
 - HARNESS TRAP: SIGTERM is not Quit. The row sidecar is stamped on Quit or after 90 quiet seconds;
   an instance stopped with `kill` before that relaunches through the full SQLite scan (18-32 s on
   this index against 1.7 s adopted) and reads as a regression.
+
+## The live index refused to open (2026-10-04)
+
+After a 13-hour 0.14.5 session the owner's live index (355k files, 7.36M occurrences, 4.19M
+contents) was refused by BOTH 0.14.5 and this build on the next open: "a recorded hole still has a
+live row on it", reported as "bookkeeping is off by 280 rows" (that number compares rows with
+positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
+/Volumes/han2tb/omni-live-snapshot-20261004; nothing was repaired by hand.
+- THE SHAPE: 148 positions in `vec_holes`, each owned by exactly ONE content with live occurrences
+  (31 files), contents and positions ascending together (ids 10,386,850+ on slots 4,171,257+), every
+  vector unit-length, no staged copy left to compare. A delete that recorded its holes, overtaken by
+  a re-add of the same content before its row removal committed.
+- WHY ONLY ON REOPEN: the adopted row sidecar never asks the question, only the by-slot loader does,
+  and the release had no sidecar after that session. An index that opens with such a hole keeps
+  offering an owned position to the free list, which is how a live vector gets overwritten.
+- THE REPAIR, at open before any loader (`releaseHolesOwnedByLiveContentsLocked`): drop the holes,
+  retire the contents' keys (four 0xFF bytes before the key's own bytes, so a re-embed cannot share
+  back onto bytes nobody can vouch for), mark their files changed, bump the generation so the
+  sidecar is not adopted over them. A position two contents share, or a content with no file, is
+  left alone and still refused. On the row layout (rank walk) the same contradiction still refuses:
+  there it is genuinely ambiguous (`testAmbiguousMismatchWithHolesStillRefuses`, now pinned to that
+  layout).
+- PROVEN ON THE REAL INDEX, THROUGH THE APP: clones of the snapshot open (148 released, 31 marked),
+  SIGKILL at 0.3 / 0.8 s leaves it untouched and at 1.5 / 3 s repaired, 0.14.5 opens the repaired
+  index. Live: opened, the 31 files re-embedded on the first pass, none left marked, no retired
+  content still referenced.
+- KEYS ARE NOT ALL 16-BYTE BLOBS: 76,970 are TEXT starting with NUL, which `length()` reports as 0
+  while they are distinct and shared. Any SQL over `chunk.key` goes through CAST(key AS BLOB).
+- THE UPGRADE PRUNE, MEASURED ON THE LIVE INDEX: 21,922 of 377,035 files, exactly what the policy
+  excludes (xcassets 7,103; Chromium web-app icons 5,096; W&B logs 1,027; Sphinx `_build`; Chromium
+  extension files). The estimate from the September bench clone (9,777) was the wrong index.
+- FIXED: the ignore-defaults version was recorded before the store opened, so a refused open
+  consumed the step and its prune would never run; it is recorded when the prune finishes now.
+- OPEN: the write-path race that records a hole while a re-add revives the content. The repair makes
+  the state survivable; the race itself is not yet found.

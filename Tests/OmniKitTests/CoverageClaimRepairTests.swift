@@ -154,6 +154,13 @@ final class CoverageClaimRepairTests: XCTestCase {
             let files = 40
             let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
             let db = dir.appendingPathComponent("index.sqlite")
+            // ON THE ROW LAYOUT, where a row's position is its RANK: a hole that is not real shifts
+            // every later row onto its neighbour, and nothing says which, so refusing is right. On
+            // a split index the position is a column and the same contradiction is repaired at
+            // open (ChunkSplitLoaderTests.testAHoleALiveContentOwnsIsReleasedAndItsFileReembedded).
+            let savedLegacy = VectorStore.legacyWriteForTest
+            VectorStore.legacyWriteForTest = true
+            defer { VectorStore.legacyWriteForTest = savedLegacy }
             try makeCoveredIndex(db, files: files)
             XCTAssertEqual(claim(db), files, "fixture never reached full coverage")
 

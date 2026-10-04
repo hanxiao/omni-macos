@@ -2791,13 +2791,24 @@ final class AppModel {
             ignoreText = OmniIgnore.synthesize(enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions)
             saveIgnoreText()
         }
-        if !Self.isolatedByLaunchArgument { defaults.set(Self.ignoreDefaultsVersion, forKey: Self.ignoreDefaultsKey) }
+        // NOT YET IF A PRUNE IS OWED. Written here, a launch whose store then refused to open had
+        // recorded the step as done with its prune never run - and nothing would run it again.
+        // The merge above is idempotent, so a step re-run on the next launch adds nothing twice.
+        if ignorePrunePending { ignoreVersionOwed = true } else { recordIgnoreDefaultsVersion() }
         loadFolderPolicies()
         ignore = compiledIgnore(ignoreText)
         ignoreHasBackup = Self.ignoreFileURL().map { FileManager.default.fileExists(atPath: $0.appendingPathExtension("bak").path) } ?? false   // one stat at launch, then cached
     }
 
     private static let ignoreDefaultsKey = "omni.ignoreDefaultsVersion"
+    /// The defaults step ran but its prune has not: the version is recorded when the prune finishes.
+    @ObservationIgnored private var ignoreVersionOwed = false
+    private func recordIgnoreDefaultsVersion() {
+        ignoreVersionOwed = false
+        if !Self.isolatedByLaunchArgument {
+            UserDefaults.standard.set(Self.ignoreDefaultsVersion, forKey: Self.ignoreDefaultsKey)
+        }
+    }
     /// 2: OmniIgnore.addedDefaults. 3: the hidden-name rule as a line in the file, the full
     /// gitignore grammar (issue #24) and OmniIgnore.addedDefaultsV3.
     private static let ignoreDefaultsVersion = 3
@@ -4098,7 +4109,11 @@ final class AppModel {
             }
             self.phase = .ready
             omniPerfLog("launch ready")
-            if ignorePrunePending { ignorePrunePending = false; pruneExcluded(store, policy: ignore) }
+            if ignorePrunePending {
+                ignorePrunePending = false
+                let owed = ignoreVersionOwed
+                pruneExcluded(store, policy: ignore) { [weak self] in if owed { self?.recordIgnoreDefaultsVersion() } }
+            }
             // A folder renamed or moved while Omni was closed. No pass of its own: the launch pass
             // below covers the new path, while the old rows are still there to reuse.
             followMovedFolders(kick: false)

@@ -537,6 +537,56 @@ final class ChunkSplitLoaderTests: XCTestCase {
     /// dropped table fails, and `prepareChunkInsertLocked` returns nil on any failure - so a
     /// statement left behind there does not degrade the write path, it stops it: every
     /// `replace()` throws and nothing is ever indexed again.
+    /// A HOLE A LIVE CONTENT OWNS IS REPAIRED AT OPEN, not refused. The shape of a real 4.2M-content
+    /// index that both the released build and this one refused: positions recorded free while
+    /// exactly one content with live occurrences still points at each. The holes go, the contents'
+    /// keys are retired so a re-embed cannot share back onto bytes nobody can vouch for, and their
+    /// files are marked changed so the next pass embeds them afresh.
+    func testAHoleALiveContentOwnsIsReleasedAndItsFileReembedded() throws {
+        let url = tempDB()
+        try writeV4Fixture(url, files: 16, dupEvery: 4)
+        try migrate(url)
+        do { let s = try VectorStore(dbURL: url); XCTAssertTrue(s.dropV4TablesForTest()); s.close() }
+        let slotSQL = """
+            SELECT c.slot FROM chunk c JOIN occurrence o ON o.chunk_id = c.id JOIN files f ON f.id = o.file_id
+             WHERE f.name = 'f3.txt' AND o.ordinal = 0
+            """
+        let slot = num(url, slotSQL)
+        XCTAssertGreaterThanOrEqual(slot, 0)
+        let rows = num(url, "SELECT COUNT(*) FROM occurrence")
+        exec(url, "INSERT INTO vec_holes(slot) VALUES(\(slot));")
+
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        XCTAssertEqual(store.rowCountForTest, rows, "the index did not open whole")
+        XCTAssertFalse(store.vecHolesForTest.contains(Int32(slot)), "the stale hole is still recorded")
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM vec_holes WHERE slot = \(slot)"), 0)
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM chunk WHERE slot = \(slot) AND hex(substr(CAST(key AS BLOB), 1, 4)) = 'FFFFFFFF'"), 1,
+                       "the content's key was not retired")
+        XCTAssertEqual(num(url, "SELECT CAST(modified AS INTEGER) FROM files WHERE name = 'f3.txt'"), -1,
+                       "the file was not marked for re-embedding")
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM files WHERE CAST(modified AS INTEGER) = -1"), 1,
+                       "files that own nothing on a hole were marked too")
+        XCTAssertNil(store.coverageAudit())
+        XCTAssertEqual(store.search(vec(1003), filter: SearchFilter(), topK: 1).first?.path, "/v4/f3.txt")
+    }
+
+    /// AND NOT WHEN THE OWNER IS AMBIGUOUS. A position two contents point at is not this shape, and
+    /// the repair must not pick one: the index stays refused, untouched.
+    func testAHoleTwoContentsShareIsLeftAlone() throws {
+        let url = tempDB()
+        try writeV4Fixture(url, files: 16, dupEvery: 4)
+        try migrate(url)
+        do { let s = try VectorStore(dbURL: url); XCTAssertTrue(s.dropV4TablesForTest()); s.close() }
+        let a = num(url, "SELECT c.slot FROM chunk c JOIN occurrence o ON o.chunk_id = c.id JOIN files f ON f.id = o.file_id WHERE f.name = 'f3.txt' AND o.ordinal = 0")
+        let bID = num(url, "SELECT c.id FROM chunk c JOIN occurrence o ON o.chunk_id = c.id JOIN files f ON f.id = o.file_id WHERE f.name = 'f5.txt' AND o.ordinal = 0")
+        exec(url, "UPDATE chunk SET slot = \(a) WHERE id = \(bID); INSERT INTO vec_holes(slot) VALUES(\(a));")
+        let before = num(url, "SELECT COUNT(*) FROM vec_holes")
+        _ = try? VectorStore(dbURL: url).close()
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM vec_holes"), before, "an ambiguous hole was touched")
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM files WHERE CAST(modified AS INTEGER) = -1"), 0)
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM chunk WHERE hex(substr(CAST(key AS BLOB), 1, 4)) = 'FFFFFFFF'"), 0)
+    }
+
     func testWritesAndDeletesWorkWithNoV4Tables() throws {
         let url = tempDB()
         try writeV4Fixture(url, files: 16, dupEvery: 4)
