@@ -597,6 +597,14 @@ bite are here.
   ~150-200 ms (removing every item: 755 -> 605) with NO body re-running and no observed property
   reaching them in Instruments' causes - it is AppKit re-laying out their hosting views inside the
   window layout. `.id(resultsToken)` is ~170 ms and stays, for the scroll-position bug it fixes.
+  RE-MEASURED 2026-10-03 WITHOUT APP NAP (testing.md, "APP NAP"): the figures above were taken on a
+  background instance whose main thread had been moved to efficiency cores, which multiplies every
+  step 4-5x. Not napped, a `score:1%` search over 240 text files (120 hits) is ~129 ms of main
+  thread, and removing every toolbar item takes ~22 ms of it. By group, only sort/view is visible
+  (~10 ms); its segmented view picker re-measured itself on each toolbar layout, as the OCR one did,
+  and is pinned to 2 x 38 pt now: 127-132 -> 120-123 ms, three interleaved rounds, same pixels
+  within a point. `ResultGrouping` computed both paths' extensions for every PAIR of hits (14,000
+  bridges for 120 hits per keystroke); once per hit now.
 - REDRAW AUDIT (2026-10-02): each common state traced 8 s with Instruments' SwiftUI template while
   nothing visible changes (results list and gallery, folder browser, Recents, Clipboard, OCR,
   Settings): ZERO view-body updates in every one. The waste was in states that change NARROWLY:

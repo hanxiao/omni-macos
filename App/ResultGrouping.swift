@@ -68,6 +68,9 @@ enum ResultGrouping {
         }
 
         let sim = nearEnabled ? similarityMatrix(hits: hits, vectors: vectors) : nil
+        // Once per hit, not once per PAIR: inside the loop below it bridged and lowercased two
+        // paths for each of the n^2/2 pairs - 14,000 for 120 hits, every keystroke.
+        let exts = nearEnabled ? hits.map { ext($0.path) } : []
         let n = hits.count
         var claimed = [Bool](repeating: false, count: n)
         var groups: [ResultGroup] = []
@@ -90,7 +93,7 @@ enum ResultGrouping {
                       // a completely different artifact - observed live, three real .html files
                       // hidden behind a log that merely contained them. Costs the .jpg/.png pair
                       // of one image, which is the cheaper mistake.
-                      ext(hits[i].path) == ext(hits[j].path),
+                      exts[i] == exts[j],
                       sizesComparable(hits[i].size, hits[j].size),
                       sim[i * n + j] >= threshold else { continue }
                 claimed[j] = true; members.append(hits[j])

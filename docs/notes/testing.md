@@ -126,6 +126,14 @@ day later the same tour measured ZERO blocks over 250 ms (see "UI tests").
   already there and never re-authenticates. `touch /tmp/omni-automation-window.release` ends it.
 
 ## UI responsiveness (App/OmniApp.swift HangWatch)
+- APP NAP (2026-10-03). An isolated instance launched from the shell is a background app, and ~30 s
+  in macOS naps it: the main thread moves to efficiency cores (747 P / 164 E samples before, 5 P /
+  6,468 E after, Time Profiler's core column) and every UI step costs 4-5x - a search 125 -> 650 ms
+  with nothing in the app changing, which read as "the 9th search is slow", then as "it gets slow
+  after 30 s". `-NSAppSleepDisabled YES` on the command line keeps it awake (argument domain, so the
+  installed app's prefs are untouched): 16 searches at ~125 ms flat. It also explains numbers that
+  "drifted" across a sitting - the same HEAD binary read 2.8 s and 13 s of OCR-run stalls on one
+  afternoon. Interleaved A/Bs stay valid within one regime; absolute numbers need the flag.
 - `-omni.hangwatch YES [-omni.hangwatchMs N]` reports how long the MAIN THREAD was unresponsive.
   A timer on the main run loop only fires when the thread is free, so the gap between firings is
   the block. This is how "feels laggy" becomes a number; N defaults to 250 ms.
@@ -244,12 +252,17 @@ day later the same tour measured ZERO blocks over 250 ms (see "UI tests").
   9.2-9.5 s, worst 0.85-1.0. Twelve page jumps in Dual on a finished transcript: 6.1-6.4 s of the
   session blocked -> 1.7-1.8 s. Same tok/s. The SAME HEAD binary read 2.8 s earlier in the day: an
   occluded window does far less work, so the absolute numbers only compare within one sitting.
+  WITHOUT APP NAP (see "APP NAP" above), the numbers that describe a window in front - Raw 2.6-2.8 s
+  blocked, worst ~415 ms -> 0.3 s, worst 140-163; Markdown 2.2 s, worst 230-314 -> 0.7-0.8 s,
+  worst ~155; Dual 3.9-5.0 s, worst 440-701 -> 0.9-1.1 s, worst ~165. Nothing over ~170 ms in any
+  mode, 540 tok/s in both arms. The napped figures above overstate every cost 4-5x.
   MEASURED AND NOT DONE: the readout's numeric-roll transitions (no change), the stream fade
   animation (no change), baseline vs leading grid alignment in tables (3.3 vs 3.1 ms a streamed
   update - tables stream cheaply in isolation). The Markdown pane's remaining cost is SwiftUI
   selectable text: with selection off pane-wide a run blocks ~5.2 s against ~8.4 s; finished pages
-  stay selectable, the page being written no longer is (8.6-8.9 s against 10.2-11.0 s). Going
-  further means prose and tables in TextKit (NSTextTable), a visual change not yet made.
+  stay selectable, the page being written no longer is (8.6-8.9 s against 10.2-11.0 s, napped).
+  Prose and tables in TextKit (NSTextTable) would go further, but un-napped the pane already peaks
+  at ~155 ms, so it is not worth the visual risk.
 - Where it stands, measured with verified coordinates on an 11-document chaotic drop: decode 1
   stall, tab switches 0, and mode switches / thumbnail clicks / OCR toggles about two stalls each
   at a median of 184 ms, p90 242, max 296. Perceptible stutter, no freezes, nothing over 300 ms.

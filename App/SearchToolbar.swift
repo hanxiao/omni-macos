@@ -202,6 +202,11 @@ struct SearchToolbar: ViewModifier {
             Image(systemName: "list.bullet").accessibilityLabel("List view").tag(ResultViewMode.list)
         }
         .pickerStyle(.segmented)
+        // FIXED WIDTH, the same fix as the OCR view picker: an `NSSegmentedControl` recomputes its
+        // intrinsic size through the constraint system whenever the toolbar re-lays out, which is
+        // every result set. 38pt a segment is what the live toolbar measures for icon-only ones.
+        .frame(width: 2 * 38)
+        .fixedSize()
         .help("Switch between list and gallery")
     }
 
