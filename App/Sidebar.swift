@@ -273,6 +273,9 @@ struct Sidebar: View {
         .onReceive(NotificationCenter.default.publisher(for: .omniPerfSidebarSelect)) { note in
             if let i = note.object as? Int, i == -1 { selection = .recents }
             else if let i = note.object as? Int, i == -2 { selection = .clipboard }
+            else if let i = note.object as? Int, i <= -100, model.searchHistory.indices.contains(-100 - i) {
+                selection = .history(model.searchHistory[-100 - i].id)
+            }
             else if let i = note.object as? Int, model.roots.indices.contains(i) { selection = .folder(model.roots[i]) }
         }
         .sheet(isPresented: Binding(get: { model.showPhotoPicker }, set: { model.showPhotoPicker = $0 })) { PhotoSourcePicker() }

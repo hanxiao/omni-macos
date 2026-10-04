@@ -306,10 +306,21 @@ public struct OmniIgnore: Sendable, Equatable {
     /// Without the bound, iCloud Drive (under `~/Library`) lost every file here to the default
     /// `Library/` rule the first time the policy changed.
     public func excludesIndexedFile(roots: [String] = []) -> (String) -> Bool {
+        let dirExcluded = excludesFolder(roots: roots)
+        return { path in
+            guard !self.rules.isEmpty else { return false }
+            let dir = path[..<(path.lastIndex(of: "/") ?? path.startIndex)]
+            return dirExcluded(dir) || self.isIgnored(path, isDir: false)
+        }
+    }
+
+    /// Whether a FOLDER is excluded - itself or any ancestor below a root - which is what decides
+    /// whether the crawl ever enters it. Roots are never excluded. Cached across calls.
+    public func excludesFolder(roots: [String] = []) -> (Substring) -> Bool {
         var dirCache: [Substring: Bool] = [:]
         let rootSet = Set(roots.map { $0.hasSuffix("/") && $0.count > 1 ? String($0.dropLast()) : $0 })
         func dirExcluded(_ dir: Substring) -> Bool {
-            if dir.isEmpty || dir == "/" { return false }
+            if dir.isEmpty || dir == "/" || rules.isEmpty { return false }
             if rootSet.contains(String(dir)) { return false }
             if let hit = dirCache[dir] { return hit }
             let parent = dir[..<(dir.lastIndex(of: "/") ?? dir.startIndex)]
@@ -317,11 +328,7 @@ public struct OmniIgnore: Sendable, Equatable {
             dirCache[dir] = v
             return v
         }
-        return { path in
-            guard !self.rules.isEmpty else { return false }
-            let dir = path[..<(path.lastIndex(of: "/") ?? path.startIndex)]
-            return dirExcluded(dir) || self.isIgnored(path, isDir: false)
-        }
+        return dirExcluded
     }
 
     /// Whether `path` (absolute) is excluded. `isDir` gates directory-only rules. Last match wins.

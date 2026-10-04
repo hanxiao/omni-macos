@@ -2335,6 +2335,7 @@ final class AppModel {
             return false   // keep current results; don't blow them away (caller clears the selection)
         }
         if item.isFile, let path = item.filePath {
+            restoreRecordedFilters(item)
             setFileQuery(URL(fileURLWithPath: path), similar: item.similar, fromHistory: true,
                          sourcePath: path)
         } else {
@@ -2359,6 +2360,25 @@ final class AppModel {
             search()
         }
         return true
+    }
+
+    /// A file entry replays under the filters it was RECORDED with, and nothing else. A text entry
+    /// gets this from its string - every filter is a qualifier in it - but a file entry carries its
+    /// filters beside the path, and they were stored and never read back: the replay ran under
+    /// whatever was set at the time of the click (a file query saved in one folder came back with
+    /// 34 results in another, against the 25 it was saved with).
+    private func restoreRecordedFilters(_ item: HistoryItem) {
+        showsClipboardOff = false
+        browsedPhotoSource = nil
+        selectFolderForVisualization(nil)
+        suppressFilterEffects = true
+        resetAllFilters()
+        filterKinds = Set(item.kinds.compactMap(FileKind.init(rawValue:)))
+        filterFolders = item.folder.map { [URL(fileURLWithPath: $0, isDirectory: true)] } ?? []
+        filterExt = item.ext
+        dateRange = DateRange(rawValue: item.dateRange) ?? .any
+        sortOrder = SortOrder(rawValue: item.sortOrder) ?? .relevance
+        suppressFilterEffects = false
     }
 
     /// Record a file query (path-keyed dedup), storing the active filter/sort context.
@@ -2892,7 +2912,9 @@ final class AppModel {
     private func loadFolderPolicies() {
         let stored = (UserDefaults.standard.dictionary(forKey: Self.folderPoliciesKey) as? [String: String]) ?? [:]
         var current: [String: String] = [:]
-        for dir in stored.keys {
+        // Against the central rules: the folder rules are what is being loaded.
+        let excluded = OmniIgnore(text: ignoreText).excludesFolder(roots: crawlRoots.map(\.path))
+        for dir in stored.keys where !excluded(Substring(dir)) {
             if let text = try? String(contentsOfFile: dir + "/" + OmniIgnore.fileName, encoding: .utf8) {
                 current[dir] = text
             }
@@ -2920,10 +2942,16 @@ final class AppModel {
     /// file lives there), is not a folder policy.
     func reloadFolderPolicies(_ dirs: Set<String>) {
         let own = Self.ownDataPaths()
+        // NOT INSIDE AN EXCLUDED FOLDER. The crawl never enters one, so a policy there can never
+        // apply - but the WATCHER still names it, and every `.omniignore` that appeared under, say,
+        // `.build/` was registered and listed in Settings. A folder that becomes excluded loses its
+        // entry the next time it is named.
+        let excluded = ignore.excludesFolder(roots: crawlRoots.map(\.path))
         var next = folderPolicies
         for dir in dirs {
             guard rootKey(for: dir) != nil, !dir.contains("\n"),
                   !own.contains(where: { RootScope.covers($0, dir) }) else { continue }
+            if excluded(Substring(dir)) { next[dir] = nil; continue }
             next[dir] = try? String(contentsOfFile: dir + "/" + OmniIgnore.fileName, encoding: .utf8)
         }
         guard next != folderPolicies else { return }

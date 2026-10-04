@@ -1135,3 +1135,21 @@ welcome mole read darker than the rest.
 All are rendered from the full 100x100 canvas, never cropped, so the mole keeps one size and place
 across screens. `StatusGlyph` draws any `symbol` starting with "Mole" as one of these. Change the
 drawing in `mole_family.py`, not the PNGs.
+
+## History replay and the sidebar (2026-10-04)
+- A HISTORY ROW REPLAYS EXACTLY WHAT WAS SAVED, whatever is set at the moment of the click. A text
+  entry always did (its string carries every filter as a qualifier); a file entry (Find Similar,
+  search by file) stored its filters beside the path and never read them back, so it replayed under
+  the current scope: saved with 25 results in one folder, it came back with 34 from another. It now
+  resets every filter and restores the recorded ones (`restoreRecordedFilters`).
+- A FOLDER CLICK WITH A SEARCH ACTIVE KEEPS THE SEARCH AND REPLACES ITS SCOPE: a replayed
+  `in:"A" type:text memory limit` becomes `memory limit type:text in:B`; a replayed file query moves
+  to B. Verified through real sidebar selections (`sidebarhistory:<n>` in PerfScript) - calling
+  `runHistoryQuery` directly leaves the sidebar selection where it was, and a re-selected folder
+  then fires nothing, which reads as this rule being broken when it is not.
+- SETTINGS: Clipboard moved to Files, with the other sources it is indexed beside. Folder ignore
+  files are rows of folder name over location with a reveal arrow (actions in the context menu), not
+  one middle-truncated path and a full-size button each. And only folders the crawl can enter: the
+  watcher used to register an `.omniignore` anywhere under a root, including inside excluded
+  folders such as `.build/`, where its rules can never apply.
+
