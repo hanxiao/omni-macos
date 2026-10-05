@@ -1,6 +1,7 @@
-# Intro video
+# Intro video (previous cut)
 
-The video on hanxiao.io/omni and in the README, rebuilt from the real app.
+The launch film that replaced it is built in `launch/` (see `launch/README.md`). This is the
+earlier recorder-and-renderer pipeline; `recwin.swift` is still what records the app takes.
 
 1. `swiftc -O recwin.swift -o work/recwin` - records one window with ScreenCaptureKit. The window
    must be on screen and the display awake: a covered window is not redrawn.

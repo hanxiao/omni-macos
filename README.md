@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://hanxiao.io/omni/assets/omni-intro.mp4">
-    <img src="site/omni/assets/omni-poster-play.jpg" alt="Omni intro video" width="720">
+    <img src="site/omni/assets/omni-poster-play.jpg" alt="Omni launch film" width="720">
   </a>
 </p>
 
