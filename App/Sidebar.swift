@@ -107,6 +107,7 @@ struct Sidebar: View {
     @Environment(AppModel.self) private var model: AppModel
     @State private var dropTargeted = false
     @State private var selection: SidebarSelection?
+    @State private var folds = SidebarFolds.load()
 
 
     /// A crawl root reports on its own pass; a folder a broader root covers has no pass to report
@@ -139,12 +140,7 @@ struct Sidebar: View {
     /// `List` literal is what exceeded the type checker before, and merging the SECTIONS does not
     /// change that.
     @ViewBuilder private var sourcesSection: some View {
-            Section("Index") {
-                // FIRST AND ALWAYS, where Finder puts its own Recents - a new install with nothing
-                // indexed has the row too, and it says so.
-                RecentsRow().sidebarRow(.recents)
-                // The other smart folder, beside Recents rather than among the user's sources.
-                ClipboardRow().sidebarRow(.clipboard)
+            Section(isExpanded: $folds.section("Index")) {
                 // NESTED, the way Finder's sidebar nests. The user's folders are a tree - a parent
                 // and the folders they added inside it - and a flat list could not say so: after a
                 // parent absorbed six children the sidebar held seven rows with no sign that six
@@ -187,6 +183,8 @@ struct Sidebar: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+            } header: {
+                SidebarHeader("Index")
             }
             .id(isNested)
     }
@@ -205,12 +203,18 @@ struct Sidebar: View {
     /// badge-heavy sections in one literal exceeded the type checker.
     private var list: some View {
         List(selection: $selection) {
+            // FIRST AND ALWAYS, above every header, where Finder puts its own Recents - a new
+            // install with nothing indexed has the row too, and it says so. Clipboard is the other
+            // smart folder, so it sits beside Recents rather than among the user's sources.
+            RecentsRow().sidebarRow(.recents)
+            ClipboardRow().sidebarRow(.clipboard)
+
             sourcesSection
 
             // Past searches, grouped by time. Extracted into its own view so it re-renders only when
             // searchHistory changes - NOT on every indexing-progress publish (~12x/sec), which would
             // otherwise re-run the historyGroups date-bucketing on the main thread and jank the sidebar.
-            HistorySections()
+            HistorySections(folds: $folds)
         }
     }
 
@@ -229,6 +233,7 @@ struct Sidebar: View {
         .modifier(SidebarMaterial())
         // Selecting a history row runs it (native "smart folder" behavior). Folder selection just
         // highlights (folders are acted on via context menu / Delete).
+        .onChange(of: folds) { _, f in f.save() }
         .onChange(of: selection) { _, sel in
             if case .history(let id) = sel, let item = model.searchHistory.first(where: { $0.id == id }) {
                 // If it couldn't run (e.g. a file query whose file is gone), drop the selection so the
@@ -338,34 +343,69 @@ struct Sidebar: View {
 }
 
 /// The past-searches sections of the sidebar. A separate view so SwiftUI Observation re-renders it only
-/// when `searchHistory` changes (via `historyGroups`), not on every indexing-progress publish the parent
-/// Folders section reads - keeping the date-bucketing off the 12x/sec progress path.
+/// when `searchHistory` changes, not on every indexing-progress publish the parent Index section
+/// reads - keeping the day grouping off the 12x/sec progress path.
+///
+/// Bookmarks, then History: one row per day that has searches, like Finder's own folders. Today
+/// and yesterday start open, older days closed, and a day the user opens or closes stays that way.
 private struct HistorySections: View {
     @Environment(AppModel.self) private var model: AppModel
-    @State private var hovered: String?
+    @Binding var folds: SidebarFolds
 
     var body: some View {
-        ForEach(model.historyGroups, id: \.title) { group in
-            Section {
-                ForEach(group.items) { item in
-                    row(item)
-                    .help(item.isFile ? (item.filePath ?? item.displayLabel) : item.displayText)
+        let bookmarks = model.historyBookmarks
+        if !bookmarks.isEmpty {
+            Section(isExpanded: $folds.section("Bookmarks")) {
+                ForEach(bookmarks) { item in historyRow(item) }
+            } header: {
+                SidebarHeader("Bookmarks")
+            }
+        }
+        let days = model.historyDays
+        if !days.isEmpty {
+            Section(isExpanded: $folds.section("History")) {
+                // FLAT ROWS, not a DisclosureGroup. A disclosure triangle anywhere in the List makes
+                // it reserve a triangle column for every row, which moved Recents, Clipboard and the
+                // folders off the edge Finder puts its own rows on. The folder row toggles on a click
+                // instead, and its searches are indented under it.
+                ForEach(days, id: \.day) { day in
+                    let open = $folds.day(day.day)
+                    Button { withAnimation(.snappy(duration: 0.2)) { open.wrappedValue.toggle() } } label: {
+                        DayRow(day: day.day, open: open.wrappedValue)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityValue(open.wrappedValue ? "Expanded" : "Collapsed")
                     .contextMenu {
-                        Button { model.toggleHistoryBookmark(item) } label: {
-                            Label(item.bookmarked ? "Remove Bookmark" : "Bookmark Search",
-                                  systemImage: item.bookmarked ? "star.slash" : "star")
-                        }
-                        Divider()
-                        Button(role: .destructive) { model.removeHistory(item) } label: {
+                        Button(role: .destructive) { model.removeHistory(day.items) } label: {
                             Label("Remove from History", systemImage: "trash")
                         }
                     }
-                    .sidebarRow(.history(item.id))
+                    if open.wrappedValue {
+                        ForEach(day.items) { item in historyRow(item, indent: true) }
+                    }
                 }
             } header: {
-                header(group.title, items: group.items)
+                SidebarHeader("History")
             }
         }
+    }
+
+    private func historyRow(_ item: HistoryItem, indent: Bool = false) -> some View {
+        row(item)
+            .padding(.leading, indent ? 8 : 0)   // half an icon in from the day: enough to read as inside it
+            .help(item.isFile ? (item.filePath ?? item.displayLabel) : item.displayText)
+            .contextMenu {
+                Button { model.toggleHistoryBookmark(item) } label: {
+                    Label(item.bookmarked ? "Remove Bookmark" : "Bookmark Search",
+                          systemImage: item.bookmarked ? "star.slash" : "star")
+                }
+                Divider()
+                Button(role: .destructive) { model.removeHistory(item) } label: {
+                    Label("Remove from History", systemImage: "trash")
+                }
+            }
+            .sidebarRow(.history(item.id))
     }
 
     @Environment(\.sidebarSelection) private var selection
@@ -373,12 +413,9 @@ private struct HistorySections: View {
     @ViewBuilder private func row(_ item: HistoryItem) -> some View {
                     let on = selection == .history(item.id)
                                         HStack(spacing: 7) {
-                        if item.bookmarked {
-                            // Monochrome, like every other glyph in this list. The rows it marks
-                            // are already under a Bookmarks header, so the colour was carrying no
-                            // information the reader did not already have from the grouping.
-                            Image(systemName: "star.fill").sidebarTint(on, else: Color.secondary).frame(width: 16)
-                        } else if item.isFile, let p = item.filePath {
+                        // A bookmark draws exactly like the search it was: the Bookmarks header
+                        // already says what a star would.
+                        if item.isFile, let p = item.filePath {
                             // A file query: show its thumbnail (falls back to a generic icon if the
                             // file is gone, so deleted files degrade gracefully).
                             Thumbnail(path: p, side: 16, corner: 3)
@@ -401,7 +438,7 @@ private struct HistorySections: View {
                                 .lineLimit(1).truncationMode(.tail)
                         }
                         Spacer(minLength: 0)
-                        if item.isFile, !item.bookmarked, let k = item.fileKind, let fk = FileKind(rawValue: k), fk != .text {
+                        if item.isFile, let k = item.fileKind, let fk = FileKind(rawValue: k), fk != .text {
                             Image(systemName: fk.symbol).font(.caption2).foregroundStyle(.tertiary)
                         } else if !item.isFile, item.isFiltered {
                             // Same trailing-glyph treatment as the file rows' kind symbol. It
@@ -417,35 +454,108 @@ private struct HistorySections: View {
                     }
     }
 
-    /// The section title with a trash that appears under the pointer.
-    ///
-    /// On the trailing edge: the title is left-aligned, so a button that appears over there moves
-    /// nothing, and it sits inside the header's own bounds rather than hanging in the margin where
-    /// it draws but cannot be clicked. Bookmarks is the one group someone curated deliberately, so
-    /// it does not get one.
-    @ViewBuilder private func header(_ title: String, items: [HistoryItem]) -> some View {
-        let shows = title != "Bookmarks" && hovered == title
-        HStack(spacing: 4) {
-            Text(title)
+}
+
+/// A section title in Finder's colour. A sidebar List draws its headers a step lighter than Finder
+/// does (171 against Finder's 112 on a light sidebar, measured side by side); Finder's is the
+/// secondary label colour, the same grey as the row icons.
+private struct SidebarHeader: View {
+    let title: String
+    init(_ title: String) { self.title = title }
+    var body: some View { Text(title).foregroundStyle(.secondary) }
+}
+
+/// A day in the History section: a calendar, named the way Finder dates things. Under the pointer it
+/// shows a chevron, the same mark a section header shows.
+private struct DayRow: View {
+    let day: Date
+    let open: Bool
+
+    /// All in the system's locale: "Today" and "Yesterday" come from the relative formatter, and
+    /// the format styles pick the field order and names ("Thu, Oct 1", "Do., 1. Okt.").
+    private static let relative: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .none
+        f.doesRelativeDateFormatting = true
+        return f
+    }()
+
+    private var title: String {
+        let cal = Calendar.current
+        if cal.isDateInToday(day) || cal.isDateInYesterday(day) { return Self.relative.string(from: day) }
+        let sameYear = cal.isDate(day, equalTo: Date(), toGranularity: .year)
+        return sameYear ? day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
+                        : day.formatted(.dateTime.month(.abbreviated).day().year())
+    }
+
+    var body: some View {
+        HStack(spacing: 7) {
+            // A calendar, not a folder: folders in this sidebar are real ones on disk, and a day
+            // of searches is not one.
+            Image(systemName: "calendar").foregroundStyle(.secondary).frame(width: 16)
+            // Explicit: a sidebar List draws a row it cannot select dimmed, like a disabled one.
+            Text(title).foregroundStyle(.primary)
             Spacer(minLength: 0)
-            if shows {
-                Button { model.removeHistory(items) } label: {
-                    Image(systemName: "trash")
-                        .font(.system(size: 10))
-                        .frame(width: 16, height: 16)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .help("Delete these searches")
-                .accessibilityLabel("Delete the searches under \(title)")
-                // A sidebar List insets its section headers less than its rows, so without this
-                // the trash sat further right than the file counts it lines up beneath.
-                .padding(.trailing, 11)
+            if hovered {
+                Image(systemName: open ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+                    .frame(width: 16)
             }
         }
-        .contentShape(Rectangle())
-        .onHover { hovered = $0 ? title : (hovered == title ? nil : hovered) }
+        .onHover { hovered = $0 }
+    }
+
+    @State private var hovered = false
+}
+
+/// Which sidebar sections and History days are folded, kept across launches. An isolated or
+/// UI-test run reads the user's folds and never writes them back.
+struct SidebarFolds: Codable, Equatable {
+    var collapsed: Set<String> = []
+    /// Days opened or closed by hand, by "yyyy-MM-dd". A day nobody touched is open when it is
+    /// today or yesterday, closed otherwise - so an old day closes by itself without being stored.
+    var days: [String: Bool] = [:]
+
+    private static let key = "omni.sidebarFolds"
+
+    static func load() -> SidebarFolds {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let folds = try? JSONDecoder().decode(SidebarFolds.self, from: data) else { return SidebarFolds() }
+        return folds
+    }
+
+    @MainActor func save() {
+        guard AppModel.persistsUIState else { return }
+        // A day over a year old is dropped rather than kept forever.
+        var kept = self
+        let cutoff = Self.dayKey(Calendar.current.date(byAdding: .day, value: -400, to: Date()) ?? .distantPast)
+        kept.days = days.filter { $0.key >= cutoff }
+        if let data = try? JSONEncoder().encode(kept) { UserDefaults.standard.set(data, forKey: Self.key) }
+    }
+
+    static func dayKey(_ day: Date) -> String {
+        let c = Calendar.current.dateComponents([.year, .month, .day], from: day)
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
+
+    func isOpen(_ day: Date) -> Bool {
+        if let set = days[Self.dayKey(day)] { return set }
+        let cal = Calendar.current
+        return cal.isDateInToday(day) || cal.isDateInYesterday(day)
+    }
+}
+
+extension Binding where Value == SidebarFolds {
+    func section(_ name: String) -> Binding<Bool> {
+        Binding<Bool>(get: { !wrappedValue.collapsed.contains(name) },
+                      set: { open in
+                          if open { wrappedValue.collapsed.remove(name) } else { wrappedValue.collapsed.insert(name) }
+                      })
+    }
+    func day(_ day: Date) -> Binding<Bool> {
+        Binding<Bool>(get: { wrappedValue.isOpen(day) },
+                      set: { wrappedValue.days[SidebarFolds.dayKey(day)] = $0 })
     }
 }
 

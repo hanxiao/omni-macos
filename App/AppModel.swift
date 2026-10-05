@@ -2207,29 +2207,21 @@ final class AppModel {
 
     // MARK: - Search history
 
-    /// History grouped for the sidebar: a pinned "Bookmarks" group, then recents bucketed by time
-    /// (Today / Yesterday / Previous 7 Days / Previous 30 Days / Earlier). Only non-empty groups are
-    /// returned, in order.
-    var historyGroups: [(title: String, items: [HistoryItem])] {
-        let cal = Calendar.current, now = Date()
-        let bookmarks = searchHistory.filter { $0.bookmarked }.sorted { $0.lastUsed > $1.lastUsed }
-        let recents = searchHistory.filter { !$0.bookmarked }.sorted { $0.lastUsed > $1.lastUsed }
-        func bucket(_ d: Date) -> Int {
-            if cal.isDateInToday(d) { return 0 }
-            if cal.isDateInYesterday(d) { return 1 }
-            let days = cal.dateComponents([.day], from: cal.startOfDay(for: d), to: cal.startOfDay(for: now)).day ?? 99
-            if days < 7 { return 2 }
-            if days < 30 { return 3 }
-            return 4
+    /// The sidebar's Bookmarks section, most recently used first.
+    var historyBookmarks: [HistoryItem] {
+        searchHistory.filter { $0.bookmarked }.sorted { $0.lastUsed > $1.lastUsed }
+    }
+
+    /// The sidebar's History section: every other search, one folder per calendar day that has any,
+    /// newest day first.
+    var historyDays: [(day: Date, items: [HistoryItem])] {
+        let cal = Calendar.current
+        var days: [(day: Date, items: [HistoryItem])] = []
+        for item in searchHistory.filter({ !$0.bookmarked }).sorted(by: { $0.lastUsed > $1.lastUsed }) {
+            let day = cal.startOfDay(for: item.lastUsed)
+            if days.last?.day == day { days[days.count - 1].items.append(item) } else { days.append((day, [item])) }
         }
-        let names = ["Today", "Yesterday", "Previous 7 Days", "Previous 30 Days", "Earlier"]
-        var groups: [(String, [HistoryItem])] = []
-        if !bookmarks.isEmpty { groups.append(("Bookmarks", bookmarks)) }
-        for b in 0 ... 4 {
-            let items = recents.filter { bucket($0.lastUsed) == b }
-            if !items.isEmpty { groups.append((names[b], items)) }
-        }
-        return groups
+        return days
     }
 
     /// Snapshot of the active filters + sort, stored with a recorded query and restored on re-run.
@@ -4547,6 +4539,9 @@ final class AppModel {
         return !((args["omni.dbDir"] as? String)?.isEmpty ?? true)
     }
     private var isIsolatedRun: Bool { Self.isolatedByLaunchArgument }
+    /// Whether UI state (sidebar folds, history) may be written back: never from a test or an
+    /// isolated run, which read the user's state and must not change it.
+    static var persistsUIState: Bool { !ephemeralUIState && !isolatedByLaunchArgument }
 
     private func saveAddedFolders() {
         guard !isIsolatedRun else { return }

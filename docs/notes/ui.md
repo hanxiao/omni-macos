@@ -1153,3 +1153,24 @@ drawing in `mole_family.py`, not the PNGs.
   watcher used to register an `.omniignore` anywhere under a root, including inside excluded
   folders such as `.build/`, where its rules can never apply.
 
+
+## Sidebar: foldable sections, one row per day (2026-10-05)
+- ORDER: Recents and Clipboard sit above every header, where Finder puts Recents; then Index,
+  Bookmarks, History. Each section folds from the chevron the sidebar shows under the pointer
+  (`Section(isExpanded:)`), and the folds persist in `omni.sidebarFolds` - never written by an
+  isolated or UI-test run (`AppModel.persistsUIState`).
+- HISTORY IS ONE ROW PER DAY with searches, replacing the Today / 7 Days / 30 Days ladder above
+  (whose 23-day bucket held 68% of the list). A `calendar` icon, not a folder: folders in this
+  sidebar are real ones. No count; searches indent 8 pt. Day names come from the system formatters
+  (relative "Today"/"Yesterday", locale field order). Today and Yesterday start open, older days
+  closed; a day opened or closed by hand stays that way (keyed by date, dropped after a year).
+- DAYS ARE FLAT BUTTON ROWS, NOT `DisclosureGroup`: one disclosure triangle makes the List reserve a
+  triangle column for EVERY row, which moved Recents and the folders 9 pt off Finder's edge. A
+  Button rather than a tap gesture, so VoiceOver can open it.
+- HEADER COLOUR: a sidebar List draws section titles at 171 grey on a light sidebar; Finder's
+  measure 112, the secondary label colour (our row icons measure 107-112). `SidebarHeader` sets it.
+  An unselectable row's text is dimmed the same way, so the day title sets `.primary`.
+- Bookmarks draw with the search's own icon, not a star: the header already says it.
+- TESTING TRAP: a synthetic click posted into a background instance toggles a Button but selects
+  no List row - the first click in a non-key window only activates it. Row selection was checked
+  through `sidebarhistory:<n>` instead.

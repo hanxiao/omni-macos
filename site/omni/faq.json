@@ -205,7 +205,7 @@
       "items": [
         {
           "q": "How does search history work?",
-          "a": "Settled searches appear in the sidebar under Today, Yesterday, Previous 7 Days, Previous 30 Days, and Earlier. Clicking one re-runs it with its filters.",
+          "a": "Settled searches appear in the sidebar under History, one row per day; today and yesterday start open. Clicking one re-runs it with its filters.",
           "shortcut": ""
         },
         {
