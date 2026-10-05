@@ -1767,7 +1767,9 @@ final class AppModel {
     private var suppressFilterSearch: Bool { applyingParsedQuery || suppressFilterEffects }
 
     var viewMode: ResultViewMode = .list {
-        didSet { UserDefaults.standard.set(viewMode.rawValue, forKey: "omni.viewMode") }
+        // Not from an isolated run: a recording script's `view:list` used to land in the user's own
+        // settings, and their next launch opened in list view.
+        didSet { if Self.persistsUIState { UserDefaults.standard.set(viewMode.rawValue, forKey: "omni.viewMode") } }
     }
 
     // Indexing performance settings.
