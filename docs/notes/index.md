@@ -701,7 +701,8 @@ After a 13-hour 0.14.5 session the owner's live index (355k files, 7.36M occurre
 contents) was refused by BOTH 0.14.5 and this build on the next open: "a recorded hole still has a
 live row on it", reported as "bookkeeping is off by 280 rows" (that number compares rows with
 positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
-/Volumes/han2tb/omni-live-snapshot-20261004; nothing was repaired by hand.
+/Volumes/han2tb/omni-live-snapshot-20261004 (deleted 2026-10-05, once the repair had shipped in
+0.15.0 and run on the live index); nothing was repaired by hand.
 - THE SHAPE: 148 positions in `vec_holes`, each owned by exactly ONE content with live occurrences
   (31 files), contents and positions ascending together (ids 10,386,850+ on slots 4,171,257+), every
   vector unit-length, no staged copy left to compare. A delete that recorded its holes, overtaken by
