@@ -13,8 +13,8 @@
 </p>
 
 <p align="center">
-  <a href="https://hanxiao.io/omni/assets/omni-intro.mp4">
-    <img src="site/omni/assets/omni-poster-play.jpg" alt="Omni launch film" width="720">
+  <a href="https://hanxiao.io/omni/assets/omni-intro.mp4?v=06b4ad11">
+    <img src="site/omni/assets/omni-poster-play.jpg?v=285be582" alt="Omni launch film" width="720">
   </a>
 </p>
 
