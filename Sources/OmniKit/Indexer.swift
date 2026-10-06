@@ -1343,9 +1343,17 @@ public final class Indexer: @unchecked Sendable {
                 if let k = FileKind(rawValue: kindRaw), !settings.enabledKinds.contains(k.governing) { return false }
                 return !settings.ignore.isIgnored(path, isDir: false)
             }
+            // Out of scope is "not maintained", not "kept forever": a file of a modality switched
+            // off with its rows kept is never crawled, so its absence from `seen` proves nothing,
+            // but one whose path no longer exists on disk is gone either way and stayed searchable.
+            // A Photos asset is not a path, so only the library's own reconcile can remove it.
+            func goneFromDisk(_ path: String) -> Bool {
+                !PhotoLibrary.isPhotoPath(path) && !FileManager.default.fileExists(atPath: path)
+            }
             // Batch the deletion: one transaction + one in-memory rebuild, not one per path.
             let stale = Set(known.compactMap { (path, sf) -> String? in
-                (!seen.contains(pathDigest(path)) && underPassRoots(path) && !inBlindRoot(path) && inScope(path, sf.kind)) ? path : nil
+                guard !seen.contains(pathDigest(path)), underPassRoots(path), !inBlindRoot(path) else { return nil }
+                return inScope(path, sf.kind) || goneFromDisk(path) ? path : nil
             })
             if !stale.isEmpty {
                 Self.log.info("reconcile: removing \(stale.count, privacy: .public) stale paths")

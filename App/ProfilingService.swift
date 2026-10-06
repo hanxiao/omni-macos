@@ -107,8 +107,8 @@ enum ProfilingService {
     /// Explicit user choice from Settings: records consent (so the dialog won't appear) and sets
     /// whether results upload.
     static func setShareEnabled(_ on: Bool) {
-        UserDefaults.standard.set(true, forKey: consentKey)
-        UserDefaults.standard.set(on, forKey: uploadEnabledKey)
+        OmniPrefs.set(true, forKey: consentKey)
+        OmniPrefs.set(on, forKey: uploadEnabledKey)
     }
 
     /// Show the one-time consent dialog if needed. Returns whether uploads are allowed for this run.
@@ -120,8 +120,8 @@ enum ProfilingService {
         a.addButton(withTitle: "Share results")
         a.addButton(withTitle: "Keep local")
         let share = a.runModal() == .alertFirstButtonReturn
-        UserDefaults.standard.set(true, forKey: consentKey)       // decision recorded; don't ask again
-        UserDefaults.standard.set(share, forKey: uploadEnabledKey)
+        OmniPrefs.set(true, forKey: consentKey)       // decision recorded; don't ask again
+        OmniPrefs.set(share, forKey: uploadEnabledKey)
         return share
     }
 

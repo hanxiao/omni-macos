@@ -19,6 +19,11 @@ codebase were already measured there, and many were rejected.
   else's broken - and it destroys the evidence that would have proved the shipped repair works. The
   test for a repair is that it runs on a real damaged index THROUGH the app, not that the index
   ends up healthy.
+- NO REPAIR SCREEN, NO REPAIR PROMPT. Han, 2026-10-06: "repair should always be only when necessary
+  and if really necessary then do it automatic and must be critically correct not sth that u need to
+  ask user consent". The open path repairs what it can prove, automatically and silently; what it
+  cannot prove is rebuilt from the user's files (derived state, never guessed); a transient cause
+  (a lock, a volume not mounted, no disk) waits and retries. Never a screen asking the user to choose.
 - ONE MIGRATION, EVERYTHING IN IT. A data-structure change that users have to migrate through is
   shipped ONCE. Write it as though there will never be another chance to change the layout: every
   optimization, every design correction, every table that should be dropped, all in the same
@@ -67,7 +72,7 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (687 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (692 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Search digest on the real index (a CLONE, never the live one): `omni-verify searchreal
@@ -117,6 +122,13 @@ codebase were already measured there, and many were rejected.
 - EVERY COPY OMNI MAKES goes through `OmniPasteboard` (the clipboard history must never record it).
 - A FLAG NOTHING CAN TURN OFF IS DELETED, and a settled A/B arm is retired with its numbers recorded
   in the notes. Do not leave experiments in the shipped path.
+- A CANCELLED TASK MAKES `try? await Task.sleep` RETURN AT ONCE, so a polling wait inside it is
+  over before it starts. A debounce `cancel()` reached a model reload this way and cut its
+  one-minute indexing hold to 1.2 s (index.md, "Settings under change"). Waits that guard
+  correctness use `waitUntilIndexWorkStops`; work started after a debounce runs in a fresh task.
+- MLX-SWIFT COMPILED FUNCTIONS DEADLOCK ACROSS THREADS when one is traced inside another while the
+  inner one is called directly elsewhere (opposite lock order). OmniEngine's `run` gate is
+  process-wide for that reason; do not give two embedding engines separate gates.
 - XCUITest flakes at the harness level ("Timed out while synthesizing event", automation-mode
   password, locked screen). Re-run, capture the error line, and screenshot before blaming the app.
 

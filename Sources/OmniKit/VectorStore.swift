@@ -1934,6 +1934,11 @@ public final class VectorStore: @unchecked Sendable {
     /// interned queries are the only ones that exist, so an index that fails to convert cannot be
     /// served, and a silent half-working store is the worst outcome available.
     private(set) var migrationBlockedReason: String?
+    /// The upgrade was postponed for disk space, which frees on its own; not a fault in the data.
+    private var migrationBlockedForSpace = false
+    /// A loader could not map the vector file: held by another process, or unreadable. The data
+    /// is not in question, so the open is refused as unavailable rather than as a bad index.
+    private var vectorFileUnmappable = false
     /// Set when the coverage claim could not be read but the vector file is still there - see
     /// reportCoverageUnreadableLocked. Makes init throw instead of returning an empty store.
     private var coverageUnreadable: String?
@@ -1946,7 +1951,7 @@ public final class VectorStore: @unchecked Sendable {
         let tOpen = Date()
         try FileManager.default.createDirectory(at: dbURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         guard sqlite3_open(dbURL.path, &db) == SQLITE_OK else {
-            throw OmniError.store("open failed: \(String(cString: sqlite3_errmsg(db)))")
+            throw OmniError.storeUnavailable("The index database could not be opened: \(String(cString: sqlite3_errmsg(db)))")
         }
         // A NEWER FORMAT IS REFUSED, NOT REWRITTEN. The version check below only drops the v2/v3
         // tables, which a later format would not have, so this build would go on to treat it as
@@ -1955,7 +1960,7 @@ public final class VectorStore: @unchecked Sendable {
         if userVersion() > Self.v5SchemaVersion {
             let v = userVersion()
             sqlite3_close(db); db = nil
-            throw OmniError.store("This index was written by a newer version of Omni (format \(v)). Update Omni to open it.")
+            throw OmniError.storeNewer(Int(v))
         }
         exec("PRAGMA journal_mode=WAL;")
         // The index is a rebuildable cache, so NORMAL sync under WAL is safe (a crash at worst
@@ -2256,6 +2261,19 @@ public final class VectorStore: @unchecked Sendable {
         // searches work (they score in memory) while snippets, filters and stats quietly fail. Say
         // so instead, so the app can show a real message rather than behaving strangely.
         if let why = queue.sync(execute: { coverageUnreadable }) {
+            let unmappable = queue.sync { vectorFileUnmappable }
+            abandon()
+            // A map can also fail because the file is SHORTER than the bookkeeping says, which is
+            // the bookkeeping's problem, not the file's: only a lock held elsewhere or a file that
+            // cannot be read is "unavailable" and waited out.
+            if unmappable {
+                if Self.vectorFileLockedElsewhere(vecSidecarURL) {
+                    throw OmniError.storeUnavailable("Another copy of Omni has the index open.")
+                }
+                if !FileManager.default.isReadableFile(atPath: vecSidecarURL.path) {
+                    throw OmniError.storeUnavailable("The index's vector file cannot be read right now.")
+                }
+            }
             throw OmniError.store(why)
         }
         // Every statement below the load speaks v4 and only v4. An index still in an older shape
@@ -2265,7 +2283,9 @@ public final class VectorStore: @unchecked Sendable {
         // the app can offer Repair and Reindex rather than behaving strangely.
         if queue.sync(execute: { layoutLocked() != .v4 }) {
             let why = migrationBlockedReason ?? "The index could not be upgraded to the new format."
-            throw OmniError.store(why)
+            let space = migrationBlockedForSpace
+            abandon()
+            throw space ? OmniError.storeNeedsSpace(why) : OmniError.store(why)
         }
     }
 
@@ -2431,6 +2451,35 @@ public final class VectorStore: @unchecked Sendable {
     /// Fold the WAL into the main db and close the connection, ON the serial queue (so it cannot race a
     /// reader/writer or a new same-path connection). Idempotent. Call this when switching model/db so the
     /// synchronous checkpoint + close runs off the main actor instead of at the @MainActor ref-drop site.
+    /// Release what a refused open took, and write nothing: close() stamps coverage and persists
+    /// caches, which an index that was just refused must not receive. Before this, the vector
+    /// file's lock and the database handle outlived the refusal, so every later open in the same
+    /// process failed the same way until a relaunch.
+    private func abandon() {
+        closeReader()
+        queue.sync {
+            guard !closed else { return }
+            flat16.releaseFileLock()
+            if let h = db {
+                var st = sqlite3_next_stmt(h, nil)
+                while let s = st { let next = sqlite3_next_stmt(h, s); sqlite3_finalize(s); st = next }
+                sqlite3_close_v2(h)
+            }
+            db = nil
+            closed = true
+        }
+    }
+
+    /// Whether another open file holds the vector file's lock. Asked only after this store failed
+    /// to map it, so this store holds no lock of its own on it.
+    static func vectorFileLockedElsewhere(_ url: URL) -> Bool {
+        let fd = Darwin.open(url.path, O_RDONLY)
+        guard fd >= 0 else { return false }
+        defer { Darwin.close(fd) }
+        if flock(fd, LOCK_EX | LOCK_NB) == 0 { flock(fd, LOCK_UN); return false }
+        return errno == EWOULDBLOCK
+    }
+
     public func close() {
         closeReader()   // the browse connection first: nothing on its queue enters this one
         queue.sync {
@@ -8389,7 +8438,7 @@ public final class VectorStore: @unchecked Sendable {
         guard flat16.mapPersistent(url: vecSidecarURL, tailSlackElements: Self.foldThreshold * d0,
                                    precommitElements: highWater * d0,
                                    adoptElements: coveredRows * d0)
-        else { return declineBySlot("could not map the vector file for \(highWater) positions") }
+        else { vectorFileUnmappable = true; return declineBySlot("could not map the vector file for \(highWater) positions") }
         dim = d0
         // Positions past the covered prefix are written where they belong, not appended in scan
         // order, so the buffer has to BE that long first. Zero-filled: a position nothing claims
@@ -8604,7 +8653,7 @@ public final class VectorStore: @unchecked Sendable {
         let expectedRows = live + holes
         guard flat16.mapPersistent(url: vecSidecarURL, tailSlackElements: Self.foldThreshold * d0,
                                    precommitElements: expectedRows * d0,
-                                   adoptElements: coveredRows * d0) else { return false }
+                                   adoptElements: coveredRows * d0) else { vectorFileUnmappable = true; return false }
         dim = d0
         rows.reserveCapacity(live + holes)
         var stmt: OpaquePointer?
@@ -8995,6 +9044,55 @@ public final class VectorStore: @unchecked Sendable {
         return doomedChunks
     }
 
+    enum SplitClaim: Equatable { case notSplit, consistent, corrected(from: Int, to: Int), unprovable(String) }
+
+    /// UNDER THE SPLIT THE COVERAGE CLAIM IS PROVABLE, NOT DERIVED. Every content records its own
+    /// slot, and a content's staged blob is cleared only once its vector is durable in the file at
+    /// that slot, so the claim has to reach exactly past the highest slot of a content with no
+    /// blob. Nothing is counted or inferred from row order, which is where the count-based
+    /// derivation goes wrong on a shared index: a healthy one disagrees with it by the contents
+    /// that are folded but still staged. Measured on a real 3.7M-content index whose claim ran 500
+    /// past its file: corrected to the slots, and the search digest identical to the undamaged
+    /// clone. Used by the open path and by repairIndex, so the two cannot disagree.
+    static func correctSplitCoverageClaim(db: OpaquePointer, dbURL: URL) -> SplitClaim {
+        func scalar(_ sql: String) -> Int {
+            var st: OpaquePointer?
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK,
+                  sqlite3_step(st) == SQLITE_ROW else { return -1 }
+            return Int(sqlite3_column_int64(st, 0))
+        }
+        guard tableExists(db, "chunk"), tableHasColumn(db, "chunk", "slot"), tableExists(db, "pending_vecs"),
+              scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(chunkSplitDoneKey)'") == 1
+        else { return .notSplit }
+        let claim = scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(coveredRowsKey)'")
+        let dim = scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='dim'")
+        guard claim > 0, dim > 0 else { return .consistent }
+        let unstaged = "FROM chunk WHERE id NOT IN (SELECT chunk_id FROM pending_vecs)"
+        // A content whose blob is gone and which has no slot: its vector is nowhere.
+        if scalar("SELECT COUNT(*) \(unstaged) AND slot < 0") > 0 {
+            return .unprovable("Some stored passages have neither a vector position nor a staged vector.")
+        }
+        let needed = scalar("SELECT COALESCE(MAX(slot), -1) \(unstaged)") + 1
+        let vecURL = dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".vecs")
+        let fileBytes = ((try? FileManager.default.attributesOfItem(atPath: vecURL.path)[.size]) as? Int) ?? 0
+        if fileBytes < needed * dim * MemoryLayout<UInt16>.size {
+            return .unprovable("The vector file ends before the positions of vectors that are stored only there.")
+        }
+        if needed == claim { return .consistent }
+        // A hole at or past the new claim names a position the claim no longer covers. Dropping it
+        // can only leak that position, never hand it out twice.
+        guard sqlite3_exec(db, "BEGIN;", nil, nil, nil) == SQLITE_OK,
+              sqlite3_exec(db, "INSERT OR REPLACE INTO meta(key,value) VALUES('\(coveredRowsKey)','\(needed)');", nil, nil, nil) == SQLITE_OK,
+              sqlite3_exec(db, "DELETE FROM vec_holes WHERE slot >= \(needed);", nil, nil, nil) == SQLITE_OK,
+              sqlite3_exec(db, "COMMIT;", nil, nil, nil) == SQLITE_OK
+        else {
+            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+            return .unprovable("The index database is read-only.")
+        }
+        return .corrected(from: claim, to: needed)
+    }
+
     /// Repair the vector bookkeeping of an index that will not open, without a store.
     ///
     /// The store refuses when the claim, the holes and the cleared blobs stop agreeing, because the
@@ -9048,6 +9146,15 @@ public final class VectorStore: @unchecked Sendable {
 
         let claim = scalar("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(coveredRowsKey)'")
         guard claim > 0 else { return .nothingToDo }
+
+        switch correctSplitCoverageClaim(db: db, dbURL: dbURL) {
+        case .notSplit: break
+        case .consistent: return .nothingToDo
+        case .corrected(let from, let to):
+            return .repaired("Corrected the vector coverage (\(from) -> \(to) positions) from the positions the stored vectors occupy. Nothing was re-embedded.")
+        case .unprovable(let why): return .needsReindex(why)
+        }
+
         let holes = scalar("SELECT COUNT(*) FROM vec_holes")
         // LAYOUT-AWARE, because `scalar` returns -1 when prepare fails and `pending_vecs` does not
         // exist on a v3 index. That -1 turned into a cleared count one HIGHER than the row count,
@@ -12413,6 +12520,12 @@ public final class VectorStore: @unchecked Sendable {
                 // still live - which need opposite repairs and give different row-to-slot
                 // mappings. Guessing there would hand back each row its neighbour's vector with no
                 // error, so it refuses and says why instead.
+                if splitBuilt, let db, case .corrected(let from, let to) = Self.correctSplitCoverageClaim(db: db, dbURL: dbURL) {
+                    FileHandle.standardError.write(Data(
+                        "[omni] coverage claim corrected \(from) -> \(to) from the content slots\n".utf8))
+                    loadCoverageLocked()
+                    if loadFromCoverageLocked() { return }
+                }
                 if let repaired = repairDerivableCoverageClaimLocked() {
                     FileHandle.standardError.write(Data(
                         "[omni] coverage claim repaired \(repaired.from) -> \(repaired.to) from the cleared-blob count\n".utf8))
@@ -14631,6 +14744,7 @@ public final class VectorStore: @unchecked Sendable {
         let dbBytes = onDiskBytes()
         let free = (try? FileManager.default.attributesOfFileSystem(forPath: dbURL.path)[.systemFreeSize] as? Int64) as? Int64 ?? .max
         guard free > dbBytes else {
+            migrationBlockedForSpace = true
             migrationBlockedReason = "Needs \(ByteCountFormatter.string(fromByteCount: dbBytes, countStyle: .file)) free to upgrade the index; \(ByteCountFormatter.string(fromByteCount: free, countStyle: .file)) available."
             FileHandle.standardError.write(Data("[omni] index upgrade postponed: \(migrationBlockedReason ?? "")\n".utf8))
             return
@@ -14867,6 +14981,7 @@ public final class VectorStore: @unchecked Sendable {
         let needed = dbBytes / 2
         let free = (try? FileManager.default.attributesOfFileSystem(forPath: dbURL.path)[.systemFreeSize] as? Int64) as? Int64 ?? .max
         guard free > needed else {
+            migrationBlockedForSpace = true
             migrationBlockedReason = "Needs \(ByteCountFormatter.string(fromByteCount: needed, countStyle: .file)) free to upgrade the index; \(ByteCountFormatter.string(fromByteCount: free, countStyle: .file)) available."
             FileHandle.standardError.write(Data("[omni] index upgrade postponed: \(migrationBlockedReason ?? "")\n".utf8))
             return
@@ -15095,6 +15210,13 @@ public final class VectorStore: @unchecked Sendable {
 
 public enum OmniError: Error, CustomStringConvertible {
     case store(String)
+    /// The index is there but cannot be reached right now: another process holds the vector file,
+    /// or the file or the database cannot be read. Nothing about the data is wrong; wait and retry.
+    case storeUnavailable(String)
+    /// The one-time upgrade needs more free disk than there is. Retry once space frees.
+    case storeNeedsSpace(String)
+    /// Written by a newer Omni (its format number). Only an update opens it.
+    case storeNewer(Int)
     /// THE WRITE LOST TO A LOCK, NOT TO THE DATA. Its own case because the caller's answer is
     /// completely different: a store error means the file cannot be indexed and should be counted
     /// as failed, while a busy database means a maintenance transaction is in flight - the split
@@ -15109,6 +15231,9 @@ public enum OmniError: Error, CustomStringConvertible {
         switch self {
         case .store(let m): return "store: \(m)"
         case .storeBusy(let m): return "store busy: \(m)"
+        case .storeUnavailable(let m): return "store unavailable: \(m)"
+        case .storeNeedsSpace(let m): return "store needs space: \(m)"
+        case .storeNewer(let v): return "store written by a newer Omni (format \(v))"
         case .model(let m): return "model: \(m)"
         case .extraction(let m): return "extraction: \(m)"
         }

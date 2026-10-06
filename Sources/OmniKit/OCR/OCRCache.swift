@@ -60,7 +60,7 @@ public enum OCRCache {
             guard defaults.object(forKey: "omni.ocr.cache.enabled") != nil else { return true }
             return defaults.bool(forKey: "omni.ocr.cache.enabled")
         }
-        set { UserDefaults.standard.set(newValue, forKey: "omni.ocr.cache.enabled") }
+        set { OmniPrefs.set(newValue, forKey: "omni.ocr.cache.enabled") }
     }
 
     /// Beside the model it came from, under Application Support, until the user moves it. Not in
@@ -79,7 +79,7 @@ public enum OCRCache {
             else { return defaultDirectory }
             return URL(fileURLWithPath: path, isDirectory: true)
         }
-        set { UserDefaults.standard.set(newValue.path, forKey: "omni.ocr.cache.dir") }
+        set { OmniPrefs.set(newValue.path, forKey: "omni.ocr.cache.dir") }
     }
 
     // MARK: - Identity

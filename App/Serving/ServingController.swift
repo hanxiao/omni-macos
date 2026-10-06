@@ -229,10 +229,10 @@ final class ServingController {
     private func persist() {
         guard !isLoading else { return }   // don't write a half-loaded snapshot back over saved values
         guard ServingLogFile.isolatedDir == nil else { return }   // an isolated run is not the user's
-        defaults.set(enabled, forKey: "omni.serving.enabled")
-        defaults.set(scope.rawValue, forKey: "omni.serving.scope")
-        defaults.set(port, forKey: "omni.serving.port")
-        defaults.set(bearerToken, forKey: "omni.serving.token")
+        OmniPrefs.set(enabled, forKey: "omni.serving.enabled")
+        OmniPrefs.set(scope.rawValue, forKey: "omni.serving.scope")
+        OmniPrefs.set(port, forKey: "omni.serving.port")
+        OmniPrefs.set(bearerToken, forKey: "omni.serving.token")
     }
 
     /// URL-safe 192-bit random token (shared by the Generate button and the public-scope autofill).

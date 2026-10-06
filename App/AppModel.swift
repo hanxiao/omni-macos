@@ -185,7 +185,7 @@ final class AppModel {
     /// `failed` carries WHICH half could not start. A store failure - the index needs disk space to
     /// finish its one-time upgrade, say - used to render as "Omni can't load its model" with a
     /// button to go pick a model folder, which is the wrong diagnosis and a remedy that cannot help.
-    enum Phase: Equatable { case loadingModel, noModel, ready, failed(String), failedIndex(String) }
+    enum Phase: Equatable { case loadingModel, noModel, ready, failed(String), waitingForIndex(String), indexNewer }
 
     /// Determinate launch progress (0...1) while phase == .loadingModel; nil once ready/failed
     /// (or before bootstrap has begun). Combined 50/50 from the store's row-load fraction and the
@@ -268,57 +268,47 @@ final class AppModel {
         store = nil
     }
 
-    /// Try to repair the index the store refused to open, then reload if it worked.
-    ///
-    /// Off the main actor: it opens the database and reads the vector file. Only the provable
-    /// repairs are attempted - see VectorStore.repairIndex - so a "cannot" here is a real answer
-    /// and not a shrug.
-    func repairIndex() {
-        guard !repairRunning, let url = try? Self.indexURL() else { return }
-        repairRunning = true
-        repairMessage = nil
-        releaseOpenIndex()
+    /// THE INDEX NEVER ASKS THE USER TO REPAIR IT. A refusal the data does not explain (the
+    /// vector file held by another process, a volume not mounted, no room for an upgrade) waits
+    /// and retries on its own. A refusal the data does explain is repaired when the repair is
+    /// provable (VectorStore.repairIndex), and rebuilt from the user's files when it is not: the
+    /// index is derived state, so a rebuild loses nothing but time, and a guess could hand rows
+    /// their neighbour's vector without an error.
+    private var indexRetryDelay: Double = 2
+    private var indexRecoveryTried = false
+
+    private func waitForIndex(_ why: String) {
+        phase = .waitingForIndex(why)
+        let delay = indexRetryDelay
+        indexRetryDelay = min(30, indexRetryDelay * 2)
         Task {
-            let outcome = await Task.detached(priority: .userInitiated) {
-                VectorStore.repairIndex(at: url)
-            }.value
-            await MainActor.run {
-                self.repairRunning = false
-                switch outcome {
-                case .repaired(let what):
-                    self.repairMessage = what
-                    self.retryBootstrap()
-                case .nothingToDo:
-                    self.repairMessage = "The vector bookkeeping is already consistent, so this is a different problem."
-                case .needsReindex(let why):
-                    self.repairMessage = why + " Re-indexing rebuilds the index from your files."
-                }
-            }
+            try? await Task.sleep(for: .seconds(delay))
+            guard case .waitingForIndex = self.phase else { return }
+            await self.bootstrap()
         }
     }
 
-    /// LAST RESORT, and destructive: delete the index and rebuild it from the user's files.
-    ///
-    /// Offered next to Repair because Repair deliberately refuses the cases it cannot prove, and
-    /// without this the only way out of one of those is deleting files in Finder. Everything it
-    /// removes is derived from the user's own files - nothing here is a source of truth - but it
-    /// costs a full re-embed, which is why it is red and behind a confirmation.
-    func reindexFromScratch() {
-        guard !repairRunning, let url = try? Self.indexURL() else { return }
-        repairRunning = true
-        repairMessage = nil
+    private func recoverIndex(_ why: String) {
+        guard let url = try? Self.indexURL() else { phase = .failed(why); return }
+        phase = .waitingForIndex("Checking the index\u{2026}")
         releaseOpenIndex()
         Task {
-            let freed = await Task.detached(priority: .userInitiated) {
-                VectorStore.deleteIndexFiles(at: url)
-            }.value
-            await MainActor.run {
-                self.repairRunning = false
-                self.repairMessage = "Removed the old index ("
-                    + ByteSize.file(freed)
-                    + "). Your files are being indexed again."
-                self.retryBootstrap()
+            let outcome = await Task.detached(priority: .userInitiated) { VectorStore.repairIndex(at: url) }.value
+            switch outcome {
+            case .repaired(let what) where !self.indexRecoveryTried:
+                self.indexRecoveryTried = true
+                omniPerfLog("index repaired: \(what)")
+            case .nothingToDo where !self.indexRecoveryTried:
+                // The bookkeeping is consistent, so what refused may not be the data: open once more.
+                self.indexRecoveryTried = true
+                omniPerfLog("index refused with consistent bookkeeping: \(why)")
+            default:
+                // Not provable, or still refusing after a repair: rebuild from the user's files.
+                self.indexRecoveryTried = false
+                let freed = await Task.detached(priority: .userInitiated) { VectorStore.deleteIndexFiles(at: url) }.value
+                omniPerfLog("index rebuilt from files (freed \(freed) bytes): \(why)")
             }
+            await self.bootstrap()
         }
     }
 
@@ -519,7 +509,7 @@ final class AppModel {
     var groupNearDuplicates: Bool = UserDefaults.standard.object(forKey: "omni.groupNearDuplicates") as? Bool ?? true {
         didSet {
             guard oldValue != groupNearDuplicates else { return }
-            UserDefaults.standard.set(groupNearDuplicates, forKey: "omni.groupNearDuplicates")
+            OmniPrefs.set(groupNearDuplicates, forKey: "omni.groupNearDuplicates")
             // Turning the near tier ON needs vectors that were never fetched; reload, don't just
             // recompute against an empty cache.
             loadGroupingInputs(for: rawResults, token: resultsToken)
@@ -531,7 +521,7 @@ final class AppModel {
     var mapNoOverlap: Bool = UserDefaults.standard.bool(forKey: "omni.mapNoOverlap") {
         didSet {
             guard oldValue != mapNoOverlap else { return }
-            UserDefaults.standard.set(mapNoOverlap, forKey: "omni.mapNoOverlap")
+            OmniPrefs.set(mapNoOverlap, forKey: "omni.mapNoOverlap")
             projectionGeneration &+= 1   // republish so the view rebuilds its point cloud
         }
     }
@@ -540,7 +530,7 @@ final class AppModel {
     /// large GPU distance tiles + a 300-epoch force layout that can freeze a low-memory Mac).
     var mapUsesUMAP: Bool = UserDefaults.standard.bool(forKey: "omni.mapUsesUMAP") {
         didSet {
-            UserDefaults.standard.set(mapUsesUMAP, forKey: "omni.mapUsesUMAP")
+            OmniPrefs.set(mapUsesUMAP, forKey: "omni.mapUsesUMAP")
             projectionCache.removeAll(); projectionCacheOrder.removeAll(); projectionTotals.removeAll()   // cached layouts belong to the other mode
             if let url = selectedFolderForViz { selectFolderForVisualization(url) }   // re-fit in the new mode
         }
@@ -920,7 +910,7 @@ final class AppModel {
         return AppModel.recentsLimits.contains(v) ? v : 100
     }() {
         didSet {
-            UserDefaults.standard.set(recentsLimit, forKey: "omni.recentsLimit")
+            OmniPrefs.set(recentsLimit, forKey: "omni.recentsLimit")
             if filterRecents, hasQuery { search() }   // a different Recents is a different scope
         }
     }
@@ -964,7 +954,7 @@ final class AppModel {
         return d.object(forKey: "omni.clipboard.retentionDays") == nil ? 30 : d.integer(forKey: "omni.clipboard.retentionDays")
     }() {
         didSet {
-            if !isIsolatedRun { UserDefaults.standard.set(clipboardRetentionDays, forKey: "omni.clipboard.retentionDays") }
+            if !isIsolatedRun { OmniPrefs.set(clipboardRetentionDays, forKey: "omni.clipboard.retentionDays") }
             pruneClipboard()
         }
     }
@@ -1017,7 +1007,7 @@ final class AppModel {
     func setClipboardEnabled(_ on: Bool) {
         guard on != clipboardEnabled else { return }
         clipboardEnabled = on
-        if !isIsolatedRun { UserDefaults.standard.set(on, forKey: "omni.clipboard.enabled") }
+        if !isIsolatedRun { OmniPrefs.set(on, forKey: "omni.clipboard.enabled") }
         if on {
             try? FileManager.default.createDirectory(at: Self.clipboardDirectory, withIntermediateDirectories: true)
             startClipboardMonitor()
@@ -1551,7 +1541,7 @@ final class AppModel {
     private let maxRecentHistory = 200   // hard ceiling on recents; the day window is the real control
     /// When searches enter History (Settings > History). Default: automatic, as before.
     var historyMode: HistoryMode = .auto {
-        didSet { UserDefaults.standard.set(historyMode.rawValue, forKey: "omni.historyMode") }
+        didSet { OmniPrefs.set(historyMode.rawValue, forKey: "omni.historyMode") }
     }
     /// Whether searches that arrive over the HTTP/MCP server are remembered too.
     ///
@@ -1560,14 +1550,14 @@ final class AppModel {
     /// exist for a request that arrives whole over a socket. So this is its own switch rather than
     /// a fourth case of a question that does not apply.
     var saveServingHistory: Bool = true {
-        didSet { UserDefaults.standard.set(saveServingHistory, forKey: "omni.saveServingHistory") }
+        didSet { OmniPrefs.set(saveServingHistory, forKey: "omni.saveServingHistory") }
     }
     /// Recent (non-bookmarked) searches older than this many days are pruned. Default 31 (about a
     /// month), so the sidebar's day buckets - Yesterday, Previous 7 Days, Previous 30 Days - actually
     /// fill in. Users who picked a shorter window in Settings keep it.
     var historyRetentionDays: Int = 31 {
         didSet {
-            UserDefaults.standard.set(historyRetentionDays, forKey: "omni.historyRetentionDays")
+            OmniPrefs.set(historyRetentionDays, forKey: "omni.historyRetentionDays")
             pruneHistory(); persistHistory()
         }
     }
@@ -1690,7 +1680,7 @@ final class AppModel {
 
     func setFolderPaused(path: String, _ paused: Bool) {
         if paused { pausedRoots.insert(path) } else { pausedRoots.remove(path) }
-        UserDefaults.standard.set(Array(pausedRoots), forKey: "omni.pausedRoots")
+        OmniPrefs.set(Array(pausedRoots), forKey: "omni.pausedRoots")
         if indexState == .indexing {
             // Re-scope the running pass. Restart is incremental (mtime-skips done files), so the
             // still-active folders pick up where they left off and the paused one is left as-is.
@@ -1784,7 +1774,7 @@ final class AppModel {
     var viewMode: ResultViewMode = .list {
         // Not from an isolated run: a recording script's `view:list` used to land in the user's own
         // settings, and their next launch opened in list view.
-        didSet { if Self.persistsUIState { UserDefaults.standard.set(viewMode.rawValue, forKey: "omni.viewMode") } }
+        didSet { if Self.persistsUIState { OmniPrefs.set(viewMode.rawValue, forKey: "omni.viewMode") } }
     }
 
     // Indexing performance settings.
@@ -1916,8 +1906,6 @@ final class AppModel {
     /// Result of the last Repair attempt, shown on the index-failure screen. Repair is offered
     /// there rather than run automatically: it writes to the index, and an index that refuses to
     /// open is exactly when the user should be the one to say go.
-    var repairMessage: String? = nil
-    var repairRunning = false
     /// Title for the launch screen. The store's phase when it has one, because that is the part
     /// that can take tens of seconds; the model otherwise, which is what a normal launch is doing.
     var launchTitle: String {
@@ -2542,7 +2530,7 @@ final class AppModel {
         // script can replay it, and never writes it: a test's searches used to land in the real
         // sidebar and, at the 200-item cap, push the user's own out.
         guard !Self.ephemeralUIState, !Self.isolatedByLaunchArgument else { return }
-        if let data = try? JSONEncoder().encode(searchHistory) { UserDefaults.standard.set(data, forKey: historyKey) }
+        if let data = try? JSONEncoder().encode(searchHistory) { OmniPrefs.set(data, forKey: historyKey) }
     }
 
     private func loadHistory() {
@@ -2835,7 +2823,7 @@ final class AppModel {
     private func recordIgnoreDefaultsVersion() {
         ignoreVersionOwed = false
         if !Self.isolatedByLaunchArgument {
-            UserDefaults.standard.set(Self.ignoreDefaultsVersion, forKey: Self.ignoreDefaultsKey)
+            OmniPrefs.set(Self.ignoreDefaultsVersion, forKey: Self.ignoreDefaultsKey)
         }
     }
     /// 2: OmniIgnore.addedDefaults. 3: the hidden-name rule as a line in the file, the full
@@ -2849,8 +2837,13 @@ final class AppModel {
     /// a file under an excluded folder is excluded (see OmniIgnore.excludesIndexedFile).
     private func pruneExcluded(_ store: VectorStore, policy: OmniIgnore, under folders: [String]? = nil,
                                then: (@MainActor () -> Void)? = nil) {
+        Task { await pruneExcludedNow(store, policy: policy, under: folders); then?() }
+    }
+
+    /// The prune itself, awaitable: Settings runs it with indexing stopped (applyIgnoreText).
+    private func pruneExcludedNow(_ store: VectorStore, policy: OmniIgnore, under folders: [String]? = nil) async {
         let rootPaths = crawlRoots.map(\.path)
-        Task.detached(priority: .utility) {
+        await Task.detached(priority: .utility) {
             let t0 = Date()
             let excluded = policy.excludesIndexedFile(roots: rootPaths)
             // `under`: a folder's own policy changed, and nothing outside that folder can have.
@@ -2883,9 +2876,8 @@ final class AppModel {
                     self.refreshIndexStats(store)
                     self.refreshSearchAfterBackgroundChange()
                 }
-                then?()
             }
-        }
+        }.value
     }
 
     /// The policy the crawl runs on: the central file, its relative patterns applied under every
@@ -2937,7 +2929,7 @@ final class AppModel {
 
     private func saveFolderPolicies() {
         guard !isIsolatedRun else { return }
-        UserDefaults.standard.set(folderPolicies, forKey: Self.folderPoliciesKey)
+        OmniPrefs.set(folderPolicies, forKey: Self.folderPoliciesKey)
     }
 
     /// Built in a nonisolated helper so the closure is not main-actor isolated: the crawl calls it
@@ -3073,7 +3065,9 @@ final class AppModel {
         saveIgnoreText()
         ignorePreview = nil
         guard changed, let store else { return }
-        pruneExcluded(store, policy: new) { self.requestIndexPass() }   // then pick up what the policy now allows
+        // With indexing stopped: a pass that started on the old rules would add back files the new
+        // rules exclude. The pass that resumes afterwards picks up what the new rules allow.
+        Task { await withIndexingStopped { await self.pruneExcludedNow(store, policy: new) } }
     }
 
 
@@ -3155,7 +3149,7 @@ final class AppModel {
     }
 
     private func persistKindOrder() {
-        UserDefaults.standard.set(settings.kindOrder.map { $0.rawValue }, forKey: "omni.kindOrder")
+        OmniPrefs.set(settings.kindOrder.map { $0.rawValue }, forKey: "omni.kindOrder")
     }
 
     // MARK: - Modality on/off (coarse filter; ignore rules apply after)
@@ -3213,17 +3207,20 @@ final class AppModel {
         let oldTowers = enabledKindTowers
         settings.set(k, on)
         if !isIsolatedRun {   // a test toggling a kind must not change the user's own setting
-            UserDefaults.standard.set(settings.enabledKinds.map { $0.rawValue }, forKey: "omni.indexKinds")
+            OmniPrefs.set(settings.enabledKinds.map { $0.rawValue }, forKey: "omni.indexKinds")
         }
         if on { clearKindExcludesFromIgnore(k) }       // make the toggle authoritative over legacy excludes
         if !on, purge, let store {
             // deleteKind is a SQL DELETE + O(N) in-place row compaction; run it off the main actor like
             // every other index mutation, then refresh stats back on the main actor.
             // scan rows are governed by Text; one deleteKinds pass = one scan + one compaction.
+            // Under a hold: a pass that started with this kind on would put the rows straight back.
             let kinds = k == .text ? [k.rawValue, FileKind.scan.rawValue] : [k.rawValue]
-            Task.detached(priority: .utility) {
-                store.deleteKinds(kinds)
-                await MainActor.run { self.refreshIndexStats(store) }
+            Task {
+                await self.withIndexingStopped {
+                    await Task.detached(priority: .utility) { store.deleteKinds(kinds) }.value
+                }
+                self.refreshIndexStats(store)
             }
         }
         if enabledKindTowers != oldTowers {
@@ -3236,7 +3233,12 @@ final class AppModel {
             modalityReloadTask = Task { [weak self] in
                 try? await Task.sleep(for: .milliseconds(250))
                 guard !Task.isCancelled, let self else { return }
-                await self.reconcileTowers()
+                // A NEW task, so the next toggle's cancel() ends only the debounce. Run in this one,
+                // the reconcile inherited that cancel: every Task.sleep in the indexing hold
+                // returned at once, the minute's wait for the writers ran out in about a second,
+                // and the engine just loaded was thrown away - measured on the live clone as a
+                // reload "not installed" 1.2 s into the hold, then loaded again.
+                Task { await self.reconcileTowers() }
             }
         } else if on {
             requestIndexPass()   // tower already resident; just crawl the now-included files
@@ -3249,14 +3251,33 @@ final class AppModel {
     /// (bootstrap). The in-place drop runs off the main actor and is NOT cancellable, so after it we
     /// RE-READ the live settings and recurse if they diverged - otherwise a drop-then-reenable burst
     /// could leave a modality removed while settings say enabled. (self-review fix for F11)
+    /// SINGLE-FLIGHT. Every tower toggle used to start its own chain, and each chain ended by
+    /// calling itself again, so a burst slower than the debounce ran several chains at once: on a
+    /// clone of the live index, switching image, video and audio back on 0.3 s apart loaded the
+    /// model three times (audio=false, then audio=true twice). Now one loop runs; a call that
+    /// arrives while it runs only marks it dirty, and the loop re-reads the settings until they
+    /// and the engine agree.
+    private var towersReconciling = false
+    private var towersAgain = false
     private func reconcileTowers() async {
+        if towersReconciling { towersAgain = true; return }
+        towersReconciling = true
+        defer { towersReconciling = false }
+        repeat {
+            towersAgain = false
+            await reconcileTowersOnce()
+        } while towersAgain
+    }
+
+    private func reconcileTowersOnce() async {
         guard let engine = self.engine else { await self.bootstrap(); return }
         let towers = self.enabledKindTowers
         if towers.vision == engine.supportsImages && towers.audio == engine.supportsAudio { return }   // converged
         let needsAbsentTower = (towers.vision && !engine.supportsImages) || (towers.audio && !engine.supportsAudio)
         if needsAbsentTower {
-            self.phase = .loadingModel
-            await self.bootstrap()   // reloads the live enabledKindTowers set, so the engine converges
+            // Check again only after a load that worked: a model that fails to load would otherwise
+            // be retried in a loop. The old engine keeps serving; the next toggle tries again.
+            if await reloadEngine() { towersAgain = true }
             return
         }
         // Pure drop: setTowers is synchronous GPU work, so run it off the main actor.
@@ -3264,7 +3285,48 @@ final class AppModel {
         self.supportsImages = engine.supportsImages
         self.audioSupported = engine.supportsAudio
         self.requestIndexPass()        // crawl any files the surviving towers now cover
-        await self.reconcileTowers()   // settings may have changed during the off-actor drop; converge
+        towersAgain = true             // settings may have changed during the off-actor drop
+    }
+
+    /// Load the model again with the towers the enabled kinds need, against the index that is
+    /// already open. Indexing is stopped and waited for, the new engine replaces the old one under
+    /// the indexer, serving and search, and indexing resumes to pick up the newly included files.
+    /// Search keeps answering on the old engine while the new one loads.
+    private var engineReloading = false
+    @discardableResult
+    private func reloadEngine() async -> Bool {
+        guard !engineReloading, let store, !modelPath.isEmpty else { return false }
+        engineReloading = true
+        defer { engineReloading = false }
+        let dir = URL(fileURLWithPath: modelPath)
+        let towers = enabledKindTowers
+        let loaded: OmniEngine
+        do {
+            loaded = try await OmniEngine.loadValidated(modelDir: dir, keepVision: towers.vision, keepAudio: towers.audio)
+        } catch {
+            omniPerfLog("engine reload failed: \(error)")
+            return false   // the old engine keeps working
+        }
+        // The swap happens only if the writers stopped. Reporting a reload that was not installed
+        // sent the reconcile loop round again against the engine it had meant to replace.
+        let swapped = await withIndexingStopped {
+            self.engine = loaded
+            self.clearQueryEmbedCache()
+            let indexer = Indexer(store: store, embedder: loaded)
+            indexer.onPolicyFile = Self.policyFileReporter(self)
+            self.indexer = indexer
+            self.serving.attach(engine: loaded, store: store, modelName: "omni-\(self.modelVariant.rawValue)")
+            self.supportsImages = loaded.supportsImages
+            self.audioSupported = loaded.supportsAudio
+            await self.ensureTagger()
+        }
+        guard swapped else {
+            omniPerfLog("engine reload not installed: indexing did not stop")
+            return false
+        }
+        omniPerfLog("engine reloaded vision=\(loaded.supportsImages) audio=\(loaded.supportsAudio)")
+        Task.detached(priority: .utility) { loaded.warmText() }
+        return true
     }
 
     /// Re-enabling a modality should fully include it again, so drop a leftover `*.ext` exclude block a
@@ -3308,18 +3370,17 @@ final class AppModel {
     }
     private func persistPerf() {
         guard !isLoadingPerf else { return }
-        let d = UserDefaults.standard
-        d.set(maxImageDimension, forKey: "omni.maxImageDim")
-        d.set(maxVideoFrames, forKey: "omni.maxVideoFrames")
-        d.set(maxTextChunkChars, forKey: "omni.maxTextChunkChars")
-        d.set(maxMemoryGB, forKey: "omni.maxMemoryGB")
-        d.set(minImageDimension, forKey: "omni.minImageDim")
-        d.set(minAudioSeconds, forKey: "omni.minAudioSec")
-        d.set(minVideoSeconds, forKey: "omni.minVideoSec")
-        d.set(minTextChars, forKey: "omni.minTextChars")
-        d.set(skipDatalessFiles, forKey: "omni.skipDataless")
-        d.set(imageTagsEnabled, forKey: "omni.imageTags")
-        d.set(instantSearchEnabled, forKey: "omni.instantSearch")
+        OmniPrefs.set(maxImageDimension, forKey: "omni.maxImageDim")
+        OmniPrefs.set(maxVideoFrames, forKey: "omni.maxVideoFrames")
+        OmniPrefs.set(maxTextChunkChars, forKey: "omni.maxTextChunkChars")
+        OmniPrefs.set(maxMemoryGB, forKey: "omni.maxMemoryGB")
+        OmniPrefs.set(minImageDimension, forKey: "omni.minImageDim")
+        OmniPrefs.set(minAudioSeconds, forKey: "omni.minAudioSec")
+        OmniPrefs.set(minVideoSeconds, forKey: "omni.minVideoSec")
+        OmniPrefs.set(minTextChars, forKey: "omni.minTextChars")
+        OmniPrefs.set(skipDatalessFiles, forKey: "omni.skipDataless")
+        OmniPrefs.set(imageTagsEnabled, forKey: "omni.imageTags")
+        OmniPrefs.set(instantSearchEnabled, forKey: "omni.instantSearch")
     }
 
     // MARK: - Filters
@@ -3628,7 +3689,7 @@ final class AppModel {
     // MARK: - Model dir
 
     func setModelDir(_ url: URL) {
-        UserDefaults.standard.set(url.path, forKey: "omni.modelDir")
+        OmniPrefs.set(url.path, forKey: "omni.modelDir")
         phase = .loadingModel
         Task { await bootstrap() }
     }
@@ -3949,7 +4010,18 @@ final class AppModel {
     /// disk and are resumed/skipped by the next attempt.
     func cancelDownload() { downloader?.cancel() }
 
+    /// One bootstrap at a time: a model switch and a finished download landing together used to
+    /// load two engines at once. A call that arrives while one runs is coalesced into one rerun.
+    private var bootstrapRunning = false
+    private var bootstrapAgain = false
+
     private func bootstrap() async {
+        if bootstrapRunning { bootstrapAgain = true; return }
+        bootstrapRunning = true
+        defer {
+            bootstrapRunning = false
+            if bootstrapAgain { bootstrapAgain = false; Task { await self.bootstrap() } }
+        }
         omniPerfLog("launch bootstrap")
         applyMemoryLimit()
         startMemoryLogIfRequested()
@@ -4046,7 +4118,13 @@ final class AppModel {
             // just-closed old store, and its lingering .indexing state makes the post-swap rebuild a
             // no-op. (First bootstrap: indexer is nil, so this is a no-op.)
             if oldIndexer != nil {
+                // Wait for the old pass to STOP before the swap: cancel() only asks, and a pass still
+                // embedding on the old engine would go on writing to a store it no longer owns, or,
+                // with the store reused, race the pass the new engine starts on the same one.
+                indexingHolds += 1
                 oldIndexer?.cancel()
+                await waitUntilIndexWorkStops(seconds: 60)
+                indexingHolds -= 1
                 indexGen += 1
                 indexState = .idle
                 restartAfterPause = false
@@ -4158,6 +4236,8 @@ final class AppModel {
                 await MainActor.run { [weak self] in self?.refreshFilenameIndex(store) }
             }
             self.phase = .ready
+            indexRetryDelay = 2
+            indexRecoveryTried = false
             omniPerfLog("launch ready")
             if ignorePrunePending {
                 ignorePrunePending = false
@@ -4209,16 +4289,19 @@ final class AppModel {
                 if self.canIndex { self.startIndexing() }
             }
         } catch {
-            // OmniError.store is the index refusing to open (it could not be upgraded, or the
-            // upgrade needs disk it does not have). Everything else is the model.
-            if case OmniError.store(let why) = error {
-                // The failure screen offers Reveal, and dbPath is normally set by refreshIndexStats
-                // - which needs the store that just refused to open. Resolve it directly.
-                if self.dbPath.isEmpty { self.dbPath = (try? Self.indexURL())?.path ?? "" }
-                omniPerfLog("bootstrap failed-index: \(why)")
-                self.phase = .failedIndex(why)
+            if self.dbPath.isEmpty { self.dbPath = (try? Self.indexURL())?.path ?? "" }
+            switch error {
+            case OmniError.storeUnavailable(let why), OmniError.storeNeedsSpace(let why):
+                omniPerfLog("bootstrap index unavailable: \(why)")
+                waitForIndex(why)
+            case OmniError.storeNewer:
+                self.phase = .indexNewer
+            case OmniError.store(let why):
+                omniPerfLog("bootstrap index refused: \(why)")
+                recoverIndex(why)
+            default:
+                self.phase = .failed("\(error)")
             }
-            else { self.phase = .failed("\(error)") }
         }
     }
 
@@ -4396,14 +4479,14 @@ final class AppModel {
         // sqlite + mmapped vector sidecar is a corrupt index, not a slow one.
         migratingIndex = true
         defer { migratingIndex = false }
-        isTerminating = true                 // blocks new passes the way a quit does
+        indexingHolds += 1                   // blocks new passes until the copy is done
         indexer?.cancel()
         // isIndexWorkInFlight, not isIndexing: a watcher reconcile, a tag batch or a folder
         // catch-up never sets indexState, and each writes the store. Still busy after a minute:
         // refuse rather than copy under a live writer.
-        for _ in 0 ..< 600 where isIndexWorkInFlight { try? await Task.sleep(for: .milliseconds(100)) }
+        await waitUntilIndexWorkStops(seconds: 60)
         if isIndexWorkInFlight {
-            isTerminating = false
+            indexingHolds -= 1
             return "Indexing did not stop in time. Try again in a moment."
         }
         releaseOpenIndex()
@@ -4413,7 +4496,7 @@ final class AppModel {
             catch { return .failure(error) }
         }.value
 
-        isTerminating = false
+        indexingHolds -= 1
         switch copied {
         case .failure(let error):
             // The setting was never changed, so reopening puts things back exactly as they were.
@@ -4421,7 +4504,7 @@ final class AppModel {
             await bootstrap()
             return "The index could not be moved: \(error.localizedDescription)"
         case .success:
-            UserDefaults.standard.set(url.path, forKey: "omni.dbDir")
+            OmniPrefs.set(url.path, forKey: "omni.dbDir")
             phase = .loadingModel
             await bootstrap()
             return nil
@@ -4521,7 +4604,7 @@ final class AppModel {
 
     private func saveRoots() {
         guard !isIsolatedRun else { return }   // see isIsolatedRun
-        UserDefaults.standard.set(roots.map { $0.path }, forKey: "omni.roots")
+        OmniPrefs.set(roots.map { $0.path }, forKey: "omni.roots")
     }
 
     /// ONE STORED LIST, TWO DERIVED ONES. `addedFolders` is what the user actually chose, in the
@@ -4574,7 +4657,7 @@ final class AppModel {
 
     private func saveAddedFolders() {
         guard !isIsolatedRun else { return }
-        UserDefaults.standard.set(addedFolders.map { $0.path }, forKey: "omni.addedFolders")
+        OmniPrefs.set(addedFolders.map { $0.path }, forKey: "omni.addedFolders")
     }
 
     /// The single place `roots` is derived. Every mutation of `addedFolders` goes through here.
@@ -4730,7 +4813,7 @@ final class AppModel {
     }
     private func savePhotoSources() {
         guard !Self.ephemeralUIState, !Self.isolatedByLaunchArgument else { return }
-        UserDefaults.standard.set(try? JSONEncoder().encode(photoSources), forKey: "omni.photoSources")
+        OmniPrefs.set(try? JSONEncoder().encode(photoSources), forKey: "omni.photoSources")
     }
 
     /// The folder rule, for Photos: the whole library contains every album, so selecting it absorbs them
@@ -4794,7 +4877,7 @@ final class AppModel {
         photoSources.removeAll { $0.id == source.id }
         pendingCatchUpPhotos.removeAll { $0.id == source.id }
         if pausedRoots.remove(source.key) != nil {
-            UserDefaults.standard.set(Array(pausedRoots), forKey: "omni.pausedRoots")
+            OmniPrefs.set(Array(pausedRoots), forKey: "omni.pausedRoots")
         }
         savePhotoSources()
         if photoSources.isEmpty { stopPhotoLibraryObserver() }
@@ -4842,13 +4925,13 @@ final class AppModel {
         photoObserver = nil
     }
     private func photoLibraryDidChange() {
-        guard !isTerminating, !indexObsolete, !photoSources.isEmpty else { return }
+        guard !indexWritesBlocked, !indexObsolete, !photoSources.isEmpty else { return }
         // Coalesce: an import or an iCloud sync fires this repeatedly, and each pass would otherwise
         // re-enumerate the whole library. One pass, 5 s after the last change.
         photoChangeDebounce?.cancel()
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor in
-                guard let self, !self.isTerminating else { return }
+                guard let self, !self.indexWritesBlocked else { return }
                 let queued = Set(self.pendingCatchUpPhotos.map(\.id))
                 self.pendingCatchUpPhotos.append(contentsOf: self.photoSources.filter { !queued.contains($0.id) })
                 self.catchUpPendingRoots()
@@ -5035,7 +5118,7 @@ final class AppModel {
         if ocrRunActive, !(pendingCatchUpRoots.isEmpty && pendingCatchUpPhotos.isEmpty), omniPerfEnabled {
             omniPerfLog("gpu-standdown catch-up held roots=\(pendingCatchUpRoots.count) (ocr run active)")
         }
-        guard !isTerminating, !isPaperRunning, !isProfilingRunning, !indexObsolete, !ocrRunActive,
+        guard !indexWritesBlocked, !isPaperRunning, !isProfilingRunning, !indexObsolete, !ocrRunActive,
               indexState != .indexing, activeRoots.isEmpty,
               !fsReconcileInFlight,
               let indexer, let store, !(pendingCatchUpRoots.isEmpty && pendingCatchUpPhotos.isEmpty) else { return }
@@ -5105,7 +5188,7 @@ final class AppModel {
         let promoted = roots.filter { !rootsBefore.contains($0.path) && RootScope.covers(url.path, $0.path) }
         if filterFolder == url { filterFolder = nil }
         if pausedRoots.remove(url.path) != nil {
-            UserDefaults.standard.set(Array(pausedRoots), forKey: "omni.pausedRoots")
+            OmniPrefs.set(Array(pausedRoots), forKey: "omni.pausedRoots")
         }
         saveRoots()
         restartWatcher()
@@ -5180,7 +5263,7 @@ final class AppModel {
         if let mark = folderBookmarks.removeValue(forKey: old.path) { folderBookmarks[new.path] = mark }
         if pausedRoots.remove(old.path) != nil {
             pausedRoots.insert(new.path)
-            UserDefaults.standard.set(Array(pausedRoots), forKey: "omni.pausedRoots")
+            OmniPrefs.set(Array(pausedRoots), forKey: "omni.pausedRoots")
         }
         let scope = filterFolders.map { f -> URL in
             guard RootScope.covers(old.path, f.path) else { return f }
@@ -5221,7 +5304,7 @@ final class AppModel {
             await MainActor.run {
                 guard self.addedFolders.map(\.path) == folders, next != self.folderBookmarks else { return }
                 self.folderBookmarks = next
-                if persist { UserDefaults.standard.set(next, forKey: Self.folderBookmarksKey) }
+                if persist { OmniPrefs.set(next, forKey: Self.folderBookmarksKey) }
             }
         }
     }
@@ -5249,7 +5332,7 @@ final class AppModel {
     /// The prune owed by a folder policy that changed while a pass was running, once nothing is
     /// indexing: run earlier, it races the pass that is still writing under the old rules.
     private func drainIdleUpkeep(_ store: VectorStore) {
-        guard !policyPruneDirs.isEmpty, !isTerminating, !isPaperRunning, indexState == .idle,
+        guard !policyPruneDirs.isEmpty, !indexWritesBlocked, !isPaperRunning, indexState == .idle,
               activeRoots.isEmpty, !fsReconcileInFlight, !restartAfterPause, pendingFSPaths.isEmpty
         else { return }
         let dirs = Array(policyPruneDirs)
@@ -5948,7 +6031,7 @@ final class AppModel {
     private var eventCheckpoint: String? {
         get { Self.eventCheckpointIsShared ? UserDefaults.standard.string(forKey: "omni.fsEventId") : sessionEventCheckpoint }
         set {
-            if Self.eventCheckpointIsShared { UserDefaults.standard.set(newValue, forKey: "omni.fsEventId") }
+            if Self.eventCheckpointIsShared { OmniPrefs.set(newValue, forKey: "omni.fsEventId") }
             else { sessionEventCheckpoint = newValue }
         }
     }
@@ -6026,7 +6109,7 @@ final class AppModel {
     func startIndexing() {
         // An OCR run owns the GPU while it lasts; see beginOCRRun. endOCRRun kicks this again.
         guard !ocrRunActive else { indexingPausedForOCR = true; return }
-        guard !isTerminating, let indexer, let store, indexState != .indexing else { return }
+        guard !indexWritesBlocked, let indexer, let store, indexState != .indexing else { return }
         // !isPaperRunning: same reason as catchUpPendingRoots - the suite owns the engine and the
         // levers for the duration. REMEMBERED, not dropped: a Reindex/Update/Resume that arrives
         // during a 25-minute run (the menu item and the Settings buttons stay live) would otherwise
@@ -6233,7 +6316,7 @@ final class AppModel {
     /// catch-up roots, then buffered FS events. Each step that starts a new pass owns the rest of
     /// the chain through its own completion handler, so passes never overlap.
     private func drainDeferredAfterPass(_ store: VectorStore) {
-        guard !isTerminating else { return }   // quitting: don't re-kick a pass that would re-enter MLX
+        guard !indexWritesBlocked else { return }   // quitting: don't re-kick a pass that would re-enter MLX
         // !isPaperRunning: every branch below writes to the USER's store (a delete + VACUUM, a full
         // pass, a reconcile, a tag batch) while the suite holds process-wide levers, and the VACUUM
         // branch is not covered by the per-producer guards because it sets no in-flight flag. Each
@@ -6374,7 +6457,7 @@ final class AppModel {
         // !ocrRunActive, !indexObsolete, !isProfilingRunning: the same stand-downs the watcher
         // drain and the catch-up pass observe. This calls indexer.update() directly too, so it
         // took the GPU from a transcription and wrote into an index waiting to be rebuilt.
-        guard !isTerminating, !isPaperRunning, !ocrRunActive, !indexObsolete, !isProfilingRunning,
+        guard !indexWritesBlocked, !isPaperRunning, !ocrRunActive, !indexObsolete, !isProfilingRunning,
               imageTagsEnabled, !tagBackfillActive, !searching,
               indexState != .indexing, indexState != .paused,
               activeRoots.isEmpty, !fsReconcileInFlight, pendingFSPaths.isEmpty,
@@ -6434,7 +6517,7 @@ final class AppModel {
         if ocrRunActive, !pendingFSPaths.isEmpty, omniPerfEnabled {
             omniPerfLog("gpu-standdown fs-drain held paths=\(pendingFSPaths.count) (ocr run active)")
         }
-        guard !isTerminating, !isPaperRunning, !ocrRunActive, !pendingFSPaths.isEmpty,
+        guard !indexWritesBlocked, !isPaperRunning, !ocrRunActive, !pendingFSPaths.isEmpty,
               !fsReconcileInFlight, let indexer, let store else { return }
         // Globally paused: keep the events buffered (resume's pass completion re-drains them).
         // Running update() now would also hit the stale cancel and silently DROP the batch.
@@ -6490,6 +6573,44 @@ final class AppModel {
     /// FS-reconcile re-kicked from a completion) re-entering MLX during the few milliseconds before
     /// the process exits. The guarded entry points below all early-return while this is true.
     private var isTerminating = false
+    /// Holds taken by withIndexingStopped. While any is held, nothing starts writing the index.
+    private var indexingHolds = 0
+    private var indexWritesBlocked: Bool { isTerminating || indexingHolds > 0 }
+
+    /// Stop every writer of the index (the pass, a watcher reconcile, a tag batch, a folder
+    /// catch-up), run `body` with none of them running and none able to start, then resume
+    /// indexing. For changes that must not race a pass: a model swap, a purge, a prune. False,
+    /// without running `body`, when the writers had not stopped after a minute.
+    /// Poll until no writer is running, or the time is up. NOT Task.sleep: inside a cancelled task
+    /// that returns at once, and a wait that is a correctness guard must not be shortened by
+    /// whoever cancelled its caller.
+    private func waitUntilIndexWorkStops(seconds: Double) async {
+        let deadline = Date().addingTimeInterval(seconds)
+        while isIndexWorkInFlight, Date() < deadline {
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { c.resume() }
+            }
+        }
+    }
+
+    @discardableResult
+    private func withIndexingStopped(_ body: () async -> Void) async -> Bool {
+        indexingHolds += 1
+        defer {
+            indexingHolds -= 1
+            if indexingHolds == 0, canIndex { startIndexing() }
+        }
+        indexer?.cancel()
+        // isIndexWorkInFlight, not isIndexing: a watcher reconcile, a tag batch or a folder
+        // catch-up never sets indexState, and each writes the store.
+        await waitUntilIndexWorkStops(seconds: 60)
+        guard !isIndexWorkInFlight else {
+            omniPerfLog("indexing hold timed out: state=\(indexState) roots=\(activeRoots.count) reconcile=\(fsReconcileInFlight)")
+            return false
+        }
+        await body()
+        return true
+    }
 
     /// Stop indexing for a quit and stamp the row sidecar (bounded at 5 s). The quit handler
     /// (AppDelegate.applicationShouldTerminate) then calls `_exit(0)` immediately, which skips

@@ -101,7 +101,7 @@ final class BrowserColumnSettings: ObservableObject {
         visible.sort { a, b in
             (BrowserColumn.allCases.firstIndex(of: a) ?? 0) < (BrowserColumn.allCases.firstIndex(of: b) ?? 0)
         }
-        UserDefaults.standard.set(visible.map(\.rawValue).joined(separator: ","), forKey: Self.key)
+        OmniPrefs.set(visible.map(\.rawValue).joined(separator: ","), forKey: Self.key)
     }
 }
 

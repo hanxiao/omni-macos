@@ -231,6 +231,11 @@ final class CoverageClaimRepairTests: XCTestCase {
     /// The ambiguous case: repair must REFUSE and explain, not guess. A wrong guess here is silent.
     func testRepairRefusesWhenTheHolesAreSpurious() throws {
         try withQuantMode {
+            // ON THE ROW LAYOUT, as in testAmbiguousMismatchWithHolesStillRefuses: on a split index
+            // a hole a live content owns is released at open, and repair has nothing to guess.
+            let savedLegacy = VectorStore.legacyWriteForTest
+            VectorStore.legacyWriteForTest = true
+            defer { VectorStore.legacyWriteForTest = savedLegacy }
             let files = 40
             let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
             let db = dir.appendingPathComponent("index.sqlite")
@@ -269,4 +274,78 @@ final class CoverageClaimRepairTests: XCTestCase {
             XCTAssertEqual(claim(db), before)
         }
     }
+
+    // MARK: - The split layout: the claim is provable from the slots
+
+    /// A claim past the end of the vector file, on the split layout. Returns the top hit of eight
+    /// probes taken before the damage, for comparing against after.
+
+    private func makeSplitIndexWithClaimPastTheFile(_ db: URL, files: Int) throws -> [String] {
+        try makeCoveredIndex(db, files: files)
+        XCTAssertEqual(claim(db), files, "fixture never reached full coverage")
+        let expected: [String] = try {
+            let s = try VectorStore(dbURL: db); defer { s.close() }
+            return (0 ..< 8).map { s.search(vec($0), topK: 1).first?.path ?? "" }
+        }()
+        // Past the END OF THE FILE, as on the index that hit it: a claim inside the file's spare
+        // capacity maps, and is only conservative.
+        let fileSlots = ((try FileManager.default.attributesOfItem(atPath: db.path + ".vecs")[.size]) as! Int) / (dim * 2)
+        sql(db, "UPDATE meta SET value = '\(fileSlots + 7)' WHERE key = 'vecs_covered_rows';")
+        dropRowSidecar(db)
+        return expected
+    }
+
+    /// The open corrects the claim from the content slots by itself: nothing to repair, nothing to
+    /// ask, nothing re-embedded, and the index answers exactly as before.
+    func testSplitClaimPastTheFileIsCorrectedAtOpen() throws {
+        try withQuantMode {
+            let files = 40
+            let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+            let db = dir.appendingPathComponent("index.sqlite")
+            let expected = try makeSplitIndexWithClaimPastTheFile(db, files: files)
+            let s = try VectorStore(dbURL: db); defer { s.close() }
+            XCTAssertEqual(claim(db), files, "the open did not set the claim from the slots")
+            XCTAssertEqual(clearedBlobs(db), files, "the correction re-staged or re-embedded rows")
+            XCTAssertEqual((0 ..< 8).map { s.search(vec($0), topK: 1).first?.path ?? "" }, expected)
+        }
+    }
+
+    /// repairIndex reaches the same answer through the same proof, without an open.
+    func testSplitClaimPastTheFileIsRepairedFromTheSlots() throws {
+        try withQuantMode {
+            let files = 40
+            let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+            let db = dir.appendingPathComponent("index.sqlite")
+            let expected = try makeSplitIndexWithClaimPastTheFile(db, files: files)
+            switch VectorStore.repairIndex(at: db) {
+            case .repaired: break
+            case .nothingToDo: XCTFail("did not notice the claim")
+            case .needsReindex(let why): XCTFail("gave up on a provable claim: \(why)")
+            }
+            XCTAssertEqual(claim(db), files)
+            let s = try VectorStore(dbURL: db); defer { s.close() }
+            XCTAssertEqual((0 ..< 8).map { s.search(vec($0), topK: 1).first?.path ?? "" }, expected)
+        }
+    }
+
+    /// A vector file that ends before positions only it holds cannot be repaired: those vectors
+    /// are gone, and only re-embedding brings them back.
+    func testSplitFileShorterThanItsVectorsNeedsReindex() throws {
+        try withQuantMode {
+            let files = 40
+            let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+            let db = dir.appendingPathComponent("index.sqlite")
+            try makeCoveredIndex(db, files: files)
+            let vecs = db.path + ".vecs"
+            let h = try FileHandle(forWritingTo: URL(fileURLWithPath: vecs))
+            try h.truncate(atOffset: UInt64(10 * dim * 2)); try h.close()
+            dropRowSidecar(db)
+            switch VectorStore.repairIndex(at: db) {
+            case .needsReindex: break
+            case .repaired(let what): XCTFail("repaired around vectors that are gone: \(what)")
+            case .nothingToDo: XCTFail("did not notice the missing vectors")
+            }
+        }
+    }
 }
+

@@ -551,6 +551,11 @@ private struct PerformanceTab: View {
     @Environment(AppModel.self) private var model: AppModel
     /// Only for the hidden paper run: its sheet lives on the main window, which may be closed.
     @Environment(\.openWindow) private var openWindow
+    /// The memory cap while the slider is being dragged. Committed once, on release: every step
+    /// used to set the MLX limit and rewrite the performance settings, including steps far below
+    /// what the loaded model occupies on the way to the value the user meant.
+    @State private var memoryDraft: Double?
+    @State private var memoryDragging = false
     /// HALF THE MACHINE, not all of it. This was `min(physicalMemory, 128)`, which means the
     /// slider's maximum was 100% OF RAM on every Mac up to 128 GB - a 16 GB laptop could be
     /// dragged to a 16 GB cap. It only came out sub-proportional on the very large machines,
@@ -621,19 +626,30 @@ private struct PerformanceTab: View {
                     HStack {
                         Text("Maximum memory")
                         Spacer()
-                        Text(model.maxMemoryGB == 0 ? "Unlimited" : "\(Int(model.maxMemoryGB)) GB")
+                        let shown = memoryDraft ?? model.maxMemoryGB
+                        Text(shown == 0 ? "Unlimited" : "\(Int(shown)) GB")
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: Binding(
-                        get: { model.maxMemoryGB },
-                        set: { model.maxMemoryGB = $0.rounded() }
-                    ), in: 0 ... memoryCeiling) {
+                        get: { memoryDraft ?? model.maxMemoryGB },
+                        set: { v in
+                            // A drag holds the value until release; a keyboard or accessibility
+                            // step has no release, so it applies at once.
+                            if memoryDragging { memoryDraft = v.rounded() } else { model.maxMemoryGB = v.rounded() }
+                        }
+                    ), in: 0 ... memoryCeiling, label: {
                         Text("Maximum memory")
-                    } minimumValueLabel: {
+                    }, minimumValueLabel: {
                         Text("Off").font(.caption).foregroundStyle(.secondary)
-                    } maximumValueLabel: {
+                    }, maximumValueLabel: {
                         Text("\(Int(memoryCeiling)) GB").font(.caption).foregroundStyle(.secondary)
-                    }
+                    }, onEditingChanged: { editing in
+                        memoryDragging = editing
+                        if !editing, let v = memoryDraft {
+                            memoryDraft = nil
+                            if v != model.maxMemoryGB { model.maxMemoryGB = v }
+                        }
+                    })
                     .labelsHidden()
                     // Locked while the paper run holds the cap. Settings is its own window, so this
                     // pane stays live behind the run's sheet: moving the slider would persist the
@@ -1155,6 +1171,9 @@ private struct IndexTab: View {
                         HStack(spacing: 8) {
                             Spacer()
                             Button("Change\u{2026}") { pickModel() }
+                                // As the picker above: a new folder reloads the engine the run or
+                                // the pass is holding.
+                                .disabled(model.isIndexing || model.isPaperRunning)
                             Button("Show in Finder") {
                                 NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.modelPath)])
                             }
@@ -1176,7 +1195,20 @@ private struct IndexTab: View {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true; panel.canChooseFiles = false
         panel.prompt = "Choose"
-        if panel.runModal() == .OK, let url = panel.url { model.setModelDir(url) }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        // Checked HERE, before the setting is written: an incomplete folder used to be saved, then
+        // passed over at load for whichever model the locator found, so Change appeared to do
+        // nothing at all.
+        let missing = ["model.safetensors", "config.json", "tokenizer.json"]
+            .filter { !FileManager.default.fileExists(atPath: url.appendingPathComponent($0).path) }
+        guard missing.isEmpty else {
+            let a = NSAlert()
+            a.messageText = "That folder doesn't contain a model"
+            a.informativeText = "It is missing \(missing.joined(separator: ", ")). Choose the folder that holds the model's files."
+            a.runModal()
+            return
+        }
+        model.setModelDir(url)
     }
     /// Choosing a folder MOVES the index into it. It used to only repoint the setting, which
     /// silently abandoned the existing index and started reindexing from scratch - on a large
@@ -1296,8 +1328,10 @@ private struct OCRTab: View {
 /// The folder and the Clear button are on the pane, not behind a disclosure: a cache whose
 /// location cannot be seen and whose contents cannot be removed is a folder that only grows.
 private struct OCRCacheSection: View {
+    @Environment(AppModel.self) private var model: AppModel
     @State private var enabled = OCRCache.isEnabled
     @State private var folder = OCRCache.directory
+    @State private var moving = false
 
     var body: some View {
         Section {
@@ -1318,7 +1352,9 @@ private struct OCRCacheSection: View {
                 }
                 HStack(spacing: 8) {
                     Spacer()
-                    Button("Change\u{2026}") { choose() }
+                    // Not while a run is writing transcripts into the folder being moved.
+                    Button(moving ? "Moving\u{2026}" : "Change\u{2026}") { choose() }
+                        .disabled(moving || model.ocrRunActive)
                     Button("Show in Finder") {
                         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
                         NSWorkspace.shared.activateFileViewerSelecting([folder])
@@ -1351,15 +1387,22 @@ private struct OCRCacheSection: View {
             a.runModal()
             return
         }
-        do {
-            _ = try OCRCache.move(to: url)
-            OCRCache.directory = url
-            folder = url
-        } catch {
-            let a = NSAlert()
-            a.messageText = "The transcripts were not moved"
-            a.informativeText = error.localizedDescription
-            a.runModal()
+        // Off the main thread: a large cache is gigabytes of files.
+        moving = true
+        Task {
+            let result = await Task.detached(priority: .userInitiated) { () -> Error? in
+                do { _ = try OCRCache.move(to: url); return nil } catch { return error }
+            }.value
+            moving = false
+            if let error = result {
+                let a = NSAlert()
+                a.messageText = "The transcripts were not moved"
+                a.informativeText = error.localizedDescription
+                a.runModal()
+            } else {
+                OCRCache.directory = url
+                folder = url
+            }
         }
     }
 }

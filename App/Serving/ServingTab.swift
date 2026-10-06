@@ -12,6 +12,17 @@ struct ServingTab: View {
     @State private var showMCPSheet = false
     @State private var showSkillSheet = false
     @State private var logHasLines = false
+    /// The token as typed. Committed on Return or when the field loses focus: every keystroke used
+    /// to restart a running server, and on the LAN scope clearing the field to paste a new token
+    /// put a random one straight back.
+    @State private var tokenDraft: String?
+    @FocusState private var tokenFocused: Bool
+
+    private func commitToken() {
+        guard let d = tokenDraft else { return }
+        tokenDraft = nil
+        if d != model.serving.bearerToken { model.serving.bearerToken = d }
+    }
 
     /// Top-level example category: the search endpoint, or an embedding endpoint.
     private enum ExampleKind: String, CaseIterable, Identifiable {
@@ -93,8 +104,8 @@ struct ServingTab: View {
             LabeledContent("Bearer token") {
               HStack(spacing: 6) {
                 let token = Binding(
-                    get: { model.serving.bearerToken },
-                    set: { model.serving.bearerToken = $0 }
+                    get: { tokenDraft ?? model.serving.bearerToken },
+                    set: { tokenDraft = $0 }
                 )
                 // Shown, not masked. A reveal toggle guards against shoulder-surfing a password;
                 // this is a local API token the user has to read to paste into a client, so hiding
@@ -108,6 +119,10 @@ struct ServingTab: View {
                 // grouped form is invisible until it has text. "Not set" is also the truth; no
                 // token is needed while the scope is this Mac only.
                 TextField("Bearer token", text: token, prompt: Text("Not set"))
+                    .focused($tokenFocused)
+                    .onSubmit { commitToken() }
+                    .onChange(of: tokenFocused) { _, focused in if !focused { commitToken() } }
+                    .onDisappear { commitToken() }
                     .labelsHidden()
                     .multilineTextAlignment(.trailing)
                     .frame(maxWidth: .infinity)
@@ -117,6 +132,7 @@ struct ServingTab: View {
                 .buttonStyle(.borderless).foregroundStyle(.secondary)
                 .help("Copy").disabled(model.serving.bearerToken.isEmpty)
                 Button {
+                    tokenDraft = nil
                     model.serving.bearerToken = ServingController.generateToken()
                 } label: { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(.borderless).foregroundStyle(.secondary)

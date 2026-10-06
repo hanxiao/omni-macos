@@ -755,9 +755,91 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
   released in close(), so the second store could not map it and refused ("bookkeeping off by 120
   rows" on the live index, a misleading reason). Switching audio off again converged against the
   old engine and changed nothing; Retry and Repair hit the same lock.
-- bootstrap now keeps the open store when the index path is the same and loads only the engine; a
-  different index is opened fresh and the old one closed. Repair, reindex-from-scratch and moving
-  the index release the open store first (releaseOpenIndex), since each works on the files directly.
+- bootstrap now keeps the open store when the index path is the same; a different index is opened
+  fresh and the old one closed. A tower switched on does not rerun bootstrap at all: reloadEngine
+  loads the new engine while the old one keeps serving, then swaps it under the indexing hold.
+  Recovery and moving the index release the open store first (releaseOpenIndex), since each works
+  on the files directly.
 - Reproduced and verified on a clone of the live index with `kind:audio:on` in PerfScript: before,
   `bootstrap failed-index`; after, a second `launch ready` and searches answering. The failed open
   deleted the row sidecar (rebuilt at the next launch) and wrote nothing else ("nothing modified").
+
+## No repair screen (2026-10-06)
+- Han: repair only when necessary, automatic, critically correct, never a consent prompt. The
+  failed-index screen with Retry / Repair / Reindex is gone. The store now says WHY it refused, as
+  three error cases, and the app acts on each without asking:
+  - `storeUnavailable` (the vector file locked by another process, an unreadable file, sqlite
+    cannot open): a waiting view with the reason, retried with backoff 2 s doubling to 30 s.
+  - `storeNeedsSpace` (an upgrade blocked on free disk): the same wait.
+  - `storeNewer`: an update view (Check for Updates), never a rewrite in an older format.
+  - `store` (the bookkeeping refuses): VectorStore.repairIndex; repaired, or consistent, gets one
+    more open; anything else, or a second refusal, deletes the index files and rebuilds from the
+    user's files. The index is derived state: everything a rebuild deletes is re-derived from disk
+    (search history and bookmarks are prefs, clipboard and OCR transcripts have their own folders).
+  - A refusal calls `abandon()`: closes the handles and releases the lock, writing nothing, so the
+    next attempt is not refused by the store that just gave up.
+- A COVERAGE CLAIM PAST THE END OF THE VECTOR FILE is provable on v5 and is now corrected at open.
+  A content's blob is cleared only once its vector is durable at its slot, so the claim must reach
+  exactly past the highest slot of an unstaged content (correctSplitCoverageClaim; also what
+  repairIndex runs). The count-based derivation cannot do this on a migrated index: its contents
+  outnumber its positions (132 slots shared by two contents on the live clone, from the v4 fold),
+  so it asks the file for more positions than exist and declines. Positive control: with the proof
+  off, the migrated fixture refuses "off by 103 rows"; with it on, it opens with the same digest.
+- Verified through the app on damaged clones of the live index (3.73M contents):
+  - claim +500 past the file: `coverage claim corrected 3730648 -> 3730148 from the content
+    slots`, ready, searches answering; search digest 7e8e2571b665a25d, identical to the undamaged
+    clone opened the same way.
+  - vector file truncated to 1 GB (vectors really gone): refused, repair could not prove it,
+    rebuilt from files automatically, ready; `.omniignore` kept.
+  - two copies on one index: the second waits ("Another copy of Omni has the index open."),
+    retries with backoff, and opens once the first has quit.
+- An unmappable vector file is "unavailable" only when another process holds its lock or it cannot
+  be read. A file SHORTER than the claim maps fine at its own size and fails the claim, which is
+  the bookkeeping's problem; classifying that as unavailable waited forever on the damaged clone.
+
+## Settings under change (2026-10-06)
+- Every control in Settings was flipped on a clone of the live index by `set:<name>=<value>` and
+  `kind:<kind>:<on|off>[:keep|purge]` (PerfScript), which assign through the control's own setter.
+  Memory, grouping, instant search, the size and length limits, iCloud downloads, tags, recents,
+  history mode and retention, serving (on, port, scope, token, off), OCR width, every kind off with
+  purge and with keep mid-pass, ignore apply and revert, and all three towers on in one burst. The
+  index stayed ready and answered after each step; the burst converged on `engine reloaded
+  vision=true audio=true` with no second bootstrap.
+- What changed to get there:
+  - The indexing hold (withIndexingStopped): a kind purge, an ignore prune, an engine swap and a
+    bootstrap stop the writers and wait for them before touching the store, then restart once.
+    Before, the purge and prune ran beside a live pass that could write back what they removed.
+  - A kind switched off with its rows KEPT is not crawled, so its deleted files stayed searchable
+    forever. The reconcile now drops kept rows whose file is gone from disk (Photos excluded);
+    KeptKindReconcileTests fails without it.
+  - The memory slider commits on release (it re-applied the MLX limit on every drag tick); the
+    serving token commits on submit or focus loss (it restarted the server per keystroke); the OCR
+    transcript cache moves off the main thread and is disabled while OCR runs.
+  - Model Location Change checks the folder holds a model before saving it (an incomplete folder
+    was saved and then passed over at load), and is disabled while indexing or a paper run holds
+    the engine, as the model picker already was.
+  - OmniPrefs: every preference write goes through it and is a no-op in an isolated or ephemeral
+    run, so measuring never writes the user's settings.
+- THREE BUGS BEHIND "SWITCHING A TOWER ON RELOADS THE MODEL SEVERAL TIMES", found in this order
+  by timestamped logs and `sample`, each one hiding the next:
+  - A cancelled task cut the indexing hold short. The tower reconcile ran INSIDE the debounced
+    `modalityReloadTask`, and the next toggle's `cancel()` reached it: every `try? await
+    Task.sleep` then returned at once, the hold's one-minute wait for the writers ran out 1.2 s in,
+    and the new engine was discarded ("not installed") and loaded again. The debounce now starts the
+    reconcile in a fresh task, and correctness waits use `waitUntilIndexWorkStops` (a main-queue
+    timer, so a cancel cannot shorten it; also the bootstrap swap and the index move).
+  - reloadEngine reported success when the hold had refused to swap, so the loop went round again
+    against the engine it meant to replace. It now returns false and logs "not installed".
+  - DEADLOCK IN MLX-SWIFT between two engines. `CompiledFunction.call` takes the function's lock,
+    then the global `evalLock`; tracing a compiled function that calls another takes `evalLock`
+    first, then the inner function's lock. `Qwen3Backbone.siluGateCompiled` is a static shared by
+    every engine, and each engine's `run` gate serialized only itself, so warmText on the new
+    engine (tracing the query graph) and a pass on the old one locked each other, with the next
+    weight load and every search queued behind them. Sampled live, three threads in
+    `__psynch_mutexwait`. The gate is now process-wide (OmniEngine `run`); the GPU runs one forward
+    at a time anyway. The OCR lane uses no compiled functions, so it is outside this.
+  - The reconcile is single-flight: one loop, later calls mark it dirty. Measured on the live clone,
+    image, video and audio switched on 0.3 s apart: two loads (vision, then vision and audio, since
+    audio arrived after the first had started), each installed within 3 s of its toggle in two
+    runs; audio off-on-off-on in 1.2 s: one load. Before: three loads with the old code, five with
+    only the single-flight loop, a hang with the per-engine gate.

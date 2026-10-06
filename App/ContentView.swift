@@ -231,8 +231,10 @@ struct ContentView: View {
             OnboardingView()
         case .failed(let msg):
             EngineFailedView(message: msg)
-        case .failedIndex(let why):
-            IndexFailedView(message: why)
+        case .waitingForIndex(let why):
+            IndexWaitingView(message: why)
+        case .indexNewer:
+            IndexNewerView()
         case .ready:
             ready
         }
@@ -829,52 +831,37 @@ struct EngineFailedView: View {
 /// chunk table and declines to start when the volume cannot hold the copy, so the message is
 /// actionable ("needs 5.6 GB free, 1.2 GB available") and the only useful button is Retry once the
 /// user has freed some. Reveal is there because the next question is always "where is it?".
-struct IndexFailedView: View {
-    @Environment(AppModel.self) private var model: AppModel
+/// The index is there but cannot be opened yet: another process holds it, its volume is not
+/// mounted, or an upgrade is waiting for disk space. The app retries on its own and says what it is
+/// waiting for; there is nothing for the user to decide (AppModel.waitForIndex).
+struct IndexWaitingView: View {
     let message: String
-    @State private var confirmReindex = false
     var body: some View {
         VStack(spacing: 12) {
-            Image(systemName: "internaldrive").font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
-            Text("Omni can't open its index").font(.title)
+            ProgressView().controlSize(.large)
+            Text("Waiting for the index").font(.title2)
             Text(message).foregroundStyle(.secondary)
                 .multilineTextAlignment(.center).frame(maxWidth: 460)
-            if let repair = model.repairMessage {
-                Text(repair).font(.callout).foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center).frame(maxWidth: 460)
-            }
-            HStack {
-                Button("Retry") { model.retryBootstrap() }.buttonStyle(.borderedProminent)
-                // Repair corrects the vector bookkeeping when the mapping is provable, and says so
-                // plainly when it is not - it never guesses, because a wrong guess here returns
-                // rows their neighbour's vector with no error at all.
-                Button(model.repairRunning ? "Repairing\u{2026}" : "Repair") { model.repairIndex() }
-                    .disabled(model.repairRunning || model.dbPath.isEmpty)
-                // And the way out of the cases Repair refuses. Destructive, so it is red and asks
-                // first: everything it deletes is derived from the user's files, but rebuilding it
-                // is hours of embedding on a large index.
-                // .tint, not just role: on macOS a destructive ROLE only colours the button inside
-                // menus and dialogs - in a plain row it renders identically to its neighbours, which
-                // is the one thing this button must not do.
-                Button("Reindex", role: .destructive) { confirmReindex = true }
-                    .buttonStyle(.bordered)
-                    .tint(.red)
-                    .disabled(model.repairRunning || model.dbPath.isEmpty)
-                Button("Show in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.dbPath)])
-                }
-                .disabled(model.dbPath.isEmpty)
-            }
-            .controlSize(.large)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
-        .confirmationDialog("Delete the index and start over?", isPresented: $confirmReindex) {
-            Button("Delete and reindex", role: .destructive) { model.reindexFromScratch() }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Your files are not affected.")
+    }
+}
+
+/// The index was written by a newer Omni. Only an update can open it, and opening it with this
+/// build would mean rewriting it in an older format.
+struct IndexNewerView: View {
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "arrow.down.circle").font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
+            Text("This index needs a newer Omni").font(.title2)
+            Text("It was written by a newer version. Update Omni to open it.").foregroundStyle(.secondary)
+                .multilineTextAlignment(.center).frame(maxWidth: 460)
+            Button("Check for Updates") { Updater.check(userInitiated: true) }
+                .buttonStyle(.borderedProminent).controlSize(.large)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
     }
 }
 

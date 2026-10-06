@@ -587,6 +587,33 @@ final class ChunkSplitLoaderTests: XCTestCase {
         XCTAssertEqual(num(url, "SELECT COUNT(*) FROM chunk WHERE hex(substr(CAST(key AS BLOB), 1, 4)) = 'FFFFFFFF'"), 0)
     }
 
+    /// A COVERAGE CLAIM PAST THE END OF THE VECTOR FILE, on an index migrated from v4: the shape a
+    /// real 3.7M-content index refused to open with. Its contents outnumber its positions (the
+    /// fold had already collapsed duplicates onto one position before the split gave each its own
+    /// content), so the count-based derivation asks the file for more positions than it holds and
+    /// declines. The open corrects the claim from the content slots instead, re-embeds nothing,
+    /// and answers exactly as before.
+    func testAClaimPastTheFileIsCorrectedFromTheSlotsAtOpen() throws {
+        let url = tempDB()
+        try writeV4Fixture(url, files: 16, dupEvery: 4)
+        try migrate(url)
+        let claim = num(url, "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'vecs_covered_rows'")
+        let needed = num(url, "SELECT MAX(slot) + 1 FROM chunk WHERE id NOT IN (SELECT chunk_id FROM pending_vecs)")
+        XCTAssertGreaterThan(claim, 0, "the fixture is not covered, so nothing below is tested")
+        let expected: [String] = try { let s = try VectorStore(dbURL: url); defer { s.close() }; return digest(s) }()
+
+        let fileSlots = ((try FileManager.default.attributesOfItem(atPath: url.path + ".vecs")[.size]) as! Int) / (Self.dim * 2)
+        exec(url, "UPDATE meta SET value = '\(fileSlots + 7)' WHERE key = 'vecs_covered_rows';")
+        for suffix in [".rows", ".rows-wal", ".rows-shm"] { try? FileManager.default.removeItem(atPath: url.path + suffix) }
+
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        XCTAssertEqual(num(url, "SELECT CAST(value AS INTEGER) FROM meta WHERE key = 'vecs_covered_rows'"), needed,
+                       "the open did not set the claim from the content slots")
+        XCTAssertEqual(num(url, "SELECT COUNT(*) FROM files WHERE CAST(modified AS INTEGER) = -1"), 0,
+                       "the correction marked files for re-embedding")
+        XCTAssertEqual(digest(store), expected)
+    }
+
     func testWritesAndDeletesWorkWithNoV4Tables() throws {
         let url = tempDB()
         try writeV4Fixture(url, files: 16, dupEvery: 4)

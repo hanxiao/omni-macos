@@ -531,7 +531,7 @@ struct SidebarFolds: Codable, Equatable {
         var kept = self
         let cutoff = Self.dayKey(Calendar.current.date(byAdding: .day, value: -400, to: Date()) ?? .distantPast)
         kept.days = days.filter { $0.key >= cutoff }
-        if let data = try? JSONEncoder().encode(kept) { UserDefaults.standard.set(data, forKey: Self.key) }
+        if let data = try? JSONEncoder().encode(kept) { OmniPrefs.set(data, forKey: Self.key) }
     }
 
     static func dayKey(_ day: Date) -> String {

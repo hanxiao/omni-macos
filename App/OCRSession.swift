@@ -91,12 +91,12 @@ final class OCRSession {
                 let stored = UserDefaults.standard.integer(forKey: "omni.ocr.draftLength")
                 return stored == 0 ? 3 : min(max(stored, 1), 8)
             }
-            set { UserDefaults.standard.set(newValue, forKey: "omni.ocr.draftLength") }
+            set { OmniPrefs.set(newValue, forKey: "omni.ocr.draftLength") }
         }
 
         static var loopGuard: Bool {
             get { UserDefaults.standard.object(forKey: "omni.ocr.loopGuard") as? Bool ?? true }
-            set { UserDefaults.standard.set(newValue, forKey: "omni.ocr.loopGuard") }
+            set { OmniPrefs.set(newValue, forKey: "omni.ocr.loopGuard") }
         }
 
         /// How many pages decode together. 0 means "as many as this Mac can hold".
@@ -110,7 +110,7 @@ final class OCRSession {
                 let stored = UserDefaults.standard.integer(forKey: "omni.ocr.batchWidth")
                 return stored <= 0 ? 0 : min(stored, 32)
             }
-            set { UserDefaults.standard.set(newValue, forKey: "omni.ocr.batchWidth") }
+            set { OmniPrefs.set(newValue, forKey: "omni.ocr.batchWidth") }
         }
 
         /// Always the model's own prompt. `nil` is what `transcribeAuto` expects for it.

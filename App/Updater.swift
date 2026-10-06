@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import CryptoKit
+import OmniKit
 
 /// In-app updater. Reads a small JSON manifest published next to the DMG on hanxiao.io/omni,
 /// compares versions, and - if a newer build exists - downloads the versioned DMG (with progress),
@@ -38,7 +39,7 @@ enum Updater {
         let now = Date().timeIntervalSince1970
         let last = UserDefaults.standard.double(forKey: lastCheckKey)
         guard now - last > 86_400 else { return }
-        UserDefaults.standard.set(now, forKey: lastCheckKey)
+        OmniPrefs.set(now, forKey: lastCheckKey)
         check(userInitiated: false)
     }
 
@@ -86,7 +87,7 @@ enum Updater {
             startUpdate(m)
         case .alertThirdButtonReturn:
             // Stop the daily launch check from re-prompting for this version.
-            UserDefaults.standard.set(m.version, forKey: "omni.skipVersion")
+            OmniPrefs.set(m.version, forKey: "omni.skipVersion")
         default:
             break
         }
