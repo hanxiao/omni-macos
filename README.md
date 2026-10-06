@@ -31,7 +31,8 @@ Download the DMG from [hanxiao.io/omni](https://hanxiao.io/omni) or
 [Releases](https://github.com/hanxiao/omni-macos/releases) and drag Omni to Applications.
 
 On first launch Omni downloads its search model (1.8 GB), and optionally the OCR model (4.2 GB)
-for transcribing scans and photos. After that nothing leaves the Mac.
+for transcribing scans and photos, both from this repository's GitHub releases. After that
+nothing leaves the Mac.
 
 ## Serving
 

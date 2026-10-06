@@ -54,6 +54,9 @@ codebase were already measured there, and many were rejected.
 - Snapshot: `/Volumes/han2tb/ai-models/huggingface/hub/models--jinaai--jina-embeddings-v5-omni-small-mlx/snapshots/716c5b684db3f6ba574dd9b4f6b14af3b2eb8bda`
 - Needs: `model.safetensors`, `adapters/retrieval/adapter_model.safetensors`, `tokenizer.json`, `config.json`.
 - Retrieval LoRA: alpha=32, r=32 -> scale 1.0, targets all 7 linear modules in `language_model`.
+- Shipped weights: release `embed-weights-v1`, the Hugging Face checkpoints with that merge applied
+  (`omni-verify exportmerged`, metadata `omni=retrieval-lora-merged`), split into parts with a
+  SHA-256 manifest. A new checkpoint is a new tag, re-exported and re-proven (digest, fixtures).
 
 ## Build, test, measure
 
@@ -64,7 +67,7 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (681 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (687 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Search digest on the real index (a CLONE, never the live one): `omni-verify searchreal

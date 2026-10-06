@@ -1,8 +1,9 @@
 import Foundation
 import MLX
 
-/// Loads jina-embeddings-v5-omni-small-mlx weights and merges the retrieval LoRA
-/// adapter at load time, mirroring `utils.JinaMultiTaskModel` + `sanitize`:
+/// Loads jina-embeddings-v5-omni weights and merges the retrieval LoRA adapter at load time,
+/// mirroring `utils.JinaMultiTaskModel` + `sanitize`. The weights the app downloads are this merge
+/// already applied (omni-verify exportmerged), and load as stored:
 ///   - retrieval LoRA merged in place in fp32: W += (alpha/r) * (B @ A)
 ///   - `language_model.*` then stored in bf16 by default (only the LoRA targets take the fp32
 ///     round-trip); OMNI_BACKBONE_DTYPE picks fp16 or fp32, and OMNI_BACKBONE_BF16=0 keeps it
@@ -20,7 +21,11 @@ public struct WeightStore {
     ///   - keepVision: also keep vision_tower.* / merger.* (image path)
     ///   - keepAudio: also keep audio_tower.* / audio_projector.* (audio path)
     public init(modelDir: URL, loraScale: Float = 1.0, keepVision: Bool = true, keepAudio: Bool = true) throws {
-        var w = try loadArrays(url: modelDir.appendingPathComponent("model.safetensors"))
+        // The release weights (ModelDownloader) are this same merge, written once; their metadata
+        // says so, and an adapter left beside them from an older download must not merge twice.
+        let (stored, meta) = try loadArraysAndMetadata(url: modelDir.appendingPathComponent("model.safetensors"))
+        var w = stored
+        let alreadyMerged = meta["omni"] == "retrieval-lora-merged"
 
         // Drop modalities we do not run.
         for key in Array(w.keys) {
@@ -51,7 +56,7 @@ public struct WeightStore {
         // fp32 round-trip is paid only where it matters.
         let adapterURL = modelDir
             .appendingPathComponent("adapters/retrieval/adapter_model.safetensors")
-        let adapter = FileManager.default.fileExists(atPath: adapterURL.path)
+        let adapter = !alreadyMerged && FileManager.default.fileExists(atPath: adapterURL.path)
             ? try loadArrays(url: adapterURL) : [:]
         var loraTargets = Set<String>()
         for key in adapter.keys where key.contains("lora_A") {

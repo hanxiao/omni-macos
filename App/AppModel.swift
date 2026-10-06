@@ -3736,7 +3736,7 @@ final class AppModel {
         }
     }
 
-    /// Download a model variant from HuggingFace and load it when finished.
+    /// Download a model variant (GitHub release, Hugging Face fallback) and load it when finished.
     func downloadModel(_ variant: ModelVariant) {
         guard !isDownloading, let dest = ModelDownloader.installDir(for: variant) else { return }
         isDownloading = true; downloadFraction = 0; downloadLabel = "Preparing\u{2026}"; downloadFailed = false

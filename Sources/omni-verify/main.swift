@@ -266,6 +266,14 @@ if args.count >= 4 && args[1] == "dumpbackbone" {
     exit(0)
 }
 
+// The release weights: the runtime merge, written once and checked bit-identical on reload.
+if args.count >= 4 && args[1] == "exportmerged" {
+    exit(try exportMergedRun(URL(fileURLWithPath: args[2]), URL(fileURLWithPath: args[3])))
+}
+if args.count >= 4 && args[1] == "fetchmodel" {
+    exit(try await fetchModelRun(args[2], URL(fileURLWithPath: args[3])))
+}
+
 if args.count >= 2 && args[1] == "churnbench" {
     let nFiles = (args.count >= 3 ? Int(args[2]) : nil) ?? 3000
     let secs = (args.count >= 4 ? Double(args[3]) : nil) ?? 12

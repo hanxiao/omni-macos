@@ -10,7 +10,7 @@
         },
         {
           "q": "What does Omni download on first launch?",
-          "a": "The embedding model, about 1.9 GB, from Hugging Face. The OCR model (about 4.5 GB) is an optional second download. Both are stored in ~/Library/Application Support/Omni.",
+          "a": "The embedding model, about 1.9 GB, from this project's GitHub releases, with Hugging Face as the fallback. The OCR model (about 4.5 GB) is an optional second download from the same releases. Both are stored in ~/Library/Application Support/Omni.",
           "shortcut": ""
         },
         {

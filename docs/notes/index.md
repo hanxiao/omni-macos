@@ -730,3 +730,20 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
   consumed the step and its prune would never run; it is recorded when the prune finishes now.
 - OPEN: the write-path race that records a hole while a re-add revives the content. The repair makes
   the state survivable; the race itself is not yet found.
+
+## The search model ships merged, from GitHub (2026-10-05)
+- The app downloaded the Hugging Face checkpoint and adapter and merged them on every load, on each
+  Mac's own GPU. The merge is weight arithmetic with nothing machine-specific in it, so release
+  `embed-weights-v1` carries its result: `omni-verify exportmerged` writes WeightStore's merged
+  dictionary, reloads it and checks all tensors bit-identical (nano 751, small 1,095).
+- PROVEN EQUAL: search digest `134b9ff183fd2f29` on the 9.7M-chunk bench index with the exported
+  nano and with nano as downloaded through ModelDownloader; the small text fixtures match the
+  Hugging Face path to the last printed digit.
+- model.safetensors ships as 1.9 GB byte parts (a release asset is capped at 2 GiB), joined into a
+  `.partial` file that resumes at part granularity and must match the manifest's SHA-256.
+- A MERGED FILE NEVER TAKES THE ADAPTER AGAIN: WeightStore skips it when the safetensors metadata
+  says `omni=retrieval-lora-merged`. Positive control: the same file without that label, beside the
+  adapter, merges twice and the digest becomes `a894f04bcf56e503`.
+- Hugging Face remains the fallback, used only when the release manifest cannot be fetched;
+  installs already holding the Hugging Face layout keep loading it and merging at load.
+
