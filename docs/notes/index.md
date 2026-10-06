@@ -747,3 +747,17 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
 - Hugging Face remains the fallback, used only when the release manifest cannot be fetched;
   installs already holding the Hugging Face layout keep loading it and merging at load.
 
+
+## One open store per index (2026-10-06)
+- SWITCHING AUDIO ON MID-SESSION SHOWED THE REPAIR SCREEN until a relaunch. A tower that is not
+  loaded needs a model reload, and the reload reran bootstrap, which opened a second VectorStore on
+  the index the first one still held: the vector file's flock is exclusive per open file and only
+  released in close(), so the second store could not map it and refused ("bookkeeping off by 120
+  rows" on the live index, a misleading reason). Switching audio off again converged against the
+  old engine and changed nothing; Retry and Repair hit the same lock.
+- bootstrap now keeps the open store when the index path is the same and loads only the engine; a
+  different index is opened fresh and the old one closed. Repair, reindex-from-scratch and moving
+  the index release the open store first (releaseOpenIndex), since each works on the files directly.
+- Reproduced and verified on a clone of the live index with `kind:audio:on` in PerfScript: before,
+  `bootstrap failed-index`; after, a second `launch ready` and searches answering. The failed open
+  deleted the row sidecar (rebuilt at the next launch) and wrote nothing else ("nothing modified").

@@ -13,7 +13,7 @@ import OmniKit
 /// `wait:<seconds>`. For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
 /// (window size, centered), `front`, `appearance:light|dark`, `history:<n>`, `sort:<order>`,
-/// `bsort:<name|column rawValue>`, `settings:<tab>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `recents`, `clipboard:on|off`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
+/// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `recents`, `clipboard:on|off`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
 enum PerfScript {
@@ -105,6 +105,9 @@ enum PerfScript {
         case "ocr": model.ocrMode = true
         case "remember": model.recordCurrentSearchToHistory(viaSubmit: true)   // what Return does
         case "sort": model.sortOrder = SortOrder(rawValue: arg) ?? .relevance
+        case "kind":      // the Settings switch for a file kind: kind:audio:on, kind:image:off
+            let parts = arg.split(separator: ":").map(String.init)
+            if parts.count == 2, let k = FileKind(rawValue: parts[0]) { Task { await model.toggleKind(k, on: parts[1] == "on") } }
         case "bsort":     // a column-header click in the folder browser
             NotificationCenter.default.post(name: .omniPerfBrowseSort, object: arg)
         case "settings":  // open Settings on a tab: files, content, performance, storage, ocr, history, serving

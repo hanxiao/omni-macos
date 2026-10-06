@@ -255,6 +255,19 @@ final class AppModel {
         return weights + (replica ?? 0)
     }
 
+    /// Close the open index before anything works on its files directly (repair, delete, move):
+    /// the store holds the vector file's exclusive lock until close(), and a pass still running
+    /// would keep writing to files being rewritten underneath it.
+    private func releaseOpenIndex() {
+        indexer?.cancel()
+        indexer = nil
+        indexGen += 1
+        indexState = .idle
+        serving.detach()
+        store?.close()
+        store = nil
+    }
+
     /// Try to repair the index the store refused to open, then reload if it worked.
     ///
     /// Off the main actor: it opens the database and reads the vector file. Only the provable
@@ -264,6 +277,7 @@ final class AppModel {
         guard !repairRunning, let url = try? Self.indexURL() else { return }
         repairRunning = true
         repairMessage = nil
+        releaseOpenIndex()
         Task {
             let outcome = await Task.detached(priority: .userInitiated) {
                 VectorStore.repairIndex(at: url)
@@ -293,6 +307,7 @@ final class AppModel {
         guard !repairRunning, let url = try? Self.indexURL() else { return }
         repairRunning = true
         repairMessage = nil
+        releaseOpenIndex()
         Task {
             let freed = await Task.detached(priority: .userInitiated) {
                 VectorStore.deleteIndexFiles(at: url)
@@ -3197,7 +3212,9 @@ final class AppModel {
         pendingDisable = nil
         let oldTowers = enabledKindTowers
         settings.set(k, on)
-        UserDefaults.standard.set(settings.enabledKinds.map { $0.rawValue }, forKey: "omni.indexKinds")
+        if !isIsolatedRun {   // a test toggling a kind must not change the user's own setting
+            UserDefaults.standard.set(settings.enabledKinds.map { $0.rawValue }, forKey: "omni.indexKinds")
+        }
         if on { clearKindExcludesFromIgnore(k) }       // make the toggle authoritative over legacy excludes
         if !on, purge, let store {
             // deleteKind is a SQL DELETE + O(N) in-place row compaction; run it off the main actor like
@@ -3987,11 +4004,22 @@ final class AppModel {
             // Load the store (CPU: reads the index into memory) concurrently with the engine (IO/GPU:
             // weights + tokenizer) - they're independent, so overlap removes the store load from the
             // critical path. VectorStore/OmniEngine are Sendable; neither touches MainActor state here.
-            async let storeC = try VectorStore(dbURL: try Self.indexURL(), onLoadProgress: { [weak self] f in
-                Task { @MainActor in self?.noteStoreLoadFrac(f) }
-            }, onPhase: { [weak self] p in
-                Task { @MainActor in self?.storePhase = p }
-            })
+            //
+            // ONE OPEN STORE PER INDEX. A rerun against the index that is already open (a tower
+            // switched on in Settings, a model switch) keeps that store: a second VectorStore on the
+            // same files cannot take the vector file's exclusive lock, which the first one holds
+            // until close(), so it refused to open and the index showed the repair screen until a
+            // relaunch. Only a different index is opened fresh.
+            let indexURL = try Self.indexURL()
+            let reuse = self.store.flatMap { $0.dbURL.standardizedFileURL == indexURL.standardizedFileURL ? $0 : nil }
+            async let storeC: VectorStore = {
+                if let reuse { return reuse }
+                return try VectorStore(dbURL: indexURL, onLoadProgress: { [weak self] f in
+                    Task { @MainActor in self?.noteStoreLoadFrac(f) }
+                }, onPhase: { [weak self] p in
+                    Task { @MainActor in self?.storePhase = p }
+                })
+            }()
             // loadValidated self-tests the media embedding path and reloads weights if the first
             // (cold) load hit the MLX uninitialized-memory NaN, so media indexes reliably. Only load
             // the towers for enabled modalities so a turned-off kind never occupies VRAM.
@@ -4065,7 +4093,7 @@ final class AppModel {
             }
             EngineServingBackend.minScore = self.minScore   // one floor, window and server
             self.serving.attach(engine: engine, store: store, modelName: "omni-\(modelVariant.rawValue)")
-            if let oldStore { Task.detached(priority: .utility) { _ = oldIndexer; oldStore.close() } }
+            if let oldStore, oldStore !== store { Task.detached(priority: .utility) { _ = oldIndexer; oldStore.close() } }
             self.supportsImages = engine.supportsImages
             self.audioSupported = engine.supportsAudio
             self.engineDim = engine.dim
@@ -4187,6 +4215,7 @@ final class AppModel {
                 // The failure screen offers Reveal, and dbPath is normally set by refreshIndexStats
                 // - which needs the store that just refused to open. Resolve it directly.
                 if self.dbPath.isEmpty { self.dbPath = (try? Self.indexURL())?.path ?? "" }
+                omniPerfLog("bootstrap failed-index: \(why)")
                 self.phase = .failedIndex(why)
             }
             else { self.phase = .failed("\(error)") }
@@ -4377,9 +4406,7 @@ final class AppModel {
             isTerminating = false
             return "Indexing did not stop in time. Try again in a moment."
         }
-        serving.detach()
-        store?.close()
-        store = nil
+        releaseOpenIndex()
 
         let copied: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
             do { try IndexRelocation.copy(from: src, to: url); return .success(()) }
