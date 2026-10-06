@@ -8,13 +8,13 @@ repository-code: "https://github.com/hanxiao/omni-macos"
 license: Apache-2.0
 type: software
 preferred-citation:
-  type: article
+  type: conference-paper
   title: "omni-macos: On-Device Omni-Modal Search on Apple Silicon"
   authors:
     - family-names: Xiao
       given-names: Han
   year: 2026
-  journal: "arXiv preprint arXiv:2608.05543"
+  collection-title: "NeurIPS 2026 Workshop on On-Device Intelligence"
   url: "https://arxiv.org/abs/2608.05543"
   identifiers:
     - type: other

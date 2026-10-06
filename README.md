@@ -9,7 +9,7 @@
 <p align="center">
   <a href="https://hanxiao.io/omni"><b>Download</b></a>
   &nbsp;&middot;&nbsp;
-  <a href="https://arxiv.org/abs/2608.05543"><b>Technical report</b></a>
+  <a href="https://arxiv.org/abs/2608.05543"><b>Paper</b></a> (NeurIPS 2026 Workshop on On-Device Intelligence)
 </p>
 
 <p align="center">
@@ -57,12 +57,14 @@ fixtures.
 ## Citation
 
 ```bibtex
-@article{xiao2026omnimacos,
-  title   = {omni-macos: On-Device Omni-Modal Search on Apple Silicon},
-  author  = {Xiao, Han},
-  journal = {arXiv preprint arXiv:2608.05543},
-  year    = {2026},
-  url     = {https://arxiv.org/abs/2608.05543}
+@inproceedings{xiao2026omnimacos,
+  title     = {omni-macos: On-Device Omni-Modal Search on Apple Silicon},
+  author    = {Xiao, Han},
+  booktitle = {NeurIPS 2026 Workshop on On-Device Intelligence},
+  year      = {2026},
+  eprint    = {2608.05543},
+  archivePrefix = {arXiv},
+  url       = {https://arxiv.org/abs/2608.05543}
 }
 ```
 
