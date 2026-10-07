@@ -4,35 +4,44 @@
 
 <h1 align="center">Omni</h1>
 
-<p align="center">Search every file on your Mac by meaning. Fully airgapped.</p>
+<p align="center">Search every file on your Mac by meaning, with local multimodal embeddings.</p>
 
-<p align="center">
-  <a href="https://hanxiao.io/omni"><b>Download</b></a>
-  &nbsp;&middot;&nbsp;
-  <a href="https://arxiv.org/abs/2608.05543"><b>Paper</b></a> (NeurIPS 2026 Workshop on On-Device Intelligence)
-</p>
+This fork of [hanxiao/omni-macos](https://github.com/hanxiao/omni-macos) uses
+**Google EmbeddingGemma 2** as its default search model. Text (including French),
+images, audio and video share normalized 768-dimensional vectors. Jina Small/Nano
+remain explicit alternatives in Settings.
 
-<p align="center">
-  <a href="https://hanxiao.io/omni/assets/omni-intro.mp4?v=06b4ad11">
-    <img src="site/omni/assets/omni-poster-play.jpg?v=285be582" alt="Omni launch film" width="720">
-  </a>
-</p>
+The app remains Swift/SwiftUI. EmbeddingGemma 2 runs on Apple Silicon through a
+persistent **local Python/MLX helper**, connected by private pipes. Inference works
+offline; the helper exposes no HTTP endpoint and does not upload inputs. This is
+not yet a self-contained downloadable app: install the helper before launching.
+Upstream releases and published Jina benchmarks do not describe this fork.
 
-Text, code, PDFs, images, audio and video in one vector space, so any query finds any kind of
-file. The embedding model is `jina-embeddings-v5-omni`, ported to MLX-Swift and running
-in-process on the GPU. No Python, no server, no cloud.
+## Install and run this fork
 
-It browses like Finder, runs on Metal, keeps up as files change, and works with the network
-cable pulled.
+Requirements: Apple Silicon, macOS 14+, Xcode with the Metal Toolchain,
+XcodeGen, and Python 3.12 (or `uv`, which manages it).
 
-## Install
+```bash
+brew install xcodegen uv
+./Scripts/setup-embeddinggemma2.sh
+export OMNI_TEAM_ID=XXXXXXXXXX  # Apple development team, local signing
+./script/build_and_run.sh
+```
 
-Download the DMG from [hanxiao.io/omni](https://hanxiao.io/omni) or
-[Releases](https://github.com/hanxiao/omni-macos/releases) and drag Omni to Applications.
+On first launch the app downloads the official Google checkpoint (~1.5 GB plus
+its tokenizer/processor). Model and helper downloads require an internet
+connection; subsequent inference uses only local files. An existing local copy
+can be selected with `OMNI_MODEL_DIR`.
 
-On first launch Omni downloads its search model (1.8 GB), and optionally the OCR model (4.2 GB)
-for transcribing scans and photos, both from this repository's GitHub releases. After that
-nothing leaves the Mac.
+The fork uses a separate bundle identifier, preferences and default data folder
+(`~/Library/Application Support/OmniEmbeddingGemma2`). Index filenames include
+the model variant; old Jina vectors are never reused as Google vectors.
+Automatic image/video tags remain a Jina-only feature. Search using images,
+video and audio is supported by EmbeddingGemma 2.
+
+See [runtime details and validation](docs/embeddinggemma2.md) for pinned versions,
+tests, resource behavior and current limitations.
 
 ## Serving
 
@@ -71,4 +80,5 @@ fixtures.
 
 ## License
 
-[Apache 2.0](LICENSE). Model weights are under the upstream Jina license (CC-BY-NC-4.0).
+[Apache 2.0](LICENSE). The default Google EmbeddingGemma 2 weights are Apache 2.0.
+Optional Jina weights retain their upstream license (CC-BY-NC-4.0).

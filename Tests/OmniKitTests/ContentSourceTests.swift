@@ -282,7 +282,7 @@ final class ContentSourceTests: XCTestCase {
     /// shared decode falls through to "nothing to do" instead of embedding silence.
     func testPhotosDeclinesAudio() {
         let src = PhotosContentSource(ref: PhotoLibrary.Ref(photoPath())!)
-        XCTAssertNil(src.audio(file(photoPath()), probe: SourceProbe(kind: .audio), settings: IndexSettings()))
+        XCTAssertNil(src.audio(file(photoPath()), probe: SourceProbe(kind: .audio), settings: IndexSettings(), rawPCM: false))
     }
 
     /// Photos content() only answers for stills - a video goes through video(), and asking

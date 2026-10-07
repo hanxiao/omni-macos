@@ -10,7 +10,9 @@ import OmniKit
 @MainActor
 enum Updater {
     /// Manifest the release CI writes alongside Omni-<version>.dmg.
-    static let feedURL = "https://hanxiao.io/omni/latest.json"
+    // A developer fork must not offer an upstream binary that restores the Jina engine.
+    // Configure a fork-specific manifest only after a standalone runtime is packaged.
+    static let feedURL: String? = nil
     private static let lastCheckKey = "omni.update.lastCheckEpoch"
     private static var inProgress = false
     private static let progressUI = UpdateProgress()
@@ -36,6 +38,7 @@ enum Updater {
 
     /// Background check at most once per 24h; silent unless an update is found.
     static func checkOnLaunchIfDue() {
+        guard feedURL != nil else { return }
         let now = Date().timeIntervalSince1970
         let last = UserDefaults.standard.double(forKey: lastCheckKey)
         guard now - last > 86_400 else { return }
@@ -46,6 +49,12 @@ enum Updater {
     /// Check now. `userInitiated` (the menu command) also reports "up to date" / errors; the launch
     /// check stays silent unless there's an update.
     static func check(userInitiated: Bool) {
+        guard let feedURL else {
+            if userInitiated {
+                info("EmbeddingGemma 2 developer fork", "Update this version from macfly1202/omni-macos. A standalone update feed is not configured yet.")
+            }
+            return
+        }
         Task {
             do {
                 // Cache-bust the manifest so the menu command sees new releases promptly even behind a CDN.
@@ -97,7 +106,7 @@ enum Updater {
 
     /// The repo is public, so its releases API needs no auth. Each release body carries a
     /// "What's changed since vX" bullet list (see .github/workflows/release.yml).
-    private static let releasesURL = "https://api.github.com/repos/hanxiao/omni-macos/releases?per_page=100"
+    private static let releasesURL = "https://api.github.com/repos/macfly1202/omni-macos/releases?per_page=100"
     private struct GHRelease: Decodable { let tag_name: String; let name: String?; let body: String? }
 
     /// Release tags are "v0.3.9"; the manifest/About version is "0.3.9".

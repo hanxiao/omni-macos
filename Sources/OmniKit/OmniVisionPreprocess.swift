@@ -35,7 +35,9 @@ public enum OmniVisionPreprocess {
     public struct RawPatches: Sendable {
         public let pixels: [Float]                  // [num_patches * 1536], row order matches grid
         public let gridTHW: [(Int, Int, Int)]
-        public init(pixels: [Float], gridTHW: [(Int, Int, Int)]) {
+        public let encodedImage: Data?
+        public init(pixels: [Float], gridTHW: [(Int, Int, Int)], encodedImage: Data? = nil) {
+            self.encodedImage = encodedImage
             self.pixels = pixels; self.gridTHW = gridTHW
         }
         public var rowLen: Int { OmniVisionPreprocess.inChannels * OmniVisionPreprocess.temporalPatchSize

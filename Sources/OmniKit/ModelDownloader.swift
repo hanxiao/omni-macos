@@ -28,15 +28,21 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
         "model.safetensors",
     ]
 
+    // Pin official weights and processors: a changing upstream main must not silently change the vector space.
+    public static let gemmaRevision = "914f7f89142e33e77833254d9c9b90c3cef7303b"
+    public static let gemmaFiles = ["config.json", "tokenizer.json", "tokenizer_config.json",
+        "processor_config.json", "preprocessor_config.json", "chat_template.jinja",
+        "config_sentence_transformers.json", "model.safetensors"]
+
     public static func repo(for variant: ModelVariant) -> String {
-        "jinaai/jina-embeddings-v5-omni-\(variant.rawValue)-mlx"
+        variant == .embeddingGemma2 ? "google/embeddinggemma-2" : "jinaai/jina-embeddings-v5-omni-\(variant.rawValue)-mlx"
     }
 
     /// Where a downloaded variant is installed.
     public static func installDir(for variant: ModelVariant) -> URL? {
         let fm = FileManager.default
         guard let appSup = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true) else { return nil }
-        return appSup.appendingPathComponent("Omni/\(variant.rawValue)")
+        return appSup.appendingPathComponent("\(variant == .embeddingGemma2 ? "OmniEmbeddingGemma2" : "Omni")/\(variant.rawValue)")
     }
 
     private var session: URLSession!
@@ -90,6 +96,10 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
 
     /// Download `variant` into `dest`: the release when it can be reached, Hugging Face otherwise.
     public func download(variant: ModelVariant, to dest: URL, onProgress: @escaping @Sendable (Progress) -> Void) async throws {
+        if variant == .embeddingGemma2 {
+            try await downloadFromHub(variant: variant, to: dest, onProgress: onProgress)
+            return
+        }
         let manifest: Manifest
         do {
             guard let url = Self.releaseURL(variant, "omni-model.json") else { throw OmniError.model("bad release URL") }
@@ -179,21 +189,23 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
         let fm = FileManager.default
         try fm.createDirectory(at: dest, withIntermediateDirectories: true)
 
-        for (idx, rel) in Self.files.enumerated() {
+        let files = variant == .embeddingGemma2 ? Self.gemmaFiles : Self.files
+        let revision = variant == .embeddingGemma2 ? Self.gemmaRevision : "main"
+        for (idx, rel) in files.enumerated() {
             // A cancel that landed between two files (no live task to kill) must still stop the
             // loop, or the next file would start downloading as if nothing happened.
             if lock.withLock({ isCancelled }) { throw URLError(.cancelled) }
             let fileURL = dest.appendingPathComponent(rel)
             try fm.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
             if let size = try? fm.attributesOfItem(atPath: fileURL.path)[.size] as? Int64, size > 0 {
-                onProgress(Progress(file: rel, fileIndex: idx, fileCount: Self.files.count, received: size, total: size))
+                onProgress(Progress(file: rel, fileIndex: idx, fileCount: files.count, received: size, total: size))
                 continue
             }
-            guard let url = URL(string: "https://huggingface.co/\(repo)/resolve/main/\(rel)") else {
+            guard let url = URL(string: "https://huggingface.co/\(repo)/resolve/\(revision)/\(rel)") else {
                 throw OmniError.model("bad URL for \(rel)")
             }
             setProgressHandler { received, total in
-                onProgress(Progress(file: rel, fileIndex: idx, fileCount: Self.files.count, received: received, total: total))
+                onProgress(Progress(file: rel, fileIndex: idx, fileCount: files.count, received: received, total: total))
             }
             let tmp = try await downloadOne(url)
             try? fm.removeItem(at: fileURL)

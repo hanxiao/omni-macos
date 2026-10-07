@@ -37,17 +37,18 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   fi
 fi
 echo $$ > "$LOCK/pid"
+./Scripts/prepare-build-cache.sh
 
 # The generated Omni.xcodeproj shadows the SwiftPM package for xcodebuild; move it aside and restore
 # it no matter how we exit.
 moved=0
-if [ -d Omni.xcodeproj ]; then mv Omni.xcodeproj "/tmp/Omni.xcodeproj.bak.$$"; moved=1; fi
+if [ -d Omni.xcodeproj ]; then mv Omni.xcodeproj ".build/Omni.xcodeproj.bak.$$"; moved=1; fi
 restore() {
   # rm -rf FIRST. `mv src dst` where dst is an existing directory moves src INSIDE it, so a
   # project that reappeared while we held ours aside would swallow the backup rather than be
   # replaced by it. The lock above should make that impossible; this makes it non-destructive
   # even if it is not.
-  if [ "$moved" = 1 ]; then rm -rf Omni.xcodeproj; mv "/tmp/Omni.xcodeproj.bak.$$" Omni.xcodeproj; fi
+  if [ "$moved" = 1 ]; then rm -rf Omni.xcodeproj; mv ".build/Omni.xcodeproj.bak.$$" Omni.xcodeproj; fi
   rm -rf "$LOCK"
 }
 trap restore EXIT
@@ -63,6 +64,8 @@ PROD="$DD/Build/Products/Debug"
 BUNDLE="$PROD/OmniKitTests.xctest"
 [ -d "$BUNDLE" ] || { echo "test bundle not found: $BUNDLE"; exit 1; }
 
+# Remove Finder attributes on generated bundles (e.g. in synced workspaces) before signing.
+xattr -dr com.apple.FinderInfo "$BUNDLE" 2>/dev/null || true
 # Ad-hoc sign so xctest will load it.
 codesign --force --deep --sign - "$BUNDLE" >/dev/null
 

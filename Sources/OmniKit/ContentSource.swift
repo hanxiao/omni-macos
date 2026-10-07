@@ -82,9 +82,9 @@ protocol ContentSource: Sendable {
     /// Video: frames now, or a segment plan for the embed stage to sample lazily. Nil = unreadable.
     func video(_ file: CrawledFile, probe: SourceProbe, settings: IndexSettings) -> SourceDecode?
 
-    /// Audio: the first mel segment, plus the open reader when the item runs longer than one.
+    /// Audio: the first mel or raw-PCM segment, plus the reader for longer files.
     /// Nil = unreadable, or the source has no audio at all (a Photos asset is image or video).
-    func audio(_ file: CrawledFile, probe: SourceProbe, settings: IndexSettings) -> SourceDecode?
+    func audio(_ file: CrawledFile, probe: SourceProbe, settings: IndexSettings, rawPCM: Bool) -> SourceDecode?
 
     /// The dimensions to STORE for a still, given what the probe said and what the decode produced.
     /// Default: the probe's, because a row's size is a quality signal describing the original while
@@ -152,13 +152,13 @@ struct FileContentSource: ContentSource {
         return frames.isEmpty ? nil : SourceDecode(payload: .images(frames), meta: probe.meta)
     }
 
-    func audio(_ file: CrawledFile, probe: SourceProbe, settings: IndexSettings) -> SourceDecode? {
+    func audio(_ file: CrawledFile, probe: SourceProbe, settings: IndexSettings, rawPCM: Bool) -> SourceDecode? {
         // Stream-decode in bounded segments (issue #7: a whole-file PCM buffer for a multi-hour
         // file overflows AudioToolbox's 32-bit byte count and killed the scan). One segment (the
         // overwhelmingly common case, <= 240 s) keeps the exact single-shot .audioMel path -
         // byte-identical mel, cross-file batching preserved. Longer files carry the open reader to
         // the embed stage, which streams one embedding per segment.
-        guard let reader = OmniAudioPreprocess.AudioSegmentReader(url: file.url),
+        guard let reader = OmniAudioPreprocess.AudioSegmentReader(url: file.url, rawPCM: rawPCM),
               let first = reader.nextMelSegment(), first.frames > 0 else { return nil }
         guard let second = reader.nextMelSegment() else {
             return SourceDecode(payload: .audioMel(first.mel, first.frames), meta: probe.meta)
@@ -239,7 +239,7 @@ struct PhotosContentSource: ContentSource {
     }
 
     /// The library holds images and videos only.
-    func audio(_ file: CrawledFile, probe: SourceProbe, settings: IndexSettings) -> SourceDecode? { nil }
+    func audio(_ file: CrawledFile, probe: SourceProbe, settings: IndexSettings, rawPCM: Bool) -> SourceDecode? { nil }
 
     /// Keep the asset's own resolution, the way a file row keeps the original's - except after an
     /// EDIT: a crop changes the framing, so the decoded aspect ratio stops matching the asset's and

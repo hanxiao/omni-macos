@@ -21,9 +21,10 @@ public enum IndexRelocation {
         "index.sqlite.vecs", "index.sqlite.quant", "index.sqlite.rows",
     ]
 
-    public static func files(in dir: URL) -> [URL] {
+    public static func files(in dir: URL, databaseName: String = "index.sqlite") -> [URL] {
         let fm = FileManager.default
-        return fileNames.map { dir.appendingPathComponent($0) }.filter { fm.fileExists(atPath: $0.path) }
+        let names = fileNames.map { $0.replacingOccurrences(of: "index.sqlite", with: databaseName) }
+        return names.map { dir.appendingPathComponent($0) }.filter { fm.fileExists(atPath: $0.path) }
     }
 
     public static func byteSize(of urls: [URL]) -> Int64 {
@@ -67,11 +68,11 @@ public enum IndexRelocation {
 
     /// Copy every index file into `dst`, verifying each one's size. Throws with the destination
     /// cleaned up, so a failure leaves the source untouched and nothing half-written behind.
-    public static func copy(from src: URL, to dst: URL) throws {
+    public static func copy(from src: URL, to dst: URL, databaseName: String = "index.sqlite") throws {
         let fm = FileManager.default
         var done: [URL] = []
         do {
-            for f in files(in: src) {
+            for f in files(in: src, databaseName: databaseName) {
                 let dest = dst.appendingPathComponent(f.lastPathComponent)
                 if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
                 try fm.copyItem(at: f, to: dest)

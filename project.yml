@@ -15,6 +15,13 @@ targets:
     platform: macOS
     sources:
       - App
+      - path: Runtime/EmbeddingGemma2/worker.py
+        buildPhase: resources
+    postBuildScripts:
+      - name: Clean generated Finder attributes before signing
+        script: |
+          /usr/bin/xattr -dr com.apple.FinderInfo "$TARGET_BUILD_DIR/$FULL_PRODUCT_NAME" 2>/dev/null || true
+        basedOnDependencyAnalysis: false
     dependencies:
       - package: OmniKit
         product: OmniKit
@@ -30,7 +37,7 @@ targets:
         com.apple.security.personal-information.photos-library: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: io.hanxiao.omni
+        PRODUCT_BUNDLE_IDENTIFIER: io.macfly1202.omni.gemma2
         MARKETING_VERSION: "0.15.4"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: YES
