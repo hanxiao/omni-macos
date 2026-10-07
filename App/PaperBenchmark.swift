@@ -133,10 +133,12 @@ extension AppModel {
         // precisely how you wedge it. Restore is the user's own setting, captured here because only
         // the app can tell "Unlimited" from "capped at exactly physical RAM" on the way back.
         let capClass = PaperCapClass.forMachine(memoryBytes: Int(ProcessInfo.processInfo.physicalMemory))
-        let originalCapBytes = maxMemoryGB > 0 ? Int(maxMemoryGB * 1_000_000_000) : 0
         let config = PaperRunConfig(runId: runId,
                                     pinMemoryCapBytes: capClass.capBytes,
-                                    restoreMemoryCap: { omniSetMemoryLimit(originalCapBytes) })
+                                    restoreMemoryCap: { [weak self] in
+                                        // The user's headroom against what is resident now.
+                                        Task { @MainActor in self?.reapplyMemorySetting() }
+                                    })
 
         paperPhase = "Running\u{2026}"
         paperFraction = 0

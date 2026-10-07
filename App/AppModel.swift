@@ -412,6 +412,23 @@ final class AppModel {
                 if let p = selection { showPreview(path: p) } else { previewURL = nil }
             }
             refreshSelectionOrdered()
+            // A PDF hit's open-at-page phrase, worked out before the open asks for it.
+            if let p = selection, p != oldValue, let h = searchHit(for: p) {
+                OpenAtHit.prefetch(p, locator: h.locator, snippet: h.snippet)
+            }
+        }
+    }
+
+    /// The search hit behind a result path, when it is one of the current results.
+    func searchHit(for path: String) -> SearchHit? { rawResults.first { $0.path == path } }
+
+    /// Open a result where it matched - a PDF at its page, a text file at its line - when the
+    /// opening app can be told (OpenAtHit, issue #26); anything else opens as it always did.
+    func openResult(_ path: String) {
+        if let h = searchHit(for: path) {
+            OpenAtHit.open(path, locator: h.locator, snippet: h.snippet)
+        } else {
+            PhotoActions.open(path)
         }
     }
     /// The full multi-selection (result paths). `selection` is the active item within it; the set
@@ -447,7 +464,7 @@ final class AppModel {
     /// few MB and six 250k-file folders retain ~100x that. Scaled off the user's memory cap like
     /// every other budget here, with a floor so a tiny cap still keeps one map cached.
     private var projectionCacheByteBudget: Int {
-        let capGB = maxMemoryGB > 0 ? maxMemoryGB : physicalMemoryGB
+        let capGB = Double(OmniMemoryBudget.capBytes) / 1_000_000_000
         return max(32 << 20, Int(capGB * 0.02 * 1_073_741_824))
     }
     /// Retained size of one layout: the point cloud plus its neighbor graph. Path/kind strings are
@@ -542,7 +559,7 @@ final class AppModel {
     /// no longer dropped - they are PLACED relative to the landmark layout (linear, memory-bounded
     /// tiles), so every file still gets a dot (up to mapTotalPointCap).
     var mapPointBudget: Int {
-        let capGB = maxMemoryGB > 0 ? maxMemoryGB : physicalMemoryGB
+        let capGB = Double(OmniMemoryBudget.capBytes) / 1_000_000_000
         let bytesPerPoint = Double(max(256, engineDim) * 4 * 5)   // X + centered copy + transient temps
         let n = Int(capGB * 0.12 * 1_073_741_824 / bytesPerPoint) // give the map ~12% of the cap
         // Ceilings scale with the USER'S cap (anchored so the default 6GB cap keeps the tuned
@@ -567,7 +584,7 @@ final class AppModel {
     /// default cap that puts the ceiling past 2M files, i.e. every file on any realistic index, while
     /// still scaling down for someone who has pinned the cap low.
     var mapTotalPointCap: Int {
-        let capGB = maxMemoryGB > 0 ? maxMemoryGB : physicalMemoryGB
+        let capGB = Double(OmniMemoryBudget.capBytes) / 1_000_000_000
         // points(40) + kNN k=15(60) + view positions/colours(40) + Metal buffers(24) + path/kind refs(32)
         let bytesPerPoint = 176.0
         let n = Int(capGB * 0.06 * 1_073_741_824 / bytesPerPoint)
@@ -634,7 +651,7 @@ final class AppModel {
     var selectedURLsOrdered: [URL] { selectedPathsOrdered.map { URL(fileURLWithPath: $0) } }
     /// Open every selected result - Finder opens a whole selection on Return / double-click.
     /// A Photos asset opens in Photos.app; there is nothing else to open it with.
-    func openSelected() { for p in selectedPathsOrdered { PhotoActions.open(p) } }
+    func openSelected() { for p in selectedPathsOrdered { openResult(p) } }
     /// Reveal every selected result, all highlighted in one window (in Photos for an asset).
     func revealSelected() { PhotoActions.reveal(paths: selectedPathsOrdered) }
     func findSimilarSelected() { if let p = selection { searchBySimilar(to: p) } }
@@ -1798,7 +1815,32 @@ final class AppModel {
     /// Longest text slice (characters) embedded as one chunk.
     var maxTextChunkChars: Int = 1800 { didSet { persistPerf() } }
     /// Hard memory cap in GB (0 = unlimited). Applied to MLX immediately.
-    var maxMemoryGB: Double = 6 { didSet { persistPerf(); applyMemoryLimit() } }
+    /// The memory setting: HEADROOM on top of what has to be resident - the model and the index -
+    /// not a total (see omniSetMemoryHeadroom; issue #27). More is faster; zero still works.
+    var memoryHeadroomGB: Double = 3 { didSet { persistPerf(); applyMemoryLimit() } }
+    /// MLX bytes that are resident at rest - the weights and the index's GPU base - measured after
+    /// the model has loaded and warmed (measureResidentMemory). nil until then.
+    @ObservationIgnored private var residentMLXBytes: Int?
+    /// The part of residentMLXBytes that is the model, so the index's share can follow its growth.
+    @ObservationIgnored private var engineRestBytes: Int?
+    /// The footprint that is neither MLX nor the index: the app itself. Measured at rest; the
+    /// value before that is the measured figure on a real index (648 MB).
+    @ObservationIgnored private var appBaselineBytes = 650_000_000
+    /// Model + index + the app's own baseline: what Omni needs before any headroom, which the
+    /// headroom ceiling is computed against. 0 until measured.
+    private(set) var requiredMemoryBytes = 0
+    /// Model + index alone - what Settings names, matching its breakdown's Model and Index
+    /// slices. The app's own baseline moves with what the UI holds, and a caption that included
+    /// it disagreed with the "using" bar right above it.
+    private(set) var modelIndexBytes = 0
+    /// The most headroom that keeps Omni within half of physical memory, so the setting can never
+    /// be what pushes the Mac into swap. The same half the old total cap's ceiling used.
+    var maxHeadroomGB: Double {
+        let required = Double(requiredMemoryBytes > 0 ? requiredMemoryBytes : (engineTotalBytes ?? 0) + appBaselineBytes)
+        return max(0, ((physicalMemoryGB * 0.5 - required / 1_000_000_000) * 2).rounded(.down) / 2)
+    }
+    /// The headroom actually applied: the setting, held under maxHeadroomGB.
+    var effectiveHeadroomGB: Double { min(memoryHeadroomGB, maxHeadroomGB) }
     var physicalMemoryGB: Double { Double(omniPhysicalMemory()) / 1_000_000_000 }
 
     // Model variant (small / nano).
@@ -3336,7 +3378,12 @@ final class AppModel {
             return false
         }
         omniPerfLog("engine reloaded vision=\(loaded.supportsImages) audio=\(loaded.supportsAudio)")
-        Task.detached(priority: .utility) { loaded.warmText() }
+        Task {
+            await Task.detached(priority: .utility) { loaded.warmText() }.value
+            // A tower on or off moves what is resident; measure once the old engine has let go.
+            try? await Task.sleep(for: .seconds(1))
+            await self.measureResidentMemory()
+        }
         return true
     }
 
@@ -3356,8 +3403,8 @@ final class AppModel {
     }
 
     private func loadPerf() {
-        // See `isLoadingPerf`. The single write at the end is what still seeds a first launch, where
-        // the maxMemoryGB default below is computed from physical RAM rather than read.
+        // See `isLoadingPerf`. The single write at the end is what still seeds a first launch, and
+        // the one-time move from the old total cap to headroom.
         isLoadingPerf = true
         defer { isLoadingPerf = false; persistPerf() }
         let d = UserDefaults.standard
@@ -3369,8 +3416,18 @@ final class AppModel {
             maxVideoFrames = [6, 16, 32].min(by: { abs($0 - stored) < abs($1 - stored) }) ?? 32
         }
         if d.object(forKey: "omni.maxTextChunkChars") != nil { maxTextChunkChars = max(200, d.integer(forKey: "omni.maxTextChunkChars")) }
-        if d.object(forKey: "omni.maxMemoryGB") != nil { maxMemoryGB = max(0, d.double(forKey: "omni.maxMemoryGB")) }
-        else { maxMemoryGB = min(6, max(2, (physicalMemoryGB * 0.4).rounded())) }   // first launch: ~3GB on 8GB RAM, 6GB on 16GB+ (unchanged)
+        if d.object(forKey: "omni.memoryHeadroomGB") != nil {
+            memoryHeadroomGB = max(0, d.double(forKey: "omni.memoryHeadroomGB"))
+        } else if d.object(forKey: "omni.maxMemoryGB") != nil {
+            // FROM THE OLD TOTAL CAP, keeping what it did: the batch budgets of a total C were those
+            // of headroom C - 3, so 6 GB -> 3 GB of headroom is the same batching. A cap at or
+            // below 3 GB - the 1 GB of issue #27 - becomes zero headroom; "Unlimited" (0) becomes
+            // the most that fits, which maxHeadroomGB then holds it to.
+            let old = d.double(forKey: "omni.maxMemoryGB")
+            memoryHeadroomGB = old > 0 ? max(0, old - Double(omniBudgetBaseBytes) / 1_000_000_000) : 64
+        } else {
+            memoryHeadroomGB = 3   // the tuned default; held under maxHeadroomGB on a small Mac
+        }
         if d.object(forKey: "omni.minImageDim") != nil { minImageDimension = max(0, d.integer(forKey: "omni.minImageDim")) }
         if d.object(forKey: "omni.minAudioSec") != nil { minAudioSeconds = max(0, d.double(forKey: "omni.minAudioSec")) }
         if d.object(forKey: "omni.minVideoSec") != nil { minVideoSeconds = max(0, d.double(forKey: "omni.minVideoSec")) }
@@ -3384,7 +3441,7 @@ final class AppModel {
         OmniPrefs.set(maxImageDimension, forKey: "omni.maxImageDim")
         OmniPrefs.set(maxVideoFrames, forKey: "omni.maxVideoFrames")
         OmniPrefs.set(maxTextChunkChars, forKey: "omni.maxTextChunkChars")
-        OmniPrefs.set(maxMemoryGB, forKey: "omni.maxMemoryGB")
+        OmniPrefs.set(memoryHeadroomGB, forKey: "omni.memoryHeadroomGB")
         OmniPrefs.set(minImageDimension, forKey: "omni.minImageDim")
         OmniPrefs.set(minAudioSeconds, forKey: "omni.minAudioSec")
         OmniPrefs.set(minVideoSeconds, forKey: "omni.minVideoSec")
@@ -3809,7 +3866,49 @@ final class AppModel {
         // flipped with the compiler (Xcode 26.6 lost it every time, 26.2 happened not to).
         // setOCRResident(false) restores the user's cap when OCR lets go.
         if ocrHoldsMemory { omniSetOCRMemory(); return }
-        omniSetMemoryLimit(maxMemoryGB > 0 ? Int(maxMemoryGB * 1_000_000_000) : 0)
+        // Until the resident set has been measured, the weights file plus the index's quant replica
+        // (what has to load), and before even that is known, half of RAM - never a limit the
+        // weights themselves would be loaded against.
+        let resident = residentMLXBytes ?? engineTotalBytes ?? Int(omniPhysicalMemory() / 2)
+        omniSetMemoryHeadroom(Int(effectiveHeadroomGB * 1_000_000_000), residentBytes: resident)
+    }
+
+    /// For the paper run's restore, which pins absolute caps of its own while it runs.
+    func reapplyMemorySetting() { applyMemoryLimit() }
+
+    /// Measure what is resident, at rest: after the model has loaded and warmed, and after an
+    /// engine reload. MLX's active bytes then are the weights and the index's GPU base; the
+    /// footprint beyond MLX and the index is the app itself.
+    private func measureResidentMemory() async {
+        let store = self.store
+        let (search, _) = await Self.searchMemory(store, fallback: lastSearchMemory)
+        let active = omniGPUActiveMemory()
+        let cache = omniGPUCacheMemory()
+        let footprint = SystemProbe.footprintBytes()
+        engineRestBytes = max(0, active - search.gpu)
+        residentMLXBytes = active
+        appBaselineBytes = max(200_000_000, footprint - active - cache - search.cpu)
+        requiredMemoryBytes = active + search.cpu + appBaselineBytes
+        modelIndexBytes = active + search.cpu
+        omniPerfLog(String(format: "memory resident: mlx=%.0fMB (model %.0f, index gpu %.0f) index cpu=%.0fMB app=%.0fMB required=%.0fMB headroom=%.1fGB (max %.1f)",
+                           Double(active) / 1e6, Double(engineRestBytes ?? 0) / 1e6, Double(search.gpu) / 1e6,
+                           Double(search.cpu) / 1e6, Double(appBaselineBytes) / 1e6, Double(requiredMemoryBytes) / 1e6,
+                           effectiveHeadroomGB, maxHeadroomGB))
+        applyMemoryLimit()
+    }
+
+    /// The index grows as it indexes, and its GPU base is resident too: follow it, so MLX's limit
+    /// never falls under what is already loaded. Called from the stats tick with the store's own
+    /// numbers; a change under 64 MB is not worth re-applying.
+    private func followIndexMemory(gpu: Int, cpu: Int) {
+        guard let engineRest = engineRestBytes else { return }
+        let resident = engineRest + gpu
+        if let r = residentMLXBytes, abs(r - resident) < 64_000_000 { return }
+        residentMLXBytes = resident
+        let required = resident + cpu + appBaselineBytes
+        if requiredMemoryBytes != required { requiredMemoryBytes = required }
+        if modelIndexBytes != resident + cpu { modelIndexBytes = resident + cpu }
+        applyMemoryLimit()
     }
 
     /// Switch model variant (small/nano). Reloads the engine; the index is flagged
@@ -4067,6 +4166,8 @@ final class AppModel {
         // (weights file + persisted quant replica - everything that must materialize before ready).
         storeLoadFrac = 0; engineLoadFrac = 0; warmFrac = 0
         engineTotalBytes = Self.expectedGPULoadBytes(modelDir: dir)
+        residentMLXBytes = nil; engineRestBytes = nil
+        applyMemoryLimit()   // against what is about to load, not the half-of-RAM placeholder
         warmPlanned = (try? Self.indexURL()).map { idx in
             let vecs = idx.deletingLastPathComponent().appendingPathComponent(idx.lastPathComponent + ".vecs")
             let bytes = ((try? FileManager.default.attributesOfItem(atPath: vecs.path)[.size]) as? Int) ?? 0
@@ -4295,6 +4396,7 @@ final class AppModel {
             // starts a few seconds later, which is strictly better than racing the compile.
             Task {
                 await warm.value
+                await self.measureResidentMemory()
                 // Attach (or build once) the image tagger BEFORE the launch pass, so a first
                 // index tags images on the way in. Cache hit = milliseconds; the one-time build
                 // just delays the invisible background pass, never readiness.
@@ -4487,6 +4589,7 @@ final class AppModel {
             let stats = (fileCount: summary.fileCount, chunkCount: summary.chunkCount, kinds: summary.kinds, exts: summary.exts)
             let folders = summary.folderCounts
             let size = store.sizeBytes()
+            let searchMem = store.residentSearchMemory()   // the index's resident share; see followIndexMemory
             let path = store.dbURL.path
             let lastTs = store.metaGet("last_indexed").flatMap { Double($0) }
             let migration = store.storageMigration
@@ -4501,6 +4604,7 @@ final class AppModel {
                 // the filter menu and the window around the results - usually to show the same
                 // numbers - and a search typed during indexing competed with it.
                 self.assign(\.indexSchemaVersion, schema)
+                self.followIndexMemory(gpu: searchMem.gpu, cpu: searchMem.cpu)
                 self.assign(\.indexStoredDim, storedDim)
                 self.assign(\.indexModelVariantRaw, builtVariant)
                 self.assign(\.indexedFiles, stats.fileCount)

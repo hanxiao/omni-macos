@@ -570,26 +570,12 @@ private struct PerformanceTab: View {
     /// what the loaded model occupies on the way to the value the user meant.
     @State private var memoryDraft: Double?
     @State private var memoryDragging = false
-    /// HALF THE MACHINE, not all of it. This was `min(physicalMemory, 128)`, which means the
-    /// slider's maximum was 100% OF RAM on every Mac up to 128 GB - a 16 GB laptop could be
-    /// dragged to a 16 GB cap. It only came out sub-proportional on the very large machines,
-    /// where 128 of 550 GB is 23%, which is the opposite of where the restraint is needed.
-    ///
-    /// The DEFAULT was always proportional and conservative - `min(6, max(2, RAM * 0.4))`, so
-    /// 3 GB on 8 GB and 6 GB on anything from 16 GB up - and that is what people actually live
-    /// with. This is about how far the control lets you go, not about what it starts at.
-    ///
-    /// NOT `recommendedMaxWorkingSetSize`, which was the obvious anchor and is the wrong one:
-    /// measured at 498 GB of 550 here, 91% of RAM. It is a device capability - what the GPU can
-    /// address - not advice about leaving room for everything else, which is the same trap the
-    /// OCR notes in CLAUDE.md already record about sizing the batch from it.
-    ///
-    /// The `max(model.maxMemoryGB, ...)` keeps a cap somebody has ALREADY chosen reachable: a
-    /// stored 100 GB on a 128 GB Mac would otherwise sit above a 64 GB ceiling, pinning the thumb
-    /// at the end while the label read 100 - and silently narrowing a choice the user made is not
-    /// this change's business.
-    private var memoryCeiling: Double {
-        max(4, min(max((model.physicalMemoryGB * 0.5).rounded(), model.maxMemoryGB), 128))
+    /// The slider's top: the most headroom that keeps Omni within half of physical memory with the
+    /// model and index it measured (AppModel.maxHeadroomGB). Half, not all: a 16 GB laptop could
+    /// once be dragged to a 16 GB cap. Never below 0.5 so the control is a control.
+    private var headroomCeiling: Double { max(0.5, model.maxHeadroomGB) }
+    private static func gb(_ v: Double) -> String {
+        v == v.rounded() ? "\(Int(v)) GB" : String(format: "%.1f GB", v)
     }
     var body: some View {
         Form {
@@ -638,30 +624,31 @@ private struct PerformanceTab: View {
             Section {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("Maximum memory")
+                        Text("Memory headroom")
                         Spacer()
-                        let shown = memoryDraft ?? model.maxMemoryGB
-                        Text(shown == 0 ? "Unlimited" : "\(Int(shown)) GB")
+                        let shown = min(memoryDraft ?? model.memoryHeadroomGB, model.maxHeadroomGB)
+                        Text(shown == 0 ? "None" : Self.gb(shown))
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: Binding(
-                        get: { memoryDraft ?? model.maxMemoryGB },
+                        get: { min(memoryDraft ?? model.memoryHeadroomGB, headroomCeiling) },
                         set: { v in
                             // A drag holds the value until release; a keyboard or accessibility
-                            // step has no release, so it applies at once.
-                            if memoryDragging { memoryDraft = v.rounded() } else { model.maxMemoryGB = v.rounded() }
+                            // step has no release, so it applies at once. Half-GB steps.
+                            let step = (v * 2).rounded() / 2
+                            if memoryDragging { memoryDraft = step } else { model.memoryHeadroomGB = step }
                         }
-                    ), in: 0 ... memoryCeiling, label: {
-                        Text("Maximum memory")
+                    ), in: 0 ... headroomCeiling, label: {
+                        Text("Memory headroom")
                     }, minimumValueLabel: {
-                        Text("Off").font(.caption).foregroundStyle(.secondary)
+                        Text("None").font(.caption).foregroundStyle(.secondary)
                     }, maximumValueLabel: {
-                        Text("\(Int(memoryCeiling)) GB").font(.caption).foregroundStyle(.secondary)
+                        Text(Self.gb(headroomCeiling)).font(.caption).foregroundStyle(.secondary)
                     }, onEditingChanged: { editing in
                         memoryDragging = editing
                         if !editing, let v = memoryDraft {
                             memoryDraft = nil
-                            if v != model.maxMemoryGB { model.maxMemoryGB = v }
+                            if v != model.memoryHeadroomGB { model.memoryHeadroomGB = v }
                         }
                     })
                     .labelsHidden()
@@ -676,8 +663,11 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Memory")
             } footer: {
-                // The cap is an MLX limit, so a total above it is normal; the legend names the parts.
-                Text(model.isPaperRunning ? "Locked while the benchmark runs." : "Applies to Model and Cache.")
+                // What the setting is: room on top of what the model and index always take.
+                Text(model.isPaperRunning ? "Locked while the benchmark runs."
+                     : (model.modelIndexBytes > 0
+                        ? "On top of the model and index, which take \(Self.gb((Double(model.modelIndexBytes) / 1e9 * 10).rounded() / 10)). More headroom indexes faster; with none, Omni still works, a small batch at a time."
+                        : "On top of the model and index. More headroom indexes faster; with none, Omni still works, a small batch at a time."))
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {

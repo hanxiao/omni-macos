@@ -185,6 +185,32 @@ public func omniSetMemoryLimit(_ bytes: Int) {
     }
 }
 
+/// THE USER'S MEMORY SETTING IS HEADROOM, not a total.
+///
+/// What must be resident - the weights and the index's GPU base - is not the user's to cap: a
+/// total below it cannot be honoured, and MLX then spins in its allocator on every allocation
+/// (measured at a 1 GB cap with ~3 GB resident: `syscall_thread_switch`, the allocator mutex and
+/// `get_active_memory` were the hottest frames, CPU time doubled, indexing ran 40% slower, and the
+/// footprint was 3 GB anyway; issue #27). So MLX's limit is what is resident, plus a working floor
+/// that one small batch needs, plus the headroom. Headroom buys speed - bigger batches and a buffer
+/// cache - and zero still indexes, one small batch at a time, with no cache.
+///
+/// `OmniMemoryBudget.capBytes`, which every batch budget scales from (anchored at 6 GB), is
+/// `omniBudgetBaseBytes + headroom`: a 3 GB headroom reproduces the tuned 6 GB batching exactly,
+/// and zero gives the 3 GB batching the 8 GB Macs ran by default.
+public let omniBudgetBaseBytes = 3_000_000_000
+/// What one small batch needs above the resident weights and index: the largest transient
+/// measured at the 3 GB batch sizes is well under this (~480 MB at the tuned 6 GB ones).
+public let omniWorkingFloorBytes = 512 * 1_048_576
+public func omniSetMemoryHeadroom(_ headroomBytes: Int, residentBytes: Int) {
+    let h = max(0, headroomBytes)
+    OmniMemoryBudget.capBytes = omniBudgetBaseBytes + h
+    MLX.Memory.memoryLimit = max(0, residentBytes) + omniWorkingFloorBytes + h
+    // Half the headroom: at 3 GB that is the 1.5 GB the 6 GB cap's quarter gave. None at zero -
+    // freed buffers go straight back, which is slower and is what zero headroom means.
+    MLX.Memory.cacheLimit = h / 2
+}
+
 /// OCR's memory settings: no compute cap (see CLAUDE.md, a cap halves decode throughput) and a
 /// SMALL buffer cache. The Unlimited branch above keeps a third of physical memory as cache, and a
 /// batched OCR run fills whatever it is given: every decode step's attention and mask are sized by

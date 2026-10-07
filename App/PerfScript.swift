@@ -198,7 +198,7 @@ enum PerfScript {
     private static func applySetting(_ name: String, _ v: String, _ model: AppModel) {
         let on = v == "on"
         switch name {
-        case "memory": model.maxMemoryGB = Double(v) ?? model.maxMemoryGB
+        case "memory": model.memoryHeadroomGB = Double(v) ?? model.memoryHeadroomGB   // headroom, GB
         case "group": model.groupNearDuplicates = on
         case "instant": model.instantSearchEnabled = on
         case "maxImage": model.maxImageDimension = Int(v) ?? model.maxImageDimension
