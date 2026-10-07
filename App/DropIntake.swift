@@ -55,8 +55,13 @@ enum DropIntake {
             let dest = FileManager.default.temporaryDirectory
                 .appendingPathComponent("omni-drop-promise-\(UUID().uuidString)", isDirectory: true)
             try? FileManager.default.createDirectory(at: dest, withIntermediateDirectories: true)
+            // .main, NOT a background queue: this reader is written inside a @MainActor type and
+            // the parameter is an ObjC block not marked Sendable, so it is main-actor isolated and
+            // Swift 6 traps on entry when it is called anywhere else (a standalone repro of this
+            // exact shape trapped; the FSWatcher crash of 2026-10-07 was the same mistake). The
+            // reader runs once the source app has written the file; it does no work of its own.
             promise.receivePromisedFiles(atDestination: dest, options: [:],
-                                         operationQueue: OperationQueue()) { url, error in
+                                         operationQueue: .main) { url, error in
                 guard error == nil, accepts(url) else { return }
                 Task { @MainActor in handle(.file(url)) }
             }

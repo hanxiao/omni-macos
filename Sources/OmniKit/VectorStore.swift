@@ -1040,7 +1040,17 @@ public final class VectorStore: @unchecked Sendable {
     // directly rather than through a score filter dead rows themselves.
     nonisolated(unsafe) public static var tombstones =
         ProcessInfo.processInfo.environment["OMNI_TOMBSTONE"] != "0"
-    private var deadRows = Set<Int32>()
+    /// Every change drops the GPU dead-occurrence mask built from it (deadOccGPULocked). That mask
+    /// was cached on the folded row count alone, which a delete does not change, so after the
+    /// second delete the fused search still scored the new dead rows: the host guard dropped them
+    /// and the live rows ranked below were never considered - a query whose best match had just
+    /// been deleted came back empty (DeadMaskAfterDeletesTests). didSet without oldValue keeps the
+    /// insert in place.
+    private var deadRows = Set<Int32>() {
+        didSet { mlxDeadOcc = nil; deadVersion &+= 1 }
+    }
+    /// Bumped on every change to `deadRows`; keys the orphan-slot cache.
+    private var deadVersion: UInt64 = 0
     /// Was the resident dead-row index list for the GPU mask. Never set any more: maskDeadLocked
     /// masks orphaned slots instead. Still cleared where tombstone state resets.
     private var deadIdxCache: MLXArray?
@@ -1286,7 +1296,18 @@ public final class VectorStore: @unchecked Sendable {
     /// Slot per row, the dense mirror of `Row.slot`. The hot loops read this and never touch `rows`,
     /// whose Strings are why the dense tables exist at all.
     /// INVARIANT: occSlot.count == rows.count, and occSlot[i] == rows[i].slot.
-    private var occSlot: [Int32] = []
+    ///
+    /// Every mutation through `occSlot` counts as structural (`occStructGen`); the two row appends
+    /// write `_occSlot` directly and do not. That difference is what lets the orphan-slot cache
+    /// survive a write that only appends (orphanSlotsLocked). `_modify`, so an element write in a
+    /// compaction loop stays in place instead of copying the array.
+    private var _occSlot: [Int32] = []
+    private var occStructGen: UInt64 = 0
+    private var occSlot: [Int32] {
+        get { _occSlot }
+        _modify { occStructGen &+= 1; yield &_occSlot }
+        set { occStructGen &+= 1; _occSlot = newValue }
+    }
     /// THE REVERSE EDGE: content -> the rows holding it, as CSR. A candidate chosen by the scan is a
     /// CONTENT and every consumer downstream wants FILES, so something has to expand one into the
     /// other. Two Int32 columns, rebuilt in one pass, keyed on the mutation generation - NOT on
@@ -1323,12 +1344,47 @@ public final class VectorStore: @unchecked Sendable {
     /// masking by dead ROW index: a tombstone releases a pointer, not a content, so a passage two
     /// files share stays scannable when one of them is deleted - and a content whose last owner is
     /// gone stops scoring, rather than sitting in the candidate budget it can never be returned from.
+    ///
+    /// NOT KEYED ON THE MUTATION GENERATION. A slot's orphan status changes only when a row dies
+    /// (`deadRows`), when rows are moved or remapped (`occStructGen`), or when a new row points at
+    /// it - and the last is checked against just the rows appended since, the slot dropped from
+    /// the list. Equivalent to a rebuild: a slot is an orphan iff every row on it is dead, and with
+    /// the dead set and the existing rows unchanged only a new (live) row on it can change that. Keyed on mutationGen,
+    /// every saved file made the next search walk every slot against the dead set: 115-125 ms on
+    /// the live 7M-row index, paid by the first search after each write, i.e. by nearly every
+    /// search while indexing (measured 2026-10-07).
     private var orphanCache: MLXArray?
-    private var orphanCacheGen: Int64 = -1
+    private var orphanCacheHost: [Int32] = []          // the same slots, ascending
+    private var orphanCacheDead: UInt64 = .max
+    private var orphanCacheStruct: UInt64 = .max
+    private var orphanCacheOcc = 0
     private var orphanCacheRows = -1
     private func orphanSlotsLocked(upTo n: Int) -> MLXArray? {
         guard n > 0 else { return nil }
-        if orphanCacheGen == mutationGen, orphanCacheRows == n { return orphanCache }
+        if orphanCacheRows == n, orphanCacheDead == deadVersion, orphanCacheStruct == occStructGen,
+           orphanCacheOcc <= _occSlot.count {
+            let cached = orphanCacheHost
+            func isCachedOrphan(_ sl: Int32) -> Bool {
+                var lo = 0, hi = cached.count
+                while lo < hi { let mid = (lo + hi) / 2; if cached[mid] < sl { lo = mid + 1 } else { hi = mid } }
+                return lo < cached.count && cached[lo] == sl
+            }
+            // A new row on a cached orphan - a freed position handed to a new content, which on
+            // an index with holes is most writes - makes that one slot live again. Drop it from
+            // the list; nothing else about the set changed.
+            var revived = Set<Int32>()
+            for r in orphanCacheOcc ..< _occSlot.count {
+                let sl = _occSlot[r]
+                if sl >= 0, Int(sl) < n, isCachedOrphan(sl) { revived.insert(sl) }
+            }
+            orphanCacheOcc = _occSlot.count
+            if !revived.isEmpty {
+                orphanCacheHost.removeAll { revived.contains($0) }
+                orphanCache = orphanCacheHost.isEmpty ? nil : MLXArray(orphanCacheHost)
+                if let c = orphanCache { MLX.eval(c) }
+            }
+            return orphanCache
+        }
         ensureSlotRowsLocked()
         let dead = deadRows
         var idx: [Int32] = []
@@ -1339,7 +1395,10 @@ public final class VectorStore: @unchecked Sendable {
             if !anyLive { idx.append(Int32(sl)) }
         }
         orphanCache = idx.isEmpty ? nil : MLXArray(idx)
-        orphanCacheGen = mutationGen
+        orphanCacheHost = idx
+        orphanCacheDead = deadVersion
+        orphanCacheStruct = occStructGen
+        orphanCacheOcc = _occSlot.count
         orphanCacheRows = n
         if let c = orphanCache { MLX.eval(c) }
         return orphanCache
@@ -1563,7 +1622,7 @@ public final class VectorStore: @unchecked Sendable {
         // nil means "this row brought a new vector", which is every caller while a row and its
         // vector are the same thing. A row that SHARES a vector passes the slot it shares.
         let s = slot
-        occSlot.append(s)
+        _occSlot.append(s)   // an append: see occSlot
         if i < rows.count { rows[i].slot = s }
         kindCode.append(kc)
         // Deferred: the chunk count only, and the file's first kind for `settleAggregatesLocked`.
@@ -1643,7 +1702,7 @@ public final class VectorStore: @unchecked Sendable {
         // keep every row after the hole on the slot its vector actually sits at. Leaving it out of
         // occSlot desynchronises the mirror from `rows` and every row past the first hole then
         // reads its neighbour's vector.
-        occSlot.append(slot)
+        _occSlot.append(slot)   // an append: see occSlot
         if fileID.count - 1 < rows.count { rows[fileID.count - 1].slot = slot }
         kindCode.append(kc)
         rowWindowCovered += 1
@@ -7575,12 +7634,13 @@ public final class VectorStore: @unchecked Sendable {
         //
         // ALL THREE, not just the one that was caught. Every cache over the row -> position
         // mapping is keyed the same way, and reuse is invisible to all of them for the same
-        // reason: `orphanSlotsLocked` on (gen, n), and `occSlotIsIdentityLocked` on
+        // reason: `orphanSlotsLocked` on (dead set, structure, n), and `occSlotIsIdentityLocked` on
         // (gen, baseOccCount) - which would answer "positions are still the row's own index"
         // after a reuse has made that false, and that answer decides whether whole scans can skip
         // the indirection. Found by looking for siblings of the bug rather than only fixing it.
         slotRowGen = -1
-        orphanCacheGen = -1
+        // Not orphanSlotsLocked's cache: the reused position was an orphan, and the row now on it
+        // is an append, which that cache checks for and drops from its list.
         identityCacheGen = -1
         // AND THE NUMBERING IS NOW NON-SEQUENTIAL. Recorded once, in this same transaction, because
         // the next open has to know before it can choose a loader.
@@ -11089,7 +11149,10 @@ public final class VectorStore: @unchecked Sendable {
         // active search - defeating foldThreshold's batching on exactly the low-end machines quant
         // mode serves. Only rebuild when NEITHER resident base exists, or the delta outgrew the fold
         // threshold, or a structural change dirtied it. (refoldprobe: quant 30 rebuilds/30 writes -> 0.)
-        guard baseDirty || (mlxBase == nil && quantBase == nil)
+        // bitBase too, as both search paths check: a sign-bit base (the live 7M-row index) left
+        // the other two nil, so every write - one saved file - rebuilt all 3.9M slots, ~390 ms on
+        // the store queue with searches behind it (measured 2026-10-07).
+        guard baseDirty || (mlxBase == nil && quantBase == nil && bitBase == nil)
                 || (n - baseRows) + patchedSlots.count > Self.foldThreshold else { return }
         // Rate limit: the high-rate writers (text full pass, reconcile) batch many files per write, so
         // in practice this fires at most ~once per flush window. The floor only matters for residual

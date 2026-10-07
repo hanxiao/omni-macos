@@ -12,13 +12,14 @@ final class RemoveVanishedTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: base) }
         let root = base.appendingPathComponent("root", isDirectory: true)
         let other = base.appendingPathComponent("other", isDirectory: true)
-        for d in ["root/big", "root/keep", "other"] {
+        for d in ["root/big/deep/er", "root/keep", "other"] {
             try FileManager.default.createDirectory(at: base.appendingPathComponent(d), withIntermediateDirectories: true)
         }
         for i in 0 ..< 5 {
             try "big note \(i) about search".write(to: root.appendingPathComponent("big/b\(i).txt"), atomically: true, encoding: .utf8)
             try "kept note \(i) about search".write(to: root.appendingPathComponent("keep/k\(i).txt"), atomically: true, encoding: .utf8)
             try "other note \(i) about search".write(to: other.appendingPathComponent("o\(i).txt"), atomically: true, encoding: .utf8)
+            try "deep note \(i) about search".write(to: root.appendingPathComponent("big/deep/er/d\(i).txt"), atomically: true, encoding: .utf8)
         }
         let dbURL = base.appendingPathComponent("db/index.sqlite")
         try FileManager.default.createDirectory(at: dbURL.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -28,13 +29,16 @@ final class RemoveVanishedTests: XCTestCase {
         indexer.index(roots: [root, other], settings: IndexSettings(enabledKinds: [.text])) { p in if p.done { done.fulfill() } }
         wait(for: [done], timeout: 60)
         func names() -> Set<String> { Set(store.knownFiles().compactMap { p, _ in (p as NSString).lastPathComponent }) }
-        XCTAssertEqual(names().count, 15)
+        XCTAssertEqual(names().count, 20)
 
         // A folder and a single file gone, a file still present, and a whole root gone.
         try FileManager.default.removeItem(at: root.appendingPathComponent("big"))
         try FileManager.default.removeItem(at: root.appendingPathComponent("keep/k0.txt"))
         try FileManager.default.removeItem(at: other)
-        let removed = indexer.removeVanished([root.appendingPathComponent("big").path,
+        // Everything `rm -rf` reports: each file and directory of the tree. One folder delete for
+        // the whole tree, not one per directory.
+        let tree = ["big", "big/deep", "big/deep/er", "big/b0.txt", "big/deep/er/d3.txt"].map { root.appendingPathComponent($0).path }
+        let removed = indexer.removeVanished(tree + [root.appendingPathComponent("big").path,
                                               root.appendingPathComponent("keep/k0.txt").path,
                                               root.appendingPathComponent("keep/k1.txt").path,
                                               other.path],

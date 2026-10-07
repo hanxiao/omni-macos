@@ -425,9 +425,11 @@ final class OCROrderedText: @unchecked Sendable {
     private var head = 0
     /// What has been sent of the head page, as bytes.
     private var sent: [UInt8] = []
-    private let emit: (String) -> Void
+    /// @Sendable: called from whatever thread finishes a page. A closure built in a @MainActor
+    /// scope and called there traps in Swift 6 (see FSWatcher).
+    private let emit: @Sendable (String) -> Void
 
-    init(count: Int, emit: @escaping (String) -> Void) {
+    init(count: Int, emit: @escaping @Sendable (String) -> Void) {
         texts = Array(repeating: "", count: count)
         done = Array(repeating: false, count: count)
         self.emit = emit

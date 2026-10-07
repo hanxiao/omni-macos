@@ -1509,6 +1509,7 @@ final class AppModel {
         // the rest of the app uses, so it drains in priority order (removals first) instead of
         // racing them.
         if wasIndexing { restartAfterPause = true }
+        flushHeldRemovals()
         guard let store else { return }
         drainDeferredAfterPass(store)
         // Results shown on screen may have gone stale: every background refresh was suppressed for
@@ -1686,6 +1687,12 @@ final class AppModel {
             // still-active folders pick up where they left off and the paused one is left as-is.
             restartAfterPause = true
             indexer?.cancel()
+        } else if paused, activeRoots.contains(path) {
+            // A catch-up or a watcher reconcile is working in it - the first index of a folder
+            // just added runs as a catch-up, for hours on a big one, and pausing it did nothing.
+            // .pause keeps what is embedded; the catch-up's completion leaves paused folders out
+            // of its re-queue, and resuming starts a pass that picks the folder up again.
+            indexer?.cancel(.pause)
         } else if !paused {
             startIndexing()   // resuming while idle: kick a pass to catch the folder up
         }
@@ -1891,6 +1898,10 @@ final class AppModel {
         didSet {
             guard oldValue != imageTagsEnabled else { return }
             persistPerf()
+            // Off: stop a re-tag batch before the tagger goes. Its files would otherwise re-embed
+            // with no tagger and store EMPTY tags over the ones they had ("existing rows are
+            // untouched either way"). Discard, so its finished images are not stored either.
+            if !imageTagsEnabled, tagBackfillActive { indexer?.cancel() }
             Task { await self.ensureTagger() }
         }
     }
@@ -1903,9 +1914,6 @@ final class AppModel {
     /// screen CALLS the phase it is in, so the words track the work instead of saying "loading the
     /// model" through a database rewrite.
     var storePhase: StoreOpenPhase? = nil
-    /// Result of the last Repair attempt, shown on the index-failure screen. Repair is offered
-    /// there rather than run automatically: it writes to the index, and an index that refuses to
-    /// open is exactly when the user should be the one to say go.
     /// Title for the launch screen. The store's phase when it has one, because that is the part
     /// that can take tens of seconds; the model otherwise, which is what a normal launch is doing.
     var launchTitle: String {
@@ -2875,6 +2883,7 @@ final class AppModel {
                 if !drop.isEmpty {
                     self.refreshIndexStats(store)
                     self.refreshSearchAfterBackgroundChange()
+                    self.requestBrowserReload()
                 }
             }
         }.value
@@ -3220,7 +3229,9 @@ final class AppModel {
                 await self.withIndexingStopped {
                     await Task.detached(priority: .utility) { store.deleteKinds(kinds) }.value
                 }
-                self.refreshIndexStats(store)
+                // Not the stats alone: purged files stayed in the results on screen and in the
+                // browser until the restarted pass ended, which on a first index is hours.
+                self.afterBulkDelete(store)
             }
         }
         if enabledKindTowers != oldTowers {
@@ -4344,15 +4355,25 @@ final class AppModel {
         }
     }
 
+    /// File events have waited `fsWaitLimit` behind a full pass or a catch-up: pause it (keeping
+    /// its work), reconcile them, resume. A catch-up had no limit at all - a save waited for the
+    /// whole first index of a folder added beside it - and the check ran only from progress
+    /// callbacks, which one long video or scan holds off; the rate sampler's 0.6 s timer calls it
+    /// too. A watcher reconcile is left alone: the events would only join its batch.
+    private func enforceEventWaitLimit() {
+        let catchUp = !activeRoots.isEmpty && !fsReconcileInFlight && indexState != .indexing
+        guard isIndexing || catchUp, !fsDrainThenResume, !restartAfterPause, !pendingFSPaths.isEmpty,
+              let since = fsEventsWaitingSince, -since.timeIntervalSinceNow > fsWaitLimit else { return }
+        fsDrainThenResume = true
+        indexer?.cancel(.pause)
+    }
+
     private func refreshIndexStats(_ store: VectorStore) {
         // A long pass (a first index of a home folder runs for hours) has no completion to hang the
         // filename refresh on, so the stats tick does it at most once a minute while files land.
-        if isIndexing, -filenameRefreshedAt.timeIntervalSinceNow > 60 { refreshFilenameIndex(store) }
-        if isIndexing, !fsDrainThenResume, !restartAfterPause, !pendingFSPaths.isEmpty,
-           let since = fsEventsWaitingSince, -since.timeIntervalSinceNow > fsWaitLimit {
-            fsDrainThenResume = true
-            indexer?.cancel(.pause)
-        }
+        // Any long write, not only a full pass: a catch-up of a new folder runs for as long.
+        if isIndexWorkInFlight, -filenameRefreshedAt.timeIntervalSinceNow > 60 { refreshFilenameIndex(store) }
+        enforceEventWaitLimit()
         // A search in flight is about to queue on the store's serial queue; indexSummary's full row
         // scan in front of it would add tens of ms to that query's tail on a large index. Deferred
         // to the search's end, not dropped: a pass completion has no next tick to catch up on.
@@ -5118,11 +5139,14 @@ final class AppModel {
         if ocrRunActive, !(pendingCatchUpRoots.isEmpty && pendingCatchUpPhotos.isEmpty), omniPerfEnabled {
             omniPerfLog("gpu-standdown catch-up held roots=\(pendingCatchUpRoots.count) (ocr run active)")
         }
+        // indexState != .paused: indexing is paused as a whole, and a Photos change arriving then
+        // started a catch-up anyway. Resume's pass drains the queue.
         guard !indexWritesBlocked, !isPaperRunning, !isProfilingRunning, !indexObsolete, !ocrRunActive,
-              indexState != .indexing, activeRoots.isEmpty,
+              indexState != .indexing, indexState != .paused, activeRoots.isEmpty,
               !fsReconcileInFlight,
               let indexer, let store, !(pendingCatchUpRoots.isEmpty && pendingCatchUpPhotos.isEmpty) else { return }
-        let batch = pendingCatchUpRoots.filter { roots.contains($0) }
+        // Not a paused folder: resuming it starts a pass, which covers it.
+        let batch = pendingCatchUpRoots.filter { roots.contains($0) && !pausedRoots.contains($0.path) }
         pendingCatchUpRoots.removeAll()
         let photoBatch = pendingCatchUpPhotos.filter { p in
             photoSources.contains { $0.id == p.id } && !pausedRoots.contains(p.key)
@@ -5133,6 +5157,8 @@ final class AppModel {
         let keys = batch.map { $0.path } + photoBatch.map(\.key)
         let gen = indexGen
         for k in keys { activeRoots.insert(k); progress.perRoot[k] = RootProgress() }   // drive the pies from 0
+        // Throughput in Settings, and the timer that enforces the event wait limit.
+        startRateSampler()
         Task.detached(priority: .utility) {
             var statsClock = 0.0
             indexer.index(roots: batch, photos: photoBatch, settings: settings, force: false) { p in
@@ -5161,13 +5187,27 @@ final class AppModel {
                             // The cancel came from a deferred removal or a queued full pass, and this
                             // pass may have stopped before finishing its roots. Re-queue the survivors
                             // (incremental, so already-embedded files are skipped on the re-run).
-                            self.pendingCatchUpRoots.append(contentsOf: batch.filter { self.roots.contains($0) })
+                            self.pendingCatchUpRoots.append(contentsOf: batch.filter {
+                                self.roots.contains($0) && !self.pausedRoots.contains($0.path)
+                            })
                             self.pendingCatchUpPhotos.append(contentsOf: photoBatch.filter { p in
                                 self.photoSources.contains { $0.id == p.id }
                             })
                         }
+                        // As the full pass does: the filename index learns the new folder's names
+                        // (it was refreshed only by a full pass or a reconcile, so files added by a
+                        // catch-up could not be found by name until one ran), and the browser gets
+                        // one reload after the last write, which its polling can miss.
+                        if p.embedded > 0 || !p.cancelled { self.markIndexed(store) }
+                        self.requestBrowserReload()
                         self.refreshIndexStats(store)
                         self.refreshSearchAfterBackgroundChange()
+                        // Paused to let waiting file events in (enforceEventWaitLimit): those
+                        // first. The catch-up resumes from the reconcile's completion.
+                        if p.cancelled, self.fsDrainThenResume {
+                            self.fsDrainThenResume = false
+                            self.drainPendingFSChanges()
+                        }
                         self.drainDeferredAfterPass(store)   // removals/restart/catch-ups/FS queued mid-pass
                         self.refitFolderMapIfPending()
                     }
@@ -5204,14 +5244,22 @@ final class AppModel {
             // reclaim the disk space those rows held (SQLite keeps freed pages until VACUUM).
             Task.detached {
                 store.deleteUnderFolder(url.path)
+                await self.afterBulkDelete(store)
                 store.compact()
-                await MainActor.run {
-                    self.refreshIndexStats(store)
-                    self.refreshSearchAfterBackgroundChange()
-                    self.requeuePromoted(promoted)
-                }
+                await MainActor.run { self.requeuePromoted(promoted) }
             }
         }
+    }
+
+    /// What the user sees after a bulk delete (a folder removed, a kind purged): the counts, the
+    /// results on screen, the filename index and the browser. For a folder, BEFORE the compaction
+    /// that follows: the VACUUM rewrites the whole database on the store queue, and the removed
+    /// folder's files stayed on screen and in the counts until it had finished.
+    private func afterBulkDelete(_ store: VectorStore) {
+        refreshIndexStats(store)
+        refreshSearchAfterBackgroundChange()
+        refreshFilenameIndex(store)   // its names would hold places in the filename tier
+        requestBrowserReload()
     }
 
     // MARK: - Folders that were renamed or moved (issue #23)
@@ -6042,11 +6090,24 @@ final class AppModel {
         watcher?.stop(); watcher = nil
         guard engine != nil, !crawlRoots.isEmpty else { return }
         let since = eventCheckpoint.flatMap { UInt64($0) }
+        // Omni's own files - the index, its WAL, the tag cache, OCR transcripts - are never
+        // indexed, and a write to them under a watched folder was an event like any other. Real
+        // paths, as FSEvents reports them. The clipboard history is user content and stays.
+        func real(_ p: String) -> String {
+            realpath(p, nil).map { r in defer { free(r) }; return String(cString: r) } ?? p
+        }
+        let own = Self.ownDataPaths().map(real)
+        let ownExceptions = [real(Self.clipboardDirectory.path)]
         let w = FSWatcher(paths: crawlRoots.map { $0.path }, since: since) { [weak self] paths, renamed in
             // Sorted into present and gone HERE, on the watcher's queue: a drag-in reports
             // thousands of paths and the main thread should not stat them.
             var here: [String] = [], gone: [String] = []
-            for p in paths { if Darwin.access(p, F_OK) == 0 { here.append(p) } else { gone.append(p) } }
+            for p in paths {
+                if own.contains(where: { p == $0 || p.hasPrefix($0 + "/") }),
+                   !ownExceptions.contains(where: { p == $0 || p.hasPrefix($0 + "/") }) { continue }
+                if Darwin.access(p, F_OK) == 0 { here.append(p) } else { gone.append(p) }
+            }
+            guard !here.isEmpty || !gone.isEmpty else { return }
             // Which gone paths may be deleted at once. A rename inside the folders reports both
             // halves, renamed, in this one callback, and the new half copies its vectors from the
             // old half's rows - so while anything was renamed IN, a renamed-away path waits for
@@ -6054,14 +6115,16 @@ final class AppModel {
             // that needs it.
             let renamedIn = here.contains { renamed.contains($0) }
             let removable = renamedIn ? gone.filter { !renamed.contains($0) } : gone
+            let names = Set(here.lazy.map { ($0 as NSString).lastPathComponent })   // see arrivingNames
             let present = here, vanished = gone
-            Task { @MainActor in self?.handleFSChange(present, vanished: vanished, removable: removable) }
+            Task { @MainActor in self?.handleFSChange(present, vanished: vanished, removable: removable, arriving: names) }
         }
         w.start()
         watcher = w
     }
 
-    private func handleFSChange(_ rawPaths: [String], vanished rawVanished: [String] = [], removable: [String] = []) {
+    private func handleFSChange(_ rawPaths: [String], vanished rawVanished: [String] = [], removable: [String] = [],
+                                arriving: Set<String> = []) {
         guard indexer != nil, store != nil else { return }
         // An obsolete index is in a different vector space (e.g. just switched models): writing
         // new-dimension vectors into it would fail the store's dimension guard. Skip background
@@ -6084,9 +6147,13 @@ final class AppModel {
         // before it deletes, so the new path finds the old rows. Measured with 60 images landing
         // during each rename: the renamed files all deduped. A delay here only kept deleted files
         // searchable longer.
+        // NOT filtered by `wanted`, and before the guard below: pausing a folder stops indexing
+        // it, not forgetting what was deleted from it. Removing a row needs no model, and a deleted
+        // file in a paused folder stayed searchable and counted for as long as it stayed paused.
+        arrivingNames.formUnion(arriving)
+        removeVanishedNow(removable)
         let paths = (rawPaths + rawVanished).filter(wanted)
         guard !paths.isEmpty else { return }
-        removeVanishedNow(removable.filter(wanted))
         // Always buffer, then kick a reconcile only if none is running. A full index drains the buffer
         // when it finishes (startIndexing); an in-flight reconcile re-drains when it finishes. This
         // coalesces a storm into back-to-back single batches instead of overlapping update() tasks.
@@ -6096,6 +6163,19 @@ final class AppModel {
         // activeRoots covers the catch-up pass too: kicking update() while a catch-up index() runs
         // would overlap two pipelines on the same Indexer. The catch-up's completion re-drains.
         if indexState != .indexing && activeRoots.isEmpty && !fsReconcileInFlight { drainPendingFSChanges() }
+    }
+
+    /// Names of present paths the watcher reported that no reconcile has finished with: queued
+    /// (`arrivingNames`) and in the running batch (`reconcilingNames`). Indexer.removeVanished
+    /// leaves a gone path with one of these names to the reconcile - it may be a copy's source.
+    @ObservationIgnored private var arrivingNames = Set<String>()
+    @ObservationIgnored private var reconcilingNames = Set<String>()
+    /// Deletes that arrived while index writes were blocked; see removeVanishedNow.
+    @ObservationIgnored private var heldRemovals = Set<String>()
+    private func flushHeldRemovals() {
+        guard !heldRemovals.isEmpty, !indexWritesBlocked, !isPaperRunning else { return }
+        let paths = Array(heldRemovals); heldRemovals.removeAll()
+        removeVanishedNow(paths)
     }
 
     /// The roots in every spelling a watcher path can carry: FSEvents reports real paths
@@ -6114,10 +6194,16 @@ final class AppModel {
     /// writer that decoded a file before it went may store it again, and the reconcile that drains
     /// the queue removes that row, as it always did.
     private func removeVanishedNow(_ paths: [String]) {
-        guard !paths.isEmpty, !indexWritesBlocked, !isPaperRunning, let indexer, let store else { return }
+        guard !paths.isEmpty else { return }
+        // Held, not dropped: a hold (model swap, purge) or a paper run must see no writer, and
+        // the paths' only other way out was the reconcile after the full pass the hold restarts -
+        // a minute of hold plus fsWaitLimit. Released at the end of either (flushHeldRemovals).
+        if indexWritesBlocked || isPaperRunning { heldRemovals.formUnion(paths); return }
+        guard let indexer, let store else { return }
         let rootPaths = watcherRootPaths
+        let arriving = arrivingNames.union(reconcilingNames)
         Task.detached(priority: .userInitiated) {
-            let removed = indexer.removeVanished(paths, roots: rootPaths)
+            let removed = indexer.removeVanished(paths, roots: rootPaths, arriving: arriving)
             guard removed > 0 else { return }
             await MainActor.run {
                 guard self.store === store else { return }
@@ -6269,10 +6355,9 @@ final class AppModel {
                             self.indexState = .idle
                             Task.detached {
                                 for path in removed { store.deleteUnderFolder(path) }
+                                await self.afterBulkDelete(store)
                                 store.compact()
                                 await MainActor.run {
-                                    self.refreshIndexStats(store)
-                                    self.refreshSearchAfterBackgroundChange()
                                     if !self.roots.isEmpty { self.startIndexing() }
                                 }
                             }
@@ -6303,10 +6388,11 @@ final class AppModel {
                         self.indexState = p.cancelled ? .paused : .idle
                         self.refreshIndexStats(store)
                         self.refreshSearchAfterBackgroundChange()
-                        if !p.cancelled {
-                            self.drainPendingFSChanges()
-                            self.drainIdleUpkeep(store)
-                        }
+                        // The whole deferred chain, not just the watcher queue: a Photos library
+                        // change during the pass queues a catch-up that only this chain starts, and
+                        // with no file event pending nothing else ever did - the library sat at
+                        // "Waiting to be indexed" and its deletions stayed searchable.
+                        if !p.cancelled { self.drainDeferredAfterPass(store) }
                         self.refitFolderMapIfPending()
                     }
                 }
@@ -6335,6 +6421,7 @@ final class AppModel {
     private func sampleRate() {
         guard isWorking else { stopRateSampler(); return }
         let now = CFAbsoluteTimeGetCurrent()
+        enforceEventWaitLimit()
         // A pass refreshes the stats from its progress callback; a watcher reconcile has none, so
         // the sidebar counts held still for the whole of one (95 s for a 20,000-file drag-in) and
         // jumped at the end. Same 1.5 s cadence as the pass.
@@ -6376,10 +6463,9 @@ final class AppModel {
         if !removed.isEmpty {
             Task.detached {
                 for path in removed { store.deleteUnderFolder(path) }
+                await self.afterBulkDelete(store)
                 store.compact()
                 await MainActor.run {
-                    self.refreshIndexStats(store)
-                    self.refreshSearchAfterBackgroundChange()
                     self.drainDeferredAfterPass(store)   // removals drained; continue the chain
                 }
             }
@@ -6458,8 +6544,16 @@ final class AppModel {
     func requestTags(_ paths: [String]) {
         guard canGenerateTags else { return }
         let media: Set<String> = [FileKind.image.rawValue, FileKind.scan.rawValue, FileKind.video.rawValue]
-        let byPath = Dictionary(uniqueKeysWithValues: rawResults.map { ($0.path, $0.kind) })
-        let mediaPaths = paths.filter { media.contains(byPath[$0] ?? "") }
+        // The kind from the results when the path is one, else from its extension: the folder
+        // browser, Recents and the map offer Generate Tags too, and with no search there are no
+        // results to look it up in - every path was dropped and the item did nothing.
+        // Never a Photos asset: update() re-embeds files by path, and an asset has no file, so it
+        // read as deleted and its rows were dropped.
+        let byPath = Dictionary(rawResults.map { ($0.path, $0.kind) }, uniquingKeysWith: { a, _ in a })
+        let mediaPaths = paths.filter { p in
+            !PhotoLibrary.isPhotoPath(p)
+                && media.contains(byPath[p] ?? FileExtractor.kind(forExtension: (p as NSString).pathExtension)?.rawValue ?? "")
+        }
         guard !mediaPaths.isEmpty else { return }
         pendingRetag.removeAll { mediaPaths.contains($0) }
         pendingRetag.insert(contentsOf: mediaPaths, at: 0)
@@ -6477,6 +6571,7 @@ final class AppModel {
         let media: Set<String> = [FileKind.image.rawValue, FileKind.scan.rawValue, FileKind.video.rawValue]
         var added = false
         for h in hits where media.contains(h.kind)
+            && !PhotoLibrary.isPhotoPath(h.path)   // see requestTags
             && pendingRetag.count < Self.retagQueueCap
             && !retagSeen.contains(h.path)
             && OmniTagger.nameDerivedSnippet(h.snippet, path: h.path) {
@@ -6514,7 +6609,7 @@ final class AppModel {
         // queued must not be re-embedded (update(force:) would re-INSERT rows deleteUnderFolder
         // just removed, resurrecting the folder in search results).
         pendingRetag.removeAll { p in
-            rootKey(for: p) == nil
+            rootKey(for: p) == nil || PhotoLibrary.isPhotoPath(p)
                 || pausedRoots.contains(where: { p == $0 || p.hasPrefix($0 + "/") })
         }
         guard !pendingRetag.isEmpty else { return }
@@ -6527,8 +6622,13 @@ final class AppModel {
         tagBackfillActive = true
         tagBackfillYieldedToSearch = false
         fsReconcileInFlight = true
+        // WITH the roots, as the watcher reconcile passes them. Without them update() tested every
+        // ancestor of a path against the ignore rules, down to "/", so a file under a folder named
+        // Library, build or Caches ABOVE the indexed folder (iCloud Drive, the clipboard history)
+        // read as ignored and was deleted from the index by the re-tag meant to improve it.
+        let rootPaths = watcherRootPaths
         Task.detached(priority: .utility) {
-            indexer.update(paths: batch, settings: s, force: true)
+            indexer.update(paths: batch, settings: s, force: true, roots: rootPaths)
             await MainActor.run {
                 self.fsReconcileInFlight = false
                 self.tagBackfillActive = false
@@ -6539,12 +6639,18 @@ final class AppModel {
                     self.tagBackfillYieldedToSearch = false
                     self.pendingRetag.removeAll { batch.contains($0) }
                     self.pendingRetag.insert(contentsOf: batch, at: 0)
+                    // Work that queued behind the batch (file events, added or removed folders)
+                    // goes now. Only the other branch drained it, so after a batch gave way to a
+                    // search nothing ran until the next file event - a removed folder stayed
+                    // searchable, a new one unindexed, a save unseen, for as long as that took.
+                    self.drainDeferredAfterPass(store)
                 } else {
                     self.refreshIndexStats(store)
                     // The re-tagged rows are already in the store: refresh the live results so
                     // the tags the user just "requested" by searching appear without another
-                    // keystroke.
+                    // keystroke. The browser's Tags column too: it reads the rows, not the results.
                     self.refreshSearchAfterBackgroundChange()
+                    self.reloadBrowserIfTouched(batch)
                     // Anything that queued while the batch ran (FS events, root changes) drains
                     // first; the chain's tail re-enters here for the next batch once idle again.
                     self.drainDeferredAfterPass(store)
@@ -6571,7 +6677,20 @@ final class AppModel {
         // Running update() now would also hit the stale cancel and silently DROP the batch.
         guard indexState != .paused else { return }
         indexer.resetCancelled()   // a stale cancel from a removal/restart chain must not kill this batch
-        let drained = Array(pendingFSPaths); pendingFSPaths.removeAll()
+        // Only what still belongs to an indexed, unpaused folder - or is gone, since deleting its
+        // rows is the only work left for it. A folder removed or paused while its events waited
+        // (behind a pass, a pause, an OCR run) kept them here, and update() re-embedded the files
+        // of a removed folder: a path under no root passes its admission gate, and no later pass
+        // looks outside its own roots, so they stayed searchable and counted for good.
+        // String checks first: the stat is only for the few that fail them, never per queued path
+        // on the main thread.
+        let drained = Array(pendingFSPaths.filter { p in
+            (rootKey(for: p) != nil && !pausedRoots.contains(where: { p == $0 || p.hasPrefix($0 + "/") }))
+                || Darwin.access(p, F_OK) != 0
+        })
+        pendingFSPaths.removeAll()
+        reconcilingNames = arrivingNames; arrivingNames.removeAll()
+        guard !drained.isEmpty else { fsEventsWaitingSince = nil; reconcilingNames.removeAll(); return }
         fsEventsWaitingSince = nil
         let eid = pendingFSEventId; pendingFSEventId = 0
         let settings = effectiveSettings()
@@ -6581,7 +6700,7 @@ final class AppModel {
         startRateSampler()   // show throughput during the background reconcile too, not only full passes
         let rootPaths = watcherRootPaths
         Task.detached(priority: .utility) {
-            indexer.update(paths: drained, settings: settings, roots: rootPaths)
+            let changed = indexer.update(paths: drained, settings: settings, roots: rootPaths)
             let cancelled = indexer.isCancelled
             await MainActor.run {
                 // A cancelled batch (a folder removal or a restart chain) did not finish: put its
@@ -6592,12 +6711,20 @@ final class AppModel {
                     // rows, which is what a moved folder's old path is waiting for.
                     self.pendingFSPaths.formUnion(drained.filter { self.rootKey(for: $0) != nil || Darwin.access($0, F_OK) != 0 })
                     self.pendingFSEventId = max(self.pendingFSEventId, eid)
+                    self.arrivingNames.formUnion(self.reconcilingNames)   // queued again with them
                 } else if eid > 0 { self.eventCheckpoint = String(eid) }
+                self.reconcilingNames.removeAll()
                 self.activeRoots.subtract(touched)
-                self.markIndexed(store)   // a reconcile brought the index current just now
-                self.refreshIndexStats(store)
-                self.refreshSearchAfterBackgroundChange()
-                self.reloadBrowserIfTouched(drained)
+                // ONLY WHEN IT CHANGED SOMETHING. markIndexed writes the index's meta table, and
+                // with the index inside a watched folder (a moved index, a home-folder root) that
+                // write was the next event: a reconcile every ~1.5 s for as long as the app ran,
+                // each rescanning the stats and re-running the search (measured, 40 a minute idle).
+                if changed || cancelled {
+                    self.markIndexed(store)   // a reconcile brought the index current just now
+                    self.refreshIndexStats(store)
+                    self.refreshSearchAfterBackgroundChange()
+                    self.reloadBrowserIfTouched(drained)
+                }
                 self.fsReconcileInFlight = false
                 // Work queued while this reconcile ran (folder removals, a deferred full pass,
                 // added roots, more FS events) drains in one place, in fixed priority.
@@ -6642,6 +6769,7 @@ final class AppModel {
         indexingHolds += 1
         defer {
             indexingHolds -= 1
+            if indexingHolds == 0 { flushHeldRemovals() }
             if indexingHolds == 0, canIndex { startIndexing() }
         }
         indexer?.cancel()

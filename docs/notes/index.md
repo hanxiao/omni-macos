@@ -874,3 +874,65 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
   FSWatcher's callback it is inferred main-actor isolated, and the first nested closure in it
   (`contains { }`) trapped in `swift_task_checkIsolated` on the watcher queue. Crash on the first
   event with a present path; the unit tests do not run the watcher, only the app did.
+
+## Review of the write, watch, search and tag paths (2026-10-07)
+- Five read-only reviews (watcher, search, tagging, pass and UI state, Swift 6 isolation), then
+  every finding checked against the code, and the ones that could be measured measured on scratch
+  roots and on the live-index clone (310k files, 7.0M rows, 96k holes, sign-bit base).
+- WRONG RESULTS:
+  - GPU dead-occurrence mask cached on the folded row count, which a delete does not change:
+    after the second delete a query whose best match was deleted came back EMPTY (fused path).
+    `deadRows` now drops it on every change. DeadMaskAfterDeletesTests fails without it.
+  - A re-tag ran update() with no roots, so every ancestor up to "/" met the ignore rules and a
+    file under a folder named Library, build, Caches... above its root was deleted from the index.
+    Photos assets were queued for re-tag too, and update() read an asset as a deleted file.
+  - A folder removed while its events were queued came back: the drain re-embedded paths under no
+    root, and no pass purges outside its own roots. The drain keeps only paths under a live,
+    unpaused root, or gone.
+  - Deletes in a paused folder were dropped; they now go through the delete lane.
+  - Tags off during a re-tag batch stored empty tags over existing ones; the batch is cancelled.
+- CRASH: DropIntake's file-promise reader (Mail attachments, some browser drags) was a
+  main-actor closure called on a background OperationQueue - the FSWatcher trap again, but on
+  entry (an ObjC block not marked Sendable). It runs on .main now.
+- WORK THAT WAITED WITHOUT A BOUND:
+  - A re-tag that gave way to a search never drained what queued behind it (file events, added
+    and removed folders) until the next file event.
+  - A catch-up pass (a folder's first index) had no event wait limit: a save elsewhere waited for
+    all of it. enforceEventWaitLimit covers catch-ups and runs from the rate sampler's timer, so a
+    single long file no longer holds it off. Pausing a folder now stops its catch-up.
+  - Photos changes during a full pass were drained only if a file event happened to be pending;
+    the pass completion now runs the whole deferred chain.
+  - Deletes during an indexing hold or paper run are held and applied when it ends.
+  - A removed folder stayed on screen through the VACUUM; results, counts, filename index and
+    browser refresh as soon as the delete commits. Kind purges refresh results and browser too.
+  - The filename index learned a catch-up's files only on some later reconcile; markIndexed now
+    runs at catch-up completion and the minute tick covers any write in flight.
+- THE DELETE LANE COST DEDUP for copy-then-delete moves (another volume, cp + rm, sync clients):
+  3,000 files moved, 136 deduped, 2,864 re-embedded (890k tokens, 13 s). A gone path now waits
+  for update() when something arriving has the same name (queued, in the batch, or crawled by
+  it): 3,000 of 3,000 deduped, 0 tokens, settled in 3 s. A delete during an unrelated drag-in
+  still lands in 1.7 s.
+- A tree delete ran deleteUnderFolder per subdirectory, each a scan of every row; gone paths are
+  collapsed to their topmost (a root never absorbs its children).
+- RECONCILE LOOP: with the index inside a watched folder (a moved index, a home-folder root), the
+  reconcile's meta write was the next event: 40 reconciles a minute while idle, each rescanning
+  stats and re-running the search. Own-data paths are dropped at the watcher, and a reconcile that
+  changed nothing writes and refreshes nothing: 0 a minute.
+- WRITE AND SEARCH COST AT SCALE (live clone, one-file save every 10 s, searches every 0.3 s):
+  - proactiveRefoldLocked checked mlxBase and quantBase but not bitBase, so on a sign-bit base
+    every write rebuilt all 3.9M slots: 390-545 ms per one-file save. Now 5-11 ms.
+  - The orphan-slot mask was keyed on mutationGen, so the first search after any write walked
+    every slot: 113-125 ms. It is now keyed on the dead set and structural changes, with appends
+    checked incrementally (a freed slot reused by a new content is dropped from the list).
+  - First two searches after a write: p50 318 ms, p90 492 -> p50 23 ms, p90 201 (the first write
+    of a session builds the free list once, ~170 ms). Other searches p50 25 -> 23 ms.
+  - searchreal on a bench clone: digest 134b9ff183fd2f29, p50 4.2 ms, unchanged.
+- Measured and left: filename-index refresh 0.13 s per reconcile on 310k files; a 30,000-file
+  delete raises searches to 40-56 ms (one 189 ms) for ~4 s; stat tick 2 ms per root.
+- OPEN (found, not changed): the global Pause is disabled during a catch-up; a watcher reconcile
+  has no event limit (events would only join its batch); a long reconcile shows no progress ring
+  and Settings says "Up to date"; a directory event re-crawls its whole subtree, and a rescan of a
+  directory never removes children that are gone (dropped events, remounts; the launch pass does);
+  VACUUM still holds the store queue; clearing the clipboard during a pass restarts the pass;
+  Generate Tags waits behind a whole pass with no feedback; the tag label cache is keyed by
+  dimension only.

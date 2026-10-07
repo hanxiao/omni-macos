@@ -244,6 +244,11 @@ public final class Indexer: @unchecked Sendable {
     static func isFinite(_ v: [Float]) -> Bool { v.allSatisfy { $0.isFinite } }
 
     private let store: VectorStore
+    /// Names (last path component) of what the running update() is indexing: the paths it was
+    /// given and the files it crawled under them. removeVanished leaves a gone path with one of
+    /// these names to update(), since that arrival may be its copy - see removeVanished.
+    private let arrivalLock = NSLock()
+    private var arrivalNames = Set<String>()
     private let embedder: Embedder
     private let queue = DispatchQueue(label: "omni.indexer")
     private var cancelled = false
@@ -1391,10 +1396,27 @@ public final class Indexer: @unchecked Sendable {
     /// never deleted by prefix here - see the vanished-path loop.
     /// Paths gone from disk, sorted into the indexed files among them and the folders with rows
     /// beneath them. A root, or a folder above one, is neither: see update() for why its rows stay.
+    ///
+    /// TOPMOST ONLY. `rm -rf` reports every file and every directory of the tree, and each gone
+    /// directory with rows became its own deleteUnderFolder - a scan of every row in the index,
+    /// a transaction and a checkpoint stat apiece, all on the queue searches wait on. A path
+    /// whose ancestor is gone too leaves with that ancestor's folder delete. A root, or a folder
+    /// above one, never absorbs its children: its own rows are kept, and the files under it that
+    /// are reported gone still go one by one, as they always did.
     private func classifyVanished(_ gone: Set<String>, known: [String: StoredFile],
                                   roots: [String]) -> (files: Set<String>, folders: [String]) {
+        let protected = { (p: String) in roots.contains { $0 == p || $0.hasPrefix(p + "/") } }
+        let absorbing = gone.filter { !protected($0) }
+        let topmost = gone.filter { p in
+            var q = (p as NSString).deletingLastPathComponent
+            while q.count > 1 {
+                if absorbing.contains(q) { return false }
+                q = (q as NSString).deletingLastPathComponent
+            }
+            return true
+        }
         var files = Set<String>(), folders: [String] = []
-        for path in gone {
+        for path in topmost {
             if known[path] != nil { files.insert(path) }    // deleted / moved away
             else if roots.contains(where: { $0 == path || $0.hasPrefix(path + "/") }) {
                 Self.log.info("update: indexed folder at or under \(path, privacy: .public) is gone; rows kept")
@@ -1413,10 +1435,22 @@ public final class Indexer: @unchecked Sendable {
     /// vectors from (content dedup), so the caller leaves those to update(), which deletes after
     /// it embeds. Idempotent with update(): a writer that decoded a file before it went can store it
     /// again, and the caller keeps the path queued so update() removes that row afterwards.
+    ///
+    /// NOR FOR A PATH SOMETHING ARRIVING SHARES A NAME WITH: `arriving` (the caller's queued
+    /// present paths) or what the running update() is indexing. A move across volumes, `cp`
+    /// then `rm`, a sync client: the copy lands as new files and the original goes as a plain
+    /// delete, and the copy dedups from the original's rows only if they are still there when it
+    /// is indexed. Measured, 3,000 files copied to another volume and the source deleted at once:
+    /// 136 deduped and 2,864 went back through the model (890k tokens) when the delete went first.
+    /// A copy keeps its file and folder names; an unrelated delete during a drag-in does not
+    /// match and still goes at once. A renamed copy only costs its re-embed.
     /// Returns the number of files and folders removed.
     @discardableResult
-    public func removeVanished(_ paths: [String], roots: [String]) -> Int {
-        let gone = Set(paths.filter { Darwin.access($0, F_OK) != 0 })   // may be back already
+    public func removeVanished(_ paths: [String], roots: [String], arriving: Set<String> = []) -> Int {
+        let names = arrivalLock.withLock { arrivalNames }.union(arriving)
+        let gone = Set(paths.filter {
+            !names.contains(($0 as NSString).lastPathComponent) && Darwin.access($0, F_OK) != 0   // may be back already
+        })
         guard !gone.isEmpty else { return 0 }
         let (files, folders) = classifyVanished(gone, known: store.storedFiles(paths: gone), roots: roots)
         if !files.isEmpty { store.deletePaths(files) }
@@ -1424,7 +1458,10 @@ public final class Indexer: @unchecked Sendable {
         return files.count + folders.count
     }
 
-    public func update(paths: [String], settings: IndexSettings, force: Bool = false, roots: [String] = []) {
+    /// Returns whether the batch could have changed the index: something was (re)embedded or
+    /// removed. False is the common watcher batch that names files already current.
+    @discardableResult
+    public func update(paths: [String], settings: IndexSettings, force: Bool = false, roots: [String] = []) -> Bool {
         beginChunkReuse(settings)
         let tUpdate = Date()
         let tok0 = (embedder as? OmniEngine)?.tokensProcessed ?? 0
@@ -1489,6 +1526,11 @@ public final class Indexer: @unchecked Sendable {
         files = files.filter { seenPaths.insert($0.path).inserted }
         var lookup = seenPaths; lookup.formUnion(deletedTop)
         let known = store.storedFiles(paths: lookup)
+        arrivalLock.withLock {
+            arrivalNames = Set(files.lazy.map { ($0.path as NSString).lastPathComponent })
+            for p in paths where !deletedTop.contains(p) { arrivalNames.insert((p as NSString).lastPathComponent) }
+        }
+        defer { arrivalLock.withLock { arrivalNames.removeAll() } }
 
         // Accumulate the batch's deletions and re-embeds, then apply each as ONE batched store call.
         // Per-file deletePath/replace would each trigger a full O(N) in-memory rebuild, so a burst
@@ -1741,6 +1783,7 @@ public final class Indexer: @unchecked Sendable {
                            paths.count, files.count, work.count, dedupHits, toDelete.count, vanishedPrefixes.count,
                            ((embedder as? OmniEngine)?.tokensProcessed ?? 0) - tok0, -tUpdate.timeIntervalSinceNow * 1000))
         embedder.indexingIdle()   // arm the debounced GPU buffer-cache trim
+        return !work.isEmpty || !toDelete.isEmpty || (finished && !vanishedPrefixes.isEmpty)
     }
 
     // MARK: - Pipeline
