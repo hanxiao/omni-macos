@@ -1266,7 +1266,8 @@ final class ContentSharingTests: XCTestCase {
     func testASharingIndexStillStampsAndAdoptsItsRowSidecar() throws {
         let saved = OmniMemoryBudget.capBytes
         OmniMemoryBudget.capBytes = 1 << 20
-        defer { OmniMemoryBudget.capBytes = saved }
+        VectorStore.fullBaseCeilingOverride = (1 << 20) / 4   // the scan mode's own lever now
+        defer { OmniMemoryBudget.capBytes = saved; VectorStore.fullBaseCeilingOverride = nil }
         let url = tempDB()
         let dim = 64
         let shared = vec(4, dim)
@@ -1303,7 +1304,8 @@ final class ContentSharingTests: XCTestCase {
     func testTheSidecarCarriesEachRowsSlotRatherThanItsIndex() throws {
         let saved = OmniMemoryBudget.capBytes
         OmniMemoryBudget.capBytes = 1 << 20
-        defer { OmniMemoryBudget.capBytes = saved }
+        VectorStore.fullBaseCeilingOverride = (1 << 20) / 4   // the scan mode's own lever now
+        defer { OmniMemoryBudget.capBytes = saved; VectorStore.fullBaseCeilingOverride = nil }
         let url = tempDB()
         let dim = 64
         var before: [Int32] = []

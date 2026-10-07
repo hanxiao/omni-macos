@@ -197,11 +197,16 @@ public func omniSetMemoryLimit(_ bytes: Int) {
 ///
 /// `OmniMemoryBudget.capBytes`, which every batch budget scales from (anchored at 6 GB), is
 /// `omniBudgetBaseBytes + headroom`: a 3 GB headroom reproduces the tuned 6 GB batching exactly,
-/// and zero gives the 3 GB batching the 8 GB Macs ran by default.
+/// and zero gives the 3 GB batching the 8 GB Macs ran by default. The default is 1.5 GB, which
+/// measured as fast as 3 GB with ~1.3 GB less peak (AppModel.defaultHeadroomGB).
 public let omniBudgetBaseBytes = 3_000_000_000
-/// What one small batch needs above the resident weights and index: the largest transient
-/// measured at the 3 GB batch sizes is well under this (~480 MB at the tuned 6 GB ones).
-public let omniWorkingFloorBytes = 512 * 1_048_576
+/// What one batch needs above the resident weights and index, so zero headroom works without the
+/// allocator spinning. 1 GB, measured (11,640 files: 1,500 images, 30 audio/video, 111 PDFs, 10,000
+/// text; zero headroom): 512 MB indexed in 180-206 s with 4:47-5:20 of CPU - the spin again, image
+/// batches outgrow it - and 1 GB in 150-152 s with 3:23-3:27, at the same 4.5 GB peak. At 1.5 GB of
+/// headroom the floor made no difference. OMNI_WORK_FLOOR_MB A/Bs it.
+public let omniWorkingFloorBytes =
+    (ProcessInfo.processInfo.environment["OMNI_WORK_FLOOR_MB"].flatMap { Int($0) } ?? 1024) * 1_048_576
 public func omniSetMemoryHeadroom(_ headroomBytes: Int, residentBytes: Int) {
     let h = max(0, headroomBytes)
     OmniMemoryBudget.capBytes = omniBudgetBaseBytes + h

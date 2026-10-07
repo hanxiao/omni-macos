@@ -112,7 +112,8 @@ final class VectorStoreFoldPersistTests: XCTestCase {
     private func withCap(_ bytes: Int, _ body: () throws -> Void) rethrows {
         let saved = OmniMemoryBudget.capBytes
         OmniMemoryBudget.capBytes = bytes
-        defer { OmniMemoryBudget.capBytes = saved }
+        VectorStore.fullBaseCeilingOverride = bytes / 4   // the scan mode's own lever now
+        defer { OmniMemoryBudget.capBytes = saved; VectorStore.fullBaseCeilingOverride = nil }
         try body()
     }
 
@@ -766,7 +767,8 @@ final class VectorStoreFoldPersistTests: XCTestCase {
         var capQuant = true
         let saved = OmniMemoryBudget.capBytes
         OmniMemoryBudget.capBytes = quantCap
-        defer { OmniMemoryBudget.capBytes = saved }
+        VectorStore.fullBaseCeilingOverride = quantCap / 4
+        defer { OmniMemoryBudget.capBytes = saved; VectorStore.fullBaseCeilingOverride = nil }
 
         func newPath(_ rng: inout Rng) -> String {
             nextFile += 1
@@ -830,6 +832,7 @@ final class VectorStoreFoldPersistTests: XCTestCase {
             case 72 ..< 76:  // mode flip
                 capQuant.toggle()
                 OmniMemoryBudget.capBytes = capQuant ? quantCap : (64 << 30)
+                VectorStore.fullBaseCeilingOverride = OmniMemoryBudget.capBytes / 4
             default:
                 verifySearch(op, &rng)
             }

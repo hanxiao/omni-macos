@@ -1817,7 +1817,12 @@ final class AppModel {
     /// Hard memory cap in GB (0 = unlimited). Applied to MLX immediately.
     /// The memory setting: HEADROOM on top of what has to be resident - the model and the index -
     /// not a total (see omniSetMemoryHeadroom; issue #27). More is faster; zero still works.
-    var memoryHeadroomGB: Double = 3 { didSet { persistPerf(); applyMemoryLimit() } }
+    var memoryHeadroomGB: Double = AppModel.defaultHeadroomGB { didSet { persistPerf(); applyMemoryLimit() } }
+    /// The smallest headroom that indexes as fast as more. Measured, 11,640 files of every kind,
+    /// two interleaved rounds: 0 GB 180-206 s (512 MB floor), 0.5 GB 146-170 s, 1 GB 143-153 s,
+    /// 1.5 GB 141-144 s, 2 GB 138 s, 3 GB 135-157 s; peak footprint 6.1-6.2 GB at 1.5 against
+    /// 7.4-7.8 GB at 3, searches and folder maps unchanged. Below 1.5 the CPU time climbs.
+    static let defaultHeadroomGB = 1.5
     /// MLX bytes that are resident at rest - the weights and the index's GPU base - measured after
     /// the model has loaded and warmed (measureResidentMemory). nil until then.
     @ObservationIgnored private var residentMLXBytes: Int?
@@ -3423,10 +3428,17 @@ final class AppModel {
             // of headroom C - 3, so 6 GB -> 3 GB of headroom is the same batching. A cap at or
             // below 3 GB - the 1 GB of issue #27 - becomes zero headroom; "Unlimited" (0) becomes
             // the most that fits, which maxHeadroomGB then holds it to.
+            // The old default was WRITTEN on every first launch, so a stored value equal to this
+            // Mac's old default was never anybody's choice: it gets the new default, not 3 GB.
             let old = d.double(forKey: "omni.maxMemoryGB")
-            memoryHeadroomGB = old > 0 ? max(0, old - Double(omniBudgetBaseBytes) / 1_000_000_000) : 64
+            let oldDefault = min(6, max(2, (physicalMemoryGB * 0.4).rounded()))
+            if old == oldDefault {
+                memoryHeadroomGB = Self.defaultHeadroomGB
+            } else {
+                memoryHeadroomGB = old > 0 ? max(0, old - Double(omniBudgetBaseBytes) / 1_000_000_000) : 64
+            }
         } else {
-            memoryHeadroomGB = 3   // the tuned default; held under maxHeadroomGB on a small Mac
+            memoryHeadroomGB = Self.defaultHeadroomGB   // held under maxHeadroomGB on a small Mac
         }
         if d.object(forKey: "omni.minImageDim") != nil { minImageDimension = max(0, d.integer(forKey: "omni.minImageDim")) }
         if d.object(forKey: "omni.minAudioSec") != nil { minAudioSeconds = max(0, d.double(forKey: "omni.minAudioSec")) }

@@ -1045,8 +1045,24 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
     old 1 GB cap:     22.7 / 21.8 s, CPU 34.9 / 33.3 s, peak 3.0-3.1 GB
     new 0 headroom:   16.5 / 16.5 s, CPU 22.1 / 22.4 s, peak 3.3 GB
     new 1 GB:         15.4 / 15.5 s, CPU 17.5 / 17.2 s, peak 4.4-4.5 GB
-  On this PDF set 1 GB of headroom is as fast as 3 GB; the default stays at 3 until image and video
-  batching (what the larger budgets feed) are measured the same way.
+- THE DEFAULT IS 1.5 GB, measured on 11,640 files of every kind (1,500 images, 30 audio/video, 111
+  PDFs, 10,000 text; tags on), fresh index each, two interleaved rounds, then a folder map of the
+  images and five searches:
+    0 GB    180-206 s  CPU 4:47-5:20  peak 4.2-4.7 GB   (512 MB floor: the allocator spin again)
+    0 GB    150-152 s  CPU 3:23-3:27  peak 4.5 GB       (1 GB floor - now the floor)
+    0.5 GB  146-170 s  CPU 2:37-2:48  peak 4.8 GB
+    1 GB    143-153 s  CPU 2:29-2:34  peak 5.7-6.0 GB
+    1.5 GB  139-162 s  CPU 2:17-2:31  peak 6.1-6.5 GB
+    2 GB    138 s      CPU 2:12-2:13  peak 6.5 GB
+    3 GB    135-157 s  CPU 2:13-2:21  peak 7.4-7.8 GB
+  Searches 6-9 ms and folder-map fits 73-95 ms at every setting from 0.5 up (128 ms at 0). 1.5 is
+  the smallest that matches 3 on time and CPU, for about 1.3 GB less peak.
+- Migration: the old default was written on every first launch, so a stored total equal to the
+  Mac's old default (min(6, max(2, 40% of RAM))) becomes the new default, not 3 GB; any other value
+  was a choice and becomes C - 3 GB.
+- The scan mode (full base vs compact replica) no longer follows the setting: its ceiling is a
+  quarter of the old default total for the machine (VectorStore.fullBaseCeilingBytes), so headroom
+  is speed only and never changes which candidates a query sees.
 
 ## Open a result where it matched (issue #26, 2026-10-07)
 - Preview has no public way to open at a page: no URL fragment, nothing in its dictionary, and

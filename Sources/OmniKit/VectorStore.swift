@@ -974,10 +974,23 @@ public final class VectorStore: @unchecked Sendable {
     /// Policy: OMNI_QUANT_BASE forces a width (0=off); unset = auto-on at `scanBits` (1 by default)
     /// when the full base would exceed a quarter of the user's memory cap (Settings > Performance),
     /// OR when the corpus is past the row count at which the replica is simply the faster scan on this device.
+    /// How big a full-precision base may get before the scan moves to the compact replica: a
+    /// quarter of the cap every Mac ran by default - min(6 GB, max(2 GB, 40% of RAM)), so 1.5 GB
+    /// from 16 GB up and 0.75 GB on 8 GB. NOT the user's headroom: that setting is speed, and the
+    /// scan mode decides which candidates a query sees. The index is resident whatever the headroom
+    /// is (it is part of what headroom goes on top of), so how it is held follows the machine.
+    /// Test seam: tests that need the replica on a small fixture set this rather than shrinking
+    /// the memory budget, which no longer decides the mode.
+    nonisolated(unsafe) static var fullBaseCeilingOverride: Int?
+    static var fullBaseCeilingBytes: Int {
+        if let v = fullBaseCeilingOverride { return v }
+        let ram = Double(ProcessInfo.processInfo.physicalMemory)
+        return Int(min(6e9, max(2e9, ram * 0.4))) / 4
+    }
     static func quantBitsFor(baseBytes: Int, rowCount: Int = 0) -> Int {
         if let v = quantBaseOverride { return v }
         if let s = ProcessInfo.processInfo.environment["OMNI_QUANT_BASE"], let v = Int(s) { return v }
-        if baseBytes > OmniMemoryBudget.capBytes / 4 { return Self.scanBits }
+        if baseBytes > fullBaseCeilingBytes { return Self.scanBits }
         return rowCount > deviceCrossoverRows ? Self.scanBits : 0
     }
     /// Width of the quantized scan replica: 1 by default (OMNI_SCAN_BITS, below). Within the affine
