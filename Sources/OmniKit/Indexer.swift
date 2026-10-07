@@ -1394,6 +1394,53 @@ public final class Indexer: @unchecked Sendable {
 
     /// `roots`: the indexed folders. A vanished path that is one of them, or sits above one, is
     /// never deleted by prefix here - see the vanished-path loop.
+    /// Does the loaded model produce the vectors this index holds? Re-embeds up to `sample` small
+    /// text files that are unchanged on disk - fresh, no dedup, no chunk reuse - and compares each
+    /// chunk with the stored vector for the SAME chunk (same chunk key: identical text and chunking
+    /// settings, so identical input). true when every compared chunk is at cosine >= `threshold`,
+    /// false when any is below it, nil when nothing could be compared (no small unchanged text
+    /// files, or none whose chunking still matches). Stored vectors are bf16; the same weights land
+    /// at ~0.9999, a different checkpoint nowhere near.
+    ///
+    /// For an index stamped before the vector-space probe existed, whose stamp named the model by
+    /// file size and date - which a re-download or a copy changes with the weights untouched.
+    public func sameVectorSpace(sample: Int = 3, threshold: Float = 0.995, settings: IndexSettings) -> Bool? {
+        var fresh = settings
+        fresh.forceFreshEmbed = true
+        let fm = FileManager.default
+        var candidates: [(path: String, file: StoredFile)] = []
+        struct Enough: Error {}   // stop the walk early: it builds a String per file otherwise
+        try? store.knownFiles().forEach { path, f in
+            if f.kind == FileKind.text.rawValue, f.size > 0, f.size < 64 * 1024,
+               !PhotoLibrary.isPhotoPath(path) { candidates.append((path, f)) }
+            if candidates.count >= 64 { throw Enough() }
+        }
+        var proven = 0
+        for c in candidates where proven < sample {
+            guard let a = try? fm.attributesOfItem(atPath: c.path),
+                  (a[.size] as? Int) == c.file.size,
+                  let m = (a[.modificationDate] as? Date)?.timeIntervalSince1970,
+                  abs(m - c.file.modified) < 0.001 else { continue }
+            let stored = store.chunkVectors(path: c.path, dim: embedder.dim)
+            guard !stored.isEmpty else { continue }
+            let chunks = embed(decode(CrawledFile(path: c.path, modified: m, size: c.file.size), settings: fresh), settings: fresh)
+            var compared = 0
+            for ch in chunks where !ch.chunkKey.isEmpty {
+                guard let v = stored[ch.chunkKey], v.count == ch.embedding.count else { continue }
+                var dot: Float = 0, na: Float = 0, nb: Float = 0
+                for i in 0 ..< v.count { dot += v[i] * ch.embedding[i]; na += v[i] * v[i]; nb += ch.embedding[i] * ch.embedding[i] }
+                let cos = dot / max((na * nb).squareRoot(), 1e-12)
+                if cos < threshold {
+                    Self.log.info("vector space differs: \(c.path, privacy: .public) cosine \(cos, privacy: .public)")
+                    return false
+                }
+                compared += 1
+            }
+            if compared > 0 { proven += 1 }
+        }
+        return proven > 0 ? true : nil
+    }
+
     /// Paths gone from disk, sorted into the indexed files among them and the folders with rows
     /// beneath them. A root, or a folder above one, is neither: see update() for why its rows stay.
     ///

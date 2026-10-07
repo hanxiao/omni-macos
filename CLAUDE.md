@@ -72,7 +72,7 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (697 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (698 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Search digest on the real index (a CLONE, never the live one): `omni-verify searchreal
@@ -126,6 +126,10 @@ codebase were already measured there, and many were rejected.
   over before it starts. A debounce `cancel()` reached a model reload this way and cut its
   one-minute indexing hold to 1.2 s (index.md, "Settings under change"). Waits that guard
   correctness use `waitUntilIndexWorkStops`; work started after a debounce runs in a fresh task.
+- AN INDEX BELONGS TO THE WEIGHTS' OUTPUT, NOT TO THE WEIGHTS' FILE. The stamp named the model by
+  model.safetensors' size and date, and a mismatch WIPED the index at the next launch, unasked: a
+  `touch` re-embedded 5,000 files from zero. Same-space is now a stored probe vector (cosine >=
+  0.999), proven from the index's own files for older stamps (index.md, "The model stamp").
 - A CLOSURE WRITTEN IN A @MainActor TYPE AND CALLED OFF-MAIN TRAPS IN SWIFT 6: on entry when the
   parameter is an ObjC block or DispatchSource handler not marked Sendable, on its first nested
   stdlib closure otherwise. Callback types called off-main are `@Sendable`, or the closure is built

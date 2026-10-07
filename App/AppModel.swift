@@ -4187,12 +4187,13 @@ final class AppModel {
             self.supportsImages = engine.supportsImages
             self.audioSupported = engine.supportsAudio
             self.engineDim = engine.dim
-            // Migrate older fingerprint formats that encode the same vector space (they
-            // carried extra decode-knob suffixes). Re-stamp so a cosmetic format change does
-            // not force a full rebuild of a perfectly valid index.
-            if let stamped = store.metaGet("embedding_version"), stamped != fingerprint,
-               !fingerprint.isEmpty, stamped.hasPrefix(fingerprint) {
-                store.metaSet("embedding_version", fingerprint)
+            // DECIDED HERE, before the store is ready and before anything can write it: the launch
+            // pass that follows wipes an index found obsolete, and stamps whatever it runs on.
+            if let indexer = self.indexer {
+                vectorSpaceDiffers = await Self.vectorSpaceDiffers(
+                    store: store, engine: engine, indexer: indexer, fingerprint: fingerprint,
+                    legacyFingerprint: legacyFingerprint, variant: modelVariant.rawValue,
+                    settings: effectiveSettings())
             }
             refreshIndexStats(store)
             // READ THE VECTORS AHEAD, as the last part of the launch bar. See
@@ -4317,17 +4318,94 @@ final class AppModel {
         }
     }
 
+    /// The embedding code and the dimension. Decode-quality knobs (maxImageDimension,
+    /// maxVideoFrames), enabled kinds and index-time thresholds deliberately do NOT belong here -
+    /// they change which files are included, not the space, and are reconciled without a wipe.
+    ///
+    /// THE MODEL IS NOT IN IT ANY MORE. It was named by model.safetensors' size and date, and a
+    /// stamp that disagreed flagged the index obsolete - which the launch pass then WIPED and
+    /// re-embedded, unasked. A re-download (the merged release weights are a different file of the
+    /// same vector space), a copy that does not keep dates, anything that rewrote the file did it:
+    /// measured, `touch` on the weights and a relaunch re-embedded a 5,000-file index from zero.
+    /// Whether the weights changed is now asked of the weights themselves: see vectorSpaceDiffers.
     private func computeFingerprint(modelDir: URL, dim: Int) -> String {
-        let sf = modelDir.appendingPathComponent("model.safetensors")
+        [embeddingVersion, "dim\(dim)"].joined(separator: "|")
+    }
+
+    /// The stamp every release before the probe wrote, for recognising an index it left unchanged.
+    private var legacyFingerprint: String {
+        guard !modelPath.isEmpty, engineDim > 0 else { return "" }
+        let sf = URL(fileURLWithPath: modelPath).appendingPathComponent("model.safetensors")
         let attrs = try? FileManager.default.attributesOfItem(atPath: sf.path)
         let size = (attrs?[.size] as? Int64) ?? 0
         let mtime = Int((attrs?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)
-        // Identifies the VECTOR SPACE only: the embedding code, dimension, and model identity.
-        // A mismatch means existing vectors are incomparable and the index must be wiped and
-        // rebuilt. Decode-quality knobs (maxImageDimension/maxVideoFrames), enabled kinds, and
-        // index-time thresholds deliberately do NOT belong here - they change which files are
-        // included, not the space, and are reconciled incrementally without a wipe.
-        return [embeddingVersion, "dim\(dim)", "model\(size)-\(mtime)"].joined(separator: "|")
+        return [embeddingVersion, "dim\(engineDim)", "model\(size)-\(mtime)"].joined(separator: "|")
+    }
+
+    /// Set at bootstrap: the loaded weights do not produce this index's vectors.
+    @ObservationIgnored private var vectorSpaceDiffers = false
+
+    /// What the probe text is embedded as. Changing it changes every stored probe's meaning, so it
+    /// does not change.
+    nonisolated static let vectorSpaceProbeText = "Omni vector space probe: a quiet harbor at dawn, invoices and recipes."
+    nonisolated static let vectorSpaceProbeKey = "space_probe"
+
+    nonisolated static func encodeProbe(_ v: [Float]) -> String {
+        v.withUnsafeBufferPointer { Data(buffer: $0) }.base64EncodedString()
+    }
+    nonisolated static func decodeProbe(_ s: String) -> [Float]? {
+        guard let d = Data(base64Encoded: s), d.count % 4 == 0, !d.isEmpty else { return nil }
+        return d.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+    }
+
+    /// Do the loaded weights embed differently from the ones that built this index?
+    ///
+    /// The index keeps a PROBE: one fixed text embedded by the weights that indexed it, written at
+    /// every pass start. Same weights reproduce it (cosine >= 0.999 allows a toolchain's rounding);
+    /// other weights do not. An index from before the probe existed is proven instead: unchanged
+    /// stamp -> same; otherwise a few of its own files are re-embedded and compared chunk by chunk
+    /// with what is stored (Indexer.sameVectorSpace). Only when nothing can be compared does the
+    /// model variant decide - one checkpoint per variant has ever shipped. A proven-same index is
+    /// adopted: the probe and the new stamp are written, and nothing is re-embedded.
+    nonisolated static func vectorSpaceDiffers(store: VectorStore, engine: OmniEngine, indexer: Indexer,
+                                               fingerprint fp: String, legacyFingerprint legacy: String,
+                                               variant: String, settings: IndexSettings) async -> Bool {
+        await Task.detached(priority: .userInitiated) { () -> Bool in
+            guard store.count > 0, !fp.isEmpty else { return false }
+            let probe = engine.embedText(vectorSpaceProbeText, as: .passage)
+            func adopt(_ why: String) -> Bool {
+                store.metaSet(vectorSpaceProbeKey, encodeProbe(probe))
+                store.metaSet("embedding_version", fp)
+                rootLog.info("index adopted for the loaded model: \(why, privacy: .public)")
+                omniPerfLog("vector-space adopted: \(why)")
+                return false
+            }
+            if let saved = store.metaGet(vectorSpaceProbeKey).flatMap(decodeProbe) {
+                guard saved.count == probe.count else { return false }   // a dim change; refreshIndexStats owns it
+                var dot: Float = 0, na: Float = 0, nb: Float = 0
+                for i in 0 ..< probe.count { dot += saved[i] * probe[i]; na += saved[i] * saved[i]; nb += probe[i] * probe[i] }
+                let cos = dot / max((na * nb).squareRoot(), 1e-12)
+                if cos < 0.999 { rootLog.info("loaded weights embed differently (probe cosine \(cos, privacy: .public))") }
+                omniPerfLog(String(format: "vector-space probe cosine %.6f", cos))
+                return cos < 0.999
+            }
+            // No probe: written by a release before it.
+            let stamped = store.metaGet("embedding_version")
+            if stamped == legacy { return adopt("stamp unchanged") }
+            // A different embedding version or dimension is not this question; refreshIndexStats
+            // compares those parts of the stamp itself.
+            guard let stamped, stamped == fp || stamped.hasPrefix(fp + "|") else { return false }
+            switch indexer.sameVectorSpace(settings: settings) {
+            case true?: return adopt("re-embedded files match their stored vectors")
+            case false?:
+                rootLog.info("re-embedded files do not match their stored vectors: index is obsolete")
+                omniPerfLog("vector-space differs: re-embedded files do not match")
+                return true
+            case nil:
+                if store.metaGet("index_model_variant") == variant { return adopt("same variant, nothing to compare") }
+                return true
+            }
+        }.value
     }
 
     /// Recompute the visible index stats. The work (allIndexStats / per-folder counts iterate the
@@ -4459,8 +4537,12 @@ final class AppModel {
                 // with reality - otherwise a stale "dim1024" stamp on a 768 index would wrongly flag a
                 // matching model obsolete and wipe the index.
                 let stringTrustworthy = stampedVersion?.contains("dim\(self.engineDim)") == true
-                let stringMismatch = hasIndex && stringTrustworthy && stampedVersion != fp
-                self.assign(\.indexObsolete, dimMismatch || stringMismatch)
+                // The code and dimension parts of the stamp; the WEIGHTS are vectorSpaceDiffers,
+                // decided at bootstrap by what they produce, not by the file's size and date.
+                let stringMismatch = hasIndex && stringTrustworthy
+                    && !(stampedVersion == fp || stampedVersion?.hasPrefix(fp + "|") == true)
+                let spaceMismatch = hasIndex && self.vectorSpaceDiffers
+                self.assign(\.indexObsolete, dimMismatch || stringMismatch || spaceMismatch)
             }
         }
     }
@@ -5332,7 +5414,7 @@ final class AppModel {
         if indexState != .indexing && activeRoots.isEmpty && !fsReconcileInFlight { drainPendingFSChanges() }
     }
 
-    static let rootLog = Logger(subsystem: "io.hanxiao.omni", category: "roots")
+    nonisolated static let rootLog = Logger(subsystem: "io.hanxiao.omni", category: "roots")
 
     nonisolated static func isInTrash(_ path: String) -> Bool {
         path.contains("/.Trash/") || path.hasSuffix("/.Trash") || path.contains("/.Trashes/")
@@ -6321,7 +6403,12 @@ final class AppModel {
         let activePhotoSources = photoSources.filter { !pausedRoots.contains($0.key) }
         guard !activeRootsToIndex.isEmpty || !activePhotoSources.isEmpty else { return }
         // An out-of-date index is in a different vector space: rebuild it, don't top up.
-        let force = indexObsolete
+        // vectorSpaceDiffers too: it is decided at bootstrap, while indexObsolete is assigned by
+        // the stats refresh, which the launch pass can start ahead of - and that pass would then
+        // stamp an index full of the old weights' vectors as the new ones'.
+        let force = indexObsolete || vectorSpaceDiffers
+        vectorSpaceDiffers = false   // what this pass writes is the loaded weights' space
+        let probeEngine = engine
         let fp = fingerprint
         let variant = modelVariant.rawValue
         if force {
@@ -6373,6 +6460,11 @@ final class AppModel {
             }
             store.metaSet("embedding_version", fp)
             store.metaSet("index_model_variant", variant)
+            // The weights' own signature beside the stamp; see vectorSpaceDiffers.
+            if let probeEngine {
+                store.metaSet(Self.vectorSpaceProbeKey,
+                              Self.encodeProbe(probeEngine.embedText(Self.vectorSpaceProbeText, as: .passage)))
+            }
             // Coalesce UI updates by wall-clock time. onProgress fires per ~10 scanned files;
             // on a fast crawl of a large index that floods the main actor (thousands of observed-property
             // writes + O(n) stats), which hangs the app and kills the Pause button. Publish the

@@ -967,3 +967,36 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
     re-download keeps it and another checkpoint of the same width builds its own. The width-only
     cache of earlier releases is ADOPTED, not rebuilt (one checkpoint per width ever shipped):
     measured on a copy of the real one, renamed with its prior, no rebuild.
+
+## The model stamp wiped indexes it should have kept (2026-10-07)
+- The index's `embedding_version` named the model by model.safetensors' SIZE AND DATE. A stamp
+  that disagreed set indexObsolete, and the launch pass, which starts on its own after warm-up,
+  ran with force: wipeChunks, then every file through the model again. Nothing asked.
+- Reproduced on a copy of the nano model and a 5,000-file scratch index: `touch` on the weights
+  (identical bytes), relaunch, and the count went 0 -> 5,000 over 20 s of re-embedding. On the
+  real 2.7M-file index that is days, with search mostly empty meanwhile.
+- What changes the date with the weights untouched: a re-download (and since 0.15.3 a
+  re-download fetches the MERGED release weights, a different file of the same vector space, so
+  any pre-0.15.3 install that re-downloads was rebuilt), a copy that does not keep dates, a
+  restore that does not, anything that rewrites the file.
+- And the other way round, a race: indexObsolete is assigned by the async stats refresh, and the
+  launch pass stamps the fingerprint as it starts. A pass that started first would have stamped
+  an index of the OLD weights' vectors as the new ones', and nothing would ever rebuild it.
+- Now: the stamp is the embedding code and the dimension only. The weights are judged by what
+  they produce: a PROBE, one fixed text embedded at every pass start and stored as meta
+  `space_probe`; at bootstrap, before anything can write, the loaded weights embed it again and
+  cosine >= 0.999 means the same space. The pass forces a rebuild from that verdict directly.
+- An index from before the probe: stamp unchanged -> adopted. Otherwise up to 3 small text files
+  unchanged on disk are re-embedded fresh (no dedup, no chunk reuse) and compared chunk by chunk
+  with the stored vector of the same chunk key (Indexer.sameVectorSpace; cosine >= 0.995, bf16
+  storage). Only with nothing to compare does the model variant decide (one checkpoint per
+  variant has shipped). Adopted = probe and new stamp written, nothing re-embedded.
+- Measured in the app on the scratch index (cosines from the perf log):
+  - old stamp, model unchanged: adopted, no re-embed;
+  - probe present, weights touched: probe cosine 1.000000, no re-embed (twice);
+  - old stamp with another date, no probe: "re-embedded files match their stored vectors",
+    adopted, no re-embed;
+  - stored probe from other weights (a random vector): cosine 0.077, rebuilt 0 -> 5,000; the
+    next launch read cosine 1.000000 and left it alone.
+- VectorSpaceProofTests: the original embedder proves true, another of the same width false, and
+  an index whose files all changed returns nil rather than a guess.
