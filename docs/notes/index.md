@@ -1018,3 +1018,47 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
     and 0.999 asks the files before anything is wiped: a toolchain could move one short text's
     vector by itself. Nudged probe at 0.9954: files matched, kept. Adapter-less model: probe
     0.878, rebuilt. touched copy of the same weights: "re-embedded files match", kept.
+
+## The memory setting is headroom (issue #27, 2026-10-07)
+- Report: 117 PDFs indexed with Maximum memory at 1 GB; the system UI stuttered during indexing and
+  stayed sluggish after Omni quit, until a reboot (search fields, Cmd-Space).
+- Measured, 111 PDFs, fresh index each: at a 1 GB cap indexing took 21.8-22.7 s against 15.5-17.6 s
+  at 6 GB, with TWICE the CPU (33.3-34.9 s against 15.9-16.9 s), and the footprint still reached
+  3.0-3.1 GB. Sampled: the hottest frames were MLX's allocator spinning - syscall_thread_switch,
+  the allocator mutex, get_memory_limit/get_active_memory, wait_for_one. A cap below what is
+  already resident (nano weights alone 2.2 GB) cannot be met, so every allocation waits, yields and
+  retries. That plus GPU load is the stutter on a small Mac; what lingers after quit fits the
+  system having swapped other processes out under the pressure (paged back on first touch: the
+  search fields and Spotlight are what they touched). Omni writes nothing Spotlight indexes
+  (0 items under its data folder) and no metadata on user files.
+- The setting is now HEADROOM on top of what has to be resident (omniSetMemoryHeadroom): MLX's
+  limit = resident (weights + the index's GPU base, measured at rest after load and warm-up, the
+  index part followed on the stats tick) + a 512 MB working floor + headroom; the buffer cache is
+  half the headroom; batch budgets scale from 3 GB + headroom, so the 3 GB default reproduces the
+  tuned 6 GB batching exactly. Headroom is held under half of physical memory less model, index and
+  the app's own baseline, so no setting can be what pushes the Mac into swap. "Unlimited" is gone.
+  The old total cap moves over once: C -> C - 3 GB (6 -> 3, identical), 1 GB -> none, Unlimited ->
+  the most that fits.
+- Same 111 PDFs, interleaved, two rounds:
+    old 6 GB cap:     17.6 / 15.5 s, CPU 16.9 / 15.9 s, peak 5.7-6.1 GB
+    new 3 GB (default) 17.6 / 15.5 s, CPU 16.5 / 16.3 s, peak 5.8-6.1 GB
+    old 1 GB cap:     22.7 / 21.8 s, CPU 34.9 / 33.3 s, peak 3.0-3.1 GB
+    new 0 headroom:   16.5 / 16.5 s, CPU 22.1 / 22.4 s, peak 3.3 GB
+    new 1 GB:         15.4 / 15.5 s, CPU 17.5 / 17.2 s, peak 4.4-4.5 GB
+  On this PDF set 1 GB of headroom is as fast as 3 GB; the default stays at 3 until image and video
+  batching (what the larger budgets feed) are measured the same way.
+
+## Open a result where it matched (issue #26, 2026-10-07)
+- Preview has no public way to open at a page: no URL fragment, nothing in its dictionary, and
+  "Go to Page" by GUI scripting needs Accessibility. The open-documents Apple Event's documented
+  keyAESearchText parameter (what Spotlight sends) is honoured: a phrase from page 10 of a 48-page
+  PDF opened it at "Page 10 of 48", highlighted. A phrase with a straight apostrophe against the
+  PDF's curly one found nothing, so the phrase is plain words only.
+- OpenAtHit: a PDF hit with "Page N" opens with a 5-10 word phrase that occurs on that page and no
+  other (checked over the document's words, then confirmed with PDFKit's own search), started
+  from the matched chunk's words; text hits with "Line N" carry keyAEPosition, the line convention
+  code editors honour. TextEdit honours neither (measured) and opens as before. Measured in the
+  app: Return on the result opened Preview at page 10 with the chunk's first words highlighted.
+- The phrase costs a pass over the document's text, ~2.4 ms a page (168 pages: 0.4 s): computed
+  when the row is selected (prefetch), cached per file version and page, and bounded at 1 s on
+  the open, past which the file opens plainly. A scan has no text and opens at page 1, as before.

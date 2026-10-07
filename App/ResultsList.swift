@@ -505,7 +505,7 @@ struct ResultsList<Footer: View>: View {
         }
     }
 
-    private func open(_ path: String) { PhotoActions.open(path) }
+    private func open(_ path: String) { model.openResult(path) }
 
     /// Click selection with Finder modifiers: Cmd toggles a row, Shift extends the range from the
     /// anchor, plain click replaces the selection.

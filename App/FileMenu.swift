@@ -42,7 +42,7 @@ struct FileMenuItems<Passages: View>: View {
     // ORDER, as Finder groups a file's menu: open it; find related; hand it elsewhere; selection;
     // and what removes it, last, so the destructive items are never in the middle.
     var body: some View {
-        Button { model.selectSingle(path); PhotoActions.open(path) } label: {
+        Button { model.selectSingle(path); model.openResult(path) } label: {
             Label("Open", systemImage: "arrow.up.forward.app")
         }
         .keyboardShortcut("o", modifiers: .command)
