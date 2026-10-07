@@ -622,9 +622,11 @@ private struct PerformanceTab: View {
                 Text("Throughput")
             }
             Section {
+                // What Omni is using first, then the room it may use on top of it.
+                MemoryBreakdown(isVisible: isVisible)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("Memory headroom")
+                        Text("Headroom")
                         Spacer()
                         let shown = min(memoryDraft ?? model.memoryHeadroomGB, model.maxHeadroomGB)
                         Text(shown == 0 ? "None" : Self.gb(shown))
@@ -639,7 +641,7 @@ private struct PerformanceTab: View {
                             if memoryDragging { memoryDraft = step } else { model.memoryHeadroomGB = step }
                         }
                     ), in: 0 ... headroomCeiling, label: {
-                        Text("Memory headroom")
+                        Text("Headroom")
                     }, minimumValueLabel: {
                         Text("None").font(.caption).foregroundStyle(.secondary)
                     }, maximumValueLabel: {
@@ -659,14 +661,13 @@ private struct PerformanceTab: View {
                     // relaunch. It also silently corrupts the run, which pins the cap as a class.
                     .disabled(model.isPaperRunning)
                 }
-                MemoryBreakdown(isVisible: isVisible)
             } header: {
                 Text("Memory")
             } footer: {
                 // What the setting is: room on top of what the model and index always take.
                 Text(model.isPaperRunning ? "Locked while the benchmark runs."
                      : (model.modelIndexBytes > 0
-                        ? "On top of the model and index, which take \(Self.gb((Double(model.modelIndexBytes) / 1e9 * 10).rounded() / 10)). More headroom indexes faster; with none, Omni still works, a small batch at a time."
+                        ? "On top of the model and index, which take \(ByteSize.memory(model.modelIndexBytes)). More headroom indexes faster; with none, Omni still works, a small batch at a time."
                         : "On top of the model and index. More headroom indexes faster; with none, Omni still works, a small batch at a time."))
                     .font(.caption).foregroundStyle(.secondary)
             }
