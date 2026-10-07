@@ -4,12 +4,12 @@ import MLX
 import PDFKit
 import Tokenizers
 
-/// The jina-embeddings-v5-omni model variants the app can run.
+/// Embedding models the app can run.
 public enum ModelVariant: String, CaseIterable, Sendable {
-    case small, nano
-    public var title: String { self == .small ? "Omni Small" : "Omni Nano" }
-    public var detail: String { self == .small ? "~1.7B, higher quality" : "smaller, faster, lighter" }
-    var hfFragment: String { "models--jinaai--jina-embeddings-v5-omni-\(rawValue)-mlx" }
+    case embeddingGemma2 = "embeddinggemma2", small, nano
+    public var title: String { self == .embeddingGemma2 ? "EmbeddingGemma 2" : (self == .small ? "Jina Omni Small" : "Jina Omni Nano") }
+    public var detail: String { self == .embeddingGemma2 ? "740M, multilingual multimodal, local MLX" : (self == .small ? "~1.7B, higher quality" : "smaller, faster, lighter") }
+    var hfFragment: String { self == .embeddingGemma2 ? "models--google--embeddinggemma-2" : "models--jinaai--jina-embeddings-v5-omni-\(rawValue)-mlx" }
 }
 
 /// Locates a usable model directory (one containing model.safetensors).
@@ -28,28 +28,22 @@ public enum ModelLocator {
     ]
     #endif
 
-    /// Explicit overrides that win regardless of variant: an env pointer and the legacy
-    /// single-model path.
+    /// Explicit environment override that wins regardless of variant.
     private static func overrides() -> [URL] {
         var out: [URL] = []
         if let env = ProcessInfo.processInfo.environment["OMNI_MODEL_DIR"] {
             out.append(URL(fileURLWithPath: env))
         }
-        let fm = FileManager.default
-        if let appSup = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false) {
-            out.append(appSup.appendingPathComponent("Omni/model"))
-        }
         return out
     }
 
     public static func candidates() -> [URL] {
-        overrides() + (resolve(variant: .nano).map { [$0] } ?? []) + (resolve(variant: .small).map { [$0] } ?? [])
+        overrides() + (resolve(variant: .embeddingGemma2).map { [$0] } ?? []) + (resolve(variant: .nano).map { [$0] } ?? []) + (resolve(variant: .small).map { [$0] } ?? [])
     }
 
-    /// Default model: an explicit override, else Nano (smaller and faster) when present,
-    /// else Small.
+    /// Default model: an explicit environment override, otherwise EmbeddingGemma 2.
     public static func resolve() -> URL? {
-        firstWithWeights(overrides()) ?? resolve(variant: .nano) ?? resolve(variant: .small)
+        firstWithWeights(overrides()) ?? resolve(variant: .embeddingGemma2)
     }
 
     /// Resolve a specific variant's model directory (staged dev path / HuggingFace cache /
@@ -58,10 +52,11 @@ public enum ModelLocator {
         let fm = FileManager.default
         var dirs: [URL] = []
         if let appSup = try? fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: false) {
-            dirs.append(appSup.appendingPathComponent("Omni/\(variant.rawValue)"))
+            dirs.append(appSup.appendingPathComponent("\(variant == .embeddingGemma2 ? "OmniEmbeddingGemma2" : "Omni")/\(variant.rawValue)"))
         }
         #if DEBUG
         switch variant {
+        case .embeddingGemma2: break
         case .small: dirs.append(URL(fileURLWithPath: "/private/tmp/omni-model"))
         case .nano: dirs.append(URL(fileURLWithPath: "/private/tmp/omni-nano"))
         }
@@ -97,7 +92,8 @@ public enum ModelLocator {
         let fm = FileManager.default
         let required = ["model.safetensors", "config.json", "tokenizer.json"]
         return dirs.first { dir in
-            required.allSatisfy { fm.fileExists(atPath: dir.appendingPathComponent($0).path) }
+            let files = OmniEngine.variant(at: dir) == .embeddingGemma2 ? ModelDownloader.gemmaFiles : required
+            return files.allSatisfy { fm.fileExists(atPath: dir.appendingPathComponent($0).path) }
         }
     }
 }
@@ -243,7 +239,7 @@ public func omniPerfLog(_ message: @autoclosure () -> String) {
     FileHandle.standardError.write(Data(("[perf] " + message() + "\n").utf8))
 }
 
-public final class OmniEngine: Embedder, @unchecked Sendable {
+public final class JinaEngine: Embedder, @unchecked Sendable {
     // var, not let: recoverMediaPath() swaps in freshly loaded encoders when a cold-load weight
     // corruption is detected at runtime. ALL THREE encoders are read from threads that are not the
     // swapper: media callers read `guard let enc = imageEncoder` OUTSIDE the run() gate, and the text
@@ -359,12 +355,12 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// fresh buffers until it passes; a low rate can pass it, and recoverMediaPath() is the runtime
     /// backstop. Attempts are capped: if every one fails the last engine is returned, so the app
     /// still runs and media files skip rather than the launch failing.
-    public static func loadValidated(modelDir: URL, gpuCacheBytes: Int = 0, keepVision: Bool = true, keepAudio: Bool = true, maxAttempts: Int = 4) async throws -> OmniEngine {
-        var engine = try await OmniEngine(modelDir: modelDir, gpuCacheBytes: gpuCacheBytes, keepVision: keepVision, keepAudio: keepAudio)
+    public static func loadValidated(modelDir: URL, gpuCacheBytes: Int = 0, keepVision: Bool = true, keepAudio: Bool = true, maxAttempts: Int = 4) async throws -> JinaEngine {
+        var engine = try await JinaEngine(modelDir: modelDir, gpuCacheBytes: gpuCacheBytes, keepVision: keepVision, keepAudio: keepAudio)
         var attempt = 1
         while attempt < maxAttempts && !engine.mediaPathFinite() {
-            FileHandle.standardError.write(Data("OmniEngine: media self-test produced NaN on load attempt \(attempt); reloading weights\n".utf8))
-            engine = try await OmniEngine(modelDir: modelDir, gpuCacheBytes: gpuCacheBytes, keepVision: keepVision, keepAudio: keepAudio)
+            FileHandle.standardError.write(Data("JinaEngine: media self-test produced NaN on load attempt \(attempt); reloading weights\n".utf8))
+            engine = try await JinaEngine(modelDir: modelDir, gpuCacheBytes: gpuCacheBytes, keepVision: keepVision, keepAudio: keepAudio)
             attempt += 1
         }
         // Flush load-time temporaries (dequant scratch, self-test activations, and on a retry the
@@ -449,14 +445,14 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                     self.weightStore = weights
                     return true
                 } catch {
-                    FileHandle.standardError.write(Data("OmniEngine: media-path recovery reload failed: \(error)\n".utf8))
+                    FileHandle.standardError.write(Data("JinaEngine: media-path recovery reload failed: \(error)\n".utf8))
                     return false
                 }
             }
             guard rebuilt else { return false }
             MLX.Memory.clearCache()   // drop the old buffers
             if mediaPathFinite(probes: 5) {
-                FileHandle.standardError.write(Data("OmniEngine: media path recovered after weight reload (attempt \(attempt))\n".utf8))
+                FileHandle.standardError.write(Data("JinaEngine: media path recovered after weight reload (attempt \(attempt))\n".utf8))
                 return true
             }
         }
@@ -535,11 +531,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     }
 
     /// Convenience initializer that locates the model automatically.
-    public static func load() async throws -> OmniEngine {
+    public static func load() async throws -> JinaEngine {
         guard let dir = ModelLocator.resolve() else {
             throw OmniError.model("no model found. Set OMNI_MODEL_DIR or install to ~/Library/Application Support/Omni/model")
         }
-        return try await OmniEngine.loadValidated(modelDir: dir)
+        return try await JinaEngine.loadValidated(modelDir: dir)
     }
 
     /// Serialize MLX work. `highPriority` calls run before any waiting low-priority

@@ -8,6 +8,8 @@ import os
 /// What the indexer needs from the embedding engine. OmniEngine conforms.
 public protocol Embedder: AnyObject {
     var dim: Int { get }
+    var usesRawAudio: Bool { get }
+    func prepareImage(_ image: CGImage) -> OmniVisionPreprocess.RawPatches
     /// True while the user is actively running interactive searches. The indexer shrinks its
     /// per-forward batch so a query's GPU work waits behind a short command buffer, not a full one.
     var interactiveQueryActive: Bool { get }
@@ -53,6 +55,8 @@ public protocol Embedder: AnyObject {
 }
 
 public extension Embedder {
+    var usesRawAudio: Bool { false }
+    func prepareImage(_ image: CGImage) -> OmniVisionPreprocess.RawPatches { OmniVisionPreprocess.preprocessRaw(image) }
     /// Default: not search-aware (test doubles, simple conformances). OmniEngine overrides.
     var interactiveQueryActive: Bool { false }
 
@@ -1881,7 +1885,7 @@ public final class Indexer: @unchecked Sendable {
             return DecodedItem(file: file, kind: kind, payload: out.payload, meta: out.meta, contentKey: contentKey)
         }
         if category == .audio {
-            guard let out = source.audio(file, probe: probe, settings: settings) else { return DecodedItem(file: file) }
+            guard let out = source.audio(file, probe: probe, settings: settings, rawPCM: embedder.usesRawAudio) else { return DecodedItem(file: file) }
             return DecodedItem(file: file, kind: kind, payload: out.payload, meta: out.meta, contentKey: contentKey)
         }
 
@@ -1911,7 +1915,7 @@ public final class Indexer: @unchecked Sendable {
             }
             // Still images: run the CPU preprocess (resize + parallel patchify) HERE, in the
             // concurrent decode stage, so the serialized GPU thread only does the tower.
-            let raws = images.map { OmniVisionPreprocess.preprocessRaw($0) }
+            let raws = images.map { embedder.prepareImage($0) }
             let item = DecodedItem(file: file, kind: kind, payload: .imagePatches(raws), meta: meta, contentKey: contentKey)
             // HQ tag refinement (retag pass only): cut the study's 5 CWR crops here on the
             // concurrent decode stage, so the GPU stage just scores them. Single-frame images
@@ -1919,7 +1923,7 @@ public final class Indexer: @unchecked Sendable {
             if settings.hqMediaTags, images.count == 1, let img = images.first {
                 item.hqCrops = OmniTagger.cwrCropRects(width: img.width, height: img.height)
                     .compactMap { img.cropping(to: $0) }
-                    .map { OmniVisionPreprocess.preprocessRaw($0) }
+                    .map { embedder.prepareImage($0) }
             }
             return item
         }
@@ -2205,7 +2209,7 @@ public final class Indexer: @unchecked Sendable {
                 if isCancelled { break }
                 autoreleasepool {
                     if let img = FileExtractor.renderPDFPage(doc, index: i, maxDimension: maxDimension) {
-                        result.append((i, OmniVisionPreprocess.preprocessRaw(img)))
+                        result.append((i, embedder.prepareImage(img)))
                     }
                 }
             }

@@ -1,0 +1,7 @@
+mlx==0.32.3
+mlx-vlm @ https://github.com/Blaizzy/mlx-vlm/archive/3d87e88402f307efbf68e568971aa887ee7d9ed0.tar.gz
+transformers @ https://github.com/huggingface/transformers/archive/e598fbad926d80bc356c0c4d96532030e3dfdb62.tar.gz
+torch==2.14.1
+torchvision==0.29.1
+librosa>=0.11,<0.12
+soundfile>=0.13,<0.14

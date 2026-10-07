@@ -1795,7 +1795,7 @@ final class AppModel {
     var physicalMemoryGB: Double { Double(omniPhysicalMemory()) / 1_000_000_000 }
 
     // Model variant (small / nano).
-    var modelVariant: ModelVariant = .small
+    var modelVariant: ModelVariant = .embeddingGemma2
     var installedVariants: [ModelVariant: URL] = [:]
 
     // Model download.
@@ -2046,6 +2046,7 @@ final class AppModel {
     /// park a thread there once a second, the sample gives up and reuses the previous numbers.
     nonisolated func sampleMemory() async -> MemorySample {
         let store = await self.store
+        let helper = await self.engine
         let vizBytes = await self.vizBytes
         let previous = await self.lastSearchMemory
         let (search, fresh) = await Self.searchMemory(store, fallback: previous)
@@ -2053,8 +2054,9 @@ final class AppModel {
         return await Task.detached(priority: .utility) {
             var s = MemorySample()
             let t0 = DispatchTime.now().uptimeNanoseconds
-            s.total = SystemProbe.footprintBytes()
-            s.cache = omniGPUCacheMemory()
+            let external = helper?.helperMemory ?? (footprint: 0, active: 0, cache: 0)
+            s.total = SystemProbe.footprintBytes() + external.footprint
+            s.cache = omniGPUCacheMemory() + external.cache
             // The quantized base is MLXArrays, so MLX counts it as active memory - but it is the
             // INDEX, not the model. Move it across, or the Model slice absorbs 1.4 GB of search
             // data and the user is told the weights are twice their real size.
@@ -2063,7 +2065,7 @@ final class AppModel {
             s.indexCPU = search.cpu
             s.index = search.cpu + search.gpu
             s.parts = search.parts
-            s.model = max(0, omniGPUActiveMemory() - search.gpu)
+            s.model = max(0, omniGPUActiveMemory() - search.gpu) + external.active
             // Clamp before subtracting: the three measured parts come from different clocks (MLX
             // can allocate between the footprint read and its own), so a momentary overshoot must
             // shrink a slice rather than produce a negative remainder that breaks the bar.
@@ -3285,7 +3287,8 @@ final class AppModel {
         self.supportsImages = engine.supportsImages
         self.audioSupported = engine.supportsAudio
         self.requestIndexPass()        // crawl any files the surviving towers now cover
-        towersAgain = true             // settings may have changed during the off-actor drop
+        towersAgain = towers.vision == engine.supportsImages && towers.audio == engine.supportsAudio
+        if !towersAgain { queryError = engine.lastError }
     }
 
     /// Load the model again with the towers the enabled kinds need, against the index that is
@@ -3701,8 +3704,8 @@ final class AppModel {
             let fm = FileManager.default
             // Require a COMPLETE model, not just weights, so a partial saved dir doesn't load and
             // then fail with missingConfig.
-            let complete = ["model.safetensors", "config.json", "tokenizer.json"]
-                .allSatisfy { fm.fileExists(atPath: u.appendingPathComponent($0).path) }
+            let required = OmniEngine.variant(at: u) == .embeddingGemma2 ? ModelDownloader.gemmaFiles : ["model.safetensors", "config.json", "tokenizer.json"]
+            let complete = required.allSatisfy { fm.fileExists(atPath: u.appendingPathComponent($0).path) }
             if complete { return u }
         }
         return ModelLocator.resolve()
@@ -3799,6 +3802,10 @@ final class AppModel {
         // setOCRResident(false) restores the user's cap when OCR lets go.
         if ocrHoldsMemory { omniSetOCRMemory(); return }
         omniSetMemoryLimit(maxMemoryGB > 0 ? Int(maxMemoryGB * 1_000_000_000) : 0)
+        if let engine, engine.isEmbeddingGemma2 {
+            let cap = OmniMemoryBudget.capBytes
+            Task.detached(priority: .utility) { engine.setHelperMemoryLimit(cap) }
+        }
     }
 
     /// Switch model variant (small/nano). Reloads the engine; the index is flagged
@@ -4049,12 +4056,12 @@ final class AppModel {
         else { phase = .noModel; return }
         omniPerfLog("launch model-dir")
         modelPath = dir.path
-        modelVariant = dir.path.contains("nano") ? .nano : .small
+        modelVariant = OmniEngine.variant(at: dir)
         // REAL launch progress, not an animation: the store reports its row-load fraction directly,
         // and the engine side is MLX's live GPU allocation against the total bytes KNOWN up front
         // (weights file + persisted quant replica - everything that must materialize before ready).
         storeLoadFrac = 0; engineLoadFrac = 0; warmFrac = 0
-        engineTotalBytes = Self.expectedGPULoadBytes(modelDir: dir)
+        engineTotalBytes = modelVariant == .embeddingGemma2 ? nil : Self.expectedGPULoadBytes(modelDir: dir)
         warmPlanned = (try? Self.indexURL()).map { idx in
             let vecs = idx.deletingLastPathComponent().appendingPathComponent(idx.lastPathComponent + ".vecs")
             let bytes = ((try? FileManager.default.attributesOfItem(atPath: vecs.path)[.size]) as? Int) ?? 0
@@ -4315,7 +4322,8 @@ final class AppModel {
         // rebuilt. Decode-quality knobs (maxImageDimension/maxVideoFrames), enabled kinds, and
         // index-time thresholds deliberately do NOT belong here - they change which files are
         // included, not the space, and are reconciled incrementally without a wipe.
-        return [embeddingVersion, "dim\(dim)", "model\(size)-\(mtime)"].joined(separator: "|")
+        let version = OmniEngine.variant(at: modelDir) == .embeddingGemma2 ? "gemma2-1-searchprefix-rawmedia" : embeddingVersion
+        return [version, OmniEngine.variant(at: modelDir).rawValue, "dim\(dim)", "model\(size)-\(mtime)"].joined(separator: "|")
     }
 
     /// Recompute the visible index stats. The work (allIndexStats / per-folder counts iterate the
@@ -4448,12 +4456,12 @@ final class AppModel {
         if let custom = UserDefaults.standard.string(forKey: "omni.dbDir"), !custom.isEmpty {
             let dir = URL(fileURLWithPath: custom)
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            return dir.appendingPathComponent("index.sqlite")
+            return dir.appendingPathComponent("index-\((resolvedModelDir().map { OmniEngine.variant(at: $0) } ?? .embeddingGemma2).rawValue).sqlite")
         }
         let base = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
-            .appendingPathComponent("Omni", isDirectory: true)
+            .appendingPathComponent("OmniEmbeddingGemma2", isDirectory: true)
         try fm.createDirectory(at: base, withIntermediateDirectories: true)
-        return base.appendingPathComponent("index.sqlite")
+        return base.appendingPathComponent("index-\((resolvedModelDir().map { OmniEngine.variant(at: $0) } ?? .embeddingGemma2).rawValue).sqlite")
     }
 
     /// MOVE the index to a user-chosen folder, rather than just repointing at it.
@@ -4469,9 +4477,10 @@ final class AppModel {
     /// told where it is.
     @discardableResult
     func moveDatabaseDir(to url: URL) async -> String? {
-        let src = (try? Self.indexURL())?.deletingLastPathComponent()
-            ?? URL(fileURLWithPath: dbPath).deletingLastPathComponent()
-        let files = IndexRelocation.files(in: src)
+        let sourceIndex = store?.dbURL ?? (try? Self.indexURL()) ?? URL(fileURLWithPath: dbPath)
+        let src = sourceIndex.deletingLastPathComponent()
+        let databaseName = sourceIndex.lastPathComponent
+        let files = IndexRelocation.files(in: src, databaseName: databaseName)
         let payload = IndexRelocation.byteSize(of: files)
         if let refusal = IndexRelocation.refusal(from: src, to: url, payload: payload) { return refusal }
 
@@ -4492,7 +4501,7 @@ final class AppModel {
         releaseOpenIndex()
 
         let copied: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
-            do { try IndexRelocation.copy(from: src, to: url); return .success(()) }
+            do { try IndexRelocation.copy(from: src, to: url, databaseName: databaseName); return .success(()) }
             catch { return .failure(error) }
         }.value
 
@@ -5896,7 +5905,16 @@ final class AppModel {
                 if Task.isCancelled { return }
                 (hits, vec) = store.search(queryGraph: g, filter: filter, topK: Self.searchTopK, textQuery: q)
             } else {
-                vec = engine.embedQuery(q)   // high priority: jumps ahead of indexing
+                vec = engine.embedQuery(q)
+                guard vec.count == engine.dim, vec.allSatisfy(\.isFinite) else {
+                    await MainActor.run {
+                        guard token == self.searchToken else { return }
+                        self.searching = false
+                        self.rawResults = []
+                        self.queryError = engine.lastError ?? "The embedding model could not process this query."
+                    }
+                    return
+                }
                 if Task.isCancelled { return }   // superseded while embedding: don't run the store scan
                 hits = store.search(vec, filter: filter, topK: Self.searchTopK, textQuery: q)
             }
@@ -5928,7 +5946,7 @@ final class AppModel {
         s.minVideoSeconds = minVideoSeconds
         s.minTextChars = minTextChars
         s.skipDataless = skipDatalessFiles
-        s.imageTags = imageTagsEnabled
+        s.imageTags = imageTagsEnabled && engine?.supportsPatchTags == true
         return s
     }
 
@@ -5989,7 +6007,7 @@ final class AppModel {
         taggerSetupGen += 1
         let gen = taggerSetupGen
         guard let engine else { return }
-        guard imageTagsEnabled else { engine.tagger = nil; return }
+        guard imageTagsEnabled, engine.supportsPatchTags else { engine.tagger = nil; return }
         guard engine.supportsImages, engine.tagger == nil,
               let url = try? Self.tagCacheURL(dim: engine.dim) else { return }
         let modelDir = engine.modelDir

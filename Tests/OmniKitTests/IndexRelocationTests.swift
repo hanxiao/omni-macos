@@ -43,6 +43,21 @@ final class IndexRelocationTests: XCTestCase {
                        "a compaction temp was carried across; it means nothing outside its compaction")
     }
 
+    func testVariantIndexMovePreservesSidecarsAndOtherModels() throws {
+        let src = try makeIndex("src")
+        let dst = root.appendingPathComponent("dst", isDirectory: true)
+        try FileManager.default.createDirectory(at: dst, withIntermediateDirectories: true)
+        let name = "index-embeddinggemma2.sqlite"
+        let names = IndexRelocation.fileNames.map { $0.replacingOccurrences(of: "index.sqlite", with: name) }
+        for file in names { try Data([1, 2, 3]).write(to: src.appendingPathComponent(file)) }
+        try Data([4, 5]).write(to: dst.appendingPathComponent("index-small.sqlite"))
+        XCTAssertEqual(IndexRelocation.files(in: src, databaseName: name).count, names.count)
+        try IndexRelocation.copy(from: src, to: dst, databaseName: name)
+        for file in names { XCTAssertEqual(try Data(contentsOf: dst.appendingPathComponent(file)), Data([1, 2, 3])) }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dst.appendingPathComponent("index.sqlite").path))
+        XCTAssertEqual(try Data(contentsOf: dst.appendingPathComponent("index-small.sqlite")), Data([4, 5]))
+    }
+
     func testTheSameFolderIsRefused() throws {
         let dir = try makeIndex("src")
         XCTAssertNotNil(IndexRelocation.refusal(from: dir, to: dir, payload: 0))

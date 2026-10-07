@@ -48,7 +48,7 @@ struct OnboardingView: View {
                 // staged copy on its own, and Settings > Storage > Model keeps an explicit
                 // Change... for the rare case, where the surrounding context makes it honest.
                 VStack(spacing: 10) {
-                    downloadButton(0, prominent: true) { model.downloadModel(.nano) }
+                    downloadButton(0, prominent: true) { model.downloadModel(.embeddingGemma2) }
                     // The second choice is the OCR add-on, not the larger embedding build. Someone
                     // meeting the app for the first time is choosing what it can DO, and a second
                     // embedding variant that is 60% bigger for a quality difference they cannot
@@ -78,7 +78,7 @@ struct OnboardingView: View {
     /// of empty pill past anything either of them said, and every narrower guess clipped whichever
     /// title was longest.
     private static let choices: [(title: String, size: String)] = [
-        ("Download embedding model", "~1.9 GB"),
+        ("Download EmbeddingGemma 2", "~1.5 GB"),
         ("Download OCR model", "Optional, ~4.5 GB"),
     ]
 

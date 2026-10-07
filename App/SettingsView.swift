@@ -347,6 +347,11 @@ private struct ContentTypesTab: View {
                     set: { model.imageTagsEnabled = $0 }
                 ))
                 .toggleStyle(.switch)
+                .disabled(model.modelVariant == .embeddingGemma2)
+                if model.modelVariant == .embeddingGemma2 {
+                    Text("Automatic tags are available with Jina. EmbeddingGemma 2 supports semantic image and video search.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             } header: {
                 Text("Image & video tagging")
             }

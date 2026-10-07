@@ -29,6 +29,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
 fi
 echo $$ > "$LOCK/pid"
 trap 'rm -rf "$LOCK"' EXIT
+./Scripts/prepare-build-cache.sh
 
 CONFIG="${1:-Release}"
 DD=".build/xcode-rel"

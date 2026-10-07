@@ -170,7 +170,9 @@ public enum OmniAudioPreprocess {
         private let nativeSegmentFrames: Int   // native frames per 240 s segment
         private var done = false
 
-        public init?(url: URL) {
+        private let rawPCM: Bool
+        public init?(url: URL, rawPCM: Bool = false) {
+            self.rawPCM = rawPCM
             guard let f = try? AVAudioFile(forReading: url) else { return nil }
             let fmt = f.processingFormat
             guard fmt.sampleRate > 0, fmt.channelCount > 0, f.length > 0 else { return nil }
@@ -221,6 +223,7 @@ public enum OmniAudioPreprocess {
         public func nextMelSegment() -> (mel: [Float], frames: Int)? {
             if let p = pending { pending = nil; return p }
             guard let samples = nextSegment() else { return nil }
+            if rawPCM { return (samples, samples.count / 160) }
             return OmniAudioPreprocess.melFrom(samples: samples) ?? ([], 0)
         }
 
