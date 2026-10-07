@@ -652,8 +652,14 @@ private struct PhotoSourceRow: View {
                 // being kept up to date". Finder marks a sidebar item that needs attention with
                 // the same outline triangle in the same trailing column.
                 Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary)
+            } else if (RootIndexState.isActive(model, key: source.key) || model.isPhotoSourceQueued(source)) && !RootIndexState.isFinished(model, key: source.key),
+                      let fraction = RootIndexState.activeFraction(model, key: source.key) {
+                CloudSyncPie(fraction: fraction)
             } else if (RootIndexState.isActive(model, key: source.key) || model.isPhotoSourceQueued(source)) && !RootIndexState.isFinished(model, key: source.key) {
-                CloudSyncPie(fraction: RootIndexState.activeFraction(model, key: source.key))
+                // As FolderRow: the count it has while there is no fraction to draw.
+                if model.hasIndexedFiles, let c = model.folderFileCounts[source.key], c > 0 {
+                    Text(c.formatted()).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                }
             } else if model.hasIndexedFiles, let c = model.folderFileCounts[source.key] {
                 Text(c.formatted())
                     .font(.caption.monospacedDigit())
@@ -717,8 +723,9 @@ private struct ClipboardRow: View {
             Image(systemName: "list.clipboard").sidebarTint(selected, else: .secondary).frame(width: 16)
             Text("Clipboard").sidebarTint(selected, else: .primary)
             Spacer()
-            if model.clipboardEnabled, RootIndexState.isActive(model, key: key), !RootIndexState.isFinished(model, key: key) {
-                CloudSyncPie(fraction: RootIndexState.activeFraction(model, key: key))
+            if model.clipboardEnabled, RootIndexState.isActive(model, key: key), !RootIndexState.isFinished(model, key: key),
+               let fraction = RootIndexState.activeFraction(model, key: key) {
+                CloudSyncPie(fraction: fraction)
             } else if model.hasIndexedFiles, let c = model.folderFileCounts[key], c > 0 {
                 Text(c.formatted())
                     .font(.caption.monospacedDigit())
@@ -816,13 +823,18 @@ private struct FolderRow: View {
                 // being kept up to date". Finder marks a sidebar item that needs attention with
                 // the same outline triangle in the same trailing column.
                 Image(systemName: "exclamationmark.triangle").foregroundStyle(.secondary)
+            } else if (RootIndexState.isActive(model, url) || model.isFolderQueued(url)) && !RootIndexState.isFinished(model, url),
+                      let fraction = RootIndexState.activeFraction(model, url) {
+                // iCloud-Drive-style transfer indicator: a pie that fills as this folder is indexed.
+                CloudSyncPie(fraction: fraction)
             } else if (RootIndexState.isActive(model, url) || model.isFolderQueued(url)) && !RootIndexState.isFinished(model, url) {
-                // iCloud-Drive-style transfer indicator: a pie that fills as this
-                // folder is indexed (or sweeps when reconciling in the background).
-                // A QUEUED folder gets the same treatment with no fraction - it has no
-                // total yet, and falling through to its stored count showed a freshly
-                // added folder a truthful "0" that reads as "nothing in here".
-                CloudSyncPie(fraction: RootIndexState.activeFraction(model, url))
+                // Working with no k of n to draw: a background update, a folder queued or paused
+                // part-way. The count it already has, if any - it climbs with the stats tick. Not a
+                // "0": for a freshly added folder that reads as "nothing in here". This used to be
+                // an empty pie, which draws nothing, so the row went blank mid-work.
+                if model.hasIndexedFiles, let c = model.folderFileCounts[url.path], c > 0 {
+                    Text(c.formatted()).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                }
             } else if model.deniedRoots.contains(url.path) {
                 // macOS denied Omni access (TCC): without this badge the folder just
                 // showed "0" forever with no explanation or recovery path.

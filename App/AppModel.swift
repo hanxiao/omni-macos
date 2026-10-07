@@ -6891,16 +6891,16 @@ final class AppModel {
         activeRoots.formUnion(touched)
         fsReconcileInFlight = true
         startRateSampler()   // show throughput during the background reconcile too, not only full passes
-        // A reconcile that is still running after 2 s is shown as work in progress: the sidebar
-        // ring and "Updating..." in Settings. Both read per-folder progress, and a finished pass
-        // leaves every folder at done == total, so a 95 s drag-in looked idle and Settings offered
-        // "Update", which cancelled it. Not sooner: a save's reconcile is over before it is seen.
+        // A reconcile that is still running after 2 s is shown as work in progress: "Updating..."
+        // in Settings, which read per-folder progress, and a finished pass leaves every folder at
+        // done == total, so a 95 s drag-in said "Up to date" and offered "Update", which cancelled
+        // it. Not sooner: a save's reconcile is over before it is seen. The sidebar shows the
+        // folder's count, which the stats tick keeps climbing (a reconcile has no total for a ring).
         reconcileToken &+= 1
         let token = reconcileToken
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(2))
             guard let self, self.fsReconcileInFlight, self.reconcileToken == token else { return }
-            for k in touched { self.progress.perRoot[k] = nil }   // no total: an indeterminate ring
             if !self.reconcileShowsProgress { self.reconcileShowsProgress = true }
         }
         let rootPaths = watcherRootPaths
