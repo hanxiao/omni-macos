@@ -1389,6 +1389,41 @@ public final class Indexer: @unchecked Sendable {
 
     /// `roots`: the indexed folders. A vanished path that is one of them, or sits above one, is
     /// never deleted by prefix here - see the vanished-path loop.
+    /// Paths gone from disk, sorted into the indexed files among them and the folders with rows
+    /// beneath them. A root, or a folder above one, is neither: see update() for why its rows stay.
+    private func classifyVanished(_ gone: Set<String>, known: [String: StoredFile],
+                                  roots: [String]) -> (files: Set<String>, folders: [String]) {
+        var files = Set<String>(), folders: [String] = []
+        for path in gone {
+            if known[path] != nil { files.insert(path) }    // deleted / moved away
+            else if roots.contains(where: { $0 == path || $0.hasPrefix(path + "/") }) {
+                Self.log.info("update: indexed folder at or under \(path, privacy: .public) is gone; rows kept")
+            }
+            else if store.hasRowsUnder(path) { folders.append(path) }
+        }
+        return (files, folders)
+    }
+
+    /// Remove the rows of paths that are gone, now: store work only, no crawl, no decode, no model,
+    /// so it does not wait for the pass or reconcile that owns the pipeline. Before, a delete queued
+    /// behind whatever was running: 31 s behind a pass (its event hold), and the whole of a reconcile
+    /// behind one - 95 s for a 20,000-file drag-in - with the sidebar counts unchanged until then.
+    ///
+    /// NOT FOR THE OLD HALF OF A RENAME INSIDE THE ROOTS: its rows are what the new half copies its
+    /// vectors from (content dedup), so the caller leaves those to update(), which deletes after
+    /// it embeds. Idempotent with update(): a writer that decoded a file before it went can store it
+    /// again, and the caller keeps the path queued so update() removes that row afterwards.
+    /// Returns the number of files and folders removed.
+    @discardableResult
+    public func removeVanished(_ paths: [String], roots: [String]) -> Int {
+        let gone = Set(paths.filter { Darwin.access($0, F_OK) != 0 })   // may be back already
+        guard !gone.isEmpty else { return 0 }
+        let (files, folders) = classifyVanished(gone, known: store.storedFiles(paths: gone), roots: roots)
+        if !files.isEmpty { store.deletePaths(files) }
+        for folder in folders { store.deleteUnderFolder(folder) }
+        return files.count + folders.count
+    }
+
     public func update(paths: [String], settings: IndexSettings, force: Bool = false, roots: [String] = []) {
         beginChunkReuse(settings)
         let tUpdate = Date()
@@ -1488,15 +1523,7 @@ public final class Indexer: @unchecked Sendable {
         // back (reproduced: rename the parent of a 3-file root, 3 rows -> 0, rename back, all 3
         // re-embedded). The full pass already keeps a missing root's rows (blindRoots); a watcher
         // event must not be the one place that decides otherwise.
-        var vanishedPrefixes: [String] = []
-        var vanishedFiles = Set<String>()
-        for path in deletedTop {
-            if known[path] != nil { vanishedFiles.insert(path) }    // deleted / moved away
-            else if roots.contains(where: { $0 == path || $0.hasPrefix(path + "/") }) {
-                Self.log.info("update: indexed folder at or under \(path, privacy: .public) is gone; rows kept")
-            }
-            else if store.hasRowsUnder(path) { vanishedPrefixes.append(path) }
-        }
+        let (vanishedFiles, vanishedPrefixes) = classifyVanished(deletedTop, known: known, roots: roots)
         // Resolve which files actually need (re)embedding - stat-level checks only, no decode.
         var work: [CrawledFile] = []
         for crawled in files {

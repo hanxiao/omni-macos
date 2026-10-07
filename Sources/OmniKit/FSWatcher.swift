@@ -1,16 +1,22 @@
 import Foundation
 import CoreServices
 
-/// Watches a set of folders with FSEvents and reports changed file paths (coalesced).
+/// Watches a set of folders with FSEvents and reports changed file paths (coalesced), with the ones
+/// flagged as renamed: both halves of a move inside the watched folders carry that flag and arrive
+/// in one callback, while a plain delete never does (measured: `rm -rf` reports removed, a move out
+/// of the tree reports only the old path, renamed).
 /// Persisting `lastEventId` lets a relaunch replay changes missed while the app was closed.
 public final class FSWatcher: @unchecked Sendable {
     private var stream: FSEventStreamRef?
     private let dispatchQueue = DispatchQueue(label: "omni.fswatch")
     private let paths: [String]
     private let sinceWhen: FSEventStreamEventId
-    private let onChange: ([String]) -> Void
+    /// @Sendable: it runs on the watcher's queue. Without it a closure written inside a @MainActor
+    /// type is inferred main-actor isolated, and Swift 6 traps on the first call from this queue.
+    private let onChange: @Sendable (_ paths: [String], _ renamed: Set<String>) -> Void
 
-    public init(paths: [String], since: UInt64? = nil, onChange: @escaping ([String]) -> Void) {
+    public init(paths: [String], since: UInt64? = nil,
+                onChange: @escaping @Sendable (_ paths: [String], _ renamed: Set<String>) -> Void) {
         self.paths = paths
         self.sinceWhen = since.map { FSEventStreamEventId($0) } ?? FSEventStreamEventId(kFSEventStreamEventIdSinceNow)
         self.onChange = onChange
@@ -62,7 +68,7 @@ public final class FSWatcher: @unchecked Sendable {
 
     deinit { stop() }
 
-    fileprivate func handle(_ paths: [String]) { onChange(paths) }
+    fileprivate func handle(_ paths: [String], renamed: Set<String>) { onChange(paths, renamed) }
 }
 
 private func fsEventsCallback(
@@ -76,5 +82,9 @@ private func fsEventsCallback(
     guard let info else { return }
     let watcher = Unmanaged<FSWatcher>.fromOpaque(info).takeUnretainedValue()
     let paths = (unsafeBitCast(eventPaths, to: NSArray.self) as? [String]) ?? []
-    watcher.handle(paths)
+    var renamed = Set<String>()
+    for i in 0 ..< min(numEvents, paths.count) where eventFlags[i] & UInt32(kFSEventStreamEventFlagItemRenamed) != 0 {
+        renamed.insert(paths[i])
+    }
+    watcher.handle(paths, renamed: renamed)
 }

@@ -6042,19 +6042,26 @@ final class AppModel {
         watcher?.stop(); watcher = nil
         guard engine != nil, !crawlRoots.isEmpty else { return }
         let since = eventCheckpoint.flatMap { UInt64($0) }
-        let w = FSWatcher(paths: crawlRoots.map { $0.path }, since: since) { [weak self] paths in
+        let w = FSWatcher(paths: crawlRoots.map { $0.path }, since: since) { [weak self] paths, renamed in
             // Sorted into present and gone HERE, on the watcher's queue: a drag-in reports
             // thousands of paths and the main thread should not stat them.
             var here: [String] = [], gone: [String] = []
             for p in paths { if Darwin.access(p, F_OK) == 0 { here.append(p) } else { gone.append(p) } }
+            // Which gone paths may be deleted at once. A rename inside the folders reports both
+            // halves, renamed, in this one callback, and the new half copies its vectors from the
+            // old half's rows - so while anything was renamed IN, a renamed-away path waits for
+            // update(). A removed path, or a move out of the folders (the Trash), never has a half
+            // that needs it.
+            let renamedIn = here.contains { renamed.contains($0) }
+            let removable = renamedIn ? gone.filter { !renamed.contains($0) } : gone
             let present = here, vanished = gone
-            Task { @MainActor in self?.handleFSChange(present, vanished: vanished) }
+            Task { @MainActor in self?.handleFSChange(present, vanished: vanished, removable: removable) }
         }
         w.start()
         watcher = w
     }
 
-    private func handleFSChange(_ rawPaths: [String], vanished rawVanished: [String] = []) {
+    private func handleFSChange(_ rawPaths: [String], vanished rawVanished: [String] = [], removable: [String] = []) {
         guard indexer != nil, store != nil else { return }
         // An obsolete index is in a different vector space (e.g. just switched models): writing
         // new-dimension vectors into it would fail the store's dimension guard. Skip background
@@ -6079,6 +6086,7 @@ final class AppModel {
         // searchable longer.
         let paths = (rawPaths + rawVanished).filter(wanted)
         guard !paths.isEmpty else { return }
+        removeVanishedNow(removable.filter(wanted))
         // Always buffer, then kick a reconcile only if none is running. A full index drains the buffer
         // when it finishes (startIndexing); an in-flight reconcile re-drains when it finishes. This
         // coalesces a storm into back-to-back single batches instead of overlapping update() tasks.
@@ -6088,6 +6096,36 @@ final class AppModel {
         // activeRoots covers the catch-up pass too: kicking update() while a catch-up index() runs
         // would overlap two pipelines on the same Indexer. The catch-up's completion re-drains.
         if indexState != .indexing && activeRoots.isEmpty && !fsReconcileInFlight { drainPendingFSChanges() }
+    }
+
+    /// The roots in every spelling a watcher path can carry: FSEvents reports real paths
+    /// (/private/var/..., a symlinked root's target), and a root that matched neither would lose
+    /// update()'s root protections.
+    private var watcherRootPaths: [String] {
+        Array(Set(crawlRoots.flatMap { u -> [String] in
+            [u.path, u.resolvingSymlinksInPath().path, (realpath(u.path, nil).map { p in defer { free(p) }; return String(cString: p) }) ?? u.path]
+        }))
+    }
+
+    /// A DELETE DOES NOT WAIT FOR THE INDEXING IN FRONT OF IT. Watcher events queue behind a running
+    /// pass (up to fsWaitLimit) or reconcile (all of it), and a deleted folder stayed searchable and
+    /// counted in the sidebar for that long: 31 s behind a pass, 95 s behind a 20,000-file drag-in.
+    /// Removing rows needs only the store, so it runs at once. The paths stay queued as well: a
+    /// writer that decoded a file before it went may store it again, and the reconcile that drains
+    /// the queue removes that row, as it always did.
+    private func removeVanishedNow(_ paths: [String]) {
+        guard !paths.isEmpty, !indexWritesBlocked, !isPaperRunning, let indexer, let store else { return }
+        let rootPaths = watcherRootPaths
+        Task.detached(priority: .userInitiated) {
+            let removed = indexer.removeVanished(paths, roots: rootPaths)
+            guard removed > 0 else { return }
+            await MainActor.run {
+                guard self.store === store else { return }
+                self.refreshIndexStats(store)
+                self.refreshSearchAfterBackgroundChange()
+                self.reloadBrowserIfTouched(paths)
+            }
+        }
     }
 
     /// Stamp "now" as the last time the index was brought current - persisted and reflected live.
@@ -6291,9 +6329,19 @@ final class AppModel {
         }
     }
 
+    /// When a watcher reconcile last refreshed the stats; see sampleRate.
+    @ObservationIgnored private var reconcileStatsClock: CFAbsoluteTime = 0
+
     private func sampleRate() {
         guard isWorking else { stopRateSampler(); return }
         let now = CFAbsoluteTimeGetCurrent()
+        // A pass refreshes the stats from its progress callback; a watcher reconcile has none, so
+        // the sidebar counts held still for the whole of one (95 s for a 20,000-file drag-in) and
+        // jumped at the end. Same 1.5 s cadence as the pass.
+        if fsReconcileInFlight, indexState != .indexing, now - reconcileStatsClock >= 1.5, let store {
+            reconcileStatsClock = now
+            refreshIndexStats(store)
+        }
         let dt = now - rateLastTime
         guard dt >= 0.4 else { return }
         let tokens = engine?.tokensProcessed ?? 0
@@ -6531,11 +6579,7 @@ final class AppModel {
         activeRoots.formUnion(touched)
         fsReconcileInFlight = true
         startRateSampler()   // show throughput during the background reconcile too, not only full passes
-        // Both spellings: FSEvents reports real paths (/private/var/..., a symlinked root's
-        // target), and a root that matched neither would lose update()'s root protections.
-        let rootPaths = Array(Set(crawlRoots.flatMap { u -> [String] in
-            [u.path, u.resolvingSymlinksInPath().path, (realpath(u.path, nil).map { p in defer { free(p) }; return String(cString: p) }) ?? u.path]
-        }))
+        let rootPaths = watcherRootPaths
         Task.detached(priority: .utility) {
             indexer.update(paths: drained, settings: settings, roots: rootPaths)
             let cancelled = indexer.isCancelled

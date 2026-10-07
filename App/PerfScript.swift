@@ -146,6 +146,9 @@ enum PerfScript {
                 "clipboardCurrent": model.clipboardCurrentPath ?? "",
                 "clipboardClips": model.clipboardClipCount,
                 "clipboardHasClips": model.clipboardHasClips,
+                "folderCounts": model.folderFileCounts,   // the sidebar's per-folder numbers
+                "indexing": model.indexState == .indexing,
+                "indexedFiles": model.indexedFiles,
             ]
             if let data = try? JSONSerialization.data(withJSONObject: payload) {
                 try? data.write(to: URL(fileURLWithPath: arg), options: .atomic)

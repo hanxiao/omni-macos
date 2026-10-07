@@ -843,3 +843,34 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
     audio arrived after the first had started), each installed within 3 s of its toggle in two
     runs; audio off-on-off-on in 1.2 s: one load. Before: three loads with the old code, five with
     only the single-flight loop, a hang with the per-engine gate.
+
+## A deleted folder stayed counted (2026-10-07)
+- Report: after `rm` of a large indexed folder the sidebar count did not move. Measured with an
+  isolated instance on a scratch root (`dumpui` now carries `folderCounts`, `indexing`,
+  `indexedFiles`), deleting a folder:
+  - idle: 2.0 s (the watcher's 1.5 s latency plus the reconcile) - fine.
+  - during a full pass: 31 s. A pass holds watcher events up to `fsWaitLimit` (floor 30 s), then
+    pauses to drain them.
+  - during a watcher reconcile (a 20,000-file drag-in): until the reconcile ended, 95 s here and
+    unbounded in general. The reconcile has no wait limit, and update() deletes only after it
+    embeds. The sidebar also showed no progress at all for the drag-in itself: a reconcile has no
+    progress callback, so the stats refreshed only when it finished.
+- Fix: a delete does not wait. Vanished paths are removed straight from the store
+  (`Indexer.removeVanished`: no crawl, no decode, no model, the same root protections as
+  update()) and stay queued, so the reconcile that drains them later removes any row a writer
+  stored for a file it decoded before the file went. The store serializes the writes, as it
+  already did for Move to Trash from the app.
+- THE OLD HALF OF A RENAME MUST NOT GO EARLY: its rows are what the new half copies its vectors
+  from. FSEvents flags measured on a scratch tree: `rm -rf` reports every path removed (X), never
+  renamed; a move out of the tree (the Trash) reports only the old path, renamed; a rename inside
+  the tree reports both halves, renamed, in one callback. So a renamed-away path is removed at once
+  only when nothing in its callback was renamed in; otherwise it waits for update().
+- While a reconcile runs, the stats refresh every 1.5 s from the rate sampler, as a pass's do.
+- After, same scenarios: idle 2.1 s; mid-pass 0.4 s (was 31 s; final count 85,000 = files on
+  disk); a 30,000-file folder deleted during a 20,000-file drag-in, 1.5 s after `rm` returned (was
+  the whole reconcile; settled at the exact expected 40,000); a 20,000-file folder renamed during a
+  drag-in: no dip in the count, `dedup=20000 tokens=0`, old prefix removed after.
+- TRAP: the watcher closure is written inside @MainActor AppModel, so without `@Sendable` on
+  FSWatcher's callback it is inferred main-actor isolated, and the first nested closure in it
+  (`contains { }`) trapped in `swift_task_checkIsolated` on the watcher queue. Crash on the first
+  event with a present path; the unit tests do not run the watcher, only the app did.
