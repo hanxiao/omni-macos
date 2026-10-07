@@ -929,10 +929,24 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
   - searchreal on a bench clone: digest 134b9ff183fd2f29, p50 4.2 ms, unchanged.
 - Measured and left: filename-index refresh 0.13 s per reconcile on 310k files; a 30,000-file
   delete raises searches to 40-56 ms (one 189 ms) for ~4 s; stat tick 2 ms per root.
-- OPEN (found, not changed): the global Pause is disabled during a catch-up; a watcher reconcile
-  has no event limit (events would only join its batch); a long reconcile shows no progress ring
-  and Settings says "Up to date"; a directory event re-crawls its whole subtree, and a rescan of a
-  directory never removes children that are gone (dropped events, remounts; the launch pass does);
-  VACUUM still holds the store queue; clearing the clipboard during a pass restarts the pass;
+- Follow-up the same day (measured in an isolated instance, scratch roots):
+  - Dropped or coalesced events (MustScanSubDirs, User/KernelDropped) and RootChanged (a root
+    deleted, moved, unmounted, mounted again) queue a catch-up of every root they touch, which
+    removes files that are gone as the launch pass does. Not triggered live: macOS cannot be made
+    to drop events on demand; the catch-up's purge is the tested one.
+  - Pause covers a catch-up and a reconcile (userPauseIndexing sets .paused, which every restart
+    path checks). 30,000-file catch-up: paused, 0 files in 10 s; resumed, finished at the exact
+    count. A full pass now drops queued catch-ups it covers instead of walking them again after.
+  - A reconcile running past 2 s shows a ring and "Updating..." with Pause, not "Up to date" and
+    an Update button that cancelled it.
+  - The event wait limit covers a watcher reconcile too, and update() embeds event-named files
+    before crawled ones: a save during a 20,000-file drag-in was in after 32.8 s (was the whole
+    drag-in), during a 30,000-file catch-up after 31.1 s (was the whole catch-up). The drag-in
+    kept what it had stored and finished at the exact count.
+  - Clearing the clipboard deletes its rows at once instead of cancelling the pass (with a
+    discard) and re-walking every folder. Not run live: an isolated instance shares the real
+    clipboard-history folder.
+  - Paused-folder delete, in the app: reflected in 2.1 s.
+- STILL OPEN: a directory event re-crawls its whole subtree; VACUUM holds the store queue;
   Generate Tags waits behind a whole pass with no feedback; the tag label cache is keyed by
   dimension only.

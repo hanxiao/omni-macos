@@ -1054,22 +1054,22 @@ final class AppModel {
         clipboardClipCount = 0
         // Delete and recreate IN ORDER, on one task. With the delete detached and the recreate on the
         // main thread, the delete usually ran second and left capture on with no folder.
+        //
+        // The rows go in the same task, after the files and before the folder is recreated, and
+        // NOT behind a running pass. They used to be queued as a folder removal with a discarding
+        // cancel, which threw away the pass's finished batch and re-walked every folder. Nothing
+        // can put them back: with capture on the folder is watched and its delete events remove
+        // any row a pass stores for a clip it read first; with capture off no pass walks it.
+        let store = self.store
         Task.detached(priority: .userInitiated) {
             try? history.clear()
+            store?.deleteUnderFolder(dir.path)
             if recreate { try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
-            await MainActor.run { self.recountClipboard() }
-        }
-        if let store {
-            if indexState == .indexing || !activeRoots.isEmpty || fsReconcileInFlight {
-                pendingRootRemovals.insert(dir.path)
-                indexer?.cancel()
-            } else {
-                Task.detached {
-                    store.deleteUnderFolder(dir.path)
-                    await MainActor.run {
-                        self.refreshIndexStats(store)
-                        self.refreshSearchAfterBackgroundChange()
-                    }
+            await MainActor.run {
+                self.recountClipboard()
+                if let store, self.store === store {
+                    self.refreshIndexStats(store)
+                    self.refreshSearchAfterBackgroundChange()
                 }
             }
         }
@@ -4359,10 +4359,13 @@ final class AppModel {
     /// its work), reconcile them, resume. A catch-up had no limit at all - a save waited for the
     /// whole first index of a folder added beside it - and the check ran only from progress
     /// callbacks, which one long video or scan holds off; the rate sampler's 0.6 s timer calls it
-    /// too. A watcher reconcile is left alone: the events would only join its batch.
+    /// too. A watcher reconcile as well (a 20,000-file drag-in held a save for 95 s): it re-queues
+    /// with the waiting events, and update() takes the files named by events before the ones it
+    /// crawls, so the save goes first and the drag-in resumes with what it had stored kept.
     private func enforceEventWaitLimit() {
         let catchUp = !activeRoots.isEmpty && !fsReconcileInFlight && indexState != .indexing
-        guard isIndexing || catchUp, !fsDrainThenResume, !restartAfterPause, !pendingFSPaths.isEmpty,
+        let reconcile = fsReconcileInFlight && !tagBackfillActive
+        guard isIndexing || catchUp || reconcile, !fsDrainThenResume, !restartAfterPause, !pendingFSPaths.isEmpty,
               let since = fsEventsWaitingSince, -since.timeIntervalSinceNow > fsWaitLimit else { return }
         fsDrainThenResume = true
         indexer?.cancel(.pause)
@@ -6098,7 +6101,7 @@ final class AppModel {
         }
         let own = Self.ownDataPaths().map(real)
         let ownExceptions = [real(Self.clipboardDirectory.path)]
-        let w = FSWatcher(paths: crawlRoots.map { $0.path }, since: since) { [weak self] paths, renamed in
+        let w = FSWatcher(paths: crawlRoots.map { $0.path }, since: since) { [weak self] paths, renamed, rescan in
             // Sorted into present and gone HERE, on the watcher's queue: a drag-in reports
             // thousands of paths and the main thread should not stat them.
             var here: [String] = [], gone: [String] = []
@@ -6107,6 +6110,7 @@ final class AppModel {
                    !ownExceptions.contains(where: { p == $0 || p.hasPrefix($0 + "/") }) { continue }
                 if Darwin.access(p, F_OK) == 0 { here.append(p) } else { gone.append(p) }
             }
+            if !rescan.isEmpty { Task { @MainActor in self?.rescanRoots(touchedBy: rescan) } }
             guard !here.isEmpty || !gone.isEmpty else { return }
             // Which gone paths may be deleted at once. A rename inside the folders reports both
             // halves, renamed, in this one callback, and the new half copies its vectors from the
@@ -6165,11 +6169,38 @@ final class AppModel {
         if indexState != .indexing && activeRoots.isEmpty && !fsReconcileInFlight { drainPendingFSChanges() }
     }
 
+    /// A watcher reconcile has been running long enough to show; see drainPendingFSChanges.
+    var reconcileShowsProgress = false
+    @ObservationIgnored private var reconcileToken: UInt64 = 0
+
     /// Names of present paths the watcher reported that no reconcile has finished with: queued
     /// (`arrivingNames`) and in the running batch (`reconcilingNames`). Indexer.removeVanished
     /// leaves a gone path with one of these names to the reconcile - it may be a copy's source.
     @ObservationIgnored private var arrivingNames = Set<String>()
     @ObservationIgnored private var reconcilingNames = Set<String>()
+    /// FSEvents could not say what changed under these paths (events coalesced or dropped, or a
+    /// watched root deleted, moved, unmounted or mounted again), so a file deleted there produced
+    /// no event and stayed searchable until the next launch. Walk every folder they touch: a
+    /// catch-up removes what is gone, as the launch pass does, and skips what is unchanged
+    /// (~3 us a file). A root that is not there is left alone - its rows are kept while it is
+    /// missing, and it reports a root change again when it comes back.
+    private func rescanRoots(touchedBy paths: Set<String>) {
+        func real(_ p: String) -> String {
+            realpath(p, nil).map { r in defer { free(r) }; return String(cString: r) } ?? p
+        }
+        let hit = crawlRoots.filter { r in
+            let spellings = [r.path, real(r.path)]
+            return !pausedRoots.contains(r.path)
+                && Darwin.access(r.path, F_OK) == 0
+                && !pendingCatchUpRoots.contains(r)
+                && paths.contains { p in spellings.contains { RootScope.covers($0, p) || RootScope.covers(p, $0) } }
+        }
+        guard !hit.isEmpty else { return }
+        Self.rootLog.info("watcher could not report changes under \(paths.sorted().joined(separator: ", "), privacy: .public); rescanning \(hit.count) folder(s)")
+        pendingCatchUpRoots.append(contentsOf: hit)
+        catchUpPendingRoots()
+    }
+
     /// Deletes that arrived while index writes were blocked; see removeVanishedNow.
     @ObservationIgnored private var heldRemovals = Set<String>()
     private func flushHeldRemovals() {
@@ -6269,6 +6300,11 @@ final class AppModel {
         indexObsolete = false
         indexModelVariantRaw = variant
         indexState = .indexing
+        // The pass walks every unpaused root, so a catch-up queued for one is covered by it - and
+        // left queued, its completion would restart the pass to walk it again (Resume after a
+        // paused catch-up, a rescan queued before the pass).
+        pendingCatchUpRoots.removeAll { activeRootsToIndex.contains($0) }
+        pendingCatchUpPhotos.removeAll { p in activePhotoSources.contains { $0.id == p.id } }
         indexGen += 1; let gen = indexGen
         progress = IndexProgress()
         startRateSampler()
@@ -6698,6 +6734,18 @@ final class AppModel {
         activeRoots.formUnion(touched)
         fsReconcileInFlight = true
         startRateSampler()   // show throughput during the background reconcile too, not only full passes
+        // A reconcile that is still running after 2 s is shown as work in progress: the sidebar
+        // ring and "Updating..." in Settings. Both read per-folder progress, and a finished pass
+        // leaves every folder at done == total, so a 95 s drag-in looked idle and Settings offered
+        // "Update", which cancelled it. Not sooner: a save's reconcile is over before it is seen.
+        reconcileToken &+= 1
+        let token = reconcileToken
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2))
+            guard let self, self.fsReconcileInFlight, self.reconcileToken == token else { return }
+            for k in touched { self.progress.perRoot[k] = nil }   // no total: an indeterminate ring
+            if !self.reconcileShowsProgress { self.reconcileShowsProgress = true }
+        }
         let rootPaths = watcherRootPaths
         Task.detached(priority: .utility) {
             let changed = indexer.update(paths: drained, settings: settings, roots: rootPaths)
@@ -6712,8 +6760,11 @@ final class AppModel {
                     self.pendingFSPaths.formUnion(drained.filter { self.rootKey(for: $0) != nil || Darwin.access($0, F_OK) != 0 })
                     self.pendingFSEventId = max(self.pendingFSEventId, eid)
                     self.arrivingNames.formUnion(self.reconcilingNames)   // queued again with them
+                    self.fsDrainThenResume = false   // the drain below takes the waiting events
                 } else if eid > 0 { self.eventCheckpoint = String(eid) }
                 self.reconcilingNames.removeAll()
+                self.reconcileToken &+= 1
+                if self.reconcileShowsProgress { self.reconcileShowsProgress = false }
                 self.activeRoots.subtract(touched)
                 // ONLY WHEN IT CHANGED SOMETHING. markIndexed writes the index's meta table, and
                 // with the index inside a watched folder (a moved index, a home-folder root) that
@@ -6738,6 +6789,21 @@ final class AppModel {
     /// .pause, so a batch the tower has already finished is stored rather than thrown away.
     /// This is the call an OCR run makes, which is the most frequent cancel in the app.
     func pauseIndexing() { indexer?.cancel(.pause) }
+
+    /// Something writing the index that the user can pause: a full pass, a folder's catch-up, or a
+    /// watcher reconcile. The menu item and Settings asked `isIndexing` alone, so the first index
+    /// of a newly added folder - a catch-up, for hours on a big one - could not be paused at all.
+    var canPauseIndexing: Bool { isIndexing || !activeRoots.isEmpty || fsReconcileInFlight }
+
+    /// The user's Pause. A full pass pauses itself on completion; a catch-up or reconcile does not
+    /// (its completion re-queues and restarts it), so the state is set here, which is what every
+    /// restart path checks. Resume is startIndexing, whose pass covers the queued folders.
+    func userPauseIndexing() {
+        if isIndexing { pauseIndexing(); return }
+        guard canPauseIndexing else { return }
+        indexState = .paused
+        indexer?.cancel(.pause)
+    }
 
     /// Set once the app is terminating so no new index pass starts after quiesceForQuit. Without it,
     /// quiesceForQuit's cancel() could be undone by the next pass's resetCancelled() (a catch-up or

@@ -13,10 +13,14 @@ public final class FSWatcher: @unchecked Sendable {
     private let sinceWhen: FSEventStreamEventId
     /// @Sendable: it runs on the watcher's queue. Without it a closure written inside a @MainActor
     /// type is inferred main-actor isolated, and Swift 6 traps on the first call from this queue.
-    private let onChange: @Sendable (_ paths: [String], _ renamed: Set<String>) -> Void
+    private let onChange: @Sendable (_ paths: [String], _ renamed: Set<String>, _ rescan: Set<String>) -> Void
 
+    /// `rescan`: paths whose events were not delivered one by one - FSEvents coalesced or dropped
+    /// them (MustScanSubDirs, UserDropped, KernelDropped) or the watched root itself changed
+    /// (RootChanged: deleted, moved, a volume unmounted or mounted again). Whatever was deleted
+    /// under such a path produced no event of its own, so only a walk of it can find out.
     public init(paths: [String], since: UInt64? = nil,
-                onChange: @escaping @Sendable (_ paths: [String], _ renamed: Set<String>) -> Void) {
+                onChange: @escaping @Sendable (_ paths: [String], _ renamed: Set<String>, _ rescan: Set<String>) -> Void) {
         self.paths = paths
         self.sinceWhen = since.map { FSEventStreamEventId($0) } ?? FSEventStreamEventId(kFSEventStreamEventIdSinceNow)
         self.onChange = onChange
@@ -68,7 +72,7 @@ public final class FSWatcher: @unchecked Sendable {
 
     deinit { stop() }
 
-    fileprivate func handle(_ paths: [String], renamed: Set<String>) { onChange(paths, renamed) }
+    fileprivate func handle(_ paths: [String], renamed: Set<String>, rescan: Set<String>) { onChange(paths, renamed, rescan) }
 }
 
 private func fsEventsCallback(
@@ -82,9 +86,12 @@ private func fsEventsCallback(
     guard let info else { return }
     let watcher = Unmanaged<FSWatcher>.fromOpaque(info).takeUnretainedValue()
     let paths = (unsafeBitCast(eventPaths, to: NSArray.self) as? [String]) ?? []
-    var renamed = Set<String>()
-    for i in 0 ..< min(numEvents, paths.count) where eventFlags[i] & UInt32(kFSEventStreamEventFlagItemRenamed) != 0 {
-        renamed.insert(paths[i])
+    var renamed = Set<String>(), rescan = Set<String>()
+    let walk = UInt32(kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagUserDropped
+                      | kFSEventStreamEventFlagKernelDropped | kFSEventStreamEventFlagRootChanged)
+    for i in 0 ..< min(numEvents, paths.count) {
+        if eventFlags[i] & UInt32(kFSEventStreamEventFlagItemRenamed) != 0 { renamed.insert(paths[i]) }
+        if eventFlags[i] & walk != 0 { rescan.insert(paths[i]) }
     }
-    watcher.handle(paths, renamed: renamed)
+    watcher.handle(paths, renamed: renamed, rescan: rescan)
 }

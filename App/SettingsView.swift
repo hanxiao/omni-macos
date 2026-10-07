@@ -113,7 +113,7 @@ private struct IndexStatusRow: View {
                     ProgressView().controlSize(.small)
                     Text(model.isPreparing ? "Preparing\u{2026}" : "Indexing\u{2026}")
                     Spacer()
-                    Button("Pause") { model.pauseIndexing() }.controlSize(.small)
+                    Button("Pause") { model.userPauseIndexing() }.controlSize(.small)
                 }
                 if model.isPreparing {
                     // No file processed yet. An indeterminate bar, not a 0% one that looks frozen.
@@ -160,6 +160,20 @@ private struct IndexStatusRow: View {
                         Text("\(activeCounts.done.formatted()) of \(activeCounts.total.formatted()) files")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                }
+            } else if model.reconcileShowsProgress {
+                // A watcher reconcile (a drag-in, a big copy) has no total until it has crawled,
+                // so no bar - but it is work, and "Up to date" with a live Update button that
+                // would cancel it was wrong.
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Updating\u{2026}")
+                    Spacer()
+                    if !rateParts.isEmpty {
+                        Text(rateParts.joined(separator: " \u{00B7} "))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                    Button("Pause") { model.userPauseIndexing() }.controlSize(.small)
                 }
             } else if model.ocrRunActive {
                 // Already true and previously invisible: a transcription stands indexing down for

@@ -149,10 +149,19 @@ enum PerfScript {
                 "folderCounts": model.folderFileCounts,   // the sidebar's per-folder numbers
                 "indexing": model.indexState == .indexing,
                 "indexedFiles": model.indexedFiles,
+                "paused": model.isPaused,
+                "reconcileShown": model.reconcileShowsProgress,
             ]
             if let data = try? JSONSerialization.data(withJSONObject: payload) {
                 try? data.write(to: URL(fileURLWithPath: arg), options: .atomic)
             }
+        case "addfolder":   // what Add... in the sidebar does with the chosen folder
+            model.addRoots([URL(fileURLWithPath: arg, isDirectory: true)])
+        case "pause":       // on: the user's Pause Indexing; off: Resume
+            if arg == "on" { model.userPauseIndexing() } else { model.startIndexing() }
+        case "pausefolder": // <path>:on|off, the sidebar's Pause/Resume on a folder
+            let parts = arg.split(separator: ":").map(String.init)
+            if parts.count == 2 { model.setFolderPaused(path: parts[0], parts[1] == "on") }
         case "clipboard":   // on | off | clear (Clear without its confirmation)
             if arg == "clear" { model.clearClipboardHistory() } else { model.setClipboardEnabled(arg == "on") }
         case "appearance": NSApp.appearance = NSAppearance(named: arg == "dark" ? .darkAqua : .aqua)

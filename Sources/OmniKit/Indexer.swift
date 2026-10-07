@@ -1486,7 +1486,11 @@ public final class Indexer: @unchecked Sendable {
         //
         // stat(2), never lstat: fileExists and resourceValues both follow symlinks, and swapping in
         // the one that does not would quietly stop indexing symlinked files.
+        // Files named by an event first, then what directory events crawl: a batch re-queued with
+        // a save waiting behind a drag-in (AppModel.enforceEventWaitLimit) embeds the save before
+        // the thousands of files the drag-in still has to go.
         var files: [CrawledFile] = []
+        var crawled: [CrawledFile] = []
         var deletedTop = Set<String>()
         // The crawl's own admission rules, for paths that arrive one at a time (admitsEventPath).
         // Keyed on the deepest root holding the path; a path under no known root is not gated.
@@ -1512,13 +1516,14 @@ public final class Indexer: @unchecked Sendable {
                                           ownDataPaths: settings.ownDataPaths,
                                       ownDataExceptions: settings.ownDataExceptions)
                 crawler.onPolicyFile = onPolicyFile
-                crawler.walk(shouldContinue: { !self.isCancelled }) { files.append($0) }
+                crawler.walk(shouldContinue: { !self.isCancelled }) { crawled.append($0) }
             } else {
                 files.append(CrawledFile(path: path,
                                          modified: Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9,
                                          size: Int(st.st_size)))
             }
         }
+        files += crawled
         // One entry per file. A batch naming a folder and something inside it (every folder and
         // file of a copied-in tree is its own event) reaches the same file more than once, and each
         // copy was embedded: media carries no chunk key, so nothing downstream merged them.

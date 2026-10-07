@@ -443,8 +443,8 @@ struct OmniApp: App {
                 Button(model.isPaused ? "Resume Indexing" : (!model.hasIndexedFiles ? "Index" : "Update Index")) { model.startIndexing() }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
                     .disabled(model.isIndexing || !model.canIndex)
-                Button("Pause Indexing") { model.pauseIndexing() }
-                    .disabled(!model.isIndexing)
+                Button("Pause Indexing") { model.userPauseIndexing() }
+                    .disabled(!model.canPauseIndexing || model.isPaused)
                 // The serving switch, same one as Settings and the toolbar toggle.
                 Toggle("Serve over HTTP", isOn: Binding(get: { model.serving.enabled },
                                                         set: { model.serving.enabled = $0 }))
