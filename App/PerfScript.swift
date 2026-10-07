@@ -155,6 +155,8 @@ enum PerfScript {
             if let data = try? JSONSerialization.data(withJSONObject: payload) {
                 try? data.write(to: URL(fileURLWithPath: arg), options: .atomic)
             }
+        case "gentags":     // File > Generate Tags on one file
+            model.requestTags([arg])
         case "addfolder":   // what Add... in the sidebar does with the chosen folder
             model.addRoots([URL(fileURLWithPath: arg, isDirectory: true)])
         case "pause":       // on: the user's Pause Indexing; off: Resume

@@ -5240,6 +5240,7 @@ public final class VectorStore: @unchecked Sendable {
         // engine raises the flag around the embed; without this the OCR lane would resume
         // submitting the moment the embed returned and contend with the scan that follows it.
         GPUInteractive.enter(); defer { GPUInteractive.leave() }
+        interruptVacuumForSearch()
         let r = searchGraphDense(queryGraph: queryGraph, filter: filter, topK: topK)
         guard LexicalIndex.enabled else { return r }
         if let explicit = filter.filenameQuery, !explicit.isEmpty {
@@ -5324,6 +5325,7 @@ public final class VectorStore: @unchecked Sendable {
     public func search(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40,
                        markActive: Bool = true, textQuery: String? = nil) -> [SearchHit] {
         GPUInteractive.enter(); defer { GPUInteractive.leave() }
+        if markActive { interruptVacuumForSearch() }
         let dense = searchDense(query, filter: filter, topK: topK, markActive: markActive)
         guard LexicalIndex.enabled else { return dense }
         // Explicit `filename:` beats the heuristic. Otherwise a bare query contributes only if it
@@ -11902,14 +11904,46 @@ public final class VectorStore: @unchecked Sendable {
     /// rewrites the file. Gated on the free-page ratio so calling it after any delete is cheap:
     /// it only rewrites when enough is free to be worth it. VACUUM cost scales with LIVE data,
     /// so a mostly-emptied DB compacts fast. Returns bytes reclaimed (0 if it skipped).
+    ///
+    /// A SEARCH STOPS IT. The rewrite holds the store queue for as long as it takes - seconds to
+    /// tens of seconds on a large index - and every keystroke queued behind it. A search arriving
+    /// meanwhile interrupts it (sqlite3_interrupt rolls a VACUUM back whole), runs, and the
+    /// rewrite is tried again once no one has searched for a while. Space is reclaimed later; no
+    /// query waits for it.
     @discardableResult
     public func compact(minFreeRatio: Double = 0.15) -> Int64 {
-        queue.sync {
-            guard dbOpen() else { return 0 }
-            let total = intPragma("page_count")
-            let free = intPragma("freelist_count")
-            guard total > 0, Double(free) / Double(total) >= minFreeRatio else { return 0 }
-            return vacuumLocked()
+        queue.sync { compactLocked(minFreeRatio: minFreeRatio) }
+    }
+
+    private func compactLocked(minFreeRatio: Double) -> Int64 {
+        guard dbOpen() else { return 0 }
+        let total = intPragma("page_count")
+        let free = intPragma("freelist_count")
+        guard total > 0, Double(free) / Double(total) >= minFreeRatio else { return 0 }
+        return vacuumLocked(interruptible: true)
+    }
+
+    /// The connection while an interruptible VACUUM runs on it, else nil. Locked, not queue-guarded:
+    /// the search that interrupts is by definition waiting for the queue.
+    private let vacuumHandle = OSAllocatedUnfairLock<OpaquePointer?>(uncheckedState: nil)
+    /// A compaction a search interrupted, still to do (queue-guarded).
+    private var vacuumOwed = false
+
+    /// Called by every search before it takes the queue. A no-op unless a compaction is running.
+    private func interruptVacuumForSearch() {
+        vacuumHandle.withLock { h in if let h { sqlite3_interrupt(h) } }
+    }
+
+    /// Retry an interrupted compaction once nobody has searched for the activity window.
+    private func scheduleOwedVacuumLocked(after delay: TimeInterval = 10) {
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.queue.sync {
+                guard self.vacuumOwed, self.dbOpen() else { return }
+                if self.searchRecentlyActiveLocked() { self.scheduleOwedVacuumLocked(after: delay); return }
+                self.vacuumOwed = false
+                _ = self.compactLocked(minFreeRatio: 0.15)
+            }
         }
     }
 
@@ -11917,7 +11951,7 @@ public final class VectorStore: @unchecked Sendable {
     /// compact(); it is factored out because the free-page ratio is not the only thing worth
     /// vacuuming for - see repackIfHollowLocked.
     @discardableResult
-    private func vacuumLocked() -> Int64 {
+    private func vacuumLocked(interruptible: Bool = false) -> Int64 {
         defer { Self.releaseFreedHeap("vacuum") }
         guard dbOpen() else { return 0 }
     let before = onDiskBytes()
@@ -11936,7 +11970,20 @@ public final class VectorStore: @unchecked Sendable {
         // +167MB and 0.69s against +0MB and 0.42s. The page cache was the whole effect.
         let restoreCache = OmniMemoryBudget.scaled(anchor6GB: 262_144, floor: 65_536, ceiling: 262_144)
         if Self.vacuumSmallCache { exec("PRAGMA cache_size=-2000;") }
+        let tVac = Date()
+        if interruptible { vacuumHandle.withLock { $0 = db } }
         let rc = sqlite3_exec(db, "VACUUM;", nil, nil, nil)
+        if interruptible { vacuumHandle.withLock { $0 = nil } }
+        if rc == SQLITE_INTERRUPT {
+            // Rolled back whole by SQLite; the file is as it was. Owed, not dropped.
+            omniPerfLog(String(format: "vacuum interrupted by a search after %.0fms; retried when idle",
+                               -tVac.timeIntervalSinceNow * 1000))
+            exec("PRAGMA cache_size=-\(restoreCache);")
+            vacuumOwed = true
+            scheduleOwedVacuumLocked()
+            return 0
+        }
+        omniPerfLog(String(format: "vacuum %.0fms", -tVac.timeIntervalSinceNow * 1000))
         // exec() ignores return codes; this one matters. A silently failing VACUUM means space
         // is never reclaimed again, and the caller would report 0 bytes freed forever.
         if rc != SQLITE_OK { print("[store] VACUUM failed (rc=\(rc)); no space reclaimed") }

@@ -4046,6 +4046,7 @@ final class AppModel {
         retagKickTask = nil
         pendingRetag.removeAll()
         retagSeen.removeAll()
+        explicitRetag.removeAll(); explicitRetagSince = nil
         // installedVariants is Settings-only - compute it off the launch critical path (it walks
         // every variant dir, slow on the external model volume).
         Task.detached { let v = ModelLocator.installedVariants(); await MainActor.run { self.installedVariants = v } }
@@ -4365,8 +4366,11 @@ final class AppModel {
     private func enforceEventWaitLimit() {
         let catchUp = !activeRoots.isEmpty && !fsReconcileInFlight && indexState != .indexing
         let reconcile = fsReconcileInFlight && !tagBackfillActive
-        guard isIndexing || catchUp || reconcile, !fsDrainThenResume, !restartAfterPause, !pendingFSPaths.isEmpty,
-              let since = fsEventsWaitingSince, -since.timeIntervalSinceNow > fsWaitLimit else { return }
+        let eventsDue = !pendingFSPaths.isEmpty
+            && (fsEventsWaitingSince.map { -$0.timeIntervalSinceNow > fsWaitLimit } ?? false)
+        let tagsDue = explicitRetagSince.map { -$0.timeIntervalSinceNow > Self.explicitRetagWait } ?? false
+        guard isIndexing || catchUp || reconcile, !fsDrainThenResume, !restartAfterPause,
+              eventsDue || tagsDue else { return }
         fsDrainThenResume = true
         indexer?.cancel(.pause)
     }
@@ -6014,8 +6018,17 @@ final class AppModel {
 
     /// Label-cache path: next to the index (follows the custom database folder), one per
     /// vector dim so Nano and Small each get a cache built by their own text tower.
-    static func tagCacheURL(dim: Int) throws -> URL {
-        try indexURL().deletingLastPathComponent().appendingPathComponent("tags-d\(dim).cache")
+    /// Keyed by the WEIGHTS as well as the width (OmniTagger.modelIdentity): two checkpoints of one
+    /// width embed labels differently. Off the main thread - it reads ~1 MB of the model.
+    nonisolated static func tagCacheURL(in dir: URL, dim: Int, modelDir: URL) throws -> URL {
+        guard let id = OmniTagger.modelIdentity(modelDir: modelDir) else {
+            throw OmniError.store("model weights unreadable")
+        }
+        return dir.appendingPathComponent("tags-d\(dim)-\(id).cache")
+    }
+    /// The width-only name every release before this used; removed once a keyed cache exists.
+    nonisolated static func legacyTagCacheURL(in dir: URL, dim: Int) -> URL {
+        dir.appendingPathComponent("tags-d\(dim).cache")
     }
 
     /// In-flight label-cache build/attach; superseded (cancelled) by any newer ensureTagger call
@@ -6042,11 +6055,26 @@ final class AppModel {
         guard let engine else { return }
         guard imageTagsEnabled else { engine.tagger = nil; return }
         guard engine.supportsImages, engine.tagger == nil,
-              let url = try? Self.tagCacheURL(dim: engine.dim) else { return }
+              let cacheDir = try? Self.indexURL().deletingLastPathComponent() else { return }
         let modelDir = engine.modelDir
         // The detached task builds/loads and SEEDS the tagger but never touches self; the
         // attach happens back on the main actor below, with the world re-checked.
         let task = Task.detached(priority: .utility) { () -> OmniTagger? in
+            guard let url = try? Self.tagCacheURL(in: cacheDir, dim: engine.dim, modelDir: modelDir) else { return nil }
+            // The width-only cache of earlier releases, with its prior, ADOPTED under the new name
+            // rather than rebuilt: one checkpoint per width has ever shipped, so it was built from
+            // these weights, and a rebuild is every label through the text tower again. Once.
+            let fm = FileManager.default
+            let legacy = Self.legacyTagCacheURL(in: cacheDir, dim: engine.dim)
+            if fm.fileExists(atPath: legacy.path) {
+                func prior(_ u: URL) -> URL { u.deletingPathExtension().appendingPathExtension("prior") }
+                if fm.fileExists(atPath: url.path) {
+                    try? fm.removeItem(at: legacy); try? fm.removeItem(at: prior(legacy))
+                } else {
+                    try? fm.moveItem(at: legacy, to: url)
+                    if fm.fileExists(atPath: prior(legacy).path) { try? fm.moveItem(at: prior(legacy), to: prior(url)) }
+                }
+            }
             if !FileManager.default.fileExists(atPath: url.path) {
                 let labels = OmniTagger.gatedLabels(modelDir: modelDir)
                 guard !labels.isEmpty else { return nil }
@@ -6101,14 +6129,19 @@ final class AppModel {
         }
         let own = Self.ownDataPaths().map(real)
         let ownExceptions = [real(Self.clipboardDirectory.path)]
-        let w = FSWatcher(paths: crawlRoots.map { $0.path }, since: since) { [weak self] paths, renamed, rescan in
+        let w = FSWatcher(paths: crawlRoots.map { $0.path }, since: since) { [weak self] paths, flags in
+            let renamed = flags.renamed, rescan = flags.rescan
             // Sorted into present and gone HERE, on the watcher's queue: a drag-in reports
             // thousands of paths and the main thread should not stat them.
             var here: [String] = [], gone: [String] = []
             for p in paths {
                 if own.contains(where: { p == $0 || p.hasPrefix($0 + "/") }),
                    !ownExceptions.contains(where: { p == $0 || p.hasPrefix($0 + "/") }) { continue }
-                if Darwin.access(p, F_OK) == 0 { here.append(p) } else { gone.append(p) }
+                if Darwin.access(p, F_OK) == 0 {
+                    // A directory whose permissions or times changed: update() would crawl all of
+                    // it; see FSWatcher.Flags.metadataOnlyDirs.
+                    if !flags.metadataOnlyDirs.contains(p) { here.append(p) }
+                } else { gone.append(p) }
             }
             if !rescan.isEmpty { Task { @MainActor in self?.rescanRoots(touchedBy: rescan) } }
             guard !here.isEmpty || !gone.isEmpty else { return }
@@ -6413,6 +6446,15 @@ final class AppModel {
                             }
                             return
                         }
+                        if wantFSDrain, p.cancelled, self.explicitRetagSince != nil {
+                            // Paused for tags the user asked for: run them, then resume.
+                            self.indexState = .idle
+                            self.restartAfterPause = true
+                            self.pendingCatchUpRoots.append(contentsOf: caughtUp)
+                            self.refreshIndexStats(store)
+                            self.drainDeferredAfterPass(store)
+                            return
+                        }
                         if wantRestart || !caughtUp.isEmpty || (wantFSDrain && p.cancelled) {
                             // A folder was paused/resumed, or roots were added, mid-pass: restart
                             // re-scoped to the current unpaused roots (incremental, so the rest resume).
@@ -6507,6 +6549,12 @@ final class AppModel {
             }
             return
         }
+        // Tags the user asked for, before the restart that would hold them for a whole pass. The
+        // batch's completion comes back here and the chain carries on.
+        if explicitRetagSince != nil {
+            scheduleTagBackfill()
+            if tagBackfillActive { return }
+        }
         if restartAfterPause {
             restartAfterPause = false
             startIndexing()
@@ -6536,6 +6584,13 @@ final class AppModel {
     /// forward is non-finite and the finiteness guard rejects it) is not retried every search.
     private var retagSeen = Set<String>()
     private var tagBackfillActive = false
+    /// Files the user asked to tag (Generate Tags), not yet in a batch, and since when. Unlike the
+    /// lazy re-tag these do not wait for idle: past `explicitRetagWait` the running pass,
+    /// catch-up or reconcile pauses for them (enforceEventWaitLimit). Before, the request sat
+    /// behind a whole first index with nothing to show for it.
+    @ObservationIgnored private var explicitRetag = Set<String>()
+    @ObservationIgnored private var explicitRetagSince: Date?
+    private static let explicitRetagWait: TimeInterval = 3
     /// Set when a user search cancels an in-flight retag batch: the completion re-queues the
     /// batch instead of dropping it.
     private var tagBackfillYieldedToSearch = false
@@ -6594,6 +6649,8 @@ final class AppModel {
         pendingRetag.removeAll { mediaPaths.contains($0) }
         pendingRetag.insert(contentsOf: mediaPaths, at: 0)
         retagSeen.formUnion(mediaPaths)   // the lazy enqueue must not re-add them this session
+        explicitRetag.formUnion(mediaPaths)
+        if explicitRetagSince == nil { explicitRetagSince = Date() }
         retagKickTask?.cancel()
         retagKickTask = nil
         scheduleTagBackfill()
@@ -6639,7 +6696,7 @@ final class AppModel {
         guard !indexWritesBlocked, !isPaperRunning, !ocrRunActive, !indexObsolete, !isProfilingRunning,
               imageTagsEnabled, !tagBackfillActive, !searching,
               indexState != .indexing, indexState != .paused,
-              activeRoots.isEmpty, !fsReconcileInFlight, pendingFSPaths.isEmpty,
+              activeRoots.isEmpty, !fsReconcileInFlight, pendingFSPaths.isEmpty || explicitRetagSince != nil,
               let engine, engine.tagger != nil, let indexer, let store else { return }
         // Revalidate against LIVE roots: a path whose root was removed or paused since it was
         // queued must not be re-embedded (update(force:) would re-INSERT rows deleteUnderFolder
@@ -6651,6 +6708,9 @@ final class AppModel {
         guard !pendingRetag.isEmpty else { return }
         let batch = Array(pendingRetag.prefix(Self.tagBackfillBatch))
         pendingRetag.removeFirst(batch.count)
+        let batchExplicit = explicitRetag.intersection(batch)
+        explicitRetag.subtract(batch)
+        if explicitRetag.isEmpty { explicitRetagSince = nil }
         var s = effectiveSettings()
         s.forceFreshEmbed = true   // dedup would hand a file its own untagged rows back
         s.hqMediaTags = true       // CWR 5-crop refinement: these are files the user is looking at
@@ -6675,6 +6735,11 @@ final class AppModel {
                     self.tagBackfillYieldedToSearch = false
                     self.pendingRetag.removeAll { batch.contains($0) }
                     self.pendingRetag.insert(contentsOf: batch, at: 0)
+                    // Still the user's request, not the lazy kind.
+                    if !batchExplicit.isEmpty {
+                        self.explicitRetag.formUnion(batchExplicit)
+                        if self.explicitRetagSince == nil { self.explicitRetagSince = Date() }
+                    }
                     // Work that queued behind the batch (file events, added or removed folders)
                     // goes now. Only the other branch drained it, so after a batch gave way to a
                     // search nothing ran until the next file event - a removed folder stayed

@@ -947,6 +947,23 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
     discard) and re-walking every folder. Not run live: an isolated instance shares the real
     clipboard-history folder.
   - Paused-folder delete, in the app: reflected in 2.1 s.
-- STILL OPEN: a directory event re-crawls its whole subtree; VACUUM holds the store queue;
-  Generate Tags waits behind a whole pass with no feedback; the tag label cache is keyed by
-  dimension only.
+- The last four, same day:
+  - A DIRECTORY EVENT IS CRAWLED ONLY WHEN SOMETHING ARRIVED. Measured flags: chmod `D o`, touch
+    `D i o`, xattr `C D x` (Created lingers on a recent directory); mkdir `C D`, a move in `R D`,
+    a copy in `C D x o`. Files changed inside a directory report themselves. A present directory
+    without Created or Renamed is dropped at the watcher (FSWatcher.Flags.metadataOnlyDirs):
+    chmod, touch and xattr on a 30,000-file folder now start no reconcile at all; a folder moved
+    in is still crawled and indexed.
+  - VACUUM YIELDS TO SEARCH. compact() runs it interruptibly: a search calls sqlite3_interrupt,
+    the rewrite rolls back whole, the search runs, and the rewrite is owed and retried once no
+    search ran for the activity window. VacuumYieldsToSearchTests: with the interrupt disabled
+    the search waited 1.07 s behind a 0.88 s rewrite; with it, under half. The open-time repack
+    and the v4 upgrade VACUUM are not interruptible (they record completion after it).
+  - GENERATE TAGS HAS ITS OWN WAIT LIMIT, 3 s: past it the pass, catch-up or reconcile pauses
+    (keeping its work), the batch runs, the work resumes. Mid 30,000-file catch-up the batch ran
+    3.6 s after the request; the catch-up resumed and finished at the exact count.
+  - THE LABEL CACHE IS KEYED BY THE WEIGHTS: `tags-d<dim>-<id>.cache`, id = SHA-256 of the
+    safetensors header and 16 slices of 64 KB (OmniTagger.modelIdentity, ~1 MB read), so a
+    re-download keeps it and another checkpoint of the same width builds its own. The width-only
+    cache of earlier releases is ADOPTED, not rebuilt (one checkpoint per width ever shipped):
+    measured on a copy of the real one, renamed with its prior, no rebuild.

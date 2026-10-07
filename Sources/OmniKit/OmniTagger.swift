@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import CryptoKit
 import MLX
 
 /// Open-vocabulary image tagging with the SAME frozen model that embeds the index - zero extra
@@ -90,6 +91,29 @@ public final class OmniTagger: @unchecked Sendable {
     /// The gate is the tokenizer's own byte-BPE space marker: a piece starting with U+0120 ("G
     /// with dot above", the GPT-2 space escape) begins a word. Keep >=3-char lowercase ASCII
     /// alphabetic words - kills code fragments and subword pieces with no external dictionary.
+    /// Which weights a label cache was built from, as 12 hex digits: SHA-256 over the safetensors
+    /// header and 16 slices of 64 KB spread across the file (~1 MB read). The cache used to be
+    /// keyed by vector width alone, so another checkpoint of the same width - a new release of the
+    /// weights - would have read labels embedded by the old text tower, and its learned prior,
+    /// without a word. Not size and mtime: a re-download of the same weights would rebuild for
+    /// nothing. nil when the file cannot be read.
+    public static func modelIdentity(modelDir: URL) -> String? {
+        let url = modelDir.appendingPathComponent("model.safetensors").resolvingSymlinksInPath()
+        guard let h = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? h.close() }
+        guard let size = try? h.seekToEnd(), size > 8 else { return nil }
+        var hasher = SHA256()
+        hasher.update(data: withUnsafeBytes(of: size.littleEndian) { Data($0) })
+        let slice: UInt64 = 64 * 1024
+        var offsets: [UInt64] = [0]   // the header: tensor names, shapes, offsets, metadata
+        for i in 1 ..< 16 { offsets.append(size / 16 * UInt64(i)) }
+        for o in offsets {
+            guard (try? h.seek(toOffset: o)) != nil, let d = try? h.read(upToCount: Int(min(slice, size - o))) else { return nil }
+            hasher.update(data: d)
+        }
+        return hasher.finalize().prefix(6).map { String(format: "%02x", $0) }.joined()
+    }
+
     public static func gatedLabels(modelDir: URL) -> [String] {
         guard let data = try? Data(contentsOf: modelDir.appendingPathComponent("tokenizer.json")),
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
