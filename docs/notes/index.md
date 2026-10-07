@@ -1000,3 +1000,21 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
     next launch read cosine 1.000000 and left it alone.
 - VectorSpaceProofTests: the original embedder proves true, another of the same width false, and
   an index whose files all changed returns nil rather than a guess.
+- PRE-RELEASE UPGRADE TEST on clones of the live index (310,472 files, 7.0M rows, stamped by
+  0.15.x): with the installed model the stamp matched and it was adopted, nothing re-embedded,
+  searches answered, the tag cache adopted, ready in 12.7 s (10.8 s of it the store load). With a
+  `touch`ed copy of the model in a folder not named "nano" IT WIPED: the file proof found nothing
+  to compare, and the fallback compared the variant label, which the app derives from the folder
+  NAME ("small" here) - so "could not compare" became "different". Two lessons, both fixed:
+  - Almost nothing on an older index compares by chunk key: files indexed before
+    content-defined chunking keep their grid chunks (a disjoint key space) until edited. 64 of
+    64 candidates, 268 fresh chunks, 0 keyed. The proof now also compares files that are ONE
+    chunk on both sides (the same text whichever chunker cut it: 1.0000 for the same weights)
+    and, failing that, file means, judged by MEDIANS with a gap between the thresholds.
+    Measured on the clone: same weights exact median 1.0000, means median 0.9795; the model
+    without its retrieval adapter (a same-width relative) exact median 0.9218, means 0.8546,
+    probe 0.8779. ~0.59 s, once per older index.
+  - A WIPE NEEDS EVIDENCE. Undecided keeps the index (adopted, logged). And a probe between 0.9
+    and 0.999 asks the files before anything is wiped: a toolchain could move one short text's
+    vector by itself. Nudged probe at 0.9954: files matched, kept. Adapter-less model: probe
+    0.878, rebuilt. touched copy of the same weights: "re-embedded files match", kept.

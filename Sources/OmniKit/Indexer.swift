@@ -1394,17 +1394,24 @@ public final class Indexer: @unchecked Sendable {
 
     /// `roots`: the indexed folders. A vanished path that is one of them, or sits above one, is
     /// never deleted by prefix here - see the vanished-path loop.
-    /// Does the loaded model produce the vectors this index holds? Re-embeds up to `sample` small
-    /// text files that are unchanged on disk - fresh, no dedup, no chunk reuse - and compares each
-    /// chunk with the stored vector for the SAME chunk (same chunk key: identical text and chunking
-    /// settings, so identical input). true when every compared chunk is at cosine >= `threshold`,
-    /// false when any is below it, nil when nothing could be compared (no small unchanged text
-    /// files, or none whose chunking still matches). Stored vectors are bf16; the same weights land
-    /// at ~0.9999, a different checkpoint nowhere near.
+    /// Does the loaded model produce the vectors this index holds? Re-embeds small text files that
+    /// are unchanged on disk - fresh, no dedup, no chunk reuse - and compares them with what is
+    /// stored. true / false only on clear evidence; nil when it cannot tell, and the caller keeps
+    /// the index then: a wrong "different" wipes it, which is the failure this exists to prevent.
     ///
     /// For an index stamped before the vector-space probe existed, whose stamp named the model by
     /// file size and date - which a re-download or a copy changes with the weights untouched.
-    public func sameVectorSpace(sample: Int = 3, threshold: Float = 0.995, settings: IndexSettings) -> Bool? {
+    ///
+    /// EXACT comparisons first: a chunk whose key matches a stored one (identical text and
+    /// chunking), or a file that is one chunk on both sides - the same text, whichever chunker cut
+    /// it. Same weights reproduce those at 1.0000 (bf16 storage). Most chunks of an older index do
+    /// NOT match by key: files indexed before content-defined chunking keep their grid chunks, a
+    /// disjoint key space, until edited. For those, the file's stored mean against the mean of its
+    /// fresh chunks, which the chunker change blurs - measured on the live index's clone, 64
+    /// files: same weights 0.889-1.000, median ~0.98; the same model without its retrieval adapter
+    /// (a close relative of the same width) 0.761-0.950, median ~0.89. One file decides nothing;
+    /// medians do, with a gap between the two thresholds where the answer is nil.
+    public func sameVectorSpace(threshold: Float = 0.995, settings: IndexSettings) -> Bool? {
         var fresh = settings
         fresh.forceFreshEmbed = true
         let fm = FileManager.default
@@ -1415,8 +1422,15 @@ public final class Indexer: @unchecked Sendable {
                !PhotoLibrary.isPhotoPath(path) { candidates.append((path, f)) }
             if candidates.count >= 64 { throw Enough() }
         }
-        var proven = 0
-        for c in candidates where proven < sample {
+        func cosine(_ a: [Float], _ b: [Float]) -> Float {
+            var dot: Float = 0, na: Float = 0, nb: Float = 0
+            for i in 0 ..< a.count { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i] }
+            return dot / max((na * nb).squareRoot(), 1e-12)
+        }
+        func median(_ v: [Float]) -> Float { let s = v.sorted(); return s[s.count / 2] }
+        var exact: [Float] = [], means: [Float] = []
+        let t0 = Date()
+        for c in candidates where exact.count < 8 {
             guard let a = try? fm.attributesOfItem(atPath: c.path),
                   (a[.size] as? Int) == c.file.size,
                   let m = (a[.modificationDate] as? Date)?.timeIntervalSince1970,
@@ -1424,21 +1438,35 @@ public final class Indexer: @unchecked Sendable {
             let stored = store.chunkVectors(path: c.path, dim: embedder.dim)
             guard !stored.isEmpty else { continue }
             let chunks = embed(decode(CrawledFile(path: c.path, modified: m, size: c.file.size), settings: fresh), settings: fresh)
-            var compared = 0
+                .filter { $0.embedding.count == embedder.dim }
+            guard !chunks.isEmpty else { continue }
+            var keyed = false
             for ch in chunks where !ch.chunkKey.isEmpty {
-                guard let v = stored[ch.chunkKey], v.count == ch.embedding.count else { continue }
-                var dot: Float = 0, na: Float = 0, nb: Float = 0
-                for i in 0 ..< v.count { dot += v[i] * ch.embedding[i]; na += v[i] * v[i]; nb += ch.embedding[i] * ch.embedding[i] }
-                let cos = dot / max((na * nb).squareRoot(), 1e-12)
-                if cos < threshold {
-                    Self.log.info("vector space differs: \(c.path, privacy: .public) cosine \(cos, privacy: .public)")
-                    return false
-                }
-                compared += 1
+                guard let v = stored[ch.chunkKey] else { continue }
+                exact.append(cosine(v, ch.embedding)); keyed = true
             }
-            if compared > 0 { proven += 1 }
+            if keyed { continue }
+            if chunks.count == 1, stored.count == 1, let v = stored.values.first {
+                exact.append(cosine(v, chunks[0].embedding))
+            } else if let storedMean = store.fileVector(c.path) {
+                var mean = [Float](repeating: 0, count: storedMean.count)
+                for ch in chunks { for i in 0 ..< mean.count { mean[i] += ch.embedding[i] } }
+                means.append(cosine(storedMean, mean))
+            }
         }
-        return proven > 0 ? true : nil
+        var verdict: Bool? = nil
+        if exact.count >= 3 {
+            let m = median(exact)
+            verdict = m >= threshold ? true : (m < 0.99 ? false : nil)
+        } else if means.count >= 8 {
+            let m = median(means)
+            verdict = m >= 0.95 ? true : (m < 0.93 ? false : nil)
+        }
+        omniPerfLog(String(format: "vector-space proof: candidates=%d exact=%d (median %.4f) means=%d (median %.4f) -> %@ %.0fms",
+                           candidates.count, exact.count, exact.isEmpty ? 0 : median(exact),
+                           means.count, means.isEmpty ? 0 : median(means),
+                           verdict.map { $0 ? "same" : "different" } ?? "undecided", -t0.timeIntervalSinceNow * 1000))
+        return verdict
     }
 
     /// Paths gone from disk, sorted into the indexed files among them and the folders with rows

@@ -4363,10 +4363,10 @@ final class AppModel {
     /// The index keeps a PROBE: one fixed text embedded by the weights that indexed it, written at
     /// every pass start. Same weights reproduce it (cosine >= 0.999 allows a toolchain's rounding);
     /// other weights do not. An index from before the probe existed is proven instead: unchanged
-    /// stamp -> same; otherwise a few of its own files are re-embedded and compared chunk by chunk
-    /// with what is stored (Indexer.sameVectorSpace). Only when nothing can be compared does the
-    /// model variant decide - one checkpoint per variant has ever shipped. A proven-same index is
-    /// adopted: the probe and the new stamp are written, and nothing is re-embedded.
+    /// stamp -> same; otherwise some of its own files are re-embedded and compared with what is
+    /// stored (Indexer.sameVectorSpace), and only a clear difference makes it obsolete. Anything
+    /// else - same, or nothing conclusive - is adopted: the probe and the new stamp are written,
+    /// and nothing is re-embedded. A wipe needs evidence.
     nonisolated static func vectorSpaceDiffers(store: VectorStore, engine: OmniEngine, indexer: Indexer,
                                                fingerprint fp: String, legacyFingerprint legacy: String,
                                                variant: String, settings: IndexSettings) async -> Bool {
@@ -4385,9 +4385,21 @@ final class AppModel {
                 var dot: Float = 0, na: Float = 0, nb: Float = 0
                 for i in 0 ..< probe.count { dot += saved[i] * probe[i]; na += saved[i] * saved[i]; nb += probe[i] * probe[i] }
                 let cos = dot / max((na * nb).squareRoot(), 1e-12)
-                if cos < 0.999 { rootLog.info("loaded weights embed differently (probe cosine \(cos, privacy: .public))") }
                 omniPerfLog(String(format: "vector-space probe cosine %.6f", cos))
-                return cos < 0.999
+                if cos >= 0.999 { return false }
+                if cos < 0.9 {
+                    rootLog.info("loaded weights embed differently (probe cosine \(cos, privacy: .public))")
+                    return true
+                }
+                // MOVED, NOT GONE: one text is not enough to wipe an index on. A toolchain or MLX
+                // update can shift numerics by itself (CLAUDE.md), and a probe that drifted to
+                // 0.998 would otherwise rebuild every user's index on upgrade. The files decide.
+                if indexer.sameVectorSpace(settings: settings) == false {
+                    rootLog.info("probe moved (\(cos, privacy: .public)) and the files do not match: index is obsolete")
+                    omniPerfLog("vector-space differs: probe moved and re-embedded files do not match")
+                    return true
+                }
+                return adopt(String(format: "probe moved to %.4f but the files still match", cos))
             }
             // No probe: written by a release before it.
             let stamped = store.metaGet("embedding_version")
@@ -4402,8 +4414,10 @@ final class AppModel {
                 omniPerfLog("vector-space differs: re-embedded files do not match")
                 return true
             case nil:
-                if store.metaGet("index_model_variant") == variant { return adopt("same variant, nothing to compare") }
-                return true
+                // Nothing conclusive. KEPT: a wipe needs evidence, and "could not compare" is not
+                // evidence - it re-embedded a 310k-file index in a test where the model's folder
+                // name made the variant label disagree.
+                return adopt("nothing conclusive to compare; kept")
             }
         }.value
     }
