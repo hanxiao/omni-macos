@@ -284,45 +284,49 @@ public enum BenchCases {
         }
         out.metrics += PaperMetric.distribution("idle", samples: idle, unit: .milliseconds, note: "no indexer running")
 
-        for arm in ctx.spec.arms.map(\.id) {
-            try ctx.checkCancel()
-            guard ctx.shouldContinue else { out.truncated = true; break }
-            out.arms.append(arm)
-            try ctx.withArm(arm) {
-                let name = "load-\(arm).sqlite"
-                let sink = try ctx.fs.store(named: name)
-                defer { ctx.fs.discard(sink, named: name) }
-                let indexer = Indexer(store: sink, embedder: ctx.engine)
-                let stop = PaperFlag(), done = DispatchSemaphore(value: 0)
-                DispatchQueue.global(qos: .utility).async {
-                    var i = 0
-                    while !stop.isOn { indexer.update(paths: [load[i % load.count]], settings: .paper, force: true); i += 1 }
-                    done.signal()
+        let arms = ctx.spec.arms.map(\.id)
+        var loaded: [String: [Double]] = [:]
+        out.arms = arms
+        let rounds = p.int("rounds")
+        rounds: for round in 0 ..< rounds {
+            for k in 0 ..< arms.count {
+                let arm = arms[(k + round) % arms.count]   // the order rotates, so neither arm always goes first
+                try ctx.checkCancel()
+                guard ctx.shouldContinue else { out.truncated = true; break rounds }
+                try ctx.withArm(arm) {
+                    let name = "load-\(arm)-\(round).sqlite"
+                    let sink = try ctx.fs.store(named: name)
+                    defer { ctx.fs.discard(sink, named: name) }
+                    let indexer = Indexer(store: sink, embedder: ctx.engine)
+                    let stop = PaperFlag(), done = DispatchSemaphore(value: 0)
+                    DispatchQueue.global(qos: .utility).async {
+                        var i = 0
+                        while !stop.isOn { indexer.update(paths: [load[i % load.count]], settings: .paper, force: true); i += 1 }
+                        done.signal()
+                    }
+                    defer { stop.turnOn(); indexer.cancel(); done.wait(); indexer.resetCancelled() }
+                    for i in 0 ..< queries {
+                        try ctx.checkCancel()
+                        guard ctx.shouldContinue else { out.truncated = true; break }
+                        ctx.engine.noteInteractive()
+                        Thread.sleep(forTimeInterval: p.double("debounce_s"))
+                        let q = queryTexts[(round * queries + i) % queryTexts.count]
+                        loaded[arm, default: []].append(timeMs {
+                            _ = store.search(ctx.engine.embedQuery(q), topK: topK, markActive: true)
+                        })
+                        if i % 25 == 0 { ctx.progress("round \(round + 1)/\(rounds), \(arm): query \(i + 1)/\(queries)") }
+                    }
                 }
-                defer { stop.turnOn(); indexer.cancel(); done.wait(); indexer.resetCancelled() }
-                var samples: [Double] = []
-                for i in 0 ..< queries {
-                    try ctx.checkCancel()
-                    guard ctx.shouldContinue else { out.truncated = true; break }
-                    ctx.engine.noteInteractive()
-                    Thread.sleep(forTimeInterval: p.double("debounce_s"))
-                    samples.append(timeMs {
-                        _ = store.search(ctx.engine.embedQuery(queryTexts[i % queryTexts.count]), topK: topK, markActive: true)
-                    })
-                    if i % 10 == 0 { ctx.progress("\(arm): query \(i + 1)/\(queries)") }
-                }
-                out.metrics += PaperMetric.distribution("loaded", samples: samples, unit: .milliseconds, arm: arm)
             }
+        }
+        for arm in arms where !(loaded[arm] ?? []).isEmpty {
+            out.metrics += PaperMetric.distribution("loaded", samples: loaded[arm]!, unit: .milliseconds, arm: arm)
         }
         for suffix in ["p50", "p95", "p99"] {
             func value(_ arm: String) -> Double? { out.metrics.first { $0.key == "\(arm).loaded.\(suffix)" }?.value }
             if let off = value("unshaped"), let on = value("shaped"), off > 0 {
                 out.metrics.append(PaperMetric.derived("shaping_gain_\(suffix)", value: 100 * (off - on) / off,
                                                        unit: .percent, from: ["unshaped.loaded.\(suffix)", "shaped.loaded.\(suffix)"]))
-            }
-            if let none = value("no_ceiling"), let capped = value("unshaped"), none > 0 {
-                out.metrics.append(PaperMetric.derived("ceiling_gain_\(suffix)", value: 100 * (none - capped) / none,
-                                                       unit: .percent, from: ["no_ceiling.loaded.\(suffix)", "unshaped.loaded.\(suffix)"]))
             }
         }
         return out
@@ -479,7 +483,7 @@ public enum BenchCases {
         let minBytes = ctx.params.int("min_bytes")
         let picks = (0 ..< corpus.spec.textFiles).filter { PaperCorpus.textFileBytes($0) >= minBytes }
             .prefix(ctx.params.int("files"))
-        for arm in ["cache_off", "cache_on"] {
+        for arm in ["reuse_off", "reuse_on"] {
             try ctx.checkCancel()
             guard ctx.shouldContinue else { out.truncated = true; break }
             out.arms.append(arm)
@@ -511,10 +515,10 @@ public enum BenchCases {
             }
         }
         for suffix in ["p50", "p95", "p99"] {
-            guard let off = out.metrics.first(where: { $0.key == "cache_off.save.\(suffix)" })?.value,
-                  let on = out.metrics.first(where: { $0.key == "cache_on.save.\(suffix)" })?.value, off > 0 else { continue }
+            guard let off = out.metrics.first(where: { $0.key == "reuse_off.save.\(suffix)" })?.value,
+                  let on = out.metrics.first(where: { $0.key == "reuse_on.save.\(suffix)" })?.value, off > 0 else { continue }
             out.metrics.append(PaperMetric.derived("reuse_gain_\(suffix)", value: 100 * (off - on) / off, unit: .percent,
-                                                   from: ["cache_off.save.\(suffix)", "cache_on.save.\(suffix)"]))
+                                                   from: ["reuse_off.save.\(suffix)", "reuse_on.save.\(suffix)"]))
         }
         return out
     }

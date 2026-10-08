@@ -491,6 +491,16 @@ day later the same tour measured ZERO blocks over 250 ms (see "UI tests").
 - Smoke at `--scale 0.05`: 16 cases ok in 2 min 20 s. Full run on the M3 Ultra: 677-690 s. The
   budgets sum to 4,795 s, the ceiling on any Mac; Settings quotes "10 to 80 minutes" until the
   smaller Macs have measured numbers.
+- bench-v5 (0.15.10) after the first in-app run (M3 Ultra, 0.15.9) showed two rows were wrong:
+  - PER-FILE REUSE read 1.9%: its off arm turned off only the per-file cache and left the
+    cross-file one on, so both arms reused every unchanged chunk (7.41 vs 7.27 ms). Both off:
+    38.8 ms against 7.95 ms, 79.5% saved.
+  - SHAPING read +55% on one run and -104% on the next: 120 searches an arm in sequence, so p99
+    was the second-largest sample and whichever arm drew two stray 30-70 ms searches lost. Now 4
+    rounds, arm order rotating, 400 an arm, and the no-ceiling arm (no row, no paper number) is
+    gone: 64%, 35%, 27% over three runs, the case 73 -> 162 s.
+  - Every latency row now carries its worst sample (the p50's largest run) instead of "max -".
+  The collector aggregates v4 runs for every row but those two.
 - `--only store_build,search_under_writes` runs a subset (2 min); the report marks it SUBSET RUN.
   With OMNI_SEARCH_TIMING=1 every slice, checkpoint and slow search logs its phases.
 - WHAT IT FOUND ON ITS FIRST FULL RUN: a 1.3-1.8 s stall in the bulk delete (tombstones over budget

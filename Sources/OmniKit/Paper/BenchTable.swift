@@ -42,7 +42,7 @@ public enum BenchTable {
         value("Indexing", "Accelerator busy while indexing", "%", .index_text, "fresh_gpu_busy", .percent),
         value("Indexing", "Peak memory while indexing", "MB", .index_text, "fresh_peak_rss_delta"),
         latency("Indexing", "Index one image", .index_image, "tags_on.index_image"),
-        latency("Indexing", "Save one edit", .save_edit, "cache_on.save"),
+        latency("Indexing", "Save one edit", .save_edit, "reuse_on.save"),
         value("Indexing", "Write vectors in bulk", "rows/s", .store_build, "write"),
 
         latency("Queries", "Filename query", .queries, "filename_query"),
@@ -84,6 +84,9 @@ public enum BenchTable {
                 for col in latencyColumns {
                     if let m = metric(s.caseID, "\(s.key).\(col)") { cells[col] = m.value }
                 }
+                // The worst sample. Cases that time a write emit it as its own metric; for the rest
+                // it is the largest of the samples the p50 was taken over.
+                if cells["max"] == nil, let worst = metric(s.caseID, "\(s.key).p50")?.runs.max() { cells["max"] = worst }
                 if let op = s.opKey, let m = metric(s.caseID, op) { cells["op"] = m.value }
             } else if let m = metric(s.caseID, s.key, s.metricUnit) {
                 cells["value"] = m.value
@@ -96,7 +99,9 @@ public enum BenchTable {
         if let scan = result.cases.first(where: { $0.id == PaperCaseID.scan_ladder.rawValue }) {
             let speedups = scan.metrics.filter { $0.key.hasSuffix(".bit1_speedup") }
             if let top = speedups.max(by: { rung($0.key) < rung($1.key) }) {
-                out.append(BenchRow(group: "Mechanisms", task: "One-bit scan at \(rung(top.key) / 1000)k rows, speedup",
+                let n = rung(top.key)
+                let size = n >= 1_000_000 && n % 1_000_000 == 0 ? "\(n / 1_000_000)M" : "\(n / 1000)k"
+                out.append(BenchRow(group: "Mechanisms", task: "One-bit scan at \(size) rows, speedup",
                                     unit: "x", cells: ["value": top.value]))
             }
         }

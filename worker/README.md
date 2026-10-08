@@ -6,12 +6,13 @@ the Omni macOS app POSTs anonymous profiling reports, the landing page GETs aggr
 ## Endpoints
 
 - `POST /omni/profiling` - ingest one report. Body must be JSON, `<= 8KB`, `datasetVersion` one of
-  `profiling-v1`, `profiling-v2` (indexing only) or `bench-v4` (app 0.15.9+, the table benchmark:
+  `profiling-v1`, `profiling-v2` (indexing only) or `bench-v4`/`bench-v5` (app 0.15.9+, the table benchmark;
+  v5 from 0.15.10 corrects the reuse and shaping rows, which v4's aggregate leaves out:
   adds `model` and `table`, up to 64 rows of `{g, t, u, c}` with cells `p50 p95 p99 max value op`).
   Returns `204` on success, `400` on bad input, `429` when over the per-IP rate limit (~20/hour).
   Dedups on `runId` (`INSERT OR IGNORE`). Server sets `created_at` from its own clock; client time is ignored.
 - `GET /omni/profiling` - aggregated JSON: `totalRuns`, per-chip medians (`byChip`), last 25 rows
-  (`recent`), all over profiling-v1/v2 only (bench-v4 indexes text only, so its rates are not
+  (`recent`), all over profiling-v1/v2 only (the bench datasets index text only, so its rates are not
   comparable); and `bench`: the table, one column per chip and model, each cell the median of its runs.
   CORS allows `https://hanxiao.io`, `Cache-Control: max-age=120`.
 - `OPTIONS` - CORS preflight.

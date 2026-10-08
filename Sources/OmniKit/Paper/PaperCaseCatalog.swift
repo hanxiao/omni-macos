@@ -87,7 +87,10 @@ public enum PaperCaseCatalog {
     /// actually ran under.
     /// v4 is the Settings benchmark: every case runs on generated data (the live family is gone),
     /// and the export carries the task table.
-    public static let suiteId = "bench-v4"
+    /// v5 corrects two of its rows: per-file reuse turns both reuse layers off in its off arm (v4
+    /// left the cross-file one on and compared reuse with reuse), and shaping interleaves 400
+    /// searches an arm (v4's 120 in sequence swung from +55% to -104% between two runs).
+    public static let suiteId = "bench-v5"
     public static let schema = 4
 
     /// Global wall-clock cap, derived rather than fixed.
@@ -439,8 +442,12 @@ public enum PaperCaseCatalog {
             id: .save_edit, title: "Save one edit",
             deliverable: "Task table, save row: the marginal cost of one edit, per-file reuse on and off",
             budgetSeconds: 240,
-            arms: [PaperArm("cache_off", PaperLeverSet(chunkCache: false)),
-                   PaperArm("cache_on", PaperLeverSet(chunkCache: true))],
+            // BOTH reuse layers move together. With only `chunkCache` off, the cross-file cache still
+            // handed back every unchanged chunk, and the two arms saved in the same 7.3 ms (M3
+            // Ultra, 0.15.9): the row compared reuse with reuse. `contentDedup` stays on: it skips
+            // byte-identical files, and an edited file is never one.
+            arms: [PaperArm("reuse_off", PaperLeverSet(chunkCache: false, globalChunkReuse: false)),
+                   PaperArm("reuse_on", PaperLeverSet(chunkCache: true, globalChunkReuse: true))],
             params: p, arithmeticPeakMB: 1_500,
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
@@ -498,18 +505,22 @@ public enum PaperCaseCatalog {
     }
 
     private static func searchWhileIndexing(_ scale: Double) -> PaperCaseSpec {
+        // INTERLEAVED, 400 searches an arm: four rounds, the arm order rotating each round. At 120
+        // searches an arm, run back to back, p99 was the second-largest sample and the arm that drew
+        // two stray 30-70 ms searches lost: shaping read +55% on one M3 Ultra run and -104% on the
+        // next. Four hundred puts p99 at the fourth-largest, and rounds spread drift over both arms.
         let p = PaperParams([
-            PaperParameter("queries", .int(120), scaling: .scaled(minimum: 10)),
+            PaperParameter("rounds", .int(4), scaling: .scaled(minimum: 1)),
+            PaperParameter("queries", .int(100), scaling: .scaled(minimum: 10)),
             PaperParameter("load_files", .int(60), scaling: .scaled(minimum: 8)),
             PaperParameter("top_k", .int(VectorStore.shippedTopK)),
             PaperParameter("debounce_s", .double(0.18), unit: .seconds),
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .search_while_indexing, title: "Search while indexing",
-            deliverable: "Task table, search-while-indexing rows: the idle floor, the gate ceiling alone, and shaping",
+            deliverable: "Task table, search-while-indexing rows: the idle floor and shaping",
             budgetSeconds: 480,
-            arms: [PaperArm("no_ceiling", PaperLeverSet(adaptiveBatch: false, indexGateWindow: Int.max)),
-                   PaperArm("unshaped", PaperLeverSet(adaptiveBatch: false)),
+            arms: [PaperArm("unshaped", PaperLeverSet(adaptiveBatch: false)),
                    PaperArm("shaped", PaperLeverSet(adaptiveBatch: true))],
             params: p, arithmeticPeakMB: nil,
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
