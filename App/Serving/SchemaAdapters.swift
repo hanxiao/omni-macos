@@ -350,36 +350,14 @@ enum SearchAdapter {
         var topK = (body["top_k"] as? Int) ?? 20
         topK = max(1, min(topK, 200))
 
+        // Read by the same code as the MCP tool (SearchArgs): kinds are checked, folders
+        // normalized, `ext` cleaned, and a date may be epoch seconds or ISO 8601.
         var filter = SearchFilter()
-        if let filters = body["filters"] as? [String: Any] {
-            if let kinds = filters["kinds"] as? [String] {
-                var set = Set(kinds.map { $0.lowercased() })
-                // Same superset rule as the app: text documents include scanned PDFs ('scan'),
-                // so API clients asking for text don't silently lose them.
-                if set.contains(FileKind.text.rawValue) { set.insert(FileKind.scan.rawValue) }
-                filter.kinds = set
-            }
-            // `folder` (one) and `folders` (several) - see issue #18. Both are accepted and merged.
-            // Lexically normalized the way the store keys paths: a trailing slash built the prefix
-            // "…//" and "~" matched nothing, and both came back as a 200 with no results - which
-            // a caller reads as "not on this Mac". MCP search already did this.
-            var scoped: [String] = []
-            let named = [filters["folder"] as? String].compactMap { $0 } + (filters["folders"] as? [String] ?? [])
-            for raw in named {
-                let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !t.isEmpty else { continue }
-                let folder = normalizeStorePath(t)
-                if !scoped.contains(folder) { scoped.append(folder) }
-            }
-            if !scoped.isEmpty { filter.folderPrefixes = scoped }
-            if let ext = filters["ext"] as? String, !ext.isEmpty { filter.ext = ext }
-            if let since = filters["since"] as? Double { filter.since = since }
-            else if let sinceInt = filters["since"] as? Int { filter.since = Double(sinceInt) }
-            // The other end of a date range, exclusive, epoch seconds like `since`.
-            if let until = filters["until"] as? Double { filter.until = until }
-            else if let untilInt = filters["until"] as? Int { filter.until = Double(untilInt) }
-            if let ms = filters["min_score"] as? Double { filter.minScore = Swift.max(0, Swift.min(1, ms)) }
-            else if let ms = filters["min_score"] as? Int { filter.minScore = Swift.max(0, Swift.min(1, Double(ms))) }
+        if let raw = body["filters"] {
+            guard let filters = raw as? [String: Any] else { return badRequest("'filters' must be an object") }
+            let (parsed, err) = SearchArgs.filter(filters)
+            if let err { return badRequest(err) }
+            filter = parsed
         }
 
         // Duplicate collapsing, on by default: copies of one file waste an agent's top-k and its

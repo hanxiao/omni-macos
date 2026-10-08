@@ -184,75 +184,6 @@ enum MCPAdapter {
         ]
     }
 
-    /// An ISO 8601 date (local midnight) or date-time (with or without fractional seconds), as
-    /// epoch seconds; nil when it is neither.
-    static func parseTime(_ s: String) -> Double? {
-        let text = s.trimmingCharacters(in: .whitespaces)
-        let full = ISO8601DateFormatter()
-        if let d = full.date(from: text) { return d.timeIntervalSince1970 }
-        full.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let d = full.date(from: text) { return d.timeIntervalSince1970 }
-        let day = DateFormatter()
-        day.calendar = Calendar(identifier: .gregorian)
-        day.locale = Locale(identifier: "en_US_POSIX")
-        day.timeZone = .current
-        day.dateFormat = "yyyy-MM-dd"
-        return day.date(from: text)?.timeIntervalSince1970
-    }
-
-    // MARK: - Filter input validation
-    //
-    // `folderPrefix` matching is `path == f || path.hasPrefix(f + "/")` (SearchFilter.acceptsPath),
-    // so a trailing slash builds the prefix "…//" and a "~" or relative path matches nothing at
-    // all. Both used to come back as an empty result set, which an agent reasonably reads as
-    // "not on this Mac". Normalize what we can and reject what we cannot, with the corrected
-    // value in the message so the next call is right.
-
-    /// nil when the folder is usable (or absent); a ready-to-return error response otherwise.
-    private static func normalizedFolder(_ raw: String) -> (value: String?, error: String?) {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return (nil, nil) }
-        let expanded = (trimmed as NSString).expandingTildeInPath
-        guard expanded.hasPrefix("/") else {
-            return (nil, "'folder' must be an absolute path (got \"\(trimmed)\"). "
-                       + "Use a path like /Users/you/Documents, or omit it to search everywhere.")
-        }
-        // A folder that is not there at all scoped the search to nothing and came back as an empty
-        // result set, which reads as "no such file on this Mac" - the one conclusion a scope typo
-        // must never produce. Say which path missed instead. Existence is the decisive half and
-        // costs one stat; a real folder that simply is not a source still returns empty, and the
-        // index-state lines already in the response explain that case.
-        var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: expanded, isDirectory: &isDir) else {
-            return (nil, "no such folder: \"\(expanded)\". Check the path, or omit 'folder' to "
-                       + "search everywhere. list_sources reports the folders Omni indexes.")
-        }
-        guard isDir.boolValue else {
-            return (nil, "'folder' must be a folder, not a file (got \"\(expanded)\"). "
-                       + "To search inside specific files, use search_inline.")
-        }
-        return (normalizeStorePath(expanded), nil)
-    }
-
-    /// Validates against FileKind, returning the expanded set (text implies scan) or an error.
-    private static func normalizedKinds(_ raw: [String]) -> (value: Set<String>?, error: String?) {
-        let cleaned = raw.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
-                         .filter { !$0.isEmpty }
-        guard !cleaned.isEmpty else { return (nil, nil) }
-        let valid = Set(FileKind.allCases.map(\.rawValue))
-        let unknown = cleaned.filter { !valid.contains($0) }
-        guard unknown.isEmpty else {
-            let known = FileKind.allCases.map(\.rawValue).sorted().joined(separator: ", ")
-            return (nil, "unknown kind\(unknown.count == 1 ? "" : "s") "
-                       + unknown.map { "\"\($0)\"" }.joined(separator: ", ")
-                       + ". Valid kinds are: \(known).")
-        }
-        var set = Set(cleaned)
-        // Same superset rule as the app: text includes scanned PDFs ('scan').
-        if set.contains(FileKind.text.rawValue) { set.insert(FileKind.scan.rawValue) }
-        return (set, nil)
-    }
-
     private static func callSearch(id: Any, args: [String: Any], backend: any ServingBackend,
                                    sources: SourcesControl?) async -> HTTPResponse {
         guard let query = args["query"] as? String, !query.isEmpty else {
@@ -267,53 +198,9 @@ enum MCPAdapter {
         var maxSnippet = (args["max_snippet"] as? Int) ?? 200
         maxSnippet = max(0, min(maxSnippet, 2000))
         let includeImages = (args["include_images"] as? Bool) ?? false
-        var filter = SearchFilter()
-        // Absent means "use the server's default floor", which is why this is Optional rather than
-        // defaulted here: a caller that says nothing gets the same cut the window applies, and
-        // min_score 0 is the explicit way to ask for everything.
-        if let ms = args["min_score"] as? Double { filter.minScore = Swift.max(0, Swift.min(1, ms)) }
-        else if let ms = args["min_score"] as? Int { filter.minScore = Swift.max(0, Swift.min(1, Double(ms))) }
-        if let kinds = args["kinds"] as? [String] {
-            let (set, err) = normalizedKinds(kinds)
-            if let err { return toolError(id: id, "search failed: \(err)") }
-            if let set { filter.kinds = set }
-        }
-        // `folder` (one) and `folders` (several) - issue #18. An agent scoping to two project
-        // folders under one indexed root could not say so: the parent subsumes its children, so
-        // adding them as roots does not help either. Both spellings are accepted and merged, so an
-        // existing caller passing `folder` is unaffected.
-        var scoped: [String] = []
-        if let folder = args["folder"] as? String {
-            let (value, err) = normalizedFolder(folder)
-            if let err { return toolError(id: id, "search failed: \(err)") }
-            if let value { scoped.append(value) }
-        }
-        if let folders = args["folders"] as? [String] {
-            for folder in folders {
-                let (value, err) = normalizedFolder(folder)
-                if let err { return toolError(id: id, "search failed: \(err)") }
-                if let value, !scoped.contains(value) { scoped.append(value) }
-            }
-        }
-        filter.folderPrefixes = scoped
-        // Date range and extension: the window's `date:`/`after:` and `ext:` qualifiers, which an
-        // agent could not reach - "what was I working on last week" needs a range, not a query.
-        for (key, apply) in [("modified_after", { (t: Double) in filter.since = t }),
-                             ("modified_before", { (t: Double) in filter.until = t })] as [(String, (Double) -> Void)] {
-            guard let raw = args[key] else { continue }
-            guard let text = raw as? String, let t = Self.parseTime(text) else {
-                return toolError(id: id, "search failed: '\(key)' must be an ISO 8601 date ('2026-10-01') or date-time ('2026-10-01T09:30:00Z')")
-            }
-            apply(t)
-        }
-        if let since = filter.since, let until = filter.until, since >= until {
-            return toolError(id: id, "search failed: modified_after must be earlier than modified_before")
-        }
-        if let raw = args["ext"] {
-            guard let ext = raw as? String else { return toolError(id: id, "search failed: 'ext' must be a string like 'pdf'") }
-            let clean = ext.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
-            if !clean.isEmpty { filter.ext = clean }
-        }
+        let (parsed, err) = SearchArgs.filter(args)
+        if let err { return toolError(id: id, "search failed: \(err)") }
+        let filter = parsed
 
         // INDEX STATE, FETCHED CONCURRENTLY. An agent cannot tell an empty result set caused by
         // "not on this Mac" from one caused by "not indexed yet", and the second reading is the
