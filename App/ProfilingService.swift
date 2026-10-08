@@ -1,101 +1,16 @@
 import Foundation
 import SwiftUI
 import AppKit
-import CryptoKit
 import OmniKit
 
-/// Download/cache the profiling dataset, gate uploads behind one-time consent, and POST the report.
-/// The dataset is placed under /tmp (no Full-Disk/folder permission needed). All hardware/timing
-/// only - no file contents, paths, or identity are sent.
+/// The benchmark's upload: one-time consent, then a POST of the compact report (BenchUpload).
+/// Hardware and timings only - no file contents, paths, or identity are sent.
 @MainActor
 enum ProfilingService {
-    static let datasetVersion = "profiling-v2"
-    // The dataset is hosted under a content-tagged filename (not plain "profiling-v2.zip") so a
-    // replaced dataset is a fresh URL the CDN has never cached - the same reason the DMG is versioned.
-    // Bump the "-300" tag (and re-host) whenever the dataset content changes.
-    static let manifestURL = "https://hanxiao.io/omni/profiling-v2-300.json"
-    static let zipURL = "https://hanxiao.io/omni/profiling-v2-300.zip"
     static let uploadURL = "https://hanxiao.io/omni/profiling"
 
     private static let consentKey = "omni.profiling.consentGiven"
     private static let uploadEnabledKey = "omni.profiling.uploadEnabled"
-
-    struct Manifest: Decodable { let version: String; let fileCount: Int?; let md5: String? }
-    struct ProfilingError: LocalizedError { let message: String; init(_ m: String) { message = m }; var errorDescription: String? { message } }
-
-    // MARK: - Dataset
-
-    /// The on-disk folder the dataset unzips to. /tmp is world-readable and needs no permission.
-    static var datasetFolder: URL {
-        URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("omni-\(datasetVersion)", isDirectory: true)
-    }
-
-    /// Ensure the dataset is present locally and return its folder + file count. Uses a cached copy
-    /// when the manifest MD5 still matches; otherwise downloads the zip, verifies it, unzips to /tmp.
-    static func ensureDataset(onPhase: @escaping (String) -> Void) async throws -> (folder: URL, fileCount: Int) {
-        onPhase("Preparing dataset\u{2026}")
-        let manifest = try await fetchManifest()
-        let folder = datasetFolder
-        let count = manifest.fileCount ?? 0
-
-        // Cache hit: folder exists and a stored stamp matches the manifest MD5.
-        let stamp = folder.appendingPathComponent(".md5")
-        if FileManager.default.fileExists(atPath: folder.path),
-           let want = manifest.md5?.lowercased(),
-           let have = try? String(contentsOf: stamp, encoding: .utf8), have == want {
-            return (folder, count)
-        }
-
-        try Task.checkCancellation()
-        onPhase("Downloading dataset\u{2026}")
-        guard let url = URL(string: zipURL) else { throw ProfilingError("Invalid dataset URL.") }
-        // URLSession's async download honors Swift task cancellation - the sheet's Cancel
-        // cancels the wrapping task, which aborts the transfer mid-flight.
-        let (tmpZip, response) = try await URLSession.shared.download(from: url)
-        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            throw ProfilingError("Dataset download failed (HTTP \(http.statusCode)). The dataset may not be published yet.")
-        }
-        if let want = manifest.md5?.lowercased() {
-            let got = await Task.detached(priority: .userInitiated) { md5Hex(tmpZip) }.value
-            if got != want { throw ProfilingError("Dataset checksum did not match the manifest.") }
-        }
-
-        try Task.checkCancellation()
-        onPhase("Unzipping dataset\u{2026}")
-        try? FileManager.default.removeItem(at: folder)
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        try await unzip(tmpZip, into: folder)
-        if let want = manifest.md5?.lowercased() { try? want.write(to: stamp, atomically: true, encoding: .utf8) }
-        return (folder, count)
-    }
-
-    private static func fetchManifest() async throws -> Manifest {
-        guard let url = URL(string: "\(manifestURL)?t=\(Int(Date().timeIntervalSince1970))") else {
-            throw ProfilingError("Invalid manifest URL.")
-        }
-        var req = URLRequest(url: url)
-        req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        req.timeoutInterval = 20
-        let (data, response) = try await URLSession.shared.data(for: req)
-        if let http = response as? HTTPURLResponse, http.statusCode != 200 {
-            throw ProfilingError("Could not fetch the dataset manifest (HTTP \(http.statusCode)). The profiling dataset may not be published yet.")
-        }
-        return try JSONDecoder().decode(Manifest.self, from: data)
-    }
-
-    /// The zip may contain a top-level folder; return the directory that actually holds the files.
-    private static func unzip(_ zip: URL, into folder: URL) async throws {
-        let dest = folder.path
-        try await Task.detached(priority: .userInitiated) {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-            p.arguments = ["-o", "-q", zip.path, "-d", dest]
-            p.standardOutput = Pipe(); p.standardError = Pipe()
-            try p.run()
-            p.waitUntilExit()
-            if p.terminationStatus != 0 { throw ProfilingError("Could not unzip the dataset (exit \(p.terminationStatus)).") }
-        }.value
-    }
 
     // MARK: - Consent + upload
 
@@ -126,7 +41,7 @@ enum ProfilingService {
     }
 
     /// POST the report. Fire-and-forget: a failed upload never fails the profiling run.
-    static func upload(_ report: ProfilingReport) async {
+    static func upload<Payload: Encodable>(_ report: Payload) async {
         guard let url = URL(string: uploadURL) else { return }
         do {
             var req = URLRequest(url: url)
@@ -138,11 +53,6 @@ enum ProfilingService {
         } catch {
             // Non-fatal; the local report is kept regardless.
         }
-    }
-
-    nonisolated static func md5Hex(_ fileURL: URL) -> String {
-        guard let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) else { return "" }
-        return Insecure.MD5.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }
 
@@ -168,12 +78,11 @@ final class CancelFlag: @unchecked Sendable {
 struct ProfilingSheet: View {
     @Environment(AppModel.self) private var model: AppModel
 
-    private var isPaper: Bool { model.isPaperRunning }
-    private var phase: String { isPaper ? model.paperPhase : model.profilingPhase }
-    private var detail: String { isPaper ? model.paperDetail : model.profilingDetail }
-    private var fraction: Double? { isPaper ? model.paperFraction : model.profilingFraction }
-    private var startedAt: Date? { isPaper ? model.paperStartedAt : model.profilingStartedAt }
-    private var cancelled: Bool { (isPaper ? model.paperCancel : model.profilingCancel)?.on ?? true }
+    private var phase: String { model.paperPhase }
+    private var detail: String { model.paperDetail }
+    private var fraction: Double? { model.paperFraction }
+    private var startedAt: Date? { model.paperStartedAt }
+    private var cancelled: Bool { model.paperCancel?.on ?? true }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -182,19 +91,16 @@ struct ProfilingSheet: View {
                     .font(.system(size: 18))
                     .foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(isPaper ? "Paper benchmark" : "Benchmark").font(.headline)
+                    Text("Benchmark").font(.headline)
                     // Once there is timed work to report, show a live elapsed clock (ticking every
                     // second) instead of a static label. A quarter-hour sheet whose text never
                     // changes reads as hung, and that is what makes people force-quit mid-run.
                     if model.profilingShowsTiming, let start = startedAt {
                         TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                            // No ETA: case durations vary too much across machines for a
+                            // budget-derived estimate to be anything but a lie.
                             Text(Self.timingLine(elapsed: ctx.date.timeIntervalSince(start),
-                                                 fraction: fraction ?? 0,
-                                                 // No ETA for the paper suite: case durations vary
-                                                 // too much across machines for a budget-derived
-                                                 // estimate to be anything but a lie.
-                                                 eta: isPaper ? nil : true,
-                                                 suffix: isPaper ? model.paperCaseLine : ""))
+                                                 suffix: model.paperCaseLine))
                                 .font(.subheadline.monospacedDigit()).foregroundStyle(.secondary).lineLimit(1)
                         }
                     } else {
@@ -217,7 +123,7 @@ struct ProfilingSheet: View {
             }
             // Machine condition, paper run only, and only when it is worth seeing: a thermal state
             // above nominal or swap that actually grew both mean the numbers are drifting.
-            if isPaper, !model.paperEnvLine.isEmpty {
+            if !model.paperEnvLine.isEmpty {
                 Text(model.paperEnvLine)
                     .font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
                     .lineLimit(1).truncationMode(.tail)
@@ -227,7 +133,7 @@ struct ProfilingSheet: View {
                 Spacer()
                 // HIG: every lengthy operation needs a cancel affordance - this one downloads a
                 // dataset and runs minutes of GPU work while blocking the window.
-                Button("Cancel") { if isPaper { model.cancelPaperRun() } else { model.cancelProfiling() } }
+                Button("Cancel") { model.cancelPaperRun() }
                     .disabled(cancelled)
             }
         }
@@ -239,11 +145,8 @@ struct ProfilingSheet: View {
     /// "1:05 elapsed  ·  ~48s left" - ETA from the linear progress fraction, suppressed until there's
     /// enough progress (>2%) for a stable estimate. `eta: nil` drops it entirely; `suffix` carries
     /// the paper run's case counter.
-    private static func timingLine(elapsed: Double, fraction: Double, eta: Bool?, suffix: String) -> String {
+    private static func timingLine(elapsed: Double, suffix: String) -> String {
         var line = fmtDur(elapsed) + " elapsed"
-        if eta == true, fraction > 0.02, fraction < 1 {
-            line += "  \u{00B7}  ~" + fmtDur(elapsed * (1 - fraction) / fraction) + " left"
-        }
         if !suffix.isEmpty { line += "  \u{00B7}  " + suffix }
         return line
     }

@@ -1,8 +1,8 @@
 import Foundation
 import MLX
 
-// The five store-and-query measurement bodies: p06 shaping, p07 gate + idle fold, p08 scan ladder,
-// p09 selection, p10 compaction.
+// The store-and-query measurement bodies: search while indexing, the prune and idle fold, the scan
+// ladder, recall, selection and compaction.
 //
 // These are ports of `omni-verify`'s `searchunderindex`, `gateparity`, `selbench` and `compactbench`
 // with four changes and no fifth: `print` becomes a metric, `exit` is gone, sizes come from
@@ -22,7 +22,7 @@ import MLX
 //     DROPPED, never padded, and `truncated` is set so the rates say they cover part of the work.
 //     A metric is emitted only when the samples behind it were actually taken.
 //  4. Bulk is bounded. Row blocks are inserted 8,192 rows at a time (~25 MB host transient at any
-//     rung), each rung's store is discarded before the next is built, and p08 re-checks the free
+//     rung), each rung's store is discarded before the next is built, and scan_ladder re-checks the free
 //     memory per rung on top of the runner's whole-case gate - the runner sizes that gate on the
 //     LARGEST rung, so without the per-rung check an 8 GB machine would lose the 125k row it can
 //     comfortably measure along with the 500k row it cannot.
@@ -40,14 +40,12 @@ public enum PaperCasesStore {
     /// with the compute-side bodies without either side knowing about the other.
     public static func body(for id: PaperCaseID) -> PaperCaseBody? {
         switch id {
-        case .p06_shape: shapeBody
-        case .p07_gate: gateBody
-        case .p08_scan: scanBody
-        case .p09_select: selectBody
-        case .p10_compact: compactBody
-        case .p19_capsweep: capSweepBody
-        case .p20_recall: recallBody
-        case .p21_delete: deleteBody
+        case .prune_fold: gateBody
+        case .scan_ladder: scanBody
+        case .select: selectBody
+        case .compaction: compactBody
+        case .recall: recallBody
+        case .delete_cost: deleteBody
         default: nil
         }
     }
@@ -56,7 +54,7 @@ public enum PaperCasesStore {
 
     /// Chunks per synthetic file. Fixed at four everywhere a case does not declare its own, because
     /// the per-file reduce and its tie-breaks are part of what a search costs and a one-chunk-per-file
-    /// store skips both. p07 declares it explicitly since its delta arithmetic depends on it.
+    /// store skips both. prune_fold declares it explicitly since its delta arithmetic depends on it.
     static let chunksPerFile = 4
 
     /// Top-K asked of every timed search, from OmniKit rather than from a copy here. The shortlist
@@ -69,7 +67,7 @@ public enum PaperCasesStore {
     /// store always crosses the gate - the case measures what VACUUM costs, not whether it fires.
     static let compactMinFreeRatio = 0.05
 
-    /// Share of free memory a single p08 rung may claim. Mirrors `PaperRunConfig.memoryGuardFraction`,
+    /// Share of free memory a single scan_ladder rung may claim. Mirrors `PaperRunConfig.memoryGuardFraction`,
     /// which the runner applies to the case as a whole and which a body cannot read.
     static let rungMemoryGuardFraction = 0.60
 
@@ -78,301 +76,9 @@ public enum PaperCasesStore {
     /// to age out first. Anything above 2 s works; 2.5 s is that with slack.
     static let foldQuietLeadSeconds = 2.5
 
-    // MARK: - p06: Table 2, search under indexing
+    // MARK: - search_while_indexing
 
-    /// Table 2's three rows, plus the two columns the paper cannot currently report: the `max` of
-    /// each latency distribution and the pure-indexing throughput each arm sustains.
-    ///
-    /// The cadence IS the measurement. 0.4 s between warm queries keeps both the engine's adaptive
-    /// batch and the store's proactive refold inside their 2 s windows; 2.6 s expires both, which is
-    /// the type-wait-type-wait pattern the shaping work exists for. Those delays are identical on
-    /// every machine and never scale, so a slow Mac takes the same wall clock here as a fast one and
-    /// the two rows are the same experiment.
-    ///
-    /// Arms are interleaved run by run (unshaped, shaped, unshaped, shaped) rather than run in two
-    /// blocks: a block layout attributes any thermal ramp during the case to whichever arm ran second.
-    static let shapeBody: PaperCaseBody = { ctx in try runShape(ctx) }
-
-    /// The flush the background load embeds, shaped like the indexer's staging window
-    /// (textBatchSize x 6 = 96 chunks of varied length). Built ONCE per case and reused by every run
-    /// of every arm: both arms must embed byte-identical text or the throughput column compares two
-    /// different workloads.
-    private static func shapeFlushBatches(textBatchSize: Int, stagingBatches: Int) -> [[String]] {
-        var out: [[String]] = []
-        for b in 0 ..< stagingBatches {
-            var batch: [String] = []
-            for i in 0 ..< textBatchSize {
-                let characters: Int = 180 + ((i * 53 + b * 97) % 1500)
-                let stream: UInt64 = UInt64(0x0F1_0500 + b * 100 + i)
-                batch.append(PaperCorpus.filler(characters: characters, stream: stream))
-            }
-            out.append(batch)
-        }
-        return out
-    }
-
-    private static func runShape(_ ctx: PaperContext) throws -> PaperCaseOutput {
-        var out = PaperCaseOutput()
-        let p = ctx.params
-        let dim = p.int("dim")
-        // The background load writes rows the engine produced, into the same store the foreground
-        // queries scan. A width mismatch would be rejected by `replaceMany` halfway through the pass,
-        // so it is refused up front with the reason rather than discovered as a failed insert.
-        guard ctx.engine.dim == dim else {
-            throw PaperCaseError("p06 needs a dim-\(dim) engine, this one is dim \(ctx.engine.dim): "
-                + "the base rows, the background indexer's rows and the query must share a width")
-        }
-        let runsPerArm = p.int("runs_per_arm")
-        // Not case parameters - p06 declares the query cadence, not the indexer's batching - so they
-        // are stamped as extras below rather than read from the catalog.
-        let textBatchSize = 16, stagingBatches = 6
-        let cfg = PaperShapeConfig(
-            dim: dim,
-            targetRows: p.int("rows"),
-            throughputWindow: p.double("throughput_window_s"),
-            idleQueries: p.int("idle_queries"),
-            warmQueries: p.int("warm_queries"),
-            coldQueries: p.int("cold_queries"),
-            keystrokeQueries: p.int("cold_keystroke_queries"),
-            warmDelay: p.double("warm_delay_s"),
-            coldDelay: p.double("cold_delay_s"),
-            flushBatches: shapeFlushBatches(textBatchSize: textBatchSize, stagingBatches: stagingBatches))
-
-        let arms = ["unshaped", "shaped"]
-        var collected: [String: [PaperShapeSets]] = [:]
-        var rowsBuilt = 0
-        var lastPassSeconds = 0.0
-
-        outer: for run in 0 ..< runsPerArm {
-            for arm in arms {
-                try ctx.checkCancel()
-                // The pass's SLEEPS are a lower bound on its cost, known exactly from the parameters.
-                // Starting one with less than that left would spend the remaining budget on a pass
-                // whose query sets are guaranteed to be dropped.
-                let need: Double = max(cfg.sleepSeconds, lastPassSeconds)
-                guard ctx.remainingSeconds > need else {
-                    let done: Int = collected.values.reduce(0) { $0 + $1.count }
-                    let planned: Int = runsPerArm * arms.count
-                    let left: Double = ctx.remainingSeconds
-                    out.truncated = true
-                    out.note = "stopped after \(done) of \(planned) passes: "
-                        + String(format: "%.0f s left, a pass needs at least %.0f s", left, need)
-                    break outer
-                }
-                ctx.progress("arm \(arm) - run \(run + 1) of \(runsPerArm) - building")
-                let t0 = Date()
-                let pass = try ctx.withArm(arm) {
-                    try shapePass(ctx, cfg: cfg, arm: arm,
-                                  storeName: "p06-\(arm)-r\(run).sqlite")
-                }
-                lastPassSeconds = -t0.timeIntervalSinceNow
-                rowsBuilt = max(rowsBuilt, pass.rowsBuilt)
-                if pass.rowsBuilt < cfg.alignedRows { out.truncated = true; break outer }
-                out.ran(arm)
-                collected[arm, default: []].append(pass.sets)
-                if pass.incomplete { out.truncated = true; break outer }
-            }
-        }
-
-        // Idle is measured BEFORE any background load starts, so it is the same experiment in both
-        // arms; its runs are pooled and the note gives their order, which is what lets a reader check
-        // that the two arms agree where they must.
-        var idleRuns: [[Double]] = []
-        for arm in arms {
-            for run in collected[arm] ?? [] where run.idle.count == cfg.idleQueries {
-                idleRuns.append(run.idle)
-            }
-        }
-        let idleNote: String = "no background indexing; runs pooled over both arms in interleave order "
-            + arms.joined(separator: ",")
-        emitLatency(&out, key: "idle", sets: idleRuns, arm: nil, note: idleNote)
-
-        let warmNote: String = "queries \(cfg.warmDelay) s apart: inside the adaptive-batch and "
-            + "proactive-fold windows"
-        let coldNote: String = "queries \(cfg.coldDelay) s apart: both windows expire between them"
-        let keystrokeNote: String = "a 2-keystroke burst plus the 180 ms search debounce precedes each "
-            + "query, so the indexer is already in per-batch mode"
-        for arm in arms {
-            let runs: [PaperShapeSets] = collected[arm] ?? []
-            guard !runs.isEmpty else { continue }
-            let warm: [[Double]] = runs.map(\.warm).filter { $0.count == cfg.warmQueries }
-            let cold: [[Double]] = runs.map(\.cold).filter { $0.count == cfg.coldQueries }
-            let keystroke: [[Double]] = runs.map(\.keystroke).filter { $0.count == cfg.keystrokeQueries }
-            emitLatency(&out, key: "\(arm).warm", sets: warm, arm: arm, note: warmNote)
-            emitLatency(&out, key: "\(arm).cold", sets: cold, arm: arm, note: coldNote)
-            emitLatency(&out, key: "\(arm).cold_keystroke", sets: keystroke, arm: arm, note: keystrokeNote)
-            // The cold split says WHERE a stalled query spent its time: waiting for the embed gate,
-            // or waiting for the store queue behind an insert.
-            let embed: [[Double]] = runs.map(\.coldEmbed).filter { $0.count == cfg.coldQueries }
-            let search: [[Double]] = runs.map(\.coldSearch).filter { $0.count == cfg.coldQueries }
-            emitMedian(&out, key: "\(arm).cold_embed", sets: embed, unit: .milliseconds, arm: arm)
-            emitMedian(&out, key: "\(arm).cold_search", sets: search, unit: .milliseconds, arm: arm)
-            let rates: [Double] = runs.compactMap(\.flushRate)
-            if !rates.isEmpty {
-                // The unit is NOT in the key: the export appends it, so `\(arm).index` renders as
-                // `shaped.index_flushes_per_s`. Spelling "flushes" here too would double it.
-                out.add("\(arm).index", rates, unit: .flushesPerSecond, arm: arm)
-            }
-        }
-
-        // The two comparisons Table 2 exists to make. Both are guarded on the inputs existing: a
-        // machine that only completed one arm gets its rows and no ratio, rather than a ratio
-        // computed against a missing number.
-        //
-        // The gain comes from the KEYSTROKE set, not the plain cold set. Shaping is armed by
-        // `noteInteractive()`, which only the keystroke set calls (step 5 above); on the plain cold
-        // set both arms take the identical path, so a ratio built from it can only ever report the
-        // spread between two single samples - and it did, at +8% on one run and -189% on the next.
-        if let off = out.metrics.first(where: { $0.key == "unshaped.cold_keystroke.p50" })?.value,
-           let on = out.metrics.first(where: { $0.key == "shaped.cold_keystroke.p50" })?.value, off > 0 {
-            out.add(PaperMetric.derived("shaping_keystroke_gain", value: 100 * (off - on) / off,
-                                        unit: .percent,
-                                        from: ["unshaped.cold_keystroke.p50", "shaped.cold_keystroke.p50"],
-                                        note: "the paper's Table 2 cadence: a 2-keystroke burst and the "
-                                        + "180 ms debounce precede each query, which is what arms shaping. "
-                                        + "STRONGLY CAP-SENSITIVE, so read it against pin.memory_cap_gb and "
-                                        + "never against Table 2 directly: measured on one machine, the same "
-                                        + "code gives +66.7% uncapped and -61.5% pinned to a 6 GB cap, "
-                                        + "because a tight MLX limit already breaks the indexing flush up "
-                                        + "and leaves shaping nothing to shorten. Table 2 was taken uncapped."))
-        }
-        // The control the gain above needs. Same queries without the keystroke burst, so shaping is
-        // inactive in both arms and this must sit near zero; a large value means the two arms
-        // differed for a reason that is not the lever, and the gain beside it is not attributable.
-        if let off = out.metrics.first(where: { $0.key == "unshaped.cold.p50" })?.value,
-           let on = out.metrics.first(where: { $0.key == "shaped.cold.p50" })?.value, off > 0 {
-            out.add(PaperMetric.derived("shaping_no_keystroke_control", value: 100 * (off - on) / off,
-                                        unit: .percent, from: ["unshaped.cold.p50", "shaped.cold.p50"],
-                                        note: "shaping is not armed without a keystroke, so this is the "
-                                        + "run-to-run spread of the pair, not an effect"))
-        }
-        // Limitation 9: the shaping ablation has never carried what the shaping COSTS indexing.
-        if let off = out.metrics.first(where: { $0.key == "unshaped.index" })?.value,
-           let on = out.metrics.first(where: { $0.key == "shaped.index" })?.value, off > 0 {
-            out.add(PaperMetric.derived("shaping_throughput_cost", value: 100 * (off - on) / off,
-                                        unit: .percent,
-                                        from: ["unshaped.index_flushes_per_s", "shaped.index_flushes_per_s"],
-                                        note: "positive means shaping cost indexing throughput"))
-        }
-
-        out.extraParameters.set("rows_built", .int(rowsBuilt))
-        out.extraParameters.set("flush_chunks", .int(textBatchSize * stagingBatches))
-        out.extraParameters.set("text_batch_size", .int(textBatchSize))
-        out.extraParameters.set("staging_window_batches", .int(stagingBatches))
-        for arm in arms {
-            out.extraParameters.set("runs_completed_\(arm)", .int((collected[arm] ?? []).count))
-        }
-        out.add(PaperFact("top_k", searchTopK))
-        return out
-    }
-
-    /// One (arm, run) pass: build a fresh store, measure idle, start the background indexer, take the
-    /// pure-indexing throughput window, then the three query cadences.
-    ///
-    /// A fresh store per pass rather than one shared store, because the background load appends rows
-    /// for the whole pass: run 2 would scan a bigger index than run 1 and the two would not be the
-    /// same measurement.
-    private static func shapePass(_ ctx: PaperContext, cfg: PaperShapeConfig, arm: String,
-                                  storeName: String) throws -> (sets: PaperShapeSets, rowsBuilt: Int,
-                                                                incomplete: Bool) {
-        let store = try ctx.fs.store(named: storeName)
-        defer { ctx.fs.discard(store, named: storeName) }
-
-        let built = try PaperVectors.buildStore(
-            rows: cfg.targetRows, into: store, chunksPerFile: chunksPerFile, snippetChars: 0,
-            dim: cfg.dim, deadline: ctx.deadline, cancelled: { ctx.isCancelled },
-            progress: { ctx.progress("\(arm) - building \($0) of \(cfg.alignedRows) rows") })
-        guard built == cfg.alignedRows else { return (PaperShapeSets(), built, true) }
-
-        // Fold: everything inserted above becomes the resident base, so the idle queries measure a
-        // settled store rather than one rebuild followed by eleven scans.
-        _ = store.search(PaperVectors.query(0, dim: cfg.dim), filter: SearchFilter(), topK: 10)
-
-        var sets = PaperShapeSets()
-        var incomplete = false
-
-        func sample(_ index: Int) -> (total: Double, embed: Double, search: Double) {
-            let text = PaperCorpus.filler(characters: 72, stream: UInt64(0x0EE1_0000 + index))
-            let t0 = Date()
-            let v = ctx.engine.embedQuery(text)
-            let embed = -t0.timeIntervalSinceNow * 1000
-            let t1 = Date()
-            _ = store.search(v, filter: SearchFilter(), topK: searchTopK)
-            let search = -t1.timeIntervalSinceNow * 1000
-            return (embed + search, embed, search)
-        }
-
-        // 1. Idle baseline, before any background load exists.
-        ctx.progress("\(arm) - idle 0/\(cfg.idleQueries)")
-        for i in 0 ..< cfg.idleQueries {
-            try ctx.checkCancel()
-            guard ctx.shouldContinue else { return (sets, built, true) }
-            sets.idle.append(sample(1000 + i).total)
-            ctx.progress("\(arm) - idle \(i + 1)/\(cfg.idleQueries)")
-        }
-
-        // The background "indexer": embed a 96-chunk flush through the low-priority gate, write its
-        // rows through the store queue, repeat. Stopped and JOINED on every exit path - it holds the
-        // engine and the store, and the arm's levers are restored the moment this function returns.
-        let load = PaperIndexLoad(engine: ctx.engine, store: store, batches: cfg.flushBatches,
-                                  startRow: built, dim: cfg.dim)
-        let worker = Thread { load.run() }
-        worker.qualityOfService = .utility
-        worker.start()
-        defer {
-            load.stop()
-            // Bounded: one flush is one indivisible unit, and the case's cancel-latency bound is
-            // stated in the export. Never unbounded, so a wedged embed cannot hang the suite.
-            let until = Date().addingTimeInterval(60)
-            while !load.finished, Date() < until { Thread.sleep(forTimeInterval: 0.002) }
-        }
-
-        do {
-            try sleepChecked(0.4, ctx)      // let a flush get in flight
-
-            // 2. Pure-indexing throughput: no foreground queries at all, so this isolates what the
-            //    arm costs indexing rather than what it gives search.
-            ctx.progress("\(arm) - throughput window \(Int(cfg.throughputWindow)) s")
-            let before = load.flushes
-            try sleepChecked(cfg.throughputWindow, ctx)
-            sets.flushRate = Double(load.flushes - before) / cfg.throughputWindow
-
-            // 3. Warm.
-            for i in 0 ..< cfg.warmQueries {
-                try ctx.checkCancel()
-                guard ctx.shouldContinue else { incomplete = true; return (sets, built, true) }
-                sets.warm.append(sample(i).total)
-                ctx.progress("\(arm) - warm \(i + 1)/\(cfg.warmQueries)")
-                try sleepChecked(cfg.warmDelay, ctx)
-            }
-
-            // 4. Cold, with the embed/search split.
-            for i in 0 ..< cfg.coldQueries {
-                try ctx.checkCancel()
-                guard ctx.shouldContinue else { incomplete = true; return (sets, built, true) }
-                let s = sample(500 + i)
-                sets.cold.append(s.total); sets.coldEmbed.append(s.embed); sets.coldSearch.append(s.search)
-                ctx.progress("\(arm) - cold \(i + 1)/\(cfg.coldQueries)")
-                try sleepChecked(cfg.coldDelay, ctx)
-            }
-
-            // 5. Cold WITH keystroke signalling: the realistic path, where the indexer is already in
-            //    per-batch mode by the time the search's embed takes the gate.
-            for i in 0 ..< cfg.keystrokeQueries {
-                try ctx.checkCancel()
-                guard ctx.shouldContinue else { incomplete = true; return (sets, built, true) }
-                ctx.engine.noteInteractive(); try sleepChecked(0.14, ctx)
-                ctx.engine.noteInteractive(); try sleepChecked(0.14, ctx)
-                try sleepChecked(0.18, ctx)      // the search debounce
-                sets.keystroke.append(sample(700 + i).total)
-                ctx.progress("\(arm) - cold+keystroke \(i + 1)/\(cfg.keystrokeQueries)")
-                try sleepChecked(cfg.coldDelay, ctx)
-            }
-        }
-        return (sets, built, incomplete)
-    }
-
-    // MARK: - p07: the can't-win prune and the idle fold
+    // MARK: - prune_fold: the can't-win prune and the idle fold
 
     /// Sec. 3.2's prune and Sec. 4.2's idle fold, on ONE store.
     ///
@@ -517,7 +223,7 @@ public enum PaperCasesStore {
         return out
     }
 
-    // MARK: - p08: Table 3, scan latency through the shipped store
+    // MARK: - scan_ladder: scan latency through the shipped store
 
     /// Table 3's scan columns, measured through `VectorStore.search` rather than a bare matmul, so
     /// the number includes the reduce, the per-file grouping and (in the 4-bit arm) the exact rerank
@@ -646,10 +352,10 @@ public enum PaperCasesStore {
         return out
     }
 
-    // MARK: - p09: the selection floor and the two-stage comparison
+    // MARK: - select: the selection floor and the two-stage comparison
 
     /// Sec. 4.3. Selection works on the score VECTOR, not on the matrix, so a rung costs 4 B/row and
-    /// the ladder reaches an order of magnitude further than p08's.
+    /// the ladder reaches an order of magnitude further than scan_ladder's.
     ///
     /// The score stream is `selbench`'s, generated in its original consumption order (the one place
     /// in the paper module where order matters), because these numbers are compared against selection
@@ -691,7 +397,7 @@ public enum PaperCasesStore {
             }
 
             var rungTimes: [String: [Double]] = [:]
-            for arm in ["argpartition", "two_level", "strided_max", "twostage_x4"] {
+            for arm in ctx.spec.arms.map(\.id) {
                 try ctx.checkCancel()
                 guard ctx.shouldContinue else { out.truncated = true; break }
                 let times = try ctx.withArm(arm) { () -> [Double] in
@@ -782,127 +488,7 @@ public enum PaperCasesStore {
         return out
     }
 
-    // MARK: - p19: the cap sweep that identifies the crossover claim
-
-    /// One machine, one corpus, one accelerator, three memory caps.
-    ///
-    /// The cross-machine crossover table cannot separate memory from accelerator width: the parts
-    /// are rank-ordered on both at once, and that table pins ONE cap on every column, so the term
-    /// the claim is about does not vary in the experiment the claim is drawn from. Here everything
-    /// except the cap is held fixed, which is the only arrangement in which the cap can be shown to
-    /// decide anything. If the crossover moves with the cap on one machine, the claim is identified.
-    /// If it does not move, the claim was about the device all along and the paper has to say so.
-    ///
-    /// The cap moves through the shipped setter, so it reaches the buffer cache, the packing budget
-    /// and the page cache exactly as a user changing the setting would. Rows are the same seeded
-    /// vectors at every cap; the store is rebuilt per cap because the representation it holds is
-    /// what the cap decides.
-    static let capSweepBody: PaperCaseBody = { ctx in
-        var out = PaperCaseOutput()
-        let p = ctx.params
-        let dim = p.int("dim")
-        let queries = p.int("queries_per_rung")
-        let caps = p.ints("caps_mb").map { $0 * 1_000_000 }
-        let ladder = p.ints("ladder")
-        var completed: [String] = []
-
-        for cap in caps {
-            try ctx.checkCancel()
-            guard ctx.shouldContinue else { out.truncated = true; break }
-            let capMB = cap / 1_000_000
-            for target in orderedUnique(ladder.map { ($0 / chunksPerFile) * chunksPerFile }) {
-                try ctx.checkCancel()
-                guard ctx.shouldContinue else { out.truncated = true; break }
-                // The rung has to fit the cap being tested, or the sweep measures paging rather
-                // than the policy. Skipped rungs are recorded, never silently dropped.
-                let peakMB = PaperCaseCatalog.storePeakMB(rows: target, quantized: true)
-                if peakMB > 0.60 * Double(capMB) {
-                    out.add(PaperFact("cap\(capMB).n\(target)", "skipped: rung exceeds the cap under test"))
-                    continue
-                }
-                let name = "p19-c\(capMB)-n\(target).sqlite"
-                let store = try ctx.fs.store(named: name)
-                ctx.progress("cap \(capMB) MB, rung \(target) - building")
-                let built = try PaperVectors.buildStore(
-                    rows: target, into: store, chunksPerFile: chunksPerFile, snippetChars: 0, dim: dim,
-                    deadline: ctx.deadline, cancelled: { ctx.isCancelled },
-                    progress: { ctx.progress("cap \(capMB) - built \($0) rows") })
-                guard built == target else {
-                    ctx.fs.discard(store, named: name)
-                    out.truncated = true
-                    break
-                }
-
-                // TWO PASSES PER POINT, INTERLEAVED BY ARM.
-                //
-                // Repeating the whole suite on one machine moved these cells by up to 18%, against
-                // a total spread of 0.35 to 0.61 across a fourfold cap change: the run-to-run noise
-                // was the size of the effect, so a single pass per cell cannot support a claim in
-                // either direction. Each pass rebuilds the base and re-warms, because that is where
-                // the variance lives; the reported value is the median of the pass medians, and the
-                // export carries both so a reader sees the spread rather than a point estimate.
-                //
-                // Interleaved, not blocked: two passes of one arm followed by two of the other
-                // would attribute any drift during the case to whichever arm ran second.
-                var armPassMedians: [String: [Double]] = ["bf16": [], "bit1": []]
-                var armBits: [String: Int] = [:]
-                let passes = 2
-                for pass in 0 ..< passes {
-                    for (armLabel, bits, mult) in [("bf16", 0, 1), ("bit1", 1, 2)] {
-                        try ctx.checkCancel()
-                        guard ctx.shouldContinue else { out.truncated = true; break }
-                        let arm = "cap\(capMB).\(armLabel)"
-                        let levers = PaperLeverSet(quantBase: .bits(bits),
-                                                   bitCandidateMultiplier: mult,
-                                                   memoryCapBytes: cap)
-                        let r = try ctx.levers.withArm(arm, levers) { () -> (times: [Double], bits: Int) in
-                            store.invalidateBaseForBenchmark()
-                            MLX.Memory.clearCache()
-                            for w in 0 ..< 3 {
-                                _ = store.search(PaperVectors.query(900 + w, dim: dim),
-                                                 filter: SearchFilter(), topK: searchTopK)
-                            }
-                            let t = try timedQueries(store, count: queries, dim: dim,
-                                                     queryBase: pass * queries, ctx: ctx,
-                                                     dumpHits: false,
-                                                     label: "cap\(capMB) n\(target) \(armLabel) pass \(pass + 1)")
-                            return (t.milliseconds, store.baseModeBits)
-                        }
-                        guard !r.times.isEmpty else { out.truncated = true; break }
-                        out.ran(arm)
-                        armPassMedians[armLabel, default: []].append(percentile(r.times.sorted(), 0.5))
-                        armBits[armLabel] = r.bits
-                    }
-                }
-                var armTimes: [String: Double] = [:]
-                for (armLabel, medians) in armPassMedians where !medians.isEmpty {
-                    let arm = "cap\(capMB).\(armLabel)"
-                    out.add("cap\(capMB).n\(target).\(armLabel)_p50", medians, unit: .milliseconds, arm: arm)
-                    // The realised representation, per point. A forcing that did not take would
-                    // otherwise appear as a cap effect.
-                    out.add(PaperFact("cap\(capMB).n\(target).\(armLabel)_base_bits",
-                                      armBits[armLabel] ?? -1, arm: arm))
-                    armTimes[armLabel] = percentile(medians.sorted(), 0.5)
-                }
-                if let a = armTimes["bf16"], let b = armTimes["bit1"], b > 0 {
-                    out.add(PaperMetric.derived("cap\(capMB).n\(target).speedup", value: a / b, unit: .speedup,
-                                                from: ["cap\(capMB).n\(target).bf16_p50",
-                                                       "cap\(capMB).n\(target).bit1_p50"],
-                                                note: "exact scan over the funnel at this cap: "
-                                                    + "above one the funnel is ahead"))
-                    completed.append("c\(capMB)n\(target)")
-                }
-                ctx.fs.discard(store, named: name)
-                MLX.Memory.clearCache()
-            }
-        }
-        out.extraParameters.set("points_completed",
-                                completed.isEmpty ? .text("none") : .texts(completed))
-        out.extraParameters.set("top_k", .int(searchTopK))
-        return out
-    }
-
-    // MARK: - p20: accuracy and latency of the coarse tier, on one grid
+    // MARK: - recall: accuracy and latency of the coarse tier, on one grid
 
     /// The frontier, not a single point.
     ///
@@ -1138,7 +724,7 @@ public enum PaperCasesStore {
         return out
     }
 
-    // MARK: - p10: Sec. 4.6, the compaction peak
+    // MARK: - compaction: the compaction peak
 
     /// The highest-value per-machine memory number in the paper, because Limitation 1 is that every
     /// memory figure came off a 512 GB box.
@@ -1374,7 +960,7 @@ private struct PaperCompactSample {
     let dbMB: Double
 }
 
-/// One p06 pass's query sets. A set is usable only when it holds every query it asked for; a short
+/// One search_while_indexing pass's query sets. A set is usable only when it holds every query it asked for; a short
 /// set is dropped by the aggregation rather than averaged, so a distribution never mixes queries
 /// taken under the intended cadence with queries taken while the case was running out of budget.
 private struct PaperShapeSets {
@@ -1415,7 +1001,7 @@ private struct PaperShapeConfig {
     }
 }
 
-/// The background indexer p06 measures against: embed a 96-chunk flush through the engine's
+/// The background indexer search_while_indexing measures against: embed a 96-chunk flush through the engine's
 /// low-priority gate, write its rows through the store queue, repeat.
 ///
 /// Lock-guarded rather than actor-isolated: it runs on its own thread beside a synchronous case body

@@ -36,11 +36,10 @@ extension AppModel {
         // two clicks in the same runloop pass cannot both get through. The button is also disabled
         // while running and the progress sheet is modal - three independent locks, because the
         // second run would race the first one's levers on process-wide statics.
-        guard !isPaperRunning, !isProfilingRunning, phase == .ready, let engine = paperEngine else { return }
+        guard !isPaperRunning, phase == .ready, let engine = paperEngine else { return }
         // Captured on the main actor, before the detached work: the live family measures the user's
         // own corpus, and reaching for the store from the detached task would touch actor-isolated
         // state. nil when no index is open, which the live cases report rather than measure around.
-        let live = paperLiveIndex
         // Claimed BEFORE the preflight, not after: the battery confirmation runs a nested modal run
         // loop, which drains the main queue - so a second click's queued Task ran there and passed
         // the guard above while the first was still asking. Both runs then raced the same statics.
@@ -122,7 +121,7 @@ extension AppModel {
             fs = try PaperFS(runId: runId, corpusVersion: Self.paperCorpusVersion,
                              protectedIndexURLs: paperProtectedIndexURLs)
         } catch {
-            paperAlert("Paper benchmark could not start",
+            paperAlert("The benchmark could not start",
                        "Its scratch directory could not be created: \(error.localizedDescription)")
             return
         }
@@ -163,7 +162,7 @@ extension AppModel {
                 progress: { publishDetail($0) },
                 cancelled: { cancel.on })
             let result = PaperSuite.run(config: config, engine: engine, fs: fs,
-                                        bodies: paperCaseBodies(), live: live,
+                                        bodies: paperCaseBodies(),
                                         isCancelled: { cancel.on },
                                         onProgress: { p in
                                             Task { @MainActor in self?.applyPaperProgress(p) }
@@ -174,6 +173,13 @@ extension AppModel {
         lastPaperReport = outcome.report
         lastPaperReportText = outcome.text
         lastPaperReportURL = outcome.savedTxtURL
+        // A cancelled run is a partial table, kept locally and never shared.
+        if !cancel.on, outcome.report.result.status == .complete || outcome.report.result.status == .partial,
+           ProfilingService.ensureConsent() {
+            let payload = BenchUpload(report: outcome.report, appVersion: Self.appVersion, model: modelVariant.rawValue)
+            Task { await ProfilingService.upload(payload) }
+        }
+        shareProfilingResults = ProfilingService.uploadsEnabled
 
         // Hand the sheet over rather than swapping the route in one tick: dismissing and presenting
         // in the same runloop pass drops the incoming sheet often enough to be a bug, and the thing
@@ -205,12 +211,6 @@ extension AppModel {
         // The paper's reference checkpoint is Nano (Table 1). A mixed-variant table is worthless,
         // and Nano is also the only variant that leaves headroom at 8 GB. Never switched here:
         // switchVariant reloads the engine and can mark the real index obsolete.
-        guard modelVariant == .nano else {
-            paperAlert("Paper benchmark needs Omni Nano",
-                       "This run is loaded with Omni \(modelVariant.rawValue.capitalized). "
-                       + "Switch to Nano in Settings > Storage > Model, then run it again.")
-            return false
-        }
         // Refused, not stopped: stopping the server would mutate a user setting. An external client
         // embedding or searching mid-run would use the benchmark's levers against the user's store.
         guard !serving.isRunning else {
@@ -250,9 +250,9 @@ extension AppModel {
         }
         // The run writes several stores plus a VACUUM transient into $TMPDIR.
         let freeBytes = SystemProbe.statics().diskFreeBytes ?? Int.max
-        guard freeBytes >= 2_000_000_000 else {
+        guard freeBytes >= 6_000_000_000 else {
             paperAlert("Not enough free disk",
-                       String(format: "The run needs about 2 GB of scratch space and there is %.1f GB free.",
+                       String(format: "The run needs about 6 GB of scratch space and there is %.1f GB free.",
                               Double(freeBytes) / 1_000_000_000))
             return false
         }
@@ -261,7 +261,7 @@ extension AppModel {
         if snap.powerSource == "battery" {
             let a = NSAlert()
             a.messageText = "Running on battery"
-            a.informativeText = "Apple silicon clocks differently on battery, and this takes up to 25 minutes. "
+            a.informativeText = "Apple silicon clocks differently on battery, and this takes \(BenchmarkDuration.minutesLabel). "
                 + "Plugging in gives numbers that merge with other machines'."
             a.addButton(withTitle: "Run anyway")
             a.addButton(withTitle: "Cancel")
@@ -312,4 +312,11 @@ private func renderPaperOutcome(result: PaperSuiteResult, engine: OmniEngine, fs
     try? FileManager.default.removeItem(at: fs.storesDir)
     try? FileManager.default.removeItem(at: fs.scratchDir)
     return PaperRunOutcome(report: report, text: text, savedTxtURL: saved?.txt)
+}
+
+/// How long a full run takes; shown in Settings and in the battery prompt. 11.5 minutes measured on
+/// the M3 Ultra (2026-10-08); the case budgets sum to 80 minutes, which no run can exceed. Replace
+/// the range with measured numbers once the smaller Macs have run it.
+enum BenchmarkDuration {
+    static let minutesLabel = "10 to 80 minutes, depending on the Mac"
 }

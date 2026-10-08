@@ -686,44 +686,29 @@ private struct PerformanceTab: View {
             Section {
                 LabeledContent("Benchmark this Mac") {
                     HStack(spacing: 8) {
-                        Button("Run benchmark") { Task { await model.runProfiling() } }
-                            .controlSize(.small)
-                            .disabled(model.isProfilingRunning || model.isPaperRunning || !model.canIndex)
-                        // Hidden developer control (PaperGate: OMNI_PAPER=1, the omni.paper default,
-                        // or Option held). Absent rather than disabled when the gate is closed.
-                        // Gated on phase == .ready, NOT canIndex: the paper suite measures a
-                        // self-contained synthetic workload and is exactly as valid on a machine
-                        // where the user has never picked a folder.
-                        PaperGated {
-                            // Opens the main window FIRST: the progress sheet - and the only Cancel
-                            // button a 25-minute run has - is presented by ContentView, and the main
-                            // window is closable while Settings stays open. Started from there with
-                            // it closed, the run had no progress, no cancel and no result sheet, and
-                            // indexing stayed suppressed until it finished on its own.
-                            Button("Paper") {
-                                openWindow(id: "main")
-                                Task { await model.runPaperBenchmark() }
-                            }
-                            .controlSize(.small)
-                            .disabled(model.isPaperRunning || model.isProfilingRunning || model.phase != .ready)
-                            .help("Up to 25 minutes on synthetic data")
+                        if let r = model.lastPaperReport {
+                            Button("Show results") { model.activeSheet = .paperResult(r.result.runId) }
+                                .controlSize(.small)
+                                .disabled(model.isPaperRunning)
                         }
+                        // Opens the main window FIRST: the progress sheet - and the only Cancel button
+                        // the run has - is presented by ContentView, and the main window is closable
+                        // while Settings stays open.
+                        Button("Run benchmark") {
+                            openWindow(id: "main")
+                            Task { await model.runPaperBenchmark() }
+                        }
+                        .controlSize(.small)
+                        .disabled(model.isPaperRunning || model.phase != .ready)
                     }
                 }
                 Toggle(isOn: Binding(get: { model.shareProfilingResults }, set: { model.shareProfilingResults = $0 })) {
                     Text("Share results")
                 }
-                if let r = model.lastProfilingReport {
-                    LabeledContent("Last run") {
-                        Text(String(format: "%.0f files/sec \u{00B7} %.1f GB peak memory",
-                                    r.metrics.filesPerSec, Double(r.metrics.peakVramDeltaBytes) / 1_073_741_824))
-                            .foregroundStyle(.secondary)
-                    }
-                }
             } header: {
-                Text("Profiling")
+                Text("Benchmark")
             } footer: {
-                Text("Sharing sends hardware and timings to hanxiao.io/omni, never files.")
+                Text("Measures indexing, queries and search under heavy writes on data it generates, in \(BenchmarkDuration.minutesLabel). Sharing sends hardware and timings to hanxiao.io/omni, never files.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

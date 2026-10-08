@@ -1,4 +1,6 @@
 import Foundation
+import AVFoundation
+import CoreVideo
 
 // The synthetic corpus the indexing cases run over.
 //
@@ -14,7 +16,7 @@ import Foundation
 //
 //  1. Sizes come from a fixed 100-entry table indexed by `i % 100`, not by `hash(i) % 100` as the
 //     plan first sketched. With a hash the bucket counts are only probabilistic, so neither the
-//     total byte count nor the plan's "at least 150 files with 5+ chunks" (which p05 depends on)
+//     total byte count nor the plan's "at least 150 files with 5+ chunks" (which save_edit depends on)
 //     is guaranteed - and a merge key that is only probably right is not a merge key. The table is
 //     a fixed permutation, so any prefix of it is still a mixed sample for a `--scale` run.
 //  2. Text is English words sampled with a head bias, not uniformly over the vocabulary and
@@ -41,13 +43,18 @@ import Foundation
 public struct PaperCorpusSpec: Sendable, Equatable, Codable {
     /// Bumped deliberately, exactly like `ProfilingService.datasetVersion`. A bump produces a new
     /// cache directory rather than silently reusing old bytes under a new meaning.
-    public static let version = "paper-corpus-1"
+    public static let version = "bench-corpus-2"
     /// The one seed. ASCII "OMNI_P1L". Every stream in this file derives from it by index.
     public static let seed: UInt64 = 0x4F4D_4E49_5F50_314C
 
     public var textFiles: Int
     public var wideFiles: Int
     public var images: Int
+    /// 16 kHz mono PCM clips, synthesized with integer arithmetic so every byte is pinned.
+    public var audioClips: Int
+    /// H.264 clips. Their pixels are pinned and their container bytes are not - the system encoder
+    /// owns those - so they are left out of the manifest hash and stamped by their parameters.
+    public var videoClips: Int
     /// Side of the synthetic PNGs. Not scaled: 512 is what the vision tower's patch packing is
     /// measured at, and a smaller image would measure a different code path, not less of the same.
     public var imagePixels: Int
@@ -56,9 +63,10 @@ public struct PaperCorpusSpec: Sendable, Equatable, Codable {
     /// reproduce the real corpus's measured 3.15% cross-file chunk duplication.
     public var duplicateParagraphPermille: Int
 
-    public init(textFiles: Int = 600, wideFiles: Int = 4000, images: Int = 16,
-                imagePixels: Int = 512, duplicateParagraphPermille: Int = 120) {
+    public init(textFiles: Int = 600, wideFiles: Int = 4000, images: Int = 48, audioClips: Int = 12,
+                videoClips: Int = 6, imagePixels: Int = 512, duplicateParagraphPermille: Int = 120) {
         self.textFiles = textFiles; self.wideFiles = wideFiles; self.images = images
+        self.audioClips = audioClips; self.videoClips = videoClips
         self.imagePixels = imagePixels; self.duplicateParagraphPermille = duplicateParagraphPermille
     }
 
@@ -69,7 +77,8 @@ public struct PaperCorpusSpec: Sendable, Equatable, Codable {
         func shrink(_ v: Int, _ floor: Int) -> Int {
             scale == 1.0 ? v : max(floor, Int((Double(v) * scale).rounded()))
         }
-        self.init(textFiles: shrink(600, 24), wideFiles: shrink(4000, 100), images: shrink(16, 4))
+        self.init(textFiles: shrink(600, 24), wideFiles: shrink(4000, 100), images: shrink(48, 4),
+                  audioClips: shrink(12, 2), videoClips: shrink(6, 2))
     }
 
     /// Directory tag for `PaperFS(corpusVersion:)`. A scaled corpus gets its own directory: it is a
@@ -77,22 +86,13 @@ public struct PaperCorpusSpec: Sendable, Equatable, Codable {
     /// mean one of the two is silently wrong.
     public var directoryTag: String {
         self == PaperCorpusSpec() ? Self.version
-            : "\(Self.version)-t\(textFiles)-w\(wideFiles)-i\(images)"
+            : "\(Self.version)-t\(textFiles)-w\(wideFiles)-i\(images)-a\(audioClips)-v\(videoClips)"
     }
 
-    public var totalFiles: Int { textFiles + wideFiles + images }
+    /// Files the manifest hash covers: everything but the video clips.
+    public var hashedFiles: Int { textFiles + wideFiles + images + audioClips }
+    public var totalFiles: Int { hashedFiles + videoClips }
 
-}
-
-/// Which edit p05 applies. Raw values match the catalog's `edits` parameter, so the arm name in the
-/// export and the edit actually performed cannot drift apart.
-public enum PaperTextEdit: String, Sendable, Codable, CaseIterable {
-    /// One line appended. Every earlier chunk boundary stays byte-identical - the best case for
-    /// chunk reuse, and the most common real edit (notes, logs, appended sections).
-    case append
-    /// One line inserted at the byte midpoint. Every boundary after the edit shifts, so only the
-    /// chunks before it can be reused. The honest average case.
-    case mid
 }
 
 /// A generated (or cached) corpus tree, with everything the export and the case bodies need.
@@ -110,11 +110,16 @@ public struct PaperCorpus: Sendable {
 
     /// The crawl root: contains exactly `spec.totalFiles` files and nothing else.
     public var treeRoot: URL { root.appendingPathComponent("corpus", isDirectory: true) }
-    /// p03's index pass and p05's edit sources. Text only, so a media file cannot change the
+    /// index_text's pass and save_edit's sources. Text only, so a media file cannot change the
     /// token count or the batch composition.
     public var textRoot: URL { treeRoot.appendingPathComponent("text", isDirectory: true) }
-    /// p12 only.
+    /// index_image and the image query.
     public var imagesRoot: URL { treeRoot.appendingPathComponent("images", isDirectory: true) }
+    public var audioRoot: URL { treeRoot.appendingPathComponent("audio", isDirectory: true) }
+    public var videoRoot: URL { treeRoot.appendingPathComponent("video", isDirectory: true) }
+    public func imageURL(_ i: Int) -> URL { root.appendingPathComponent(Self.imageRelativePath(i)) }
+    public func audioURL(_ i: Int) -> URL { root.appendingPathComponent(Self.audioRelativePath(i)) }
+    public func videoURL(_ i: Int) -> URL { root.appendingPathComponent(Self.videoRelativePath(i)) }
 
     public var totalBytes: Int { textBytes + wideBytes + imageBytes }
 
@@ -123,7 +128,8 @@ public struct PaperCorpus: Sendable {
     public var stamp: PaperCorpusStamp {
         PaperCorpusStamp(version: PaperCorpusSpec.version, seed: PaperCorpusSpec.seed,
                          fnv1a64: fnv1a64, textFiles: spec.textFiles, textBytes: textBytes,
-                         wideFiles: spec.wideFiles, images: spec.images)
+                         wideFiles: spec.wideFiles, images: spec.images,
+                         audioClips: spec.audioClips, videoClips: spec.videoClips)
     }
 
     // MARK: - Generation
@@ -147,7 +153,9 @@ public struct PaperCorpus: Sendable {
            let stored = try? JSONDecoder().decode(StoredManifest.self, from: data),
            stored.spec == spec,
            let digest = try? manifestDigest(of: tree),
-           digest.hex == stored.fnv1a64, digest.files == spec.totalFiles {
+           digest.hex == stored.fnv1a64, digest.files == spec.hashedFiles,
+           (0 ..< spec.videoClips).allSatisfy({ fm.fileExists(atPath: tree.appendingPathComponent(
+               String(videoRelativePath($0).dropFirst("corpus/".count))).path) }) {
             return PaperCorpus(root: root, spec: spec, textBytes: stored.textBytes,
                                wideBytes: stored.wideBytes, imageBytes: stored.imageBytes,
                                fnv1a64: stored.fnv1a64, regenerated: false)
@@ -162,13 +170,15 @@ public struct PaperCorpus: Sendable {
         let textBytes = try writeTextFiles(spec: spec, into: tree, progress: progress, cancelled: cancelled)
         let wideBytes = try writeWideFiles(spec: spec, into: tree, progress: progress, cancelled: cancelled)
         let imageBytes = try writeImages(spec: spec, into: tree, progress: progress, cancelled: cancelled)
+        _ = try writeAudio(spec: spec, into: tree, progress: progress, cancelled: cancelled)
+        try writeVideo(spec: spec, into: tree, progress: progress, cancelled: cancelled)
 
         progress("Hashing corpus\u{2026}")
         let digest = try manifestDigest(of: tree)
         // Loud rather than silent: a tree with the wrong file count would still hash to something,
         // and that something would look like a legitimate merge key.
-        guard digest.files == spec.totalFiles else {
-            throw OmniError.store("paper corpus wrote \(digest.files) files, expected \(spec.totalFiles)")
+        guard digest.files == spec.hashedFiles else {
+            throw OmniError.store("paper corpus wrote \(digest.files) files, expected \(spec.hashedFiles)")
         }
         let stamp = StoredManifest(spec: spec, fnv1a64: digest.hex, textBytes: textBytes,
                                    wideBytes: wideBytes, imageBytes: imageBytes)
@@ -195,100 +205,8 @@ public struct PaperCorpus: Sendable {
     /// Byte size of text file `i`, exactly. Chosen from the fixed table, so this is arithmetic.
     public static func textFileBytes(_ i: Int) -> Int { sizeTable[i % sizeTable.count] }
 
-    /// Chunks the indexer will make of text file `i`, under the paper's pinned chunking.
-    ///
-    /// Exact, not estimated, for three reasons that all hold here and would not hold for a real
-    /// corpus: the content is pure ASCII (so bytes == Characters), `FileExtractor.extractText`
-    /// trims exactly the one trailing newline this generator writes, and `Indexer.chunk` walks
-    /// fixed `limit`/`step` character offsets (Indexer.swift:1482-1516).
-    public static func predictedChunks(_ i: Int) -> Int {
-        predictedChunks(forCharacters: textFileBytes(i) - 1)
-    }
-
-    public static func predictedChunks(forCharacters n: Int,
-                                       limit: Int = IndexSettings.paper.maxCharsPerChunk,
-                                       overlap: Int = defaultChunkOverlap) -> Int {
-        guard n > limit else { return 1 }
-        let step = max(1, limit - overlap)
-        return 1 + (n - limit + step - 1) / step
-    }
-
-    /// `Indexer.chunkOverlap`'s shipped default (Indexer.swift:264). Mirrored rather than read
-    /// because it is an instance property and constructing an Indexer to ask would need a store.
-    /// If it ever moves, `predictedChunks` is wrong and p05's file selection must be rechecked.
+    /// `Indexer.chunkOverlap`'s shipped default, for the tail-row case's chunk-length fixture.
     public static let defaultChunkOverlap = 200
-
-    /// Text files with at least `minChunks` chunks, in index order. p05 needs multi-chunk files: an
-    /// append edit to a single-chunk file rewrites the only chunk there is, and would measure
-    /// nothing. With the shipped table this returns the 25% of files at 8 KiB and above - 150 of
-    /// the 600, exactly as the sizing justification claims.
-    public func multiChunkFileIndices(minChunks: Int, limit: Int = .max) -> [Int] {
-        var out: [Int] = []
-        for i in 0 ..< spec.textFiles where Self.predictedChunks(i) >= minChunks {
-            out.append(i)
-            if out.count >= limit { break }
-        }
-        return out
-    }
-
-    // MARK: - The edit tree (p05)
-
-    /// Copy `files` multi-chunk text files into `dir` as a flat, self-contained tree.
-    ///
-    /// Flat and copied rather than edited in place, for two reasons. The corpus is shared between
-    /// cases and between the two arms, so editing it would make arm 2 index arm 1's leftovers; and
-    /// both arms must start from byte-identical trees or the cross-arm vector diff proves nothing.
-    /// The destination is created by `PaperFS.scratch(named:)`, which is what keeps this inside the
-    /// run directory.
-    @discardableResult
-    public func stageEditTree(files: Int, minChunks: Int, into dir: URL) throws -> [URL] {
-        let fm = FileManager.default
-        let indices = multiChunkFileIndices(minChunks: minChunks, limit: files)
-        guard indices.count == files else {
-            throw OmniError.store("paper corpus has \(indices.count) files with \(minChunks)+ chunks, needs \(files)")
-        }
-        var out: [URL] = []
-        out.reserveCapacity(indices.count)
-        for i in indices {
-            let src = textFileURL(i)
-            // Flat names keep the copied tree independent of the corpus's directory layout, and
-            // the index prefix keeps them unique and ordered.
-            let dst = dir.appendingPathComponent(src.lastPathComponent)
-            try? fm.removeItem(at: dst)
-            try fm.copyItem(at: src, to: dst)
-            out.append(dst)
-        }
-        return out
-    }
-
-    /// The exact bytes an edit adds. Fixed strings, so the two arms edit identically and the
-    /// re-indexed vectors are comparable bit for bit.
-    public static func editLine(_ edit: PaperTextEdit) -> String {
-        switch edit {
-        case .append: "\nAppended line for the paper benchmark.\n"
-        case .mid: "\nInserted line for the paper benchmark.\n"
-        }
-    }
-
-    /// Apply one edit in place. Append seeks to the end (the FSEvents save path's cheapest case);
-    /// mid splices at the byte midpoint, which shifts every later chunk boundary.
-    public static func applyEdit(_ edit: PaperTextEdit, to url: URL) throws {
-        let line = Data(editLine(edit).utf8)
-        switch edit {
-        case .append:
-            let fh = try FileHandle(forWritingTo: url)
-            defer { try? fh.close() }
-            try fh.seekToEnd()
-            try fh.write(contentsOf: line)
-        case .mid:
-            let data = try Data(contentsOf: url)
-            let cut = data.count / 2
-            var out = Data(data.prefix(cut))
-            out.append(line)
-            out.append(data.suffix(from: cut))
-            try out.write(to: url)
-        }
-    }
 
     // MARK: - Content (pure functions of the index)
 
@@ -352,7 +270,7 @@ public struct PaperCorpus: Sendable {
         var rng = PaperCorpusRNG(stream: stream, tag: 0x46494C4C)       // "FILL"
         var s = ""
         s.reserveCapacity(characters + 16)
-        // Length tracked rather than re-counted: this runs once per row, and p10 builds 120,000 of
+        // Length tracked rather than re-counted: this runs once per row, and compaction builds 120,000 of
         // them. ASCII throughout, so the character count is the byte count.
         var length = 0
         while length < characters {
@@ -379,6 +297,18 @@ public struct PaperCorpus: Sendable {
     public static func imageRelativePath(_ i: Int) -> String {
         String(format: "corpus/images/img%02d.png", i)
     }
+
+    public static func audioRelativePath(_ i: Int) -> String {
+        String(format: "corpus/audio/clip%02d.wav", i)
+    }
+
+    public static func videoRelativePath(_ i: Int) -> String {
+        String(format: "corpus/video/clip%02d.mp4", i)
+    }
+
+    /// Clip `i` lasts 6 to 20 seconds, so the media rows see a spread of decode lengths.
+    public static func audioSeconds(_ i: Int) -> Int { 6 + (i * 5) % 15 }
+    public static func videoSeconds(_ i: Int) -> Int { 4 + (i * 3) % 9 }
 
     // MARK: - Prose
 
@@ -520,6 +450,108 @@ public struct PaperCorpus: Sendable {
         return bytes
     }
 
+    /// 16-bit mono PCM at 16 kHz: two square-wave voices on an index-derived pitch ladder with an
+    /// integer amplitude envelope. Integer arithmetic throughout, so the bytes are identical
+    /// everywhere; the header is written by hand for the same reason.
+    private static func writeAudio(spec: PaperCorpusSpec, into tree: URL,
+                                   progress: (String) -> Void, cancelled: () -> Bool) throws -> Int {
+        try FileManager.default.createDirectory(at: tree.appendingPathComponent("audio", isDirectory: true),
+                                                withIntermediateDirectories: true)
+        let rate = 16_000
+        var bytes = 0
+        for i in 0 ..< spec.audioClips {
+            if cancelled() { throw CancellationError() }
+            progress("Generating corpus audio \(i)/\(spec.audioClips)")
+            let n = audioSeconds(i) * rate
+            var pcm = [UInt8](); pcm.reserveCapacity(n * 2)
+            for t in 0 ..< n {
+                let note = (t / (rate / 4) + i) % 8
+                let p1 = rate / (220 + note * 55), p2 = rate / (330 + (note * 3 % 8) * 40)
+                let v1 = (t % p1) < p1 / 2 ? 1 : -1, v2 = (t % p2) < p2 / 2 ? 1 : -1
+                let env = 2_000 + (t % (rate / 4)) * 8_000 / (rate / 4)
+                let sample = Int16(clamping: (v1 * env + v2 * env / 2))
+                pcm.append(UInt8(truncatingIfNeeded: sample)); pcm.append(UInt8(truncatingIfNeeded: sample >> 8))
+            }
+            var wav = Data("RIFF".utf8)
+            func le32(_ v: Int) { var x = UInt32(v).littleEndian; wav.append(Data(bytes: &x, count: 4)) }
+            func le16(_ v: Int) { var x = UInt16(v).littleEndian; wav.append(Data(bytes: &x, count: 2)) }
+            le32(36 + pcm.count); wav.append(Data("WAVEfmt ".utf8)); le32(16); le16(1); le16(1)
+            le32(rate); le32(rate * 2); le16(2); le16(16); wav.append(Data("data".utf8)); le32(pcm.count)
+            wav.append(contentsOf: pcm)
+            try wav.write(to: tree.appendingPathComponent(String(audioRelativePath(i).dropFirst("corpus/".count))))
+            bytes += wav.count
+        }
+        return bytes
+    }
+
+    /// H.264 at 320x240 and 2 fps: each frame is a painted image, so the decoded pixels are pinned
+    /// even where the encoder's container bytes are not.
+    private static func writeVideo(spec: PaperCorpusSpec, into tree: URL,
+                                   progress: (String) -> Void, cancelled: () -> Bool) throws {
+        try FileManager.default.createDirectory(at: tree.appendingPathComponent("video", isDirectory: true),
+                                                withIntermediateDirectories: true)
+        let (w, h, fps) = (320, 240, 2)
+        for i in 0 ..< spec.videoClips {
+            if cancelled() { throw CancellationError() }
+            progress("Generating corpus video \(i)/\(spec.videoClips)")
+            let url = tree.appendingPathComponent(String(videoRelativePath(i).dropFirst("corpus/".count)))
+            try? FileManager.default.removeItem(at: url)
+            let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+            let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
+                AVVideoCodecKey: AVVideoCodecType.h264, AVVideoWidthKey: w, AVVideoHeightKey: h])
+            input.expectsMediaDataInRealTime = false
+            let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: w, kCVPixelBufferHeightKey as String: h])
+            writer.add(input)
+            guard writer.startWriting() else { throw OmniError.store("video writer: \(String(describing: writer.error))") }
+            writer.startSession(atSourceTime: .zero)
+            for f in 0 ..< videoSeconds(i) * fps {
+                while !input.isReadyForMoreMediaData { usleep(2_000) }
+                var pb: CVPixelBuffer?
+                guard let pool = adaptor.pixelBufferPool,
+                      CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pb) == kCVReturnSuccess, let pb
+                else { throw OmniError.store("video pixel buffer") }
+                let rgb = paintFrame(clip: i, frame: f, width: w, height: h)
+                CVPixelBufferLockBaseAddress(pb, [])
+                if let base = CVPixelBufferGetBaseAddress(pb)?.assumingMemoryBound(to: UInt8.self) {
+                    let stride = CVPixelBufferGetBytesPerRow(pb)
+                    for y in 0 ..< h {
+                        for x in 0 ..< w {
+                            let s = (y * w + x) * 3, d = y * stride + x * 4
+                            base[d] = rgb[s + 2]; base[d + 1] = rgb[s + 1]; base[d + 2] = rgb[s]; base[d + 3] = 255
+                        }
+                    }
+                }
+                CVPixelBufferUnlockBaseAddress(pb, [])
+                adaptor.append(pb, withPresentationTime: CMTime(value: CMTimeValue(f), timescale: CMTimeScale(fps)))
+            }
+            input.markAsFinished()
+            let done = DispatchSemaphore(value: 0)
+            writer.finishWriting { done.signal() }
+            done.wait()
+            guard writer.status == .completed else { throw OmniError.store("video writer: \(String(describing: writer.error))") }
+        }
+    }
+
+    /// A video frame: the image painter's recipe at the frame's size, its squares stepped by frame.
+    static func paintFrame(clip i: Int, frame f: Int, width w: Int, height h: Int) -> [UInt8] {
+        var px = [UInt8](repeating: 0, count: w * h * 3)
+        for y in 0 ..< h {
+            let shade = 128 + (127 * y) / max(1, h - 1)
+            for x in 0 ..< w {
+                let (r, g, b) = hue(((x * 1536) / w + i * 160 + f * 24) % 1536)
+                let o = (y * w + x) * 3
+                px[o] = UInt8((Int(r) * shade) / 255); px[o + 1] = UInt8((Int(g) * shade) / 255)
+                px[o + 2] = UInt8((Int(b) * shade) / 255)
+            }
+        }
+        let box = 48
+        let x0 = (i * 37 + f * 29) % (w - box), y0 = (i * 23 + f * 17) % (h - box)
+        for y in y0 ..< y0 + box { for x in x0 ..< x0 + box { let o = (y * w + x) * 3; px[o] = 255; px[o + 1] = 255; px[o + 2] = 255 } }
+        return px
+    }
+
     /// Row-major RGB8 pixels for image `i`: a horizontal hue ramp shaded vertically, plus
     /// `2 + i % 5` opaque squares at index-derived positions. Same visual recipe as the frame
     /// painter in omni-verify's `writeMP4`, but written with integer arithmetic only, so the bytes
@@ -596,6 +628,7 @@ public struct PaperCorpus: Sendable {
             guard values?.isRegularFile == true else { continue }
             let path = url.standardizedFileURL.path
             let relative = path.hasPrefix(base + "/") ? String(path.dropFirst(base.count + 1)) : path
+            if relative.hasPrefix("video/") { continue }   // encoder-owned bytes: see `videoClips`
             let size = values?.fileSize ?? 0
             total += size
             let body = (try? Data(contentsOf: url, options: .mappedIfSafe)) ?? Data()

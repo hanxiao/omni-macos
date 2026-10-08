@@ -2,9 +2,9 @@ import Foundation
 import MLX
 import MLXFast
 
-// The compute and indexing measurement bodies: p01 (fused attention), p02 (tail-row narrowing),
-// p03 (index pass), p04 (tokenizer share), p05 (chunk reuse on edits), p11 (thermal canary) and
-// p12 (image-tagging overhead). The store-shaped cases (p06-p10) live in `PaperCasesStore.swift`.
+// The compute and indexing measurement bodies: attention (fused attention), tail_rows (tail-row
+// narrowing), index_text (the index pass) and canary (the thermal canary). The store-shaped cases
+// live in `PaperCasesStore.swift`, the task-table cases in `BenchCases.swift`.
 //
 // Everything here is a port of an existing omni-verify bench, not a new instrument: `sdpabench`
 // (main.swift:1735), `embbench` (:1843), `tokbench` (:1894) and `editbench` (:3496). The ports keep
@@ -25,33 +25,30 @@ import MLXFast
 //  3. Every file this module creates goes through `PaperFS`, and every store is discarded in a
 //     `defer` that fires on throw, on cancel and on success. The user's index is never opened.
 //  4. Bulk is bounded. The largest allocation any of these cases makes is one 600-file text index
-//     (which the model's own activations dominate) and, in p01, three n=4888 fp32 tensors at 15 MB
+//     (which the model's own activations dominate) and, in attention, three n=4888 fp32 tensors at 15 MB
 //     each. Nothing here can wedge an 8 GB machine, which is why none of these cases declares an
 //     arithmetic peak the runner would gate on.
 public enum PaperCasesCompute {
 
-    /// The bodies this file owns. p06-p10 are the store-shaped cases and live in `PaperCasesStore`;
+    /// The bodies this file owns. The store-shaped cases live in `PaperCasesStore`;
     /// a case with no body anywhere records `skipped:unimplemented`, which is the correct outcome
     /// for "this build has no such case" and is deliberately not a measured zero.
     ///
-    /// p11 is here rather than with the store cases because it IS p01's bf16 point at n=1272,
+    /// canary is here rather than with the store cases because it IS attention's bf16 point at n=1272,
     /// measured by the same function; splitting it would have left the suite's drift stamp measured
     /// by a second copy of the same code.
     public static func body(for id: PaperCaseID) -> PaperCaseBody? {
         switch id {
-        case .p01_sdpa:      return { try sdpaCurve($0) }
-        case .p02_textlever: return { try textLever($0) }
-        case .p03_indexpass: return { try indexPass($0) }
-        case .p04_tokshare:  return { try tokenizerShare($0) }
-        case .p05_editreuse: return { try editReuse($0) }
-        case .p11_canary:    return { try canary($0) }
-        case .p12_media:     return { try mediaTagging($0) }
+        case .attention:      return { try sdpaCurve($0) }
+        case .tail_rows: return { try textLever($0) }
+        case .index_text: return { try indexPass($0) }
+        case .canary:    return { try canary($0) }
         default: return nil
         }
     }
 }
 
-// MARK: - p01 / p11: fused attention
+// MARK: - attention / canary: fused attention
 
 extension PaperCasesCompute {
 
@@ -102,7 +99,7 @@ extension PaperCasesCompute {
         return out
     }
 
-    /// The thermal canary: p01's bf16 point at n=1272 and nothing else. Invoked twice by the runner,
+    /// The thermal canary: attention's bf16 point at n=1272 and nothing else. Invoked twice by the runner,
     /// which folds the pair into `canary_start` / `canary_end` and derives the drift.
     ///
     /// The metric keyed exactly `canary` (the spec's `driftMetricKey`) MUST be the TFLOPS one and
@@ -110,7 +107,7 @@ extension PaperCasesCompute {
     /// and a drift computed over milliseconds would carry the opposite sign to the one the export's
     /// warning threshold is written against.
     ///
-    /// Why this one warms by wall clock and p01 does not. The OPENING invocation is the first GPU
+    /// Why this one warms by wall clock and attention does not. The OPENING invocation is the first GPU
     /// work of the whole suite, so a single warm-up iteration left it timing the clock ramp rather
     /// than the machine: measured on the reference M3 Ultra, the opening series fell from 1.65 ms to
     /// 0.88 ms across its 20 timed iterations while the closing series was flat, which the runner
@@ -206,7 +203,7 @@ extension PaperCasesCompute {
     }
     private static func dtype(named s: String) -> DType { s == "fp32" ? .float32 : .bfloat16 }
     /// `steel_bf16` -> `sdpa_bf16`, so the exported key reads as the quantity rather than as the
-    /// kernel family: `m.p01.sdpa_bf16_n1000_tflops`.
+    /// kernel family: `m.attention.sdpa_bf16_n1000_tflops`.
     private static func armKeyPrefix(_ arm: String) -> String {
         arm.hasSuffix("fp32") ? "sdpa_fp32" : "sdpa_bf16"
     }
@@ -217,7 +214,7 @@ extension PaperCasesCompute {
     }
 }
 
-// MARK: - p02: tail-row narrowing
+// MARK: - tail_rows: tail-row narrowing
 
 extension PaperCasesCompute {
 
@@ -310,7 +307,7 @@ extension PaperCasesCompute {
     }
 }
 
-// MARK: - p03: the index pass
+// MARK: - index_text: the index pass
 
 extension PaperCasesCompute {
 
@@ -377,14 +374,6 @@ extension PaperCasesCompute {
             out.add(PaperFact("fresh_host_cpu_cores", String(format: "%.2f", fresh.hostCPUCores)))
             out.add(PaperFact("fresh_scanned", fresh.progress.scanned))
             out.add(PaperFact("fresh_failed", fresh.progress.failed))
-            // The chunk count is arithmetic for this corpus (PaperCorpus.predictedChunks is exact,
-            // not an estimate). A mismatch means the chunker moved under the generator, which would
-            // silently change every tok/s figure the suite has ever exported.
-            if !fresh.stoppedEarly, fresh.progress.embedded == corpus.spec.textFiles {
-                let predicted = (0 ..< corpus.spec.textFiles).reduce(0) { $0 + PaperCorpus.predictedChunks($1) }
-                out.add(Self.count("predicted_chunks", predicted))
-                out.add(PaperFact("chunks_match_prediction", predicted == chunks))
-            }
             if fresh.stoppedEarly {
                 out.truncated = true
                 out.note = "the fresh pass hit the case budget; its rates cover \(files) of "
@@ -453,309 +442,6 @@ extension PaperCasesCompute {
         var n = 0
         crawler.walk(shouldContinue: { !ctx.isCancelled }) { _ in n += 1 }
         return n
-    }
-}
-
-// MARK: - p04: the tokenizer's share of a flush
-
-extension PaperCasesCompute {
-
-    /// Sec. 2's "tokenizer share of a flush": one 96-chunk flush measured tokenize-only, then in
-    /// full, five times, alternating.
-    ///
-    /// `tokbench` gets the tokenise-only half by constructing its own `OmniTextEncoder`. Inside the
-    /// app that would load a second copy of the weights - roughly 1.9 GB on Nano, i.e. precisely the
-    /// allocation that wedges an 8 GB machine - so this uses `OmniEngine.tokenizeOnlyForBenchmark`,
-    /// which runs the same `tokenizeParallel` calls against the already-resident encoder.
-    ///
-    /// The reported share is tokenise-wall over full-flush wall. That is NOT tokbench's
-    /// `T_tok / (T_tok + T_gpu)`: the shipped flush overlaps tokenisation of batch K+1 with the GPU
-    /// forward of batch K, so the full flush already hides most of it. The number here is therefore
-    /// the share of the flush the tokeniser would cost if it were serialised, which is the upper
-    /// bound the section needs, and the metric says so rather than leaving a reader to assume.
-    static func tokenizerShare(_ ctx: PaperContext) throws -> PaperCaseOutput {
-        var out = PaperCaseOutput()
-        let flushChunks = ctx.params.int("flush_chunks")
-        let reps = ctx.params.int("reps")
-        let batchSize = 16      // the indexer's shipped textBatchSize, pinned for the whole suite
-
-        let chunks = Self.syntheticChunks(count: flushChunks, stream: 0x50_30_34_54)   // "P04T"
-        let batches = Self.lengthSortedBatches(chunks, batchSize: batchSize)
-        out.extraParameters.set("batches_per_flush", .int(batches.count))
-        out.extraParameters.set("chunk_chars_total", .int(chunks.reduce(0) { $0 + $1.count }))
-
-        // Warm the kernels for these shapes; a cold compile would land entirely in rep 1's full half
-        // and inflate the flush wall the share is divided by.
-        _ = ctx.engine.embedTextBatches(batches, as: .passage)
-
-        var tokenizeMs: [Double] = []
-        var flushMs: [Double] = []
-        var tokenCounts = Set<Int>()
-        for rep in 0 ..< reps {
-            guard ctx.shouldContinue else { out.truncated = true; break }
-            try ctx.checkCancel()
-            ctx.progress("rep \(rep + 1) of \(reps)")
-            let t0 = Date()
-            let tokens = ctx.engine.tokenizeOnlyForBenchmark(batches, as: .passage)
-            tokenizeMs.append(-t0.timeIntervalSinceNow * 1000)
-            tokenCounts.insert(tokens)
-
-            let t1 = Date()
-            _ = ctx.engine.embedTextBatches(batches, as: .passage)
-            flushMs.append(-t1.timeIntervalSinceNow * 1000)
-        }
-
-        guard !tokenizeMs.isEmpty, !flushMs.isEmpty else {
-            out.note = "no flush completed inside the budget"
-            return out
-        }
-        out.add(PaperMetric("tokenize", runs: tokenizeMs, unit: .milliseconds))
-        out.add(PaperMetric("flush_total", runs: flushMs, unit: .milliseconds))
-        if let tokenize = Self.metric(out, "tokenize"), let flush = Self.metric(out, "flush_total"),
-           flush.value > 0 {
-            out.add(PaperMetric.derived("tokenize", value: 100 * tokenize.value / flush.value,
-                                        unit: .percent, from: ["tokenize_ms", "flush_total_ms"],
-                                        note: "tokenise wall over full-flush wall; the shipped flush "
-                                        + "overlaps tokenisation with the GPU forward, so this is the "
-                                        + "cost of serialising it, not the cost it actually pays"))
-        }
-        if let tokens = tokenCounts.first {
-            out.add(Self.count("flush_tokens", tokens))
-            out.add(PaperFact("token_count_stable", tokenCounts.count == 1))
-        }
-        return out
-    }
-}
-
-// MARK: - p05: chunk reuse on edits
-
-extension PaperCasesCompute {
-
-    /// Table 4's reindex-seconds columns: `Indexer.chunkCache` off and on, over both edit shapes,
-    /// with the cross-arm vector diff that is the only thing making the saving citable.
-    ///
-    /// The port of `editbench` keeps its two load-bearing properties. Both arms index a FRESHLY
-    /// STAGED, byte-identical copy of the same files (an in-place edit of the shared corpus would
-    /// make arm 2 index arm 1's leftovers), and every stored vector is dumped so the arms can be
-    /// compared exactly: reuse is a saving only if the vectors it skipped recomputing are the ones
-    /// it would have produced. A `false` on `vecdump_identical` invalidates the seconds columns
-    /// beside it, which is why it is a fact on the same case rather than a separate check.
-    ///
-    /// The whole arm - initial index, edit, update - runs inside one arm scope, because the chunk
-    /// cache is read on the update path but populated on the index path, and splitting them would
-    /// measure a cache the other arm filled.
-    static func editReuse(_ ctx: PaperContext) throws -> PaperCaseOutput {
-        var out = PaperCaseOutput()
-        let fileCount = ctx.params.int("files")
-        let minChunks = ctx.params.int("min_chunks_per_file")
-        let edits = ctx.params.texts("edits").compactMap { PaperTextEdit(rawValue: $0) }
-        let corpus = try Self.corpus(ctx)
-        Self.stampCorpus(&out, corpus)
-
-        editLoop: for edit in edits {
-            var dumps: [String: [String: [Float]]] = [:]
-            for arm in ctx.spec.arms {
-                guard ctx.shouldContinue else { out.truncated = true; break editLoop }
-                try ctx.checkCancel()
-                let tag = "p05-\(edit.rawValue)-\(arm.id)"
-                ctx.progress("\(edit.rawValue) \u{00B7} \(arm.id) \u{00B7} staging")
-
-                // realpath, exactly as editbench does: $TMPDIR is a symlink on macOS, and the crawl
-                // records whatever prefix it walked. If our staged URLs and the crawl's paths
-                // disagree by /var vs /private/var, `update` looks up paths the store has never seen
-                // and re-embeds everything under both arms - a 0% saving that looks like a result.
-                var dir = try ctx.fs.scratch(named: tag)
-                if let rp = realpath(dir.path, nil) {
-                    dir = URL(fileURLWithPath: String(cString: rp), isDirectory: true)
-                    free(rp)
-                }
-                let staged = try corpus.stageEditTree(files: fileCount, minChunks: minChunks, into: dir)
-                let paths = staged.map(\.path)
-
-                let storeName = tag + ".sqlite"
-                let store = try ctx.fs.store(named: storeName)
-                defer {
-                    ctx.fs.discard(store, named: storeName)
-                    try? FileManager.default.removeItem(at: dir)
-                }
-
-                let measured: (initial: Double, update: Double, tokens: Int, chunks: Int) =
-                    try ctx.withArm(arm.id) {
-                        let indexer = Indexer(store: store, embedder: ctx.engine)
-                        ctx.progress("\(edit.rawValue) \u{00B7} \(arm.id) \u{00B7} first index")
-                        let first = try Self.runIndexPass(indexer: indexer, root: dir, settings: .paper,
-                                                          force: true, label: "\(edit.rawValue) first", ctx: ctx)
-                        for url in staged { try PaperCorpus.applyEdit(edit, to: url) }
-
-                        // The measured quantity: the FSEvents save path, which is where the whole
-                        // chunk-reuse benefit lands. One indivisible unit - `update` takes no
-                        // progress callback - bounded by this file count, which is why the case's
-                        // cancel granularity is stated as a set of files rather than one.
-                        ctx.progress("\(edit.rawValue) \u{00B7} \(arm.id) \u{00B7} update")
-                        let tok0 = ctx.engine.tokensProcessed
-                        let t0 = Date()
-                        indexer.update(paths: paths, settings: .paper)
-                        let wall = -t0.timeIntervalSinceNow
-                        return (first.wallSeconds, wall, ctx.engine.tokensProcessed - tok0, store.count)
-                    }
-
-                out.ran(arm.id)
-                dumps[arm.id] = Self.vectorDump(store, paths: paths, dim: ctx.engine.dim)
-                let prefix = "\(edit.rawValue).\(arm.id)"
-                out.add(PaperMetric(prefix, runs: [measured.update], unit: .seconds, aggregate: .single, arm: arm.id))
-                out.add(PaperMetric(prefix + "_initial", runs: [measured.initial], unit: .seconds,
-                                    aggregate: .single, arm: arm.id,
-                                    note: "full forced index of the staged tree, the baseline the update is saved against"))
-                // Token counts are a VALIDITY CHECK, not a measurement: the paper carries Table 4's
-                // token columns as machine-independent. A machine whose counts differ did not run
-                // the same work and its seconds must not be merged.
-                out.add(Self.count(prefix + "_tokens", measured.tokens, arm: arm.id))
-                out.add(Self.count(prefix + "_chunks", measured.chunks, arm: arm.id))
-            }
-
-            let offKey = "\(edit.rawValue).cache_off", onKey = "\(edit.rawValue).cache_on"
-            if let off = Self.metric(out, offKey), let on = Self.metric(out, onKey), off.value > 0 {
-                out.add(PaperMetric.derived("\(edit.rawValue).saved",
-                                            value: 100 * (off.value - on.value) / off.value,
-                                            unit: .percent, from: [offKey + "_s", onKey + "_s"]))
-            }
-            // The bit-diff the plan asks for. Reported as three facts rather than one bool: an
-            // "identical: false" with no count says nothing about whether one chunk drifted at
-            // rounding level or the reuse path stored the wrong file's vectors.
-            if let a = dumps["cache_off"], let b = dumps["cache_on"] {
-                let diff = Self.dumpDifference(a, b)
-                out.add(PaperFact("\(edit.rawValue).vecdump_identical", diff.differing == 0 && diff.missing == 0))
-                out.add(PaperFact("\(edit.rawValue).vecdump_chunks", a.count))
-                out.add(PaperFact("\(edit.rawValue).vecdump_differing_chunks", diff.differing))
-                out.add(PaperFact("\(edit.rawValue).vecdump_missing_chunks", diff.missing))
-            }
-        }
-        return out
-    }
-
-    /// Every stored chunk vector for `paths`, keyed by `filename#chunk_key`.
-    ///
-    /// Keyed on the CONTENT key rather than the chunk index because that is what survives the `mid`
-    /// edit: an inserted line shifts every later chunk's index, so an index-keyed comparison would
-    /// report the whole tail as different in both arms and prove nothing. The chunk key is written
-    /// by the indexer whether or not the cache is enabled (Indexer.swift:519, :920), so both arms
-    /// produce the same key set when the reuse is correct.
-    ///
-    /// The FILE part is the last path component, not the full path. Each arm stages into its own
-    /// scratch directory (`p05-append-cache_off/` and `p05-append-cache_on/`), so a full-path key
-    /// makes the two dumps disjoint by construction: the diff then reports every chunk `missing`,
-    /// zero `differing`, and `vecdump_identical=false` on a run where the reuse was in fact exact -
-    /// which per the doc above invalidates the seconds columns beside it. `stageEditTree` copies
-    /// into a FLAT tree with the corpus file's own name, so the last component is unique per arm.
-    private static func vectorDump(_ store: VectorStore, paths: [String], dim: Int) -> [String: [Float]] {
-        var out: [String: [Float]] = [:]
-        for path in paths.sorted() {
-            let file = (path as NSString).lastPathComponent
-            for (key, vec) in store.chunkVectors(path: path, dim: dim) {
-                out[file + "#" + key] = vec
-            }
-        }
-        return out
-    }
-
-    /// Exact comparison. `differing` counts keys present in both whose bytes are not identical;
-    /// `missing` counts keys present in one dump only.
-    private static func dumpDifference(_ a: [String: [Float]], _ b: [String: [Float]]) -> (differing: Int, missing: Int) {
-        var differing = 0, missing = 0
-        for (key, va) in a {
-            guard let vb = b[key] else { missing += 1; continue }
-            if va.count != vb.count { differing += 1; continue }
-            for i in 0 ..< va.count where va[i].bitPattern != vb[i].bitPattern {
-                differing += 1
-                break
-            }
-        }
-        for key in b.keys where a[key] == nil { missing += 1 }
-        return (differing, missing)
-    }
-}
-
-// MARK: - p12: image-tagging overhead
-
-extension PaperCasesCompute {
-
-    /// Sec. 2's tagging overhead per image, over the corpus's 16 synthetic 512x512 PNGs.
-    ///
-    /// The vision tower is never loaded by this module: the runner refuses the case with
-    /// `skipped:towers` when `engine.supportsImages` is false, because reloading the engine to get
-    /// the tower would double resident VRAM, which is the exact allocation that wedges an 8 GB
-    /// machine. The guard below is the same condition restated where the work happens, so a body
-    /// invoked outside the suite fails loudly instead of measuring a text-only engine.
-    ///
-    /// A resident tower is not the same as a resident TAGGER. When the tagger is absent the `tags_on`
-    /// arm would take the identical code path as `tags_off` and report an overhead of zero that was
-    /// never measured, so it is not run at all and the case says why.
-    ///
-    /// Each round indexes into a FRESH store. Content dedup is pinned on for the whole suite, so a
-    /// second pass over the same images in the same store would reuse the stored vectors and round 2
-    /// would measure the dedup path rather than the tower.
-    static func mediaTagging(_ ctx: PaperContext) throws -> PaperCaseOutput {
-        var out = PaperCaseOutput()
-        guard ctx.engine.supportsImages else {
-            throw OmniError.model("the vision tower is not resident, so the tagging case cannot run")
-        }
-        let rounds = ctx.params.int("rounds")
-        let corpus = try Self.corpus(ctx)
-        Self.stampCorpus(&out, corpus)
-        let images = corpus.spec.images
-
-        let taggerResident = ctx.engine.tagger != nil
-        out.add(PaperFact("tagger_resident", taggerResident))
-        let arms = taggerResident ? ctx.spec.arms : ctx.spec.arms.filter { $0.id == "tags_off" }
-        if !taggerResident {
-            out.note = "the tagger is not resident, so only the tags_off arm ran and no overhead is reported"
-        }
-
-        var perImage: [String: [Double]] = [:]
-        // Round 0 is a warm-up and is discarded: the vision tower's Metal pipelines for this patch
-        // shape compile on first use, and 16 images is far too few for that to average out.
-        roundLoop: for round in 0 ... rounds {
-            for arm in arms {
-                guard ctx.shouldContinue else { out.truncated = true; break roundLoop }
-                try ctx.checkCancel()
-                let tag = "p12-r\(round)-\(arm.id)"
-                ctx.progress(round == 0 ? "warm-up \u{00B7} \(arm.id)"
-                                        : "round \(round) of \(rounds) \u{00B7} \(arm.id)")
-                var settings = IndexSettings.paperMedia
-                settings.imageTags = (arm.id == "tags_on")
-                let store = try ctx.fs.store(named: tag + ".sqlite")
-                defer { ctx.fs.discard(store, named: tag + ".sqlite") }
-                let pass = try ctx.withArm(arm.id) {
-                    try Self.runIndexPass(indexer: Indexer(store: store, embedder: ctx.engine),
-                                          root: corpus.imagesRoot, settings: settings, force: true,
-                                          label: tag, ctx: ctx)
-                }
-                guard round > 0 else { continue }
-                out.ran(arm.id)
-                let embedded = pass.progress.embedded
-                guard embedded > 0 else { continue }
-                perImage[arm.id, default: []].append(pass.wallSeconds * 1000 / Double(embedded))
-            }
-        }
-
-        for arm in arms {
-            guard let runs = perImage[arm.id], !runs.isEmpty else { continue }
-            out.add(PaperMetric("\(arm.id).per_image", runs: runs, unit: .milliseconds, arm: arm.id,
-                                note: "whole-pass wall over files embedded; batching is the indexer's "
-                                + "own image staging, not a parameter this case sets"))
-        }
-        if let off = Self.metric(out, "tags_off.per_image"), let on = Self.metric(out, "tags_on.per_image") {
-            out.add(PaperMetric.derived("tag_overhead.per_image", value: on.value - off.value,
-                                        unit: .milliseconds,
-                                        from: ["tags_off.per_image_ms", "tags_on.per_image_ms"]))
-            if off.value > 0 {
-                out.add(PaperMetric.derived("tag_overhead", value: 100 * (on.value - off.value) / off.value,
-                                            unit: .percent,
-                                            from: ["tags_off.per_image_ms", "tags_on.per_image_ms"]))
-            }
-        }
-        out.add(Self.count("images", images))
-        return out
     }
 }
 
@@ -862,13 +548,13 @@ extension PaperCasesCompute {
         out.metrics.first { $0.key == key }
     }
 
-    // MARK: Synthetic chunk text (p02, p04)
+    // MARK: Synthetic chunk text (tail_rows)
 
     /// `count` chunk texts whose LENGTH DISTRIBUTION is the one the real corpus produces.
     ///
     /// The obvious implementation is a fixed table of lengths, and it is wrong in a way that matters:
     /// the tail-row lever and the tokeniser share both depend on how ragged a length-sorted batch of
-    /// 16 is, and an invented distribution would make p02 and p04 measure a batch shape that no
+    /// 16 is, and an invented distribution would make tail_rows measure a batch shape that no
     /// indexing pass ever sees. Walking the corpus's own size table through the chunker's arithmetic
     /// gives the real multiset - mostly whole small files, plus runs of full 1,800-character chunks
     /// with a short tail - without touching the disk. The text itself is `PaperCorpus.filler`, so it
@@ -888,7 +574,6 @@ extension PaperCasesCompute {
     }
 
     /// The chunk lengths `Indexer.chunk` produces for a text of `n` characters, mirroring
-    /// `PaperCorpus.predictedChunks` (which is verified against the real chunker over all 600 files).
     static func chunkLengths(forCharacters n: Int,
                              limit: Int = IndexSettings.paper.maxCharsPerChunk,
                              overlap: Int = PaperCorpus.defaultChunkOverlap) -> [Int] {

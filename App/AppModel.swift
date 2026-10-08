@@ -1424,28 +1424,10 @@ final class AppModel {
     /// tokens (backbone sequence positions) per second. Both exactly measured.
     var filesPerSec: Double = 0
     var tokensPerSec: Double = 0
-    // Profiling ("Run profiling" menu): downloads a fixed dataset and times an isolated index pass.
-    var isProfilingRunning = false
-    /// Set while a benchmark runs; the sheet's Cancel button flips it (cooperative - the pass
-    /// checks it at every progress tick and between phases).
-    var profilingCancel: CancelFlag?
-    private var profilingDatasetTask: Task<(folder: URL, fileCount: Int), Error>?
-    func cancelProfiling() {
-        profilingCancel?.on = true
-        profilingDatasetTask?.cancel()
-        profilingPhase = "Cancelling\u{2026}"
-    }
-    var profilingPhase = ""
-    var profilingDetail = ""
-    var profilingFraction: Double? = nil   // nil = indeterminate (download/unzip/upload)
-    var profilingStartedAt: Date? = nil    // start of the indexing pass, for live elapsed/ETA
-    /// Whether the progress sheet shows the live elapsed line. Was keyed on the phase label being
-    /// the literal string "Indexing", which silently drops the timing line for every phase name the
-    /// paper run publishes - and a 25-minute sheet with no clock on it looks hung.
+    /// Whether the progress sheet shows the live elapsed line.
     var profilingShowsTiming = false
-    var lastProfilingReport: ProfilingReport?
 
-    // MARK: - Paper benchmark (hidden "Paper" button, PaperGate)
+    // MARK: - Benchmark (Settings > Performance > Benchmark this Mac)
 
     /// Deliberately not the profiling flags. The two runs must never overlap and each refuses while
     /// the other is up; one shared flag would make that unprovable, and the paper run's progress
@@ -1484,15 +1466,6 @@ final class AppModel {
     /// touches it - but the suite must reuse the ALREADY LOADED one: constructing a second would
     /// double resident VRAM on exactly the 8 GB machine this must not wedge.
     var paperEngine: OmniEngine? { engine }
-    /// The live index, for the paper run's live-corpus cases. Handed over READ-ONLY by contract:
-    /// those cases search it and read its summary, and every case that writes stages a sample of
-    /// real files into PaperFS and indexes those into a throwaway store instead. `store` itself
-    /// stays private for the same reason `engine` does.
-    var paperLiveIndex: PaperLiveIndex? {
-        guard let store, !roots.isEmpty else { return nil }
-        return PaperLiveIndex(store: store, roots: roots,
-                              modelVariant: indexModelVariantRaw ?? "unknown")
-    }
     /// Paths the paper run's filesystem refuses to open, in either direction (equal, parent, or
     /// child). The index file, its containing folder (which holds every sidecar), and the live
     /// store's own URL if the user moved the database elsewhere.
@@ -5436,7 +5409,7 @@ final class AppModel {
         }
         // indexState != .paused: indexing is paused as a whole, and a Photos change arriving then
         // started a catch-up anyway. Resume's pass drains the queue.
-        guard !indexWritesBlocked, !isPaperRunning, !isProfilingRunning, !indexObsolete, !ocrRunActive,
+        guard !indexWritesBlocked, !isPaperRunning, !indexObsolete, !ocrRunActive,
               indexState != .indexing, indexState != .paused, activeRoots.isEmpty,
               !fsReconcileInFlight,
               let indexer, let store, !(pendingCatchUpRoots.isEmpty && pendingCatchUpPhotos.isEmpty) else { return }
@@ -6589,13 +6562,10 @@ final class AppModel {
         guard !indexWritesBlocked, let indexer, let store, indexState != .indexing else { return }
         // !isPaperRunning: same reason as catchUpPendingRoots - the suite owns the engine and the
         // levers for the duration. REMEMBERED, not dropped: a Reindex/Update/Resume that arrives
-        // during a 25-minute run (the menu item and the Settings buttons stay live) would otherwise
+        // during a benchmark run (the menu item and the Settings buttons stay live) would otherwise
         // silently do nothing, and the run's resume drains restartAfterPause exactly as a paused
         // pass's completion does.
-        // isProfilingRunning too: the benchmark pauses live indexing and then measures a timed
-        // pass, so a watcher- or catch-up-triggered pass starting underneath it both skews the
-        // measurement and is what leaves `indexState == .indexing` when the resume above runs.
-        guard !isPaperRunning, !isProfilingRunning else { restartAfterPause = true; return }
+        guard !isPaperRunning else { restartAfterPause = true; return }
         // A catch-up pass (added folders) or FS reconcile is mid-flight on the SAME Indexer: starting
         // a full pass now would run two passes concurrently (shared `cancelled` flag, double
         // embedding, racing reconciles). Cancel it and defer; its completion drains the flag.
@@ -6995,10 +6965,10 @@ final class AppModel {
     /// real work always wins between batches. The GPU work itself is the engine's normal
     /// low-priority gate - an interactive search preempts per image.
     private func scheduleTagBackfill() {
-        // !ocrRunActive, !indexObsolete, !isProfilingRunning: the same stand-downs the watcher
+        // !ocrRunActive, !indexObsolete: the same stand-downs the watcher
         // drain and the catch-up pass observe. This calls indexer.update() directly too, so it
         // took the GPU from a transcription and wrote into an index waiting to be rebuilt.
-        guard !indexWritesBlocked, !isPaperRunning, !ocrRunActive, !indexObsolete, !isProfilingRunning,
+        guard !indexWritesBlocked, !isPaperRunning, !ocrRunActive, !indexObsolete,
               imageTagsEnabled, !tagBackfillActive, !searching,
               indexState != .indexing, indexState != .paused,
               activeRoots.isEmpty, !fsReconcileInFlight, pendingFSPaths.isEmpty || explicitRetagSince != nil,
@@ -7239,117 +7209,6 @@ final class AppModel {
 
     static var appVersion: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
-    }
-
-    /// Menu action: download the fixed profiling dataset, pause live indexing, run an ISOLATED timed
-    /// index pass over it (a throwaway temp store, so the real index is untouched), record hardware +
-    /// throughput + peak VRAM, write a local report, and - with one-time consent - upload it. Live
-    /// indexing is restored afterward no matter how the run ends.
-    func runProfiling() async {
-        guard !isProfilingRunning, !isPaperRunning, let engine else { return }
-        isProfilingRunning = true
-        let cancelFlag = CancelFlag()
-        profilingCancel = cancelFlag
-        profilingPhase = ""; profilingDetail = ""; profilingFraction = nil
-        profilingShowsTiming = false
-        activeSheet = .progress
-        let wasIndexing = (indexState == .indexing)
-
-        // Pause any live pass and wait (bounded) for it to actually stop, so the measurement is not
-        // skewed by a concurrent pass sharing the engine.
-        if wasIndexing {
-            profilingPhase = "Pausing indexing\u{2026}"
-            pauseIndexing()
-            for _ in 0 ..< 50 { if indexState != .indexing { break }; try? await Task.sleep(nanoseconds: 100_000_000) }
-        }
-
-        defer {
-            isProfilingRunning = false
-            profilingCancel = nil
-            profilingPhase = ""; profilingDetail = ""; profilingFraction = nil; profilingStartedAt = nil
-            profilingShowsTiming = false
-            if activeSheet == .progress { activeSheet = nil }
-            // THE SAME RESUME THE PAPER RUN USES. This was `if wasIndexing { startIndexing() }` -
-            // verbatim the line resumeAfterPaperRun was written to replace, kept here because only
-            // the paper path was fixed at the time.
-            //
-            // A bare startIndexing() is a single unguarded attempt. Its first guard is
-            // `indexState != .indexing`, and the pass this run cancelled may still be unwinding -
-            // the wait above gives up after 5 s, which a large index routinely needs more than - so
-            // the call returns having done nothing, sets no deferred restart, and indexing never
-            // comes back for the rest of the session. Going through the deferred restart instead
-            // means the unwinding pass's own completion drains it. It also drains the folder
-            // removals and catch-ups queued during the run, and refreshes results that went stale.
-            resumeAfterPaperRun(wasIndexing: wasIndexing)
-        }
-
-        do {
-            profilingFraction = nil
-            // A child task so Cancel can abort the dataset download mid-flight (URLSession's
-            // async download honors task cancellation); the phase label stays "Cancelling..."
-            // once the flag is set instead of being overwritten by later phases.
-            let datasetTask = Task { try await ProfilingService.ensureDataset { phase in
-                Task { @MainActor in if !cancelFlag.on { self.profilingPhase = phase } }
-            } }
-            profilingDatasetTask = datasetTask
-            defer { profilingDatasetTask = nil }
-            let (folder, count) = try await datasetTask.value
-            if cancelFlag.on { throw CancellationError() }
-
-            let total = count > 0 ? count : 300
-            profilingPhase = "Indexing"
-            profilingDetail = "0 of \(total) files"
-            profilingFraction = 0
-            profilingStartedAt = Date()   // anchor for the live elapsed/ETA readout
-            profilingShowsTiming = true
-            // Fixed canonical settings (NOT the user's) so every machine indexes the same workload -
-            // that is what makes the crowdsourced numbers comparable.
-            let metrics = try await runProfilingPass(engine: engine, targetURL: folder, settings: .profiling,
-                                                     shouldCancel: { cancelFlag.on }) { p in
-                Task { @MainActor in
-                    self.profilingFraction = total > 0 ? Double(p.scanned) / Double(total) : nil
-                    self.profilingDetail = "\(p.scanned) of \(total) files \u{00B7} \(p.embedded) embedded"
-                        + (p.skipped > 0 ? " \u{00B7} \(p.skipped) skipped" : "")
-                        + (p.failed > 0 ? " \u{00B7} \(p.failed) failed" : "")
-                }
-            }
-
-            let report = ProfilingReport(
-                runId: UUID().uuidString,
-                appVersion: Self.appVersion,
-                datasetVersion: ProfilingService.datasetVersion,
-                model: modelVariant.rawValue,
-                hardware: HardwareProfile.collect(),
-                metrics: metrics)
-            lastProfilingReport = report
-            writeProfilingReport(report)
-
-            if cancelFlag.on { throw CancellationError() }
-            profilingPhase = "Uploading results\u{2026}"; profilingFraction = nil; profilingDetail = ""
-            profilingShowsTiming = false
-            if ProfilingService.ensureConsent() { await ProfilingService.upload(report) }
-            shareProfilingResults = ProfilingService.uploadsEnabled   // reflect the consent choice in Settings
-
-            profilingPhase = "Benchmark complete"
-            profilingFraction = 1
-            profilingDetail = String(format: "%.1f files/sec  \u{00B7}  %.0f tokens/sec  \u{00B7}  %.1f GB peak memory",
-                                     metrics.filesPerSec, metrics.tokensPerSec,
-                                     Double(metrics.peakVramDeltaBytes) / 1_073_741_824)
-            try? await Task.sleep(nanoseconds: 1_800_000_000)
-        } catch is CancellationError {
-            // User-cancelled: close quietly, no failure banner.
-        } catch {
-            profilingPhase = "Benchmark failed"
-            profilingFraction = nil
-            profilingDetail = (error as? ProfilingService.ProfilingError)?.message ?? error.localizedDescription
-            try? await Task.sleep(nanoseconds: 2_500_000_000)
-        }
-    }
-
-    private func writeProfilingReport(_ report: ProfilingReport) {
-        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("omni-profiling-report.json")
-        let enc = JSONEncoder(); enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-        if let data = try? enc.encode(report) { try? data.write(to: url) }
     }
 }
 

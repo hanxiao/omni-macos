@@ -3,17 +3,14 @@ import AppKit
 import UniformTypeIdentifiers
 import OmniKit
 
-/// The paper run's final dialog: what was measured, on what machine, and what about the run makes
-/// it suspect - shown before the operator sends the file, not after.
-///
-/// Modelled on AgentConfigSheet (Serving/ServingTab.swift): the same selectable monospaced
-/// ScrollView on `.textBackgroundColor`, the same Copy-with-label-flip, the same NSSavePanel and
-/// `.onExitCommand`. The body is exactly the text that gets saved, character for character - there
-/// is no second rendering path that could disagree with the file.
+/// The benchmark's final dialog: the table, the machine it ran on, and what about the run makes it
+/// suspect. The full report - every metric with its runs - is one toggle away, and Copy and Save
+/// take that text, character for character.
 struct PaperResultSheet: View {
     @Environment(AppModel.self) private var model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var copied = false
+    @State private var showReport = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -21,12 +18,12 @@ struct PaperResultSheet: View {
                 header(report)
                 let warnings = Self.warnings(report.result)
                 if !warnings.isEmpty { warningStrip(warnings) }
-                reportBox(model.lastPaperReportText)
+                if showReport { reportBox(model.lastPaperReportText) } else { tableBox(report.table) }
                 footer(report)
             } else {
                 // Only reachable if the report was cleared underneath the sheet. Say so rather than
                 // showing an empty box that looks like a run which measured nothing.
-                Text("No paper report").font(.headline)
+                Text("No benchmark report").font(.headline)
                 Text("The run produced no report to show.")
                     .font(.subheadline).foregroundStyle(.secondary)
                 Spacer()
@@ -41,7 +38,7 @@ struct PaperResultSheet: View {
     // MARK: - Pieces
 
     @ViewBuilder private func header(_ report: PaperReport) -> some View {
-        Text("Paper benchmark \u{00B7} \(report.result.status.rawValue)").font(.headline)
+        Text("Benchmark \u{00B7} \(report.result.status.rawValue)").font(.headline)
         Text(Self.subtitle(report))
             .font(.subheadline).foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
@@ -72,6 +69,53 @@ struct PaperResultSheet: View {
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
+    /// The table, one group per section: a latency row shows its percentiles and worst sample, a
+    /// rate or a share its one value.
+    @ViewBuilder private func tableBox(_ rows: [BenchRow]) -> some View {
+        ScrollView {
+            Grid(alignment: .leading, horizontalSpacing: 14, verticalSpacing: 5) {
+                ForEach(BenchTable.groups, id: \.self) { group in
+                    let g = rows.filter { $0.group == group }
+                    if !g.isEmpty {
+                        GridRow {
+                            Text(group).font(.subheadline.weight(.semibold))
+                            ForEach(BenchTable.latencyColumns, id: \.self) { c in
+                                Text(c).font(.caption).foregroundStyle(.secondary).gridColumnAlignment(.trailing)
+                            }
+                            Text("").gridCellUnsizedAxes(.horizontal)
+                        }
+                        .padding(.top, 6)
+                        ForEach(g) { r in
+                            GridRow {
+                                Text(r.task).font(.callout)
+                                if let v = r.cells["value"] {
+                                    Text(Self.number(v) + " " + r.unit).font(.callout.monospacedDigit())
+                                        .gridCellColumns(4).gridColumnAlignment(.trailing)
+                                        .frame(maxWidth: .infinity, alignment: .trailing)
+                                } else {
+                                    ForEach(BenchTable.latencyColumns, id: \.self) { c in
+                                        Text(r.cells[c].map(Self.number) ?? "\u{2013}").font(.callout.monospacedDigit())
+                                    }
+                                }
+                                Text(r.cells["value"] != nil ? "" : (r.cells["op"].map { String(format: "ms  (write %.1f s)", $0) } ?? "ms"))
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(Color(nsColor: .textBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.primary.opacity(0.1)))
+    }
+
+    private static func number(_ v: Double) -> String {
+        v >= 1000 ? String(format: "%.0f", v) : v >= 100 ? String(format: "%.1f", v) : String(format: "%.2f", v)
+    }
+
     @ViewBuilder private func reportBox(_ text: String) -> some View {
         ScrollView {
             Text(text)
@@ -100,11 +144,12 @@ struct PaperResultSheet: View {
                     try? model.lastPaperReportText.write(to: url, atomically: true, encoding: .utf8)
                 }
             }
+            Toggle("Full report", isOn: $showReport).toggleStyle(.button)
             Spacer()
             Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
         }
         // The auto-saved copy, written before this dialog appeared. Stated so that Done, a crash or
-        // a closed laptop is never what loses a run that took up to 25 minutes.
+        // a closed laptop is never what loses a long run.
         if let url = model.lastPaperReportURL {
             Text("Also saved to \(url.path)")
                 .font(.caption).foregroundStyle(.secondary)
@@ -138,7 +183,7 @@ struct PaperResultSheet: View {
                      + "Do not present this as a complete suite.")
         }
         if r.scale < 1.0 {
-            w.append(String(format: "Smoke run at scale %.3f: every rate covers less work than the paper's.", r.scale))
+            w.append(String(format: "Smoke run at scale %.3f: every row covers less work than a full run.", r.scale))
         }
         for c in r.cases where c.status != .ok {
             w.append("\(c.id) \(c.status.rawValue)" + (c.note.map { ": " + $0 } ?? ""))

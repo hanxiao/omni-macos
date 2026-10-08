@@ -29,7 +29,7 @@ public enum PaperVectors {
     /// in the catalog is computed at 768, and Table 3's rows are keyed on it.
     public static let dim = 768
 
-    /// Query indices start here. Above every ladder rung the suite can reach (p09's 4M is the
+    /// Query indices start here. Above every ladder rung the suite can reach (select's 4M is the
     /// largest) and far below the point where the LCG step wraps into anything interesting.
     public static let queryIndexBase = 1 << 32
 
@@ -85,7 +85,7 @@ public enum PaperVectors {
         let base = k * chunksPerFile
         return (p, (0 ..< chunksPerFile).map { c in
             IndexedChunk(path: p, modified: 0, size: 0, kind: "text", chunkIndex: c,
-                         // Snippets are stored text: p10's compaction case needs the SQLite file to
+                         // Snippets are stored text: the compaction case needs the SQLite file to
                          // have realistic bulk, every other case wants the rows as small as they can
                          // be so the measurement is the scan and not the row decode.
                          snippet: snippetChars > 0
@@ -182,12 +182,12 @@ public enum PaperVectors {
         return out
     }
 
-    // MARK: - Selection scores (p09)
+    // MARK: - Selection scores (select)
 
     /// The score vector `selbench` selects over (main.swift:2948-2951), reproduced exactly.
     ///
     /// This one stream IS consumption-ordered - a single xorshift64 walk from the golden-ratio
-    /// constant - unlike everything else in the paper module. Kept that way on purpose: p09's
+    /// constant - unlike everything else in the paper module. Kept that way on purpose: select's
     /// numbers are compared against the selection measurements already in the paper, and those were
     /// taken over these values in this order. It is generated serially for the same reason.
     public static func selectionScores(_ n: Int) -> [Float] {

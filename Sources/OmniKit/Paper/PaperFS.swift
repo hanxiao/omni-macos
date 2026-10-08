@@ -53,15 +53,41 @@ public final class PaperFS: Sendable {
     /// Close a store and delete it plus every sidecar it may have written (-wal/-shm, the row and
     /// vector sidecars, the quant replica). The suite builds several multi-hundred-MB stores in one
     /// run; leaving them until the final cleanup would need the peak of all of them at once on disk.
+    /// Every file a store keeps beside its database.
+    static let storeSuffixes = ["", "-wal", "-shm", ".rows", ".vecs", ".quant", ".hits", ".vecdump",
+                                ".lex", ".lex-wal", ".lex-shm", ".names", ".names-wal", ".names-shm"]
+
     public func discard(_ store: VectorStore, named name: String) {
         store.close()
+        discard(named: name)
+    }
+
+    public func discard(named name: String) {
         let base = storesDir.appendingPathComponent(name).path
-        for suffix in ["", "-wal", "-shm", ".rows", ".vecs", ".quant", ".hits", ".vecdump", ".lex", ".lex-wal", ".lex-shm"] {
+        for suffix in Self.storeSuffixes {
             try? FileManager.default.removeItem(at: URL(fileURLWithPath: base + suffix))
         }
     }
 
-    /// A scratch subdirectory inside the run dir (p05's copied edit tree lives here).
+    /// Copy a closed store and its sidecars under a new name. On APFS a copy is a clone, so a
+    /// case can mutate a fresh copy of a large store without paying for its bytes.
+    public func clone(named name: String, as copy: String) throws {
+        let src = storesDir.appendingPathComponent(name), dst = storesDir.appendingPathComponent(copy)
+        try assertSafe(src); try assertSafe(dst)
+        discard(named: copy)
+        let fm = FileManager.default
+        for suffix in Self.storeSuffixes where fm.fileExists(atPath: src.path + suffix) {
+            try fm.copyItem(atPath: src.path + suffix, toPath: dst.path + suffix)
+        }
+    }
+
+    public func storeURL(named name: String) throws -> URL {
+        let url = storesDir.appendingPathComponent(name)
+        try assertSafe(url)
+        return url
+    }
+
+    /// A scratch subdirectory inside the run dir (save_edit's copied files live here).
     public func scratch(named name: String) throws -> URL {
         let url = scratchDir.appendingPathComponent(name, isDirectory: true)
         try assertSafe(url)
@@ -106,7 +132,8 @@ public final class PaperFS: Sendable {
         // hour after their last write - well past the 25-minute wall cap, so a run in flight in
         // another instance is never swept - instead of waiting the 24 h a FINISHED run's report is
         // deliberately kept for.
-        let abandonedCutoff = Date().addingTimeInterval(-3600)
+        // Longer than a full run, so a second launch never sweeps one still in progress.
+        let abandonedCutoff = Date().addingTimeInterval(-6 * 3600)
         for url in entries where url.lastPathComponent.hasPrefix("omni-paper-run-") {
             let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
             let hasReport = fm.fileExists(atPath: url.appendingPathComponent("report.json").path)

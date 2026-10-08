@@ -42,12 +42,15 @@ public struct PaperCorpusStamp: Sendable, Codable {
     public let textBytes: Int
     public let wideFiles: Int
     public let images: Int
+    public let audioClips: Int
+    public let videoClips: Int
 
     public init(version: String, seed: UInt64, fnv1a64: String, textFiles: Int,
-                textBytes: Int, wideFiles: Int, images: Int) {
+                textBytes: Int, wideFiles: Int, images: Int, audioClips: Int = 0, videoClips: Int = 0) {
         self.version = version; self.seed = seed; self.fnv1a64 = fnv1a64
         self.textFiles = textFiles; self.textBytes = textBytes
         self.wideFiles = wideFiles; self.images = images
+        self.audioClips = audioClips; self.videoClips = videoClips
     }
 }
 
@@ -134,10 +137,13 @@ public struct PaperReport: Sendable, Codable {
     public let statics: SystemStatics
     public let app: PaperAppIdentity
     public let corpus: PaperCorpusStamp?
+    /// The rows the settings sheet shows, read from `result` (BenchTable).
+    public let table: [BenchRow]
 
     public init(result: PaperSuiteResult, statics: SystemStatics,
                 app: PaperAppIdentity, corpus: PaperCorpusStamp?) {
         self.result = result; self.statics = statics; self.app = app; self.corpus = corpus
+        self.table = BenchTable.rows(result)
     }
 
     // MARK: - Rendering
@@ -146,6 +152,8 @@ public struct PaperReport: Sendable, Codable {
     public func renderText() -> String {
         let built = dataLines()
         var out = formatHeader()
+        out.append(BenchTable.renderText(table))
+        out.append("")
         out += summaryLines(duplicates: built.duplicates)
         out.append("")
         out += built.lines.map { "\($0.key)=\($0.value)" }
@@ -273,6 +281,8 @@ public struct PaperReport: Sendable, Codable {
         b.put("corpus.text_bytes", c.textBytes)
         b.put("corpus.wide_files", c.wideFiles)
         b.put("corpus.images", c.images)
+        b.put("corpus.audio_clips", c.audioClips)
+        b.put("corpus.video_clips", c.videoClips)
     }
 
     /// Everything held constant for the whole run. `PaperLeverSet.suiteWide` is the authority for
@@ -439,10 +449,10 @@ public struct PaperReport: Sendable, Codable {
     private func appendTierOmissions(_ b: inout PaperLineBuffer, caseId: String, short: String) {
         let full: [Int], mine: [Int]
         switch caseId {
-        case PaperCaseID.p08_scan.rawValue:
+        case PaperCaseID.scan_ladder.rawValue:
             full = PaperCaseCatalog.scanLadder(memoryBytes: .max)
             mine = PaperCaseCatalog.scanLadder(memoryBytes: statics.memoryBytes)
-        case PaperCaseID.p09_select.rawValue:
+        case PaperCaseID.select.rawValue:
             full = PaperCaseCatalog.selectLadder(memoryBytes: .max)
             mine = PaperCaseCatalog.selectLadder(memoryBytes: statics.memoryBytes)
         default:
@@ -457,7 +467,7 @@ public struct PaperReport: Sendable, Codable {
 
     private func formatHeader() -> [String] {
         [
-        "# omni paper benchmark - machine-comparable measurement export",
+        "# Omni benchmark - machine-comparable measurement export",
         "# Format: one key=value per line, sorted by key. '#' lines are comments and carry no data.",
         "# Units live in the key suffix (_ms _s _mb _gb _bytes _pct _tok_per_s _files_per_s",
         "#   _chunks_per_s _flushes_per_s _us_per_file _tflops _x). No unit is ever implied.",
@@ -504,8 +514,6 @@ public struct PaperReport: Sendable, Codable {
             out.append("# WARNINGS - READ BEFORE CITING ANY NUMBER ABOVE:")
             out += warnings.map { "#   ! " + $0 }
         }
-        out.append("#")
-        out += Self.neverCovered.map { "# " + $0 }
         out.append("# =======================================================================")
         return out
     }
@@ -553,8 +561,7 @@ public struct PaperReport: Sendable, Codable {
         if let only = PaperCaseCatalog.onlyCases {
             w.append("SUBSET RUN: this build measures only "
                      + only.map(\.rawValue).sorted().joined(separator: ", ")
-                     + ". Every other case is carried from the previous full run; nothing under "
-                     + "measurement changed between the two builds.")
+                     + ". The table has no rows for the others; do not present it as a full run.")
         }
         if result.status != .complete || result.casesOK != result.casesTotal {
             w.append("PARTIAL RUN (status \(result.status.rawValue), \(result.casesOK) of \(result.casesTotal) cases ok). "
@@ -611,25 +618,10 @@ public struct PaperReport: Sendable, Codable {
         return w
     }
 
-    /// What this button cannot produce, whatever the run says. Static: it is a property of the
-    /// suite, not of one run, and it exists so a reader never reads an absence as a zero.
-    static let neverCovered: [String] = [
-        "NOT COVERED BY THIS SUITE (reference-box, historical, or no instrument exists):",
-        "  Table 1 corpus statistics - all filename-channel numbers (Sec. 3.5) - 34.1%/39.4% VCS reuse -",
-        "  3.15% cross-file duplication - 3342 ms gate wait - Sec. 4.4 retraction (0.66) -",
-        "  Table 5 rows 1-3 (needs 3.8M chunks) - gemvoverflow/bigscan (needs >= 32 GB) -",
-        "  Table 3 recall columns and Table 4 token columns (machine-independent, carried) -",
-        "  Sec. 4.6 slabbed conversion +777 MB (NO INSTRUMENT EXISTS) - video staging -91 MB -",
-        "  nameconcat - mrlbench",
-    ]
-
     // MARK: - Formatting primitives
 
-    /// Case number only: `p03_indexpass` -> `p03`. The metric namespace stays short and stable even
-    /// if a case is renamed, and `case.*` keeps the full id so the two can always be tied together.
-    static func shortID(_ id: String) -> String {
-        String(id.prefix(while: { $0 != "_" }))
-    }
+    /// The metric namespace: the case id, which is already a short plain name.
+    static func shortID(_ id: String) -> String { id }
 
     static func gb(_ bytes: Int) -> Double { Double(bytes) / 1_073_741_824 }
 

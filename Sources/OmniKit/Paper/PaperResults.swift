@@ -307,7 +307,7 @@ public enum PaperCaseStatus: String, Sendable, Codable {
     case failed
     /// The global wall-clock cap was reached before this case started.
     case skippedBudget = "skipped:budget"
-    /// p12 only: the vision tower is not resident and reloading it would double resident VRAM.
+    /// Image cases only: the vision tower is not resident and reloading it would double resident VRAM.
     case skippedTowers = "skipped:towers"
     /// The case's arithmetic peak did not fit in the memory actually available (Risk 1).
     case skippedMemory = "skipped:memory"

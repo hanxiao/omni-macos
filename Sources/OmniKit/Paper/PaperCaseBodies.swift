@@ -3,9 +3,9 @@ import Foundation
 // Where the runner finds every body this build has.
 //
 // The two body files are deliberately ignorant of each other: `PaperCasesCompute` owns the cases
-// whose cost is the model (p01-p05, p11, p12) and `PaperCasesStore` owns the ones whose cost is the
-// vector store (p06-p10). Neither imports the other, so either can be edited, or left out of a
-// build, without touching the other. This type is the only place that knows both exist.
+// whose cost is the model, `PaperCasesStore` the ones whose cost is the vector store, and
+// `BenchCases` the task-table cases on the generated one-million-row store. None imports another,
+// so any can be edited, or left out of a build, without touching the others. This type is the only place that knows both exist.
 //
 // Lookup order is compute-then-store, and it is checked rather than assumed: `contestedIDs` names
 // any case both files claim. Two providers answering for one id would mean the export's numbers
@@ -15,7 +15,7 @@ public struct PaperAllCaseBodies: PaperCaseBodies {
     public init() {}
 
     public func body(for id: PaperCaseID) -> PaperCaseBody? {
-        PaperCasesCompute.body(for: id) ?? PaperCasesStore.body(for: id) ?? PaperCasesLive.body(for: id)
+        PaperCasesCompute.body(for: id) ?? PaperCasesStore.body(for: id) ?? BenchCases.body(for: id)
     }
 
     /// Cases with no body in this build. They record `skipped:unimplemented`, never a measured zero.
@@ -30,7 +30,7 @@ public struct PaperAllCaseBodies: PaperCaseBodies {
     }
 
     private static func providerCount(for id: PaperCaseID) -> Int {
-        [PaperCasesCompute.body(for: id), PaperCasesStore.body(for: id), PaperCasesLive.body(for: id)]
+        [PaperCasesCompute.body(for: id), PaperCasesStore.body(for: id), BenchCases.body(for: id)]
             .reduce(0) { $0 + ($1 == nil ? 0 : 1) }
     }
 }

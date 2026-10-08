@@ -466,3 +466,34 @@ day later the same tour measured ZERO blocks over 250 ms (see "UI tests").
   consecutive `score:1%` searches, Release). Sampled: 759 of 2162 samples in window layout, 343 of
   them `NSToolbarView layout` (the toolbar's items change with the result state), and CoreText.
   Taken down 19% on 2026-10-02: see "A RESULT SET COSTS 19% LESS" under the speed review.
+
+## The benchmark (2026-10-08, Settings > Performance > Benchmark this Mac)
+- ONE benchmark. It replaced two: the public "Run benchmark" (a downloaded 300-file dataset, one
+  indexing pass, files/s and tokens/s) and the hidden "Paper" suite (Option-click, about 1.9 h of
+  case budgets though its UI said 25 minutes). Same runner, levers, PaperFS rules and report as the
+  suite (`Sources/OmniKit/Paper/`); `omni-verify bench <modelDir> [--scale F]` runs it headless.
+- EVERYTHING IS GENERATED from a seed when the button is clicked (`PaperCorpus`, `bench-corpus-2`):
+  600 text files, 4,000 tiny files for the crawl, 48 PNGs, 12 WAV clips (integer synthesis), 6 MP4
+  clips, and a one-million-row store of seeded vectors (`BenchStore`: 250k files, one in eight an
+  image, one in 5,000 a 3,000-row file, a tenth of passages from a shared pool, eight top folders).
+  The manifest hash covers every byte but the MP4s, whose container bytes the system encoder owns.
+  Nothing reads the user's index or files any more: the live family (p13-p18) is gone.
+- THE TABLE (`BenchTable`): Indexing, Queries, Search under load (a search every 50 ms on a copy of
+  the store while one bulk change runs: rewrite 5,000 files, delete 50,000, remove a top folder,
+  remove every image, reclaim), Mechanisms. The result sheet shows it; Copy and Save take the full
+  report; the upload (consent, as before) is `BenchUpload`: the table plus the old top-level
+  throughput fields, under the collector's 8 KB limit.
+- CASES DROPPED: p05 edit reuse (never emitted its result: arms renamed under it), p19 cap sweep
+  (the representation no longer depends on the cap), p12 media tagging (toggled a setting nothing
+  reads), p04/p06 (retired already), the live family; p03's chunk-count check (content-defined
+  chunking ended the fixed grid it predicted). Recall now grids one and three bits (three is the
+  shipped affine width); selection keeps only the shipped form and the primitive.
+- Smoke at `--scale 0.05`: 16 cases ok in 2 min 20 s. Full run on the M3 Ultra: 677-690 s. The
+  budgets sum to 4,795 s, the ceiling on any Mac; Settings quotes "10 to 80 minutes" until the
+  smaller Macs have measured numbers.
+- `--only store_build,search_under_writes` runs a subset (2 min); the report marks it SUBSET RUN.
+  With OMNI_SEARCH_TIMING=1 every slice, checkpoint and slow search logs its phases.
+- WHAT IT FOUND ON ITS FIRST FULL RUN: a 1.3-1.8 s stall in the bulk delete (tombstones over budget
+  compacted inside the delete), the WAL valve on the store queue, and an ungated folder tail
+  (index.md, "Heavy CRUD"). The store is exact below a million contents on the M3 Ultra, so
+  "While reclaiming space" reports not applicable there: no coverage, nothing to relocate.
