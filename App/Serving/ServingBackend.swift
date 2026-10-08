@@ -3,7 +3,9 @@ import OmniKit
 
 /// Which surface a served request arrived on. The history row is marked from this, so an agent's
 /// tool call and a script's REST call are distinguishable after the fact.
-enum ServedSurface: String, Sendable { case rest, mcp }
+/// Where a served search came from, for the history drawer's mark: REST, an MCP client, or the
+/// `omni` command line (an MCP call that arrived over the app's own socket).
+enum ServedSurface: String, Sendable { case rest, mcp, cli }
 
 /// The only seam between the HTTP serving layer and the engine/store. Adapters call
 /// these three members; nothing else in Serving touches OmniKit directly.

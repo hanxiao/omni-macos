@@ -12,6 +12,9 @@ struct Router: Sendable {
     /// What Omni indexes, and how to change it. Optional because it is wired from AppModel after
     /// the store loads; a request that arrives first gets a 503 rather than a wrong answer.
     var sources: SourcesControl? = nil
+    /// What an MCP tool call through this router counts as: `.cli` on the command line's socket,
+    /// where the only caller is `omni`.
+    var mcpSurface: ServedSurface = .mcp
 
     func handle(_ req: HTTPRequest) async -> HTTPResponse {
         let route = req.routePath
@@ -29,7 +32,7 @@ struct Router: Sendable {
         // MCP: JSON-RPC over streamable HTTP. Auth-gated like everything else (loopback scope
         // never requires a token; LAN scope always does, sent as a normal Authorization header).
         if route == "/mcp" {
-            return await MCPAdapter.handle(req, backend, appVersion: appVersion, sources: sources)
+            return await MCPAdapter.handle(req, backend, appVersion: appVersion, sources: sources, surface: mcpSurface)
         }
 
         // What Omni indexes (folders + Photos sources), and the four things the sidebar can do to it.

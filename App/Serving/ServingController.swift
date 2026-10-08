@@ -127,7 +127,8 @@ final class ServingController {
             }
             unlink(path)
         }
-        let router = Router(backend: backend, auth: { _ in true }, appVersion: AppModel.appVersion, sources: sources)
+        let router = Router(backend: backend, auth: { _ in true }, appVersion: AppModel.appVersion, sources: sources,
+                            mcpSurface: .cli)
         let sink: @Sendable (LogEntry) -> Void = { [weak self] entry in
             Task { @MainActor in self?.ingest(entry) }
         }

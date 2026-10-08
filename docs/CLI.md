@@ -18,6 +18,12 @@ The MCP tools in `App/Serving/MCPAdapter.swift` are the interface. Everything el
 - REST `/v1/search` reads its `filters` with the same code as the MCP tool
   (`App/Serving/SearchArgs.swift`); only the output format differs.
 
+## History
+
+A search from the command line is recorded with source `cli` and drawn with a terminal icon in the
+History drawer, beside REST (globe) and MCP clients (the MCP mark). It is an MCP call, so the
+surface is decided by transport: the socket's router reports `.cli`.
+
 ## Transport
 
 The app serves its HTTP router on a Unix socket at

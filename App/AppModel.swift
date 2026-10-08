@@ -17,9 +17,10 @@ enum IndexState { case idle, indexing, paused }
 /// Where a remembered search came from. A served search is one an agent or script sent over the
 /// HTTP/MCP server, not something the user typed - worth telling apart in the sidebar, and worth
 /// being able to switch off separately.
-/// `serving` is the REST surface, `mcp` an agent's tool call. Two cases and not one because the
-/// sidebar marks them differently and a reader should be able to tell an agent apart from a script.
-enum HistorySource: String, Codable, Sendable { case app, serving, mcp }
+/// `serving` is the REST surface, `mcp` an agent's tool call, `cli` the `omni` command line. Separate
+/// cases because the sidebar marks them differently and a reader should be able to tell an agent
+/// apart from a script.
+enum HistorySource: String, Codable, Sendable { case app, serving, mcp, cli }
 
 struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
     var query: String                 // semantic (embedding) text, or "" for a file query
@@ -39,8 +40,9 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
     var similar: Bool = false         // doc-vs-doc "find similar" vs query-by-file
     /// Defaulted, so every history item written before serving was remembered decodes unchanged.
     var source: String = HistorySource.app.rawValue
-    var isServed: Bool { source == HistorySource.serving.rawValue || source == HistorySource.mcp.rawValue }
+    var isServed: Bool { source != HistorySource.app.rawValue }
     var isMCP: Bool { source == HistorySource.mcp.rawValue }
+    var isCLI: Bool { source == HistorySource.cli.rawValue }
     // The string the user actually typed/sees (with qualifiers) drives display, identity, and dedup.
     var displayText: String { rawQuery ?? query }
     // Namespaced so a file path can never collide with a text query of the same string. id is
@@ -2362,7 +2364,11 @@ final class AppModel {
         guard saveServingHistory else { return }
         let q = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard q.count >= 2 else { return }
-        let source = (surface == .mcp ? HistorySource.mcp : HistorySource.serving).rawValue
+        let source: String = switch surface {
+            case .rest: HistorySource.serving.rawValue
+            case .mcp: HistorySource.mcp.rawValue
+            case .cli: HistorySource.cli.rawValue
+        }
         if let i = searchHistory.firstIndex(where: { $0.isServed && $0.displayText.caseInsensitiveCompare(q) == .orderedSame }) {
             searchHistory[i].lastUsed = Date()
             // The same text can arrive first over REST and later from an agent. The row keeps one

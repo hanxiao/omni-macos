@@ -424,6 +424,9 @@ private struct HistorySections: View {
                             // a globe: the globe says the query crossed a socket, which is true of
                             // every served row and therefore tells the reader nothing.
                             MCPMark().sidebarTint(on, else: Color.secondary).frame(width: 16, height: 16)
+                        } else if item.isCLI {
+                            // The `omni` command line: an agent or a person in a shell.
+                            Image(systemName: "terminal").sidebarTint(on, else: Color.secondary).frame(width: 16)
                         } else if item.isServed {
                             // The REST surface: a script or a curl, not an agent.
                             Image(systemName: "network").sidebarTint(on, else: Color.secondary).frame(width: 16)

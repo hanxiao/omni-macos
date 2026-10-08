@@ -147,6 +147,7 @@ enum PerfScript {
                 "clipboardClips": model.clipboardClipCount,
                 "clipboardHasClips": model.clipboardHasClips,
                 "folderCounts": model.folderFileCounts,   // the sidebar's per-folder numbers
+                "history": model.searchHistory.prefix(20).map { ["text": $0.displayText, "source": $0.source] },
                 "indexing": model.indexState == .indexing,
                 "indexedFiles": model.indexedFiles,
                 "paused": model.isPaused,

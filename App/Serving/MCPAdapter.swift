@@ -54,7 +54,7 @@ enum MCPAdapter {
     }
 
     static func handle(_ req: HTTPRequest, _ backend: any ServingBackend, appVersion: String,
-                       sources: SourcesControl? = nil) async -> HTTPResponse {
+                       sources: SourcesControl? = nil, surface: ServedSurface = .mcp) async -> HTTPResponse {
         // GET is the SSE stream in the full spec; this server has no server-initiated
         // messages, and the spec allows refusing it.
         guard req.method == "POST" else {
@@ -103,8 +103,8 @@ enum MCPAdapter {
             }
             let args = params["arguments"] as? [String: Any] ?? [:]
             switch name {
-            case "search":        return await callSearch(id: id, args: args, backend: backend, sources: sources)
-            case "search_inline": return callSearchInline(id: id, args: args, backend: backend)
+            case "search":        return await callSearch(id: id, args: args, backend: backend, sources: sources, surface: surface)
+            case "search_inline": return callSearchInline(id: id, args: args, backend: backend, surface: surface)
             case "file_status":   return callFileStatus(id: id, args: args, backend: backend)
             case "tag_image":     return callTagImage(id: id, args: args, backend: backend)
             case "ocr":           return await callOCR(id: id, args: args)
@@ -194,7 +194,7 @@ enum MCPAdapter {
     }
 
     private static func callSearch(id: Any, args: [String: Any], backend: any ServingBackend,
-                                   sources: SourcesControl?) async -> HTTPResponse {
+                                   sources: SourcesControl?, surface: ServedSurface) async -> HTTPResponse {
         guard let query = args["query"] as? String, !query.isEmpty else {
             // Tool-level (not protocol-level) failure: isError true with a readable message.
             return result(id: id, [
@@ -222,7 +222,7 @@ enum MCPAdapter {
         // agent more than they cost a human - every one is context spent re-reading a file it has
         // already seen - so this defaults ON, with "group_duplicates": false for the flat list.
         let group = (args["group_duplicates"] as? Bool) ?? true
-        let hits = backend.search(query, topK: group ? min(topK * 3, 150) : topK, filter: filter, surface: .mcp)
+        let hits = backend.search(query, topK: group ? min(topK * 3, 150) : topK, filter: filter, surface: surface)
         let groups = backend.groupedResults(hits, enabled: group, limit: topK)
         let reps = groups.map(\.representative)
         let dupesByPath = Dictionary(uniqueKeysWithValues: groups.map { ($0.representative.path, $0) })
@@ -345,7 +345,8 @@ enum MCPAdapter {
         ]
     }
 
-    private static func callSearchInline(id: Any, args: [String: Any], backend: any ServingBackend) -> HTTPResponse {
+    private static func callSearchInline(id: Any, args: [String: Any], backend: any ServingBackend,
+                                         surface: ServedSurface) -> HTTPResponse {
         guard let query = args["query"] as? String, !query.isEmpty else {
             return result(id: id, [
                 "content": [["type": "text", "text": "search_inline failed: 'query' is required"]],
@@ -364,7 +365,7 @@ enum MCPAdapter {
         var maxSnippet = (args["max_snippet"] as? Int) ?? 400
         maxSnippet = max(0, min(maxSnippet, 4000))
 
-        let hits = backend.searchInline(query, paths: paths, topK: topK, surface: .mcp)
+        let hits = backend.searchInline(query, paths: paths, topK: topK, surface: surface)
 
         var content: [[String: Any]] = []
         if hits.isEmpty {
