@@ -16,11 +16,15 @@ export interface Env {
   RATE_SALT?: string;
 }
 
-// Current dataset (reported in GET). Uploads are accepted for every KNOWN dataset and stored with
-// the version they ran on: v1 (1000 files) and v2 (300 files, same modality mix) have comparable
-// files/s and tokens/s RATES, so the per-chip trend keeps its history across the dataset change.
+// Uploads are accepted for every KNOWN dataset and stored with the version they ran on.
+// v1 (1000 files) and v2 (300 files, same modality mix) have comparable files/s and tokens/s RATES,
+// so the indexing history spans both. bench-v4 is the table benchmark (app 0.15.9+): its indexing
+// pass is text only, so its rates are NOT comparable with v1/v2 and stay out of that history; its
+// table is aggregated on its own (`bench` in GET).
 const DATASET_VERSION = "profiling-v2";
-const ACCEPTED_DATASETS = new Set(["profiling-v1", "profiling-v2"]);
+const HISTORY_DATASETS = ["profiling-v1", "profiling-v2"];
+const BENCH_DATASET = "bench-v4";
+const ACCEPTED_DATASETS = new Set([...HISTORY_DATASETS, BENCH_DATASET]);
 const MAX_BODY_BYTES = 8 * 1024; // 8KB
 const RATE_LIMIT_PER_HOUR = 20;
 const ALLOWED_ORIGIN = "https://hanxiao.io";
@@ -29,6 +33,10 @@ const ALLOWED_ORIGIN = "https://hanxiao.io";
 const FILES_MAX = 200_000;
 const SECONDS_MAX = 86_400;
 const BYTES_MAX = 1e15; // ~1PB, generous upper bound to reject absurd values
+const TABLE_ROWS_MAX = 64;
+const TABLE_TEXT_MAX = 80;
+const TABLE_CELLS = new Set(["p50", "p95", "p99", "max", "value", "op"]);
+const CELL_ABS_MAX = 1e9;
 
 // ---------------------------------------------------------------------------
 // Routing
@@ -79,10 +87,20 @@ function handleOptions(): Response {
 // POST: ingest
 // ---------------------------------------------------------------------------
 
+/** One row of the benchmark table: group, task, unit, cells (p50/p95/p99/max, value, op). */
+interface BenchRow {
+  g: string;
+  t: string;
+  u: string;
+  c: Record<string, number>;
+}
+
 interface ProfilingReport {
   runId: string;
   appVersion?: string;
   datasetVersion: string;
+  model?: string;
+  table?: BenchRow[];
   hardware: {
     chip?: string | null;
     hwModel?: string | null;
@@ -154,8 +172,9 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
        chip, hw_model, release_year, macos_version,
        mem_bytes, vram_bytes, cpu_cores, disk_internal, disk_fs,
        files, scanned, failed, seconds, files_per_sec,
-       tokens, tokens_per_sec, error_rate, peak_vram_delta
-     ) VALUES (?,?,?,?, ?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?)`
+       tokens, tokens_per_sec, error_rate, peak_vram_delta,
+       model, bench_table
+     ) VALUES (?,?,?,?, ?,?,?,?, ?,?,?,?,?, ?,?,?,?,?, ?,?,?,?, ?,?)`
   )
     .bind(
       body.runId,
@@ -179,7 +198,9 @@ async function handlePost(request: Request, env: Env): Promise<Response> {
       intOrNull(m.tokens),
       numOrNull(m.tokensPerSec),
       numOrNull(m.errorRate),
-      intOrNull(m.peakVramDeltaBytes)
+      intOrNull(m.peakVramDeltaBytes),
+      str(body.model),
+      Array.isArray(body.table) ? JSON.stringify(body.table.map(cleanRow)) : null
     )
     .run();
 
@@ -234,7 +255,57 @@ function validate(b: ProfilingReport): Validation {
   if (!nullableInRange(h.cpuCores, 0, 4096)) return { ok: false, error: "cpuCores invalid" };
   if (!nullableInRange(h.releaseYear, 1990, 2100)) return { ok: false, error: "releaseYear invalid" };
 
+  if (b.model !== undefined && b.model !== null && !shortText(b.model)) {
+    return { ok: false, error: "model invalid" };
+  }
+  // The table is required for bench-v4 and refused for the older datasets, which never had one.
+  if (b.datasetVersion === BENCH_DATASET) {
+    const t = validateTable(b.table);
+    if (!t.ok) return t;
+  } else if (b.table !== undefined) {
+    return { ok: false, error: "table not expected for this dataset" };
+  }
+
   return { ok: true };
+}
+
+function validateTable(t: unknown): Validation {
+  if (!Array.isArray(t) || t.length === 0 || t.length > TABLE_ROWS_MAX) {
+    return { ok: false, error: "table invalid" };
+  }
+  const seen = new Set<string>();
+  for (const r of t as BenchRow[]) {
+    if (typeof r !== "object" || r === null) return { ok: false, error: "table row invalid" };
+    if (!shortText(r.g) || !shortText(r.t) || !shortText(r.u)) {
+      return { ok: false, error: "table row text invalid" };
+    }
+    const key = r.g + "/" + r.t;
+    if (seen.has(key)) return { ok: false, error: "table row duplicated" };
+    seen.add(key);
+    if (typeof r.c !== "object" || r.c === null || Array.isArray(r.c)) {
+      return { ok: false, error: "table cells invalid" };
+    }
+    const cells = Object.entries(r.c);
+    if (cells.length === 0) return { ok: false, error: "table cells empty" };
+    for (const [k, v] of cells) {
+      if (!TABLE_CELLS.has(k) || !inRange(v, -CELL_ABS_MAX, CELL_ABS_MAX)) {
+        return { ok: false, error: "table cell invalid" };
+      }
+    }
+  }
+  return { ok: true };
+}
+
+/** A non-empty string of at most TABLE_TEXT_MAX characters. */
+function shortText(x: unknown): x is string {
+  return typeof x === "string" && x.length > 0 && x.length <= TABLE_TEXT_MAX;
+}
+
+/** Only the four known fields, cells rounded to 2 decimals (what the app already sends). */
+function cleanRow(r: BenchRow): BenchRow {
+  const c: Record<string, number> = {};
+  for (const [k, v] of Object.entries(r.c)) c[k] = Math.round(v * 100) / 100;
+  return { g: r.g, t: r.t, u: r.u, c };
 }
 
 /** finite number within [min, max] inclusive. Rejects NaN/Infinity/non-number. */
@@ -318,8 +389,11 @@ async function handleGet(env: Env): Promise<Response> {
     `SELECT chip, app_version, release_year, macos_version, mem_bytes, vram_bytes,
             files_per_sec, tokens_per_sec, seconds, peak_vram_delta, created_at
        FROM profiling_runs
+      WHERE dataset_ver IN (${HISTORY_DATASETS.map(() => "?").join(",")})
       ORDER BY created_at DESC`
-  ).all<RunRow>();
+  )
+    .bind(...HISTORY_DATASETS)
+    .all<RunRow>();
 
   const rows = results ?? [];
 
@@ -406,6 +480,7 @@ async function handleGet(env: Env): Promise<Response> {
     byChip,
     byVersion,
     recent,
+    bench: await benchAggregate(env),
   };
 
   return new Response(JSON.stringify(payload), {
@@ -416,6 +491,108 @@ async function handleGet(env: Env): Promise<Response> {
       ...corsHeaders(),
     },
   });
+}
+
+// ---------------------------------------------------------------------------
+// GET: the bench-v4 table
+// ---------------------------------------------------------------------------
+
+interface BenchRunRow {
+  chip: string | null;
+  model: string | null;
+  release_year: number | null;
+  mem_bytes: number | null;
+  vram_bytes: number | null;
+  cpu_cores: number | null;
+  app_version: string | null;
+  macos_version: string | null;
+  bench_table: string | null;
+}
+
+/**
+ * One column per (chip, model): every cell is the median over that machine's runs. Rows keep the
+ * order of the newest run's table, then any row only older runs had. Machines are ordered by text
+ * indexing throughput, fastest first.
+ */
+async function benchAggregate(env: Env) {
+  const { results } = await env.DB.prepare(
+    `SELECT chip, model, release_year, mem_bytes, vram_bytes, cpu_cores, app_version,
+            macos_version, bench_table
+       FROM profiling_runs
+      WHERE dataset_ver = ? AND bench_table IS NOT NULL
+      ORDER BY created_at DESC`
+  )
+    .bind(BENCH_DATASET)
+    .all<BenchRunRow>();
+  const runs = results ?? [];
+
+  const rows: { g: string; t: string; u: string; kind: "latency" | "value" }[] = [];
+  const rowSeen = new Set<string>();
+  type Machine = { meta: BenchRunRow[]; cells: Map<string, Map<string, number[]>> };
+  const machines = new Map<string, Machine>();
+
+  for (const r of runs) {
+    let table: BenchRow[];
+    try {
+      table = JSON.parse(r.bench_table ?? "[]") as BenchRow[];
+    } catch {
+      continue;
+    }
+    const key = (r.chip ?? "Unknown") + "\u0000" + (r.model ?? "?");
+    let m = machines.get(key);
+    if (!m) machines.set(key, (m = { meta: [], cells: new Map() }));
+    m.meta.push(r);
+    for (const row of table) {
+      const id = row.g + "/" + row.t;
+      if (!rowSeen.has(id)) {
+        rowSeen.add(id);
+        rows.push({ g: row.g, t: row.t, u: row.u, kind: "value" in row.c ? "value" : "latency" });
+      }
+      let cell = m.cells.get(id);
+      if (!cell) m.cells.set(id, (cell = new Map()));
+      for (const [k, v] of Object.entries(row.c)) {
+        const list = cell.get(k);
+        if (list) list.push(v);
+        else cell.set(k, [v]);
+      }
+    }
+  }
+
+  const out = [...machines.values()].map((m) => {
+    const rep = m.meta[0];
+    const cells: Record<string, Record<string, number>> = {};
+    for (const [id, cell] of m.cells) {
+      const c: Record<string, number> = {};
+      for (const [k, list] of cell) {
+        const v = median(list);
+        if (v !== null) c[k] = Math.round(v * 100) / 100;
+      }
+      cells[id] = c;
+    }
+    return {
+      chip: rep.chip ?? "Unknown",
+      model: rep.model,
+      releaseYear: firstNonNull(m.meta.map((r) => r.release_year)),
+      memoryBytes: firstNonNull(m.meta.map((r) => r.mem_bytes)),
+      vramBytes: firstNonNull(m.meta.map((r) => r.vram_bytes)),
+      cpuCores: firstNonNull(m.meta.map((r) => r.cpu_cores)),
+      runs: m.meta.length,
+      appVersions: uniq(m.meta.map((r) => r.app_version)).sort((a, b) => cmpVersion(b, a)),
+      macosVersions: uniq(m.meta.map((r) => r.macos_version)),
+      cells,
+    };
+  });
+  const speed = (x: (typeof out)[number]) => x.cells["Indexing/Text indexing"]?.value ?? 0;
+  out.sort((a, b) => speed(b) - speed(a));
+
+  const versions = uniq(runs.map((r) => r.app_version)).sort((a, b) => cmpVersion(b, a));
+  return {
+    datasetVersion: BENCH_DATASET,
+    runs: runs.length,
+    latestVersion: versions[0] ?? null,
+    rows,
+    machines: out,
+  };
 }
 
 // ---------------------------------------------------------------------------

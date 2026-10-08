@@ -255,7 +255,7 @@
         },
         {
           "q": "What does Run benchmark do?",
-          "a": "Settings > Performance > Run benchmark indexes a fixed 300-file dataset in isolation and reports files per second and peak memory. Your index is not touched, and indexing resumes afterwards.",
+          "a": "Settings > Performance > Run benchmark generates the same data on every Mac (text, images, audio, video and a 946,568-row index) and reports a table: indexing speed, query latency, search during bulk changes, and what each optimization saves. Your files and index are not touched, indexing pauses during the run and resumes afterwards, and results are shared only if Share results is on.",
           "shortcut": ""
         },
         {

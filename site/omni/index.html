@@ -291,6 +291,29 @@
     .bench-legend > span { display: inline-flex; align-items: center; gap: 7px; }
     .bench-legend .sw { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
     .bench-legend .chip-year { color: var(--text-3); margin-left: 4px; }
+    #benchmark .wrap { min-width: 0; }
+    .bench, #bench-view, .bench-panel { min-width: 0; max-width: 100%; }
+    .bench-table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
+    .bench-table { border-collapse: collapse; width: 100%; font-size: 13.5px; font-variant-numeric: tabular-nums; }
+    .bench-table th, .bench-table td { padding: 7px 9px; text-align: right; white-space: nowrap; }
+    .bench-table th:first-child, .bench-table td:first-child { text-align: left; position: sticky; left: 0; background: var(--bg-alt); }
+    .bench-table thead th { vertical-align: bottom; font-weight: 600; font-size: 13px; border-bottom: 1px solid var(--line); }
+    .bench-table thead .mach { display: block; color: var(--text-3); font-weight: 400; font-size: 11.5px; margin-top: 2px; }
+    .bench-table .grp td { padding-top: 18px; font-weight: 600; color: var(--text); border-bottom: 1px solid var(--line); }
+    .bench-table tbody tr:not(.grp) td { border-bottom: 1px solid var(--line); }
+    .bench-table tbody tr:not(.grp):last-child td { border-bottom: 0; }
+    .bench-table td:first-child { color: var(--text); padding-right: 22px; }
+    .bench-table .unit { color: var(--text-3); margin-left: 6px; font-size: 12px; }
+    .bench-table td.v { color: var(--text-2); cursor: default; }
+    .bench-table td.v .mx { color: var(--text-3); }
+    .bench-table td.na { color: var(--text-3); }
+    @media (max-width: 734px) {
+      .bench-panel { padding: 16px 10px 12px; }
+      .bench-table { font-size: 12.5px; }
+      .bench-table .unit { display: block; margin-left: 0; font-size: 11px; }
+      .bench-table td:first-child { padding-right: 12px; white-space: normal; min-width: 128px; }
+    }
+    .bench-note { margin: 14px 2px 0; font-size: 12.5px; color: var(--text-3); text-align: center; }
     .profiling-empty { border-radius: var(--radius); background: var(--bg-alt); padding: 48px 20px; text-align: center; color: var(--text-2); font-size: 15px; display: grid; gap: 6px; }
     #bench-tip {
       position: fixed; z-index: 100; pointer-events: none; max-width: 280px;
@@ -503,7 +526,7 @@ curl http://127.0.0.1:51234/v1/search -d '{"query": "invoice from february", "to
       <div class="wrap">
         <div class="head-center">
           <h2 id="bench-title">Benchmarks.</h2>
-          <p class="sub">300 files, community runs.</p>
+          <p class="sub">Community runs on the same generated data.</p>
         </div>
         <p class="profiling-meta" id="profiling-meta" hidden></p>
         <div class="bench" id="profiling-content">
@@ -619,21 +642,169 @@ curl http://127.0.0.1:51234/v1/search -d '{"query": "invoice from february", "to
       return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * mag;
     }
 
+    var EMPTY =
+      '<div class="profiling-empty">' +
+      '<strong>No results yet</strong>' +
+      '<span>Run one in Settings &rsaquo; Performance &rsaquo; Run benchmark.</span>' +
+      "</div>";
+
     function showEmpty() {
       var content = document.getElementById("profiling-content");
-      if (content) {
-        content.innerHTML =
-          '<div class="profiling-empty">' +
-          '<strong>No results yet</strong>' +
-          '<span>Run one in Settings &rsaquo; Performance &rsaquo; Run benchmark.</span>' +
-          "</div>";
-      }
+      if (content) content.innerHTML = EMPTY;
+      var meta = document.getElementById("profiling-meta");
+      if (meta) meta.hidden = true;
+    }
+
+    function hasTable(data) {
+      var b = data && data.bench;
+      return !!(b && b.runs > 0 && Array.isArray(b.machines) && b.machines.length && Array.isArray(b.rows));
     }
 
     function render(data) {
       var content = document.getElementById("profiling-content");
-      var meta = document.getElementById("profiling-meta");
       if (!content) return;
+      if (view === null) view = hasTable(data) ? "tasks" : "history";
+      var tabs =
+        '<div class="bench-toggle mono" role="tablist" aria-label="Benchmark view">' +
+          ["tasks", "history"].map(function (v) {
+            return '<button role="tab" aria-selected="' + (view === v ? "true" : "false") + '" data-view="' + v + '"' +
+              (view === v ? ' class="on"' : "") + ">" + (v === "tasks" ? "Tasks" : "Indexing history") + "</button>";
+          }).join("") +
+        "</div>";
+      content.innerHTML = tabs + '<div id="bench-view"></div>';
+      var buttons = content.querySelectorAll("[data-view]");
+      for (var i = 0; i < buttons.length; i++) {
+        buttons[i].addEventListener("click", function () {
+          var v = this.getAttribute("data-view");
+          if (v && v !== view && lastData) { view = v; render(lastData); }
+        });
+      }
+      var holder = document.getElementById("bench-view");
+      if (view === "tasks") renderTable(data, holder);
+      else renderHistory(data, holder);
+    }
+
+    function shortChip(c) { return String(c || "Unknown").replace(/^Apple /, ""); }
+
+    // One cell's text. Latency rows show the median; under a bulk change, the median and the worst
+    // wait, since the worst wait is what the row is about.
+    function cellText(row, c) {
+      if (!c) return null;
+      function n(v) {
+        if (typeof v !== "number" || !isFinite(v)) return "\u2014";
+        var a = Math.abs(v);
+        return a >= 1000 ? Math.round(v).toLocaleString("en-US") : a >= 100 ? v.toFixed(0) : a >= 10 ? v.toFixed(1) : v.toFixed(2);
+      }
+      if (row.kind === "value") return esc(n(c.value));
+      if (row.g === "Search under load" && typeof c.max === "number") {
+        return esc(n(c.p50)) + ' <span class="mx">/ ' + esc(n(c.max)) + "</span>";
+      }
+      return esc(n(c.p50));
+    }
+
+    function cellTip(row, m, c) {
+      var head = "<div class=\"t\">" + esc(row.t) + " \u00B7 " + esc(shortChip(m.chip)) + "</div>";
+      if (row.kind === "value") return head + "<div><strong>" + esc(String(c.value)) + "</strong> " + esc(row.u) + "</div>";
+      var parts = ["p50", "p95", "p99", "max"].filter(function (k) { return typeof c[k] === "number"; })
+        .map(function (k) { return k + " <strong>" + esc(String(c[k])) + "</strong>"; });
+      var op = typeof c.op === "number" ? "<div>the change itself took " + esc(c.op.toFixed(1)) + " s</div>" : "";
+      return head + "<div>" + parts.join(" \u00B7 ") + " ms</div>" + op;
+    }
+
+    function renderTable(data, holder) {
+      var meta = document.getElementById("profiling-meta");
+      if (!hasTable(data)) {
+        holder.innerHTML = EMPTY;
+        if (meta) meta.hidden = true;
+        return;
+      }
+      var b = data.bench;
+      var machines = b.machines;
+      if (meta) {
+        var rel = relTime(data.updatedAt);
+        meta.innerHTML =
+          fmtInt(b.runs) + (b.runs === 1 ? " run" : " runs") +
+          '<span class="dot">&middot;</span>' + machines.length + (machines.length === 1 ? " Mac" : " Macs") +
+          (b.latestVersion ? '<span class="dot">&middot;</span>latest v' + esc(b.latestVersion) : "") +
+          (rel ? '<span class="dot">&middot;</span>updated ' + esc(rel) : "");
+        meta.hidden = false;
+      }
+      var head = "<thead><tr><th>Task</th>" + machines.map(function (m) {
+        var hw = [typeof m.releaseYear === "number" ? m.releaseYear : null,
+                  typeof m.memoryBytes === "number" ? gb(m.memoryBytes) : null].filter(Boolean).join(" \u00B7 ");
+        var run = [m.model || null, (m.runs || 1) + ((m.runs || 1) === 1 ? " run" : " runs")].filter(Boolean).join(" \u00B7 ");
+        return "<th>" + esc(shortChip(m.chip)) + '<span class="mach">' + esc(hw) + '</span><span class="mach">' + esc(run) + "</span></th>";
+      }).join("") + "</tr></thead>";
+      var body = "", group = null;
+      b.rows.forEach(function (row) {
+        if (row.g !== group) {
+          group = row.g;
+          body += '<tr class="grp"><td colspan="' + (machines.length + 1) + '">' + esc(group) + "</td></tr>";
+        }
+        var worst = row.g === "Search under load" && machines.some(function (m) {
+          var c = m.cells ? m.cells[row.g + "/" + row.t] : null;
+          return c && typeof c.max === "number";
+        });
+        var unit = worst ? "ms, median / worst" : row.u;
+        body += "<tr><td>" + esc(row.t) + '<span class="unit">' + esc(unit) + "</span></td>" +
+          machines.map(function (m) {
+            var c = m.cells ? m.cells[row.g + "/" + row.t] : null;
+            var text = cellText(row, c);
+            if (text === null) return '<td class="na">\u2013</td>';
+            return '<td class="v" data-tip="' + esc(cellTip(row, m, c)) + '">' + text + "</td>";
+          }).join("") + "</tr>";
+      });
+      holder.innerHTML =
+        '<div class="bench-panel"><div class="bench-table-wrap"><table class="bench-table">' + head +
+        "<tbody>" + body + "</tbody></table></div></div>" +
+        '<p class="bench-note">Medians over each Mac&rsquo;s runs. Search under load: a search every 50&nbsp;ms during one bulk change to a 946,568-row index.</p>';
+      wireTips(holder, "td.v", null);
+    }
+
+    var tipEl = null;
+    function tipNode() {
+      if (!tipEl) {
+        tipEl = document.getElementById("bench-tip");
+        if (!tipEl) {
+          tipEl = document.createElement("div");
+          tipEl.id = "bench-tip";
+          tipEl.hidden = true;
+          document.body.appendChild(tipEl);
+        }
+      }
+      return tipEl;
+    }
+    function moveTip(e) {
+      var tip = tipNode(), pad = 14;
+      var tw = tip.offsetWidth, th = tip.offsetHeight;
+      var px = e.clientX + pad, py = e.clientY + pad;
+      if (px + tw > window.innerWidth - 8) px = e.clientX - tw - pad;
+      if (py + th > window.innerHeight - 8) py = e.clientY - th - pad;
+      tip.style.left = px + "px";
+      tip.style.top = py + "px";
+    }
+    // Hover tips by delegation: elements matching `sel` carry their payload in data-tip.
+    function wireTips(root, sel, onEnter, onLeave) {
+      root.addEventListener("mouseover", function (e) {
+        var el = e.target.closest ? e.target.closest(sel) : null;
+        if (!el || !root.contains(el)) return;
+        var tip = tipNode();
+        tip.innerHTML = el.getAttribute("data-tip") || "";
+        tip.hidden = false;
+        if (onEnter) onEnter(el);
+        moveTip(e);
+      });
+      root.addEventListener("mousemove", function (e) { if (!tipNode().hidden) moveTip(e); });
+      root.addEventListener("mouseout", function (e) {
+        var el = e.target.closest ? e.target.closest(sel) : null;
+        if (!el) return;
+        tipNode().hidden = true;
+        if (onLeave) onLeave(el);
+      });
+    }
+
+    function renderHistory(data, content) {
+      var meta = document.getElementById("profiling-meta");
 
       var byChip = (data && Array.isArray(data.byChip)) ? data.byChip.slice() : [];
       var total = (data && typeof data.totalRuns === "number") ? data.totalRuns : 0;
@@ -643,7 +814,7 @@ curl http://127.0.0.1:51234/v1/search -d '{"query": "invoice from february", "to
       });
 
       if (!total || chips.length === 0) {
-        showEmpty();
+        content.innerHTML = EMPTY;
         if (meta) meta.hidden = true;
         return;
       }
@@ -776,27 +947,7 @@ curl http://127.0.0.1:51234/v1/search -d '{"query": "invoice from february", "to
 
       // Tooltip + line spotlight (event delegation; dots carry their payload).
       var svg = document.getElementById("bench-svg");
-      var tip = document.getElementById("bench-tip");
-      if (!tip) {
-        tip = document.createElement("div");
-        tip.id = "bench-tip";
-        tip.hidden = true;
-        document.body.appendChild(tip);
-      }
-      function moveTip(e) {
-        var pad = 14;
-        var tw = tip.offsetWidth, th = tip.offsetHeight;
-        var px = e.clientX + pad, py = e.clientY + pad;
-        if (px + tw > window.innerWidth - 8) px = e.clientX - tw - pad;
-        if (py + th > window.innerHeight - 8) py = e.clientY - th - pad;
-        tip.style.left = px + "px";
-        tip.style.top = py + "px";
-      }
-      svg.addEventListener("mouseover", function (e) {
-        var dot = e.target.closest ? e.target.closest(".bench-dot") : null;
-        if (!dot) return;
-        tip.innerHTML = dot.getAttribute("data-tip") || "";
-        tip.hidden = false;
+      wireTips(svg, ".bench-dot", function (dot) {
         dot.setAttribute("r", "6.5");
         svg.classList.add("focusing");
         var si = dot.getAttribute("data-series");
@@ -804,20 +955,12 @@ curl http://127.0.0.1:51234/v1/search -d '{"query": "invoice from february", "to
         for (var i = 0; i < groups.length; i++) {
           groups[i].classList.toggle("focus", groups[i].getAttribute("data-series") === si);
         }
-        moveTip(e);
-      });
-      svg.addEventListener("mousemove", function (e) {
-        if (!tip.hidden) moveTip(e);
-      });
-      svg.addEventListener("mouseout", function (e) {
-        var dot = e.target.closest ? e.target.closest(".bench-dot") : null;
-        if (!dot) return;
+      }, function (dot) {
         dot.setAttribute("r", "4.5");
-        tip.hidden = true;
         svg.classList.remove("focusing");
       });
 
-      var buttons = content.querySelectorAll(".bench-toggle button");
+      var buttons = content.querySelectorAll("[data-metric]");
       for (var bi = 0; bi < buttons.length; bi++) {
         buttons[bi].addEventListener("click", function () {
           var m2 = this.getAttribute("data-metric");
@@ -830,7 +973,8 @@ curl http://127.0.0.1:51234/v1/search -d '{"query": "invoice from february", "to
     }
 
     var lastData = null;
-    var metric = "tps";   // "tps" (tokens/s) | "fps" (files/s)
+    var view = null;      // "tasks" | "history"; null picks tasks once any table run exists
+    var metric = "tps";   // "tps" (tokens/s) | "fps" (files/s), the history chart
 
     function load() {
       fetch(ENDPOINT, { method: "GET" })
