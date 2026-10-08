@@ -1814,15 +1814,23 @@ final class AppModel {
     var maxVideoFrames: Int = 32 { didSet { persistPerf() } }
     /// Longest text slice (characters) embedded as one chunk.
     var maxTextChunkChars: Int = 1800 { didSet { persistPerf() } }
-    /// Hard memory cap in GB (0 = unlimited). Applied to MLX immediately.
     /// The memory setting: HEADROOM on top of what has to be resident - the model and the index -
     /// not a total (see omniSetMemoryHeadroom; issue #27). More is faster; zero still works.
-    var memoryHeadroomGB: Double = AppModel.defaultHeadroomGB { didSet { persistPerf(); applyMemoryLimit() } }
-    /// The smallest headroom that indexes as fast as more. Measured, 11,640 files of every kind,
-    /// two interleaved rounds: 0 GB 180-206 s (512 MB floor), 0.5 GB 146-170 s, 1 GB 143-153 s,
-    /// 1.5 GB 141-144 s, 2 GB 138 s, 3 GB 135-157 s; peak footprint 6.1-6.2 GB at 1.5 against
-    /// 7.4-7.8 GB at 3, searches and folder maps unchanged. Below 1.5 the CPU time climbs.
-    static let defaultHeadroomGB = 1.5
+    /// nil until the user moves it: then it follows the model (defaultHeadroomGB).
+    var memoryHeadroomChoiceGB: Double? = nil { didSet { persistPerf(); applyMemoryLimit() } }
+    var memoryHeadroomGB: Double {
+        get { memoryHeadroomChoiceGB ?? defaultHeadroomGB }
+        set { memoryHeadroomChoiceGB = newValue }
+    }
+    /// The smallest headroom that indexes as fast as more, which grows with the model: its
+    /// batches' working set does. Measured on 11,640 files of every kind, with the 1 GB working
+    /// floor and 512 MB cache floor (omniWorkingFloorBytes, omniCacheFloorBytes):
+    ///   nano (2.3 GB):  0.5 GB 145-146 s CPU 2:32 peak 5.3 | 1 GB 143 s 2:26 6.1 | 1.5 GB 141 s 2:17 6.7
+    ///   small (4.4 GB): 0 GB 429 s 3:53 6.0 | 1.5 GB 414 s 2:58 8.8 | 3 GB 409 s 2:54 9.7
+    /// Within 2% of the fastest: nano 1 GB, small 1.5 GB - by the model, not by its measured size,
+    /// which moves with the towers loaded (nano read 1.93 GB in one run, 2.28 in another, and a
+    /// third of either rounds to a different half-GB).
+    var defaultHeadroomGB: Double { modelVariant == .nano ? 1.0 : 1.5 }
     /// MLX bytes that are resident at rest - the weights and the index's GPU base - measured after
     /// the model has loaded and warmed (measureResidentMemory). nil until then.
     @ObservationIgnored private var residentMLXBytes: Int?
@@ -1842,10 +1850,24 @@ final class AppModel {
     /// be what pushes the Mac into swap. The same half the old total cap's ceiling used.
     var maxHeadroomGB: Double {
         let required = Double(requiredMemoryBytes > 0 ? requiredMemoryBytes : (engineTotalBytes ?? 0) + appBaselineBytes)
-        return max(0, ((physicalMemoryGB * 0.5 - required / 1_000_000_000) * 2).rounded(.down) / 2)
+        let fits = max(0, ((physicalMemoryGB * 0.5 - required / 1_000_000_000) * 2).rounded(.down) / 2)
+        return min(Self.headroomUsefulCeilingGB, fits)
     }
-    /// The headroom actually applied: the setting, held under maxHeadroomGB.
-    var effectiveHeadroomGB: Double { min(memoryHeadroomGB, maxHeadroomGB) }
+    /// PAST THIS, HEADROOM BUYS NOTHING. 3 GB is where the last budgets that measured any value
+    /// saturate (the image batch's 8,192 tokens, SQLite's page cache); what still grows past it was
+    /// measured flat or worse, only bigger: 10,000 text files 34 s at 1.5 and 3 GB, 33 s at 6 GB
+    /// (peak 3.7 -> 5.8 GB); a long scan 7-10 s at 1.5, 3 and 9 GB (peak 4.5 -> 7.8 GB); a
+    /// 60,000-file folder map 627 ms at 1.5, 557 at 3, 778 at 6, 1,092 at 12, 1,711 at 21 GB (more
+    /// landmarks, every file placed either way; peak to 10 GB).
+    static let headroomUsefulCeilingGB = 3.0
+    /// The headroom actually applied: the setting, held under maxHeadroomGB - and none at all
+    /// while macOS reports memory pressure (see memoryPressureChanged).
+    var effectiveHeadroomGB: Double { memoryPressureActive ? 0 : min(memoryHeadroomGB, maxHeadroomGB) }
+    /// macOS has reported memory pressure and it has not been normal for `pressureSettle` since.
+    private(set) var memoryPressureActive = false
+    @ObservationIgnored private var pressureSource: DispatchSourceMemoryPressure?
+    @ObservationIgnored private var pressureRelief: Task<Void, Never>?
+    private static let pressureSettle: Duration = .seconds(30)
     var physicalMemoryGB: Double { Double(omniPhysicalMemory()) / 1_000_000_000 }
 
     // Model variant (small / nano).
@@ -3422,7 +3444,7 @@ final class AppModel {
         }
         if d.object(forKey: "omni.maxTextChunkChars") != nil { maxTextChunkChars = max(200, d.integer(forKey: "omni.maxTextChunkChars")) }
         if d.object(forKey: "omni.memoryHeadroomGB") != nil {
-            memoryHeadroomGB = max(0, d.double(forKey: "omni.memoryHeadroomGB"))
+            memoryHeadroomChoiceGB = max(0, d.double(forKey: "omni.memoryHeadroomGB"))
         } else if d.object(forKey: "omni.maxMemoryGB") != nil {
             // FROM THE OLD TOTAL CAP, keeping what it did: the batch budgets of a total C were those
             // of headroom C - 3, so 6 GB -> 3 GB of headroom is the same batching. A cap at or
@@ -3432,13 +3454,9 @@ final class AppModel {
             // Mac's old default was never anybody's choice: it gets the new default, not 3 GB.
             let old = d.double(forKey: "omni.maxMemoryGB")
             let oldDefault = min(6, max(2, (physicalMemoryGB * 0.4).rounded()))
-            if old == oldDefault {
-                memoryHeadroomGB = Self.defaultHeadroomGB
-            } else {
-                memoryHeadroomGB = old > 0 ? max(0, old - Double(omniBudgetBaseBytes) / 1_000_000_000) : 64
-            }
-        } else {
-            memoryHeadroomGB = Self.defaultHeadroomGB   // held under maxHeadroomGB on a small Mac
+            if old != oldDefault {
+                memoryHeadroomChoiceGB = old > 0 ? max(0, old - Double(omniBudgetBaseBytes) / 1_000_000_000) : 64
+            }   // else: never chosen - the default, which follows the model
         }
         if d.object(forKey: "omni.minImageDim") != nil { minImageDimension = max(0, d.integer(forKey: "omni.minImageDim")) }
         if d.object(forKey: "omni.minAudioSec") != nil { minAudioSeconds = max(0, d.double(forKey: "omni.minAudioSec")) }
@@ -3453,7 +3471,9 @@ final class AppModel {
         OmniPrefs.set(maxImageDimension, forKey: "omni.maxImageDim")
         OmniPrefs.set(maxVideoFrames, forKey: "omni.maxVideoFrames")
         OmniPrefs.set(maxTextChunkChars, forKey: "omni.maxTextChunkChars")
-        OmniPrefs.set(memoryHeadroomGB, forKey: "omni.memoryHeadroomGB")
+        // Only a choice is stored; the default is recomputed for whatever model is loaded.
+        if let choice = memoryHeadroomChoiceGB { OmniPrefs.set(choice, forKey: "omni.memoryHeadroomGB") }
+        else { OmniPrefs.remove("omni.memoryHeadroomGB") }
         OmniPrefs.set(minImageDimension, forKey: "omni.minImageDim")
         OmniPrefs.set(minAudioSeconds, forKey: "omni.minAudioSec")
         OmniPrefs.set(minVideoSeconds, forKey: "omni.minVideoSec")
@@ -3885,6 +3905,50 @@ final class AppModel {
         omniSetMemoryHeadroom(Int(effectiveHeadroomGB * 1_000_000_000), residentBytes: resident)
     }
 
+    /// THE SYSTEM, NOT A FORMULA, SAYS WHEN MEMORY IS SHORT. The ceiling keeps Omni within half of
+    /// RAM, but what else is running is not Omni's to know; macOS reports pressure as it happens.
+    /// Warning or critical: give back everything above what must be resident - the buffer cache
+    /// at once, headroom to zero (smaller batches, no cache) - so Omni is not the process that
+    /// pushes the Mac into swap. Normal again for 30 s: the setting returns. Indexing goes on
+    /// throughout, at the zero-headroom speed, which is its slowest and still works.
+    func watchMemoryPressure() {
+        guard pressureSource == nil else { return }
+        pressureSource = Self.makePressureWatch { [weak self] event in
+            let raw = event.rawValue   // the event type is not Sendable; its bits are
+            Task { @MainActor in self?.memoryPressureChanged(DispatchSource.MemoryPressureEvent(rawValue: raw)) }
+        }
+    }
+
+    /// Built outside the main actor and handed a @Sendable callback, like makeFolderWatch: a
+    /// DispatchSource handler written in a @MainActor scope traps in Swift 6 off the main queue.
+    private nonisolated static func makePressureWatch(
+        _ onEvent: @escaping @Sendable (DispatchSource.MemoryPressureEvent) -> Void
+    ) -> DispatchSourceMemoryPressure {
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.normal, .warning, .critical],
+                                                             queue: DispatchQueue.global(qos: .utility))
+        source.setEventHandler { onEvent(source.data) }
+        source.resume()
+        return source
+    }
+
+    func memoryPressureChanged(_ event: DispatchSource.MemoryPressureEvent) {
+        if event.contains(.warning) || event.contains(.critical) {
+            pressureRelief?.cancel(); pressureRelief = nil
+            omniPerfLog("memory pressure \(event.contains(.critical) ? "critical" : "warning"): headroom 0, cache cleared")
+            if !memoryPressureActive { memoryPressureActive = true; applyMemoryLimit() }
+            omniClearGPUCache()
+        } else if memoryPressureActive, pressureRelief == nil {
+            pressureRelief = Task { [weak self] in
+                try? await Task.sleep(for: Self.pressureSettle)
+                guard let self, !Task.isCancelled else { return }
+                self.pressureRelief = nil
+                self.memoryPressureActive = false
+                omniPerfLog("memory pressure normal: headroom back to \(self.effectiveHeadroomGB) GB")
+                self.applyMemoryLimit()
+            }
+        }
+    }
+
     /// For the paper run's restore, which pins absolute caps of its own while it runs.
     func reapplyMemorySetting() { applyMemoryLimit() }
 
@@ -4147,6 +4211,7 @@ final class AppModel {
         omniPerfLog("launch bootstrap")
         applyMemoryLimit()
         startMemoryLogIfRequested()
+        watchMemoryPressure()
         watchActivationForDeniedRoots()
         // A model/db switch tears the old engine down: stop any in-flight label-cache build on
         // it (buildCache checks cancellation per batch) and drop the stale re-tag queue (it

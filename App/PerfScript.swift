@@ -155,6 +155,8 @@ enum PerfScript {
             if let data = try? JSONSerialization.data(withJSONObject: payload) {
                 try? data.write(to: URL(fileURLWithPath: arg), options: .atomic)
             }
+        case "pressure":    // what macOS's memory-pressure source reports: warning | critical | normal
+            model.memoryPressureChanged(arg == "critical" ? .critical : arg == "warning" ? .warning : .normal)
         case "gentags":     // File > Generate Tags on one file
             model.requestTags([arg])
         case "addfolder":   // what Add... in the sidebar does with the chosen folder

@@ -1064,6 +1064,24 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
   quarter of the old default total for the machine (VectorStore.fullBaseCeilingBytes), so headroom
   is speed only and never changes which candidates a query sees.
 
+- REFINED (same day): the default follows the model, the slider stops where more stops helping,
+  and pressure takes headroom away. Fresh index each, 11,640 files of every kind, interleaved:
+    nano   0 GB 147-175 s peak 4.8 GB | 0.5 145-146 s 5.3 | 1 143 s 6.1-6.2 | 1.5 141 s 6.6-6.7
+    small  0 GB 426-429 s peak 6.0 GB | 1.5 414-417 s 8.3-8.8 | 3 408-409 s 9.6 | 6 409 s 11.3
+  Default nano 1 GB, small 1.5 GB: within 2% of the fastest. By the variant, not by the measured
+  weights, which read 1.93 GB in one nano run and 2.28 in another and round to different steps.
+  A setting is stored only when chosen, so a default that moves with the model is not frozen.
+- Nothing gains past 3 GB, measured three ways: 10,000 text files 34 / 34 / 33 s at 1.5 / 3 / 6;
+  a scanned PDF 7-10 s at 1.5 / 3 / 9 with no order; a 60,000-point folder map gets SLOWER (fit
+  627 ms at 1.5, 557 at 3, 778 at 6, 1,092 at 12, 1,711 at 21 - landmarks scale with the budget).
+  The slider stops at 3 GB (headroomUsefulCeilingGB) or half of RAM less the required, whichever
+  is lower.
+- A 512 MB cache floor (OMNI_CACHE_FLOOR_MB): with no cache MLX frees and reallocates every batch.
+  Small at 0 headroom: 478 s, CPU 7:32 without it, 426 s, CPU 3:53 with it.
+- Memory pressure (DispatchSource, warning or critical): headroom drops to 0 and the buffer cache is
+  cleared at once; it comes back after 30 s at normal. Verified in an isolated instance with the
+  perf script's `pressure:` step: "headroom 0, cache cleared", then "headroom back to 1.0 GB".
+
 ## The read lanes raced on first use (2026-10-07)
 - The full suite died once with SIGTRAP in `_os_object_retain` under onReader, from
   BrowseReaderTests.testConcurrentBrowsesAgree. The two browse lanes were `lazy var`s; Swift lazy

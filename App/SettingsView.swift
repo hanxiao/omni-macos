@@ -629,7 +629,8 @@ private struct PerformanceTab: View {
                         Text("Headroom")
                         Spacer()
                         let shown = min(memoryDraft ?? model.memoryHeadroomGB, model.maxHeadroomGB)
-                        Text(shown == 0 ? "None" : Self.gb(shown))
+                        let isDefault = memoryDraft == nil && model.memoryHeadroomChoiceGB == nil
+                        Text((shown == 0 ? "None" : Self.gb(shown)) + (isDefault ? " \u{00B7} default" : ""))
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: Binding(
@@ -666,6 +667,7 @@ private struct PerformanceTab: View {
             } footer: {
                 // What the setting is: room on top of what the model and index always take.
                 Text(model.isPaperRunning ? "Locked while the benchmark runs."
+                     : model.memoryPressureActive ? "Paused while your Mac is short of memory; Omni runs on what the model and index need, and the headroom comes back on its own."
                      : (model.modelIndexBytes > 0
                         ? "On top of the model and index, which take \(ByteSize.memory(model.modelIndexBytes)). More headroom indexes faster; with none, Omni still works, a small batch at a time."
                         : "On top of the model and index. More headroom indexes faster; with none, Omni still works, a small batch at a time."))

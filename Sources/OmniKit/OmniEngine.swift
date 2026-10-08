@@ -207,13 +207,19 @@ public let omniBudgetBaseBytes = 3_000_000_000
 /// headroom the floor made no difference. OMNI_WORK_FLOOR_MB A/Bs it.
 public let omniWorkingFloorBytes =
     (ProcessInfo.processInfo.environment["OMNI_WORK_FLOOR_MB"].flatMap { Int($0) } ?? 1024) * 1_048_576
+/// The buffer cache's minimum, headroom or not: without one every buffer is allocated and freed
+/// again per step, and that churn is CPU. Measured at zero headroom on 11,640 files: small model
+/// 478 s / 7:32 CPU without, 426 s / 3:54 with 512 MB; nano 150 s / 3:25 without, 147 s / 2:31
+/// with, peak 4.5 -> 4.8 GB. OMNI_CACHE_FLOOR_MB A/Bs it.
+public let omniCacheFloorBytes =
+    (ProcessInfo.processInfo.environment["OMNI_CACHE_FLOOR_MB"].flatMap { Int($0) } ?? 512) * 1_048_576
 public func omniSetMemoryHeadroom(_ headroomBytes: Int, residentBytes: Int) {
     let h = max(0, headroomBytes)
     OmniMemoryBudget.capBytes = omniBudgetBaseBytes + h
     MLX.Memory.memoryLimit = max(0, residentBytes) + omniWorkingFloorBytes + h
     // Half the headroom: at 3 GB that is the 1.5 GB the 6 GB cap's quarter gave. None at zero -
     // freed buffers go straight back, which is slower and is what zero headroom means.
-    MLX.Memory.cacheLimit = h / 2
+    MLX.Memory.cacheLimit = max(h / 2, omniCacheFloorBytes)
 }
 
 /// OCR's memory settings: no compute cap (see CLAUDE.md, a cap halves decode throughput) and a
