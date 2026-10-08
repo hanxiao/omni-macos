@@ -47,3 +47,63 @@ final class OrphanCacheTests: XCTestCase {
         XCTAssertEqual(top(store, 7), "/delta/again.txt", "re-added content is visible")
     }
 }
+
+/// The incremental orphan list must equal a rebuild from scratch after ANY sequence of writes:
+/// appends, replacements (tombstones), deletes, re-adds of a known content, and the collects that
+/// shrink the dead set. Random operations, checked after every one.
+final class OrphanCacheEquivalenceTests: XCTestCase {
+    private static let dim = 64
+    private func vec(_ seed: Int) -> [Float] {
+        var s = UInt64(seed &* 2_654_435_761 &+ 12345)
+        var v = [Float](repeating: 0, count: Self.dim)
+        for i in 0 ..< Self.dim { s ^= s << 13; s ^= s >> 7; s ^= s << 17; v[i] = Float(s % 2048) / 1024 - 1 }
+        let n = (v.reduce(0) { $0 + $1 * $1 }).squareRoot()
+        return v.map { $0 / n }
+    }
+
+    func testIncrementalEqualsRebuildUnderRandomWrites() throws {
+        let saved = VectorStore.quantBaseOverride
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        defer { VectorStore.quantBaseOverride = saved }
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("orphan-eq-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = try VectorStore(dbURL: dir.appendingPathComponent("t.sqlite"))
+        defer { store.close() }
+        var rng = SystemRandomNumberGenerator()
+        var seedOf: [String: [Int]] = [:]
+        var checks = 0, nonEmpty = 0
+        func chunks(_ path: String, _ seeds: [Int], from: Int = 0) -> [IndexedChunk] {
+            seeds.enumerated().map { i, sd in
+                IndexedChunk(path: path, modified: 1, size: 10, kind: "text", chunkIndex: from + i, snippet: "s\(sd)",
+                             embedding: vec(sd), chunkKey: "k\(sd)")
+            }
+        }
+        for step in 0 ..< 400 {
+            let path = "/f/\(Int.random(in: 0 ..< 30, using: &rng)).txt"
+            switch Int.random(in: 0 ..< 10, using: &rng) {
+            case 0 ..< 4:   // replace: tombstones the old rows; seeds overlap other files' (shared contents)
+                let seeds = (0 ..< Int.random(in: 1 ... 6, using: &rng)).map { _ in Int.random(in: 0 ..< 80, using: &rng) }
+                try store.replaceMany([(path, chunks(path, seeds))]); seedOf[path] = seeds
+            case 4 ..< 6:   // append onto an existing file, as a streamed window does
+                guard let have = seedOf[path] else { continue }
+                let more = (0 ..< Int.random(in: 1 ... 4, using: &rng)).map { _ in Int.random(in: 0 ..< 200, using: &rng) }
+                try store.replaceMany([(path, chunks(path, more, from: have.count))], keepExisting: true)
+                seedOf[path] = have + more
+            case 6 ..< 8:   // delete
+                store.deletePaths([path]); seedOf[path] = nil
+            case 8:         // a search, which is what reads (and folds) the cache
+                _ = store.search(vec(Int.random(in: 0 ..< 200, using: &rng)), filter: SearchFilter(), topK: 5)
+            default:        // collect: shrinks the dead set
+                _ = store.reclaimVectorHolesForTest()
+            }
+            let (cached, rebuilt) = store.orphanSlotsForTest()
+            XCTAssertEqual(cached, rebuilt, "step \(step)")
+            if cached != rebuilt { return }
+            checks += 1
+            if !rebuilt.isEmpty { nonEmpty += 1 }
+        }
+        // The check is only meaningful if orphans actually arose.
+        XCTAssertGreaterThan(nonEmpty, 50, "orphans arose in \(nonEmpty) of \(checks) checks")
+    }
+}

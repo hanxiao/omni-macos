@@ -1135,3 +1135,39 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
 - The phrase costs a pass over the document's text, ~2.4 ms a page (168 pages: 0.4 s): computed
   when the row is selected (prefetch), cached per file version and page, and bounded at 1 s on
   the open, past which the file opens plainly. A scan has no text and opens at page 1, as before.
+
+## Search while long files stream (2026-10-08)
+- Seen on the live index during 0.15.7's first pass: searches 20 ms to 11 s, median 103 ms (Oct 3
+  served searches: 32-98 ms). A sample of the app during a slow one: 658 of 662 ms inside
+  `VectorStore.search`, none in the query embedding. Not GPU contention: index upkeep the
+  search did itself, or waited for, on the store queue.
+- Reproduced headless: `mutbench <db> --stream <paths> 40 6 1200` on a clone of a 7.5M-row v5
+  index (launch-film-index, copied to the internal SSD - the external volume was busy with the
+  live app's own catch-up), 288k rows written as 2 MB windows, a search every 50 ms. Vector file
+  pre-read, or cold page faults (gather 63 ms) dominate. No writes: p50 9.7 / p90 15.8 / max 17.6 ms.
+  With writes: p50 76 / p90 358 / p99 1,191 / max 1,679 ms, 3 over 1 s.
+- Four holders of the queue, each fixed:
+  - WAL CHECKPOINT. Deferred while searches were active, so the WAL grew to the 256 MB hard cap
+    and a TRUNCATE inside a write held the queue 1.2-1.5 s. Now a PASSIVE checkpoint on its own
+    connection (Checkpointer), then a RESTART once fully copied, never on the queue; past 1 GB the
+    old TRUNCATE remains as a valve. A/B on the follow-up: none grows the WAL to 1.1 GB and trips
+    the valve twice a run; RESTART and TRUNCATE both cap it near 300 MB with no measurable speed
+    difference. A fresh connection must read once before it sees WAL mode: the first version's
+    checkpoints returned -1 frames and did nothing.
+  - ORPHAN SLOTS. The cache survived only writes that added no slot and killed no row, so during
+    the stream every search walked all rows against the dead set: 100-140 ms. Now a live-row count
+    per slot, folded forward from `deadLog` and the appended rows; full rebuild only on a remap or a
+    shrinking dead set, and over a flat mask. `OrphanCacheEquivalenceTests` compares it with a
+    rebuild after 400 random operations; with deaths ignored it fails at once. Peak 30 ms after.
+  - COVERAGE STAMP. When it ran through after maxYieldToSearch it took a full 50k-row slice,
+    ~1.07 s on the queue. Capped at 5k rows while searches are active.
+  - The fold itself was fine: incremental, 15-44 ms.
+- Back to back, old and new binaries alternating on identical clones (the machine was busy, so
+  only pairs compare): p90 355-367 -> 146-149 ms, p99 894-1,307 -> 408-543 ms, over 1 s 2-5 -> 0,
+  writes ~6,000 -> 7,200-7,400 rows/s. The median does not move (~80 ms): it is the wait behind
+  one 1,200-row write, which this bench issues back to back; the app writes far less often.
+- searchreal on the bench clone, interleaved: same digest 134b9ff183fd2f29, latency equal.
+- Other systems do the same: delete bitmaps updated on write, rebuilds in the background with the
+  old structure serving (Milvus, Lance, Qdrant, Lucene, FreshDiskANN). None recompute on the query.
+- MLX + `exit()`: a benchmark that exits while an idle fold is queued segfaults in MLX's
+  scheduler during static destruction. mutbench ends with `_exit`, as the app does.

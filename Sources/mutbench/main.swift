@@ -68,6 +68,81 @@ if args[2] == "--reclaim" {
 // depend on what the numbers are, and an embedder here would only add a model load to the timing.
 //
 //   mutbench <dbPath> --reuse [nFiles]
+if args[2] == "--stream" {
+    // THE LONG-TEXT CATCH-UP'S WRITE PATTERN, with searches timed while it runs (index.md, "Search
+    // while long files stream"). Per file: one window that REPLACES the file's rows - which
+    // tombstones them - then appended windows (replaceMany keepExisting), `rowsPerWindow` new
+    // contents each. A probe thread searches every 50 ms. No model: this isolates what the INDEX
+    // costs a query under writes from what the GPU does.
+    // usage: mutbench <dbPath> --stream <pathsFile> [files] [windowsPerFile] [rowsPerWindow]
+    let paths = (try String(contentsOfFile: args[3], encoding: .utf8)).split(separator: "\n").map(String.init)
+    let files = args.count > 4 ? Int(args[4]) ?? 40 : 40
+    let windows = args.count > 5 ? Int(args[5]) ?? 8 : 8
+    let perWindow = args.count > 6 ? Int(args[6]) ?? 1200 : 1200
+    let store = try VectorStore(dbURL: url)
+    let dim = store.vectorDim
+    print("mutbench --stream rows=\(store.count) dim=\(dim) files=\(files) windows=\(windows) rows/window=\(perWindow)")
+    var seed: UInt64 = 0x9E3779B97F4A7C15
+    func vec() -> [Float] {
+        var v = [Float](repeating: 0, count: dim)
+        for i in 0 ..< dim { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; v[i] = Float(seed % 2048) / 1024 - 1 }
+        let nn = (v.reduce(0) { $0 + $1 * $1 }).squareRoot()
+        return nn > 0 ? v.map { $0 / nn } : v
+    }
+    let queries = (0 ..< 64).map { _ in vec() }
+    _ = store.search(queries[0], filter: SearchFilter(), topK: 10)   // warm, as a running app is
+    let lock = NSLock()
+    var probes: [(t: Double, ms: Double)] = []
+    var running = true
+    let t0 = Date()
+    let prober = Thread {
+        var k = 0
+        while true {
+            lock.lock(); let go = running; lock.unlock()
+            if !go { break }
+            let t = Date()
+            _ = store.search(queries[k % queries.count], filter: SearchFilter(), topK: 10)
+            let ms = -t.timeIntervalSinceNow * 1000
+            lock.lock(); probes.append((-t0.timeIntervalSinceNow, ms)); lock.unlock()
+            k += 1
+            usleep(50_000)
+        }
+    }
+    prober.start()
+    var written = 0
+    if files == 0 { sleep(8) }   // the baseline: the same probe with nothing written
+    for f in 0 ..< Swift.min(files, paths.count) {
+        let path = paths[f]
+        for w in 0 ..< windows {
+            let last = w == windows - 1
+            let chunks = (0 ..< perWindow).map { i in
+                IndexedChunk(path: path, modified: last ? 2_000_000_000 : 0, size: 1, kind: "text",
+                             chunkIndex: w * perWindow + i, snippet: "stream \(f)-\(w)-\(i)", embedding: vec(),
+                             locator: "Line \(w * perWindow + i + 1)", chunkKey: "stream-\(f)-\(w)-\(i)")
+            }
+            try store.replaceMany([(path, chunks)], keepExisting: w > 0)
+            written += chunks.count
+        }
+    }
+    let wall = -t0.timeIntervalSinceNow
+    lock.lock(); running = false; let p = probes; lock.unlock()
+    while !prober.isFinished { usleep(1000) }
+    let ms = p.map(\.ms).sorted()
+    func pct(_ q: Double) -> Double { ms.isEmpty ? 0 : ms[Swift.min(ms.count - 1, Int(Double(ms.count) * q))] }
+    print(String(format: "  wrote %d rows in %.1f s (%.0f rows/s)", written, wall, Double(written) / wall))
+    print(String(format: "  searches n=%d  p50 %.1f  p90 %.1f  p99 %.1f  max %.1f ms  over 250 ms: %d  over 1 s: %d",
+                 ms.count, pct(0.5), pct(0.9), pct(0.99), ms.last ?? 0,
+                 ms.filter { $0 > 250 }.count, ms.filter { $0 > 1000 }.count))
+    let slow = p.filter { $0.ms > 250 }.prefix(12).map { String(format: "%.1fs:%.0fms", $0.t, $0.ms) }
+    if !slow.isEmpty { print("  slow at: " + slow.joined(separator: " ")) }
+    if let bad = store.coverageAudit() { print("  AUDIT FAILED: \(bad)") } else { print("  audit clean") }
+    store.close()
+    // _exit, as the app quits: exit() runs MLX's C++ destructors while a scheduled idle fold may
+    // still be on the store queue, and that race segfaulted the first runs of this mode.
+    fflush(stdout)
+    _exit(0)
+}
+
 func metaScalar(_ sql: String) -> Int {
     var db: OpaquePointer?
     guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { return -1 }

@@ -1267,7 +1267,17 @@ public final class VectorStore: @unchecked Sendable {
     /// rebuilt or emptied wholesale - the sources those paths read from (the database, the row
     /// sidecar) never contain a deleted row. Clearing this anywhere a row still stands would bring
     /// a deleted file back to life.
-    private func resetTombstonesLocked() { deadRows.removeAll(); deadIdxCache = nil }
+    private func resetTombstonesLocked() { deadRows.removeAll(); deadIdxCache = nil; deadLog.removeAll(); deadShrinkGen &+= 1 }
+    /// Rows tombstoned since the dead set last shrank, in order - what the orphan-slot cache folds
+    /// in instead of re-walking every row (orphanSlotsLocked). Cleared, with `deadShrinkGen`
+    /// bumped, wherever `deadRows` loses entries; bounded by the dead set it mirrors.
+    private var deadLog: [Int32] = []
+    private var deadShrinkGen: UInt64 = 0
+    /// Tombstone one row, logging it for the orphan cache. A row already dead is not logged twice:
+    /// the cache would count its death twice.
+    private func markDeadLocked(_ i: Int32) {
+        if deadRows.insert(i).inserted { deadLog.append(i) }
+    }
 
     private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxFileIDRows = 0; mlxKindCode = nil; mlxKindCodeRows = 0; mlxModified = nil; mlxModifiedRows = 0; quantBase = nil; bitBase = nil; baseRows = 0
                                      mlxOccSlot = nil; mlxOccSlotRows = 0; mlxDeadOcc = nil; mlxDeadOccRows = 0; baseOccCount = 0
@@ -1360,63 +1370,121 @@ public final class VectorStore: @unchecked Sendable {
     /// files share stays scannable when one of them is deleted - and a content whose last owner is
     /// gone stops scoring, rather than sitting in the candidate budget it can never be returned from.
     ///
-    /// NOT KEYED ON THE MUTATION GENERATION. A slot's orphan status changes only when a row dies
-    /// (`deadRows`), when rows are moved or remapped (`occStructGen`), or when a new row points at
-    /// it - and the last is checked against just the rows appended since, the slot dropped from
-    /// the list. Equivalent to a rebuild: a slot is an orphan iff every row on it is dead, and with
-    /// the dead set and the existing rows unchanged only a new (live) row on it can change that. Keyed on mutationGen,
-    /// every saved file made the next search walk every slot against the dead set: 115-125 ms on
-    /// the live 7M-row index, paid by the first search after each write, i.e. by nearly every
-    /// search while indexing (measured 2026-10-07).
+    /// KEPT AS A LIVE-ROW COUNT PER SLOT, folded forward by what changed since the last search:
+    /// rows appended (counted if alive), rows tombstoned since (`deadLog`), slots added. A slot is
+    /// an orphan iff its count is zero. Only a remap (`occStructGen`), the dead set shrinking
+    /// (`deadShrinkGen`) or the slot count shrinking rebuild from scratch.
+    ///
+    /// The cache before this survived only a write that changed nothing but the rows: any new
+    /// slot (any new content) or any tombstone sent the next search through every row against the
+    /// dead set - 100-140 ms on a 7.5M-row clone, paid by nearly every search while the long-text
+    /// catch-up streamed (index.md, "Search while long files stream"). A full rebuild is cheaper
+    /// now too: a flat dead-row mask, not a set lookup per row.
     private var orphanCache: MLXArray?
     private var orphanCacheHost: [Int32] = []          // the same slots, ascending
-    private var orphanCacheDead: UInt64 = .max
+    private var orphanLive: [Int32] = []               // live rows per slot
     private var orphanCacheStruct: UInt64 = .max
-    private var orphanCacheOcc = 0
-    private var orphanCacheRows = -1
+    private var orphanCacheShrink: UInt64 = .max
+    private var orphanCacheOcc = 0                     // rows already counted
+    private var orphanCacheLogged = 0                  // deadLog entries already applied
+    private var orphanCacheRows = -1                   // slots covered
     private func orphanSlotsLocked(upTo n: Int) -> MLXArray? {
         guard n > 0 else { return nil }
-        if orphanCacheRows == n, orphanCacheDead == deadVersion, orphanCacheStruct == occStructGen,
-           orphanCacheOcc <= _occSlot.count {
-            let cached = orphanCacheHost
-            func isCachedOrphan(_ sl: Int32) -> Bool {
-                var lo = 0, hi = cached.count
-                while lo < hi { let mid = (lo + hi) / 2; if cached[mid] < sl { lo = mid + 1 } else { hi = mid } }
-                return lo < cached.count && cached[lo] == sl
-            }
-            // A new row on a cached orphan - a freed position handed to a new content, which on
-            // an index with holes is most writes - makes that one slot live again. Drop it from
-            // the list; nothing else about the set changed.
-            var revived = Set<Int32>()
-            for r in orphanCacheOcc ..< _occSlot.count {
-                let sl = _occSlot[r]
-                if sl >= 0, Int(sl) < n, isCachedOrphan(sl) { revived.insert(sl) }
-            }
-            orphanCacheOcc = _occSlot.count
-            if !revived.isEmpty {
-                orphanCacheHost.removeAll { revived.contains($0) }
-                orphanCache = orphanCacheHost.isEmpty ? nil : MLXArray(orphanCacheHost)
-                if let c = orphanCache { MLX.eval(c) }
-            }
-            return orphanCache
+        let occ = _occSlot.count
+        guard orphanCacheRows >= 0, orphanCacheStruct == occStructGen, orphanCacheShrink == deadShrinkGen,
+              orphanCacheOcc <= occ, orphanCacheLogged <= deadLog.count, n >= orphanCacheRows else {
+            return rebuildOrphansLocked(upTo: n)
         }
-        ensureSlotRowsLocked()
-        let dead = deadRows
+        let oldOcc = orphanCacheOcc
+        var touched: [Int32] = []
+        func grow(_ sl: Int) { if sl >= orphanLive.count { orphanLive.append(contentsOf: repeatElement(0, count: sl + 1 - orphanLive.count)) } }
+        // Deaths first, against the rows counted before this pass: a row appended since and
+        // already dead was never counted, so its death is not taken off either.
+        for k in orphanCacheLogged ..< deadLog.count {
+            let r = Int(deadLog[k])
+            guard r < oldOcc else { continue }
+            let sl = _occSlot[r]
+            guard sl >= 0, Int(sl) < orphanLive.count else { continue }
+            orphanLive[Int(sl)] -= 1
+            touched.append(sl)
+        }
+        for r in oldOcc ..< occ {
+            let sl = _occSlot[r]
+            guard sl >= 0, !deadRows.contains(Int32(r)) else { continue }
+            grow(Int(sl))
+            orphanLive[Int(sl)] += 1
+            touched.append(sl)
+        }
+        if n > orphanCacheRows { grow(n - 1); touched.append(contentsOf: (orphanCacheRows ..< n).map(Int32.init)) }
+        orphanCacheOcc = occ
+        orphanCacheLogged = deadLog.count
+        orphanCacheRows = n
+        guard !touched.isEmpty else { return orphanCache }
+        // Merge the touched slots' new standing into the sorted list.
+        var add = Set<Int32>(), drop = Set<Int32>()
+        for sl in touched where Int(sl) < n {
+            if orphanLive[Int(sl)] == 0 { add.insert(sl); drop.remove(sl) } else { drop.insert(sl); add.remove(sl) }
+        }
+        var changed = false
+        if !drop.isEmpty {
+            let before = orphanCacheHost.count
+            orphanCacheHost.removeAll { drop.contains($0) }
+            changed = orphanCacheHost.count != before
+        }
+        if !add.isEmpty {
+            let have = Set(orphanCacheHost)
+            let fresh = add.filter { !have.contains($0) }
+            if !fresh.isEmpty { orphanCacheHost = (orphanCacheHost + fresh).sorted(); changed = true }
+        }
+        if changed {
+            orphanCache = orphanCacheHost.isEmpty ? nil : MLXArray(orphanCacheHost)
+            if let c = orphanCache { MLX.eval(c) }
+        }
+        return orphanCache
+    }
+
+    private func rebuildOrphansLocked(upTo n: Int) -> MLXArray? {
+        let occ = _occSlot.count
+        var dead = [Bool](repeating: false, count: occ)
+        for d in deadRows where Int(d) >= 0 && Int(d) < occ { dead[Int(d)] = true }
+        // Every slot a row points at, `n` or not: a slot past `n` today is inside it once more
+        // contents arrive, and the incremental pass must find it already counted.
+        let top = _occSlot.reduce(Int32(-1), Swift.max)
+        var live = [Int32](repeating: 0, count: Swift.max(n, Int(top) + 1))
+        _occSlot.withUnsafeBufferPointer { os in
+            dead.withUnsafeBufferPointer { dm in
+                live.withUnsafeMutableBufferPointer { lv in
+                    for r in 0 ..< occ where !dm[r] {
+                        let sl = Int(os[r])
+                        if sl >= 0 { lv[sl] += 1 }
+                    }
+                }
+            }
+        }
         var idx: [Int32] = []
-        let cap = Swift.min(n, Swift.max(0, slotRowStart.count - 1))
-        for sl in 0 ..< cap {
-            var anyLive = false
-            for r in rowsOfSlotLocked(sl) where !dead.contains(r) { anyLive = true; break }
-            if !anyLive { idx.append(Int32(sl)) }
-        }
+        for sl in 0 ..< n where live[sl] == 0 { idx.append(Int32(sl)) }
+        orphanLive = live
         orphanCache = idx.isEmpty ? nil : MLXArray(idx)
         orphanCacheHost = idx
-        orphanCacheDead = deadVersion
         orphanCacheStruct = occStructGen
-        orphanCacheOcc = _occSlot.count
+        orphanCacheShrink = deadShrinkGen
+        orphanCacheOcc = occ
+        orphanCacheLogged = deadLog.count
         orphanCacheRows = n
         if let c = orphanCache { MLX.eval(c) }
         return orphanCache
+    }
+
+    /// For tests: the cached orphan list as a search would see it, and the same list rebuilt from
+    /// scratch. They must always be equal.
+    func orphanSlotsForTest() -> (cached: [Int32], rebuilt: [Int32]) {
+        queue.sync {
+            let n = slotCount
+            _ = orphanSlotsLocked(upTo: n)
+            let cached = orphanCacheHost
+            _ = rebuildOrphansLocked(upTo: n)
+            return (cached, orphanCacheHost)
+        }
     }
     /// THE POSITIONS THESE ROWS ARE ABOUT TO RELEASE, which is what a hole actually records.
     ///
@@ -2022,6 +2090,7 @@ public final class VectorStore: @unchecked Sendable {
         self.dbURL = dbURL
         self.interactiveLane = ReadLane(dbURL: dbURL, label: "omni.vectorstore.read")
         self.aggregateLane = ReadLane(dbURL: dbURL, label: "omni.vectorstore.read.agg")
+        self.checkpointer = Checkpointer(dbURL: dbURL)
         self.onLoadProgress = onLoadProgress
         self.onPhase = onPhase
         let tOpen = Date()
@@ -2058,6 +2127,9 @@ public final class VectorStore: @unchecked Sendable {
         // concurrent search's lockwait tail. Disable it (0) and checkpoint via checkpointIfDueLocked
         // instead: same cadence, but scheduled AWAY from active-search windows.
         exec("PRAGMA wal_autocheckpoint=0;")
+        // Checkpoints run on their own connection (Checkpointer) and never truncate; the WAL file
+        // is cut back to this size when the writer restarts it instead.
+        exec("PRAGMA journal_size_limit=\(Self.walSoftCapBytes * 2);")
         exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
         // The index is a rebuildable cache: on a schema change, drop and recreate.
         if !Self.compatibleSchemaVersions.contains(userVersion()) {
@@ -4220,7 +4292,95 @@ public final class VectorStore: @unchecked Sendable {
     private func closeReader() {
         interactiveLane.close()
         aggregateLane.close()
+        checkpointer.close()
     }
+
+    /// WAL CHECKPOINTS RUN HERE, NOT ON `queue`. A checkpoint used to run inside a write, holding the
+    /// store queue: and since it was deferred while searches were active, a searched-during index
+    /// let the WAL grow to the 256 MB hard cap and then folded it back in one go - 1.2-1.5 s with
+    /// every search queued behind it, measured streaming 288k rows onto a 7.5M-row clone (index.md,
+    /// "Search while long files stream"). PASSIVE on a connection of its own takes no lock that
+    /// the writer or a reader waits on: it copies what it can and returns. The writer restarts
+    /// the WAL once it is fully copied, and `journal_size_limit` gives the file back then.
+    final class Checkpointer: @unchecked Sendable {
+        private let dbURL: URL
+        private let queue = DispatchQueue(label: "omni.vectorstore.checkpoint", qos: .utility)
+        private var db: OpaquePointer?
+        private var shut = false
+        private let lock = NSLock()
+        private var running = false, again = false
+        /// Checkpoints completed, for tests and the bench.
+        private(set) var completed = 0
+
+        init(dbURL: URL) { self.dbURL = dbURL }
+
+        /// Ask for one. Coalesced: requests while one runs fold into a single follow-up.
+        func request() {
+            lock.lock()
+            if shut { lock.unlock(); return }
+            if running { again = true; lock.unlock(); return }
+            running = true
+            lock.unlock()
+            queue.async { self.drain() }
+        }
+
+        private func drain() {
+            while true {
+                runOne()
+                lock.lock()
+                if again && !shut { again = false; lock.unlock(); continue }
+                running = false
+                lock.unlock()
+                return
+            }
+        }
+
+        private func runOne() {
+            if db == nil {
+                lock.lock(); let isShut = shut; lock.unlock()
+                if isShut { return }
+                var h: OpaquePointer?
+                guard sqlite3_open_v2(dbURL.path, &h, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK, let handle = h else {
+                    if let h { sqlite3_close(h) }
+                    return
+                }
+                sqlite3_exec(handle, "PRAGMA wal_autocheckpoint=0;", nil, nil, nil)
+                // A connection finds the database in WAL mode on its first read; until then a
+                // checkpoint answers -1 frames and does nothing (it did, in the first bench run).
+                sqlite3_exec(handle, "PRAGMA journal_mode;", nil, nil, nil)
+                db = handle
+            }
+            let t = VectorStore.searchTiming ? Date() : nil
+            var log: Int32 = 0, copied: Int32 = 0
+            let rc = sqlite3_wal_checkpoint_v2(db, nil, SQLITE_CHECKPOINT_PASSIVE, &log, &copied)
+            // Under continuous writes the writer never starts a transaction on a fully copied WAL,
+            // so it never restarts it and the file only grows: 281k frames (1.1 GB) over 288k rows,
+            // and the hard cap's TRUNCATE on the queue twice. Once a passive pass has copied
+            // everything, RESTART here: next to nothing is left to copy, and with no busy wait it
+            // gives up at once rather than wait for a writer mid-transaction. Measured A/B against
+            // TRUNCATE (index.md): both cap the WAL at ~300 MB with no hard-cap stall and no
+            // difference in search or write speed; RESTART reuses the file, journal_size_limit
+            // trims it to 64 MB.
+            var truncated = false
+            if rc == SQLITE_OK, log > 0, log == copied {
+                sqlite3_busy_timeout(db, 0)
+                truncated = sqlite3_wal_checkpoint_v2(db, nil, SQLITE_CHECKPOINT_RESTART, nil, nil) == SQLITE_OK
+            }
+            lock.lock(); completed += 1; lock.unlock()
+            if let t { print(String(format: "[ckpt] passive rc=%d frames=%d copied=%d restarted=%@ %.1fms (off the store queue)", rc, log, copied, truncated ? "yes" : "no", -t.timeIntervalSinceNow * 1000)) }
+        }
+
+        /// Waits for a running checkpoint, then closes. Before the writer's own close, whose
+        /// TRUNCATE would otherwise wait behind it.
+        func close() {
+            lock.lock(); shut = true; lock.unlock()
+            queue.sync {
+                if let h = db { sqlite3_close(h); db = nil }
+            }
+        }
+    }
+
+    private let checkpointer: Checkpointer
 
     /// Run a browse query on `lane`, falling back to the writer's queue if that lane could not open
     /// (a removed database, a permissions change). The fallback is the pre-existing behaviour, so a
@@ -7966,6 +8126,9 @@ public final class VectorStore: @unchecked Sendable {
     /// Smaller slice when the store is closing. Measured on a 4.5M-row index, a 100k slice costs
     /// ~2.2s inside close(), which is a visible pause on quit; the idle stamp can afford the full
     /// slice because nothing is waiting on it but a background search.
+    /// The slice when searches are active and the stamp runs anyway (yieldToSearchLocked's bound):
+    /// ~100 ms of queue at the measured rate.
+    static let coverageSliceBusy = 5_000
     static let coverageSliceOnClose = ProcessInfo.processInfo.environment["OMNI_COVERAGE_SLICE_CLOSE"].flatMap(Int.init) ?? 25_000
     /// Gap between slices when nothing is being searched. A 50k slice is ~0.5s of queue time at the
     /// measured 10us/row, so this is roughly a 20% duty cycle - the migration finishes in minutes
@@ -9544,7 +9707,7 @@ public final class VectorStore: @unchecked Sendable {
         let i = rows.count
         rows.append(newRowLocked(path: "", kind: "", chunkIndex: 0, meta: FileMeta(), slot: slot, live: false))
         appendDeadRowMetaLocked(rows[rows.count - 1].fid, kindCode: rows[rows.count - 1].kc, slot: slot)
-        deadRows.insert(Int32(i))
+        markDeadLocked(Int32(i))
         deadIdxCache = nil
     }
 
@@ -10267,8 +10430,11 @@ public final class VectorStore: @unchecked Sendable {
             // A reused position still owes its blob back even when the claim cannot move: the file
             // has to be synced first, which is the one thing this branch still does.
             if flat16.isPersistent, !unsyncedReuse.isEmpty {
+                let t = Self.searchTiming ? Date() : nil
                 flat16.msyncFile()
+                let tm = t.map { -$0.timeIntervalSinceNow * 1000 }
                 clearSyncedReuseBlobsLocked()
+                if let t, let tm { print(String(format: "[stamp] msync %.1fms + clear reuse %.1fms (on the store queue)", tm, -t.timeIntervalSinceNow * 1000 - tm)) }
             }
             // FOLD BEFORE RECLAIM. The fold turns duplicates into holes and the reclaim turns
             // holes into space; run the other way round and the reclaim rewrites a 15 GB file for
@@ -10308,7 +10474,11 @@ public final class VectorStore: @unchecked Sendable {
             scheduleCoverageStampLocked(after: Self.coverageBusyGap)
             return
         }
-        defer { scheduleCoverageStampLocked() }
+        let tCov = Self.searchTiming ? Date() : nil
+        defer {
+            if let tCov { print(String(format: "[stamp] coverage %.1fms covered=%d of %d (on the store queue)", -tCov.timeIntervalSinceNow * 1000, coveredRows, coverUnits)) }
+            scheduleCoverageStampLocked()
+        }
         // THE SPLIT, FROM HERE TOO, OR AN INDEX THAT IS STILL INDEXING NEVER MIGRATES.
         //
         // The build lives in the caught-up branch above, which needs `coveredRows >= slotCount`.
@@ -10354,7 +10524,11 @@ public final class VectorStore: @unchecked Sendable {
         guard flat16.isPersistent, flat16.extendFileCoverage() else { return }
         flat16.msyncFile()
         clearSyncedReuseBlobsLocked()
-        advanceCoverageLocked(budget: budget)
+        // Forced through after maxYieldToSearch of searching: a slice small enough not to be the
+        // stall. The full slice (~1 s on a 7.5M-row clone) was the longest hold on the queue left
+        // once the long-text catch-up's other costs were gone (index.md, "Search while long
+        // files stream"); the next idle stamp catches up at full size.
+        advanceCoverageLocked(budget: searchRecentlyActiveLocked() ? Swift.min(budget, Self.coverageSliceBusy) : budget)
     }
 
     private func stampRowSidecarLocked(sync: Bool) {
@@ -11211,15 +11385,12 @@ public final class VectorStore: @unchecked Sendable {
     static let refoldMinInterval: TimeInterval =
         (ProcessInfo.processInfo.environment["OMNI_REFOLD_MIN_INTERVAL"].flatMap { Double($0) }) ?? 0.25
 
-    /// Scheduled WAL maintenance (autocheckpoint is off - see init). After a write, fold the WAL back
-    /// into the db once it exceeds the soft cap, but only when no search ran recently - the checkpoint
-    /// is the same 40-70ms it always was, it just no longer fires in the middle of a write txn that a
-    /// live search is queued behind. The hard cap bounds WAL growth if the user searches continuously
-    /// (a checkpoint then runs anyway; one bounded stall beats unbounded disk). Not single-connection:
-    /// the two read-only browse connections hold read transactions of their own, so TRUNCATE can
-    /// wait up to busy_timeout (5 s) behind a browse statement in flight, and gives up without
-    /// truncating if it is still running then. Crash-durability is unchanged in kind - the index
-    /// is a rebuildable cache, and a lost WAL tail just means the next pass re-embeds those files.
+    /// Scheduled WAL maintenance (autocheckpoint is off - see init). After a write, once the WAL is
+    /// past the soft cap, ask the Checkpointer for a PASSIVE checkpoint on its own connection, which
+    /// holds nothing a search or the writer waits on. Only past the hard cap - a reader pinning
+    /// frames under continuous writes - does a TRUNCATE run here, on the queue, as before.
+    /// Crash-durability is unchanged in kind - the index is a rebuildable cache, and a lost WAL tail
+    /// just means the next pass re-embeds those files.
     private func checkpointIfDueLocked(forceStat: Bool = false) {
         // The WAL only grows by the bytes we insert, so below the soft cap we cannot be due. Gate the
         // per-write attributesOfItem stat (a syscall + a ~12-entry NSDictionary alloc) behind a cheap
@@ -11235,14 +11406,20 @@ public final class VectorStore: @unchecked Sendable {
         guard forceStat || bytesWrittenSinceCkpt >= Self.walSoftCapBytes else { return }
         let wal = ((try? FileManager.default.attributesOfItem(atPath: dbURL.path + "-wal")[.size]) as? Int) ?? 0
         guard wal > Self.walSoftCapBytes else { return }
-        if searchRecentlyActiveLocked() && wal < Self.walHardCapBytes { return }
+        // Off this queue, whether or not a search is active: it no longer blocks anything.
+        checkpointer.request()
+        bytesWrittenSinceCkpt = 0
+        // The safety valve. A passive checkpoint cannot copy frames a reader still needs, and the
+        // writer cannot restart a WAL that is not fully copied, so a long-lived reader under
+        // continuous writes could grow it without bound. Past the hard cap, fold it back here,
+        // as every write used to: one bounded stall beats an unbounded file.
+        guard wal > Self.walHardCapBytes else { return }
         let t = Self.searchTiming ? Date() : nil
         exec("PRAGMA wal_checkpoint(TRUNCATE);")
-        bytesWrittenSinceCkpt = 0
-        if let t { print(String(format: "[ckpt] wal=%dMB %.1fms", wal >> 20, -t.timeIntervalSinceNow * 1000)) }
+        if let t { print(String(format: "[ckpt] HARD CAP wal=%dMB %.1fms", wal >> 20, -t.timeIntervalSinceNow * 1000)) }
     }
     private static let walSoftCapBytes = 32 << 20
-    private static let walHardCapBytes = 256 << 20
+    private static let walHardCapBytes = 1 << 30
 
     public func kinds() -> Set<String> { queue.sync { Set(kindFileCounts.keys) } }
 
@@ -12298,7 +12475,7 @@ public final class VectorStore: @unchecked Sendable {
             let r = rows[Int(i)]
             removedIDs.insert(r.fid)
             fileChunkDec(fileID[Int(i)], kindOf(r))
-            deadRows.insert(i)
+            markDeadLocked(i)
         }
         deadIdxCache = nil
         return Set(removedIDs.map { filePaths[Int($0)] })
@@ -12362,6 +12539,7 @@ public final class VectorStore: @unchecked Sendable {
         let removed = rows.count - w
         guard removed > 0 else { return Set(removedIDs.map { filePaths[Int($0)] }) }
         deadRows.removeAll(keepingCapacity: true)   // collected by this pass
+        deadLog.removeAll(); deadShrinkGen &+= 1
         deadIdxCache = nil
         // Every row index at or past `firstRemoved` just moved, so a cursor into the row table
         // means something else now.
