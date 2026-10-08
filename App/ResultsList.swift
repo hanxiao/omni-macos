@@ -743,6 +743,17 @@ struct PassagesView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     Text(scoreText(p.score)).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
                 }
+                // A PASSAGE OPENS WHERE IT IS (#26): double-click opens the file at this passage's
+                // page or line, not the file's top hit. Hovering works the PDF phrase out first.
+                .contentShape(Rectangle())
+                // Simultaneous, as on the rows, so the list's marquee still sees a drag that starts here.
+                .simultaneousGesture(TapGesture(count: 2).onEnded {
+                    if !path.isEmpty { OpenAtHit.open(path, locator: p.locator, snippet: p.snippet) }
+                })
+                .onHover { inside in
+                    if inside, !path.isEmpty { OpenAtHit.prefetch(path, locator: p.locator, snippet: p.snippet) }
+                }
+                .help(p.locator.isEmpty ? "" : "Double-click to open at \(p.locator)")
             }
             if let passages, passages.isEmpty {
                 Text("No passages").font(.caption).foregroundStyle(.tertiary)

@@ -43,23 +43,67 @@ enum OpenAtHit {
         guard !PhotoLibrary.isPhotoPath(path), (path as NSString).pathExtension.lowercased() == "pdf",
               let page = ChunkPreview.pageIndex(fromLocator: locator) else { return }
         let url = URL(fileURLWithPath: path)
-        Task.detached(priority: .utility) { _ = phraseCache.phrase(url, page: page, snippet: snippet) }
+        Task.detached(priority: .utility) {
+            _ = phraseCache.phrase(url, page: page, snippet: snippet, budget: prefetchBudget)
+        }
     }
 
-    /// Phrases by file version and page, for the session; the work behind one is done once.
+    /// The open itself waits at most `openBudget` for a phrase; a prefetch, which nobody waits on,
+    /// may take longer, and leaves the document's page text cached for the open that follows.
+    static let openBudget: TimeInterval = 1.0
+    nonisolated static let prefetchBudget: TimeInterval = 8.0
+
+    /// Phrases by file version and page, for the session; the work behind one is done once. The
+    /// pages' text is kept per file version too, so the second passage of a long book does not read
+    /// it again. A phrase that ran out of budget is not remembered: the next ask resumes from the
+    /// text read so far.
     nonisolated static let phraseCache = PhraseCache()
     final class PhraseCache: @unchecked Sendable {
         private let lock = NSLock()
-        private var done: [String: String?] = [:]
-        nonisolated func phrase(_ url: URL, page: Int, snippet: String) -> String? {
+        private var done: [String: String] = [:]
+        /// The page text of the last few documents asked about; an open PDF is not small, so older
+        /// ones are let go (their phrases stay in `done`).
+        private var texts: [String: PageTexts] = [:]
+        private var textOrder: [String] = []
+        private static let documentsKept = 4
+        nonisolated func phrase(_ url: URL, page: Int, snippet: String, budget: TimeInterval = OpenAtHit.openBudget) -> String? {
             let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)?
                 .timeIntervalSince1970 ?? 0
-            let key = "\(url.path)|\(mtime)|\(page)"
+            let doc = "\(url.path)|\(mtime)", key = "\(doc)|\(page)"
             if let hit = lock.withLock({ done[key] }) { return hit }
-            let p = OpenAtHit.uniquePhrase(in: url, page: page, near: snippet)
-            lock.withLock { done[key] = .some(p) }
+            let pages = lock.withLock { () -> PageTexts in
+                textOrder.removeAll { $0 == doc }
+                textOrder.append(doc)
+                if let t = texts[doc] { return t }
+                while textOrder.count > Self.documentsKept { texts[textOrder.removeFirst()] = nil }
+                let t = PageTexts(url); texts[doc] = t; return t
+            }
+            guard let p = OpenAtHit.uniquePhrase(pages, page: page, near: snippet, budget: budget) else { return nil }
+            lock.withLock { done[key] = p }
             return p
         }
+    }
+
+    /// One document's pages as lowercased words joined by single spaces, read on demand and kept.
+    final class PageTexts: @unchecked Sendable {
+        let doc: PDFDocument?
+        private let lock = NSLock()
+        private var pages: [String] = []
+        init(_ url: URL) { doc = PDFDocument(url: url) }
+        /// Pages 0 ... `last`, or nil when reading them would pass `deadline`.
+        func upTo(_ last: Int, deadline: Date) -> [String]? {
+            lock.lock(); defer { lock.unlock() }
+            guard let doc else { return nil }
+            while pages.count <= last {
+                if Date() > deadline { return nil }
+                pages.append(" " + OpenAtHit.words(doc.page(at: pages.count)?.string ?? "").joined(separator: " ").lowercased() + " ")
+            }
+            return Array(pages[0 ... last])
+        }
+    }
+
+    nonisolated static func words(_ s: String) -> [String] {
+        s.split(whereSeparator: { !($0.isLetter || $0.isNumber) }).map(String.init)
     }
 
     /// "Line 1240" -> 1240.
@@ -107,29 +151,23 @@ enum OpenAtHit {
         }
     }
 
-    /// A few words that occur on `page` and on no other page, so the viewer's first hit is that
-    /// page. Started from the matched chunk's own words when they are on the page, then the page's
+    /// A few words that occur on `page` and on no page before it, so the viewer's first hit is that
+    /// page: a search lands on its first match, so what follows the page cannot pull it away, and
+    /// only the pages up to it are read - page 327 of a 900-page book reads 328, not 900. Started from the matched chunk's own words when they are on the page, then the page's
     /// text from the top. Plain words only: punctuation is where a PDF's text and a typed search
     /// disagree - a straight against a curly apostrophe failed to match at all (measured). nil
     /// when the page has no text (a scan) or nothing short enough is unique.
-    /// `budget` bounds the whole-document pass, so the open it gates is never more than about a
-    /// second late: past it, nil, and the file opens as it always did.
-    nonisolated static func uniquePhrase(in url: URL, page: Int, near snippet: String, budget: TimeInterval = 1.0) -> String? {
-        let t0 = Date()
-        guard let doc = PDFDocument(url: url), page >= 0, page < doc.pageCount else { return nil }
-        func words(_ s: String) -> [String] {
-            s.split(whereSeparator: { !($0.isLetter || $0.isNumber) }).map(String.init)
-        }
+    /// `budget` bounds the reading of the pages, so an open it gates is never more than about a
+    /// second late: past it, nil, and the file opens as it always did (a prefetch, which nothing
+    /// waits on, gets longer and leaves the pages read for the open).
+    nonisolated static func uniquePhrase(_ texts: PageTexts, page: Int, near snippet: String, budget: TimeInterval) -> String? {
+        let deadline = Date().addingTimeInterval(budget)
+        guard let doc = texts.doc, page >= 0, page < doc.pageCount else { return nil }
         let pageWords = words(doc.page(at: page)?.string ?? "")
         guard pageWords.count >= 4 else { return nil }
-        // Every page's text once, as lowercased words joined by single spaces, so a phrase test is
+        // The pages up to this one, as lowercased words joined by single spaces, so a phrase test is
         // a substring search rather than a PDFKit pass per candidate.
-        var pages: [String] = []
-        pages.reserveCapacity(doc.pageCount)
-        for i in 0 ..< doc.pageCount {
-            if -t0.timeIntervalSinceNow > budget { return nil }
-            pages.append(" " + words(doc.page(at: i)?.string ?? "").joined(separator: " ").lowercased() + " ")
-        }
+        guard let pages = texts.upTo(page, deadline: deadline) else { return nil }
         func onlyOnPage(_ phrase: String) -> Bool {
             let needle = " " + phrase.lowercased() + " "
             for (i, text) in pages.enumerated() where text.contains(needle) != (i == page) { return false }
@@ -148,8 +186,10 @@ enum OpenAtHit {
                 let phrase = pageWords[i ..< i + length].joined(separator: " ")
                 // Short tokens alone make a phrase that is everywhere; insist on some substance.
                 guard phrase.count >= 20, onlyOnPage(phrase) else { continue }
-                // The viewer searches the PDF's text, not this word list: PDFKit must find it too.
-                guard let hit = doc.findString(phrase, withOptions: .caseInsensitive).first,
+                // The viewer searches the PDF's text, not this word list: PDFKit's FIRST match must be
+                // on this page too. One forward search that stops at that match, not every match in
+                // the book.
+                guard let hit = doc.findString(phrase, fromSelection: nil, withOptions: .caseInsensitive),
                       hit.pages.contains(where: { doc.index(for: $0) == page }) else { continue }
                 return phrase
             }

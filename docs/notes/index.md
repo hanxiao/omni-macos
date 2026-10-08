@@ -1135,6 +1135,20 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
 - The phrase costs a pass over the document's text, ~2.4 ms a page (168 pages: 0.4 s): computed
   when the row is selected (prefetch), cached per file version and page, and bounded at 1 s on
   the open, past which the file opens plainly. A scan has no text and opens at page 1, as before.
+- FOLLOW-UP (2026-10-08, the reporter on macOS 15.8.1, a ~900-page textbook): big PDFs opened
+  plainly. The pass read EVERY page before testing a phrase, so past ~400 pages it always ran out
+  its 1 s budget, whatever the page. Measured on a generated 1,799-page PDF: the old code gave up
+  at pages 11, 327 and 857 (2.5 s unbounded). A search lands on its first match, so the phrase only
+  has to be absent from the pages BEFORE the target: page 11 in 17 ms, page 327 in 430 ms, and
+  PDFKit's check is now one forward search that stops at its first match (it collected every
+  match in the book). The page text is kept per document (last four), and a prefetch - row
+  selected, or a passage hovered - gets 8 s: page 1,701 prefetched in 2.2 s, then opened in 0.1 ms,
+  and another passage of the same book in 92 ms.
+- Passage rows (the expanded card) did nothing on double-click; they now open the file at that
+  passage's page or line.
+- REPORTED, NOT REPRODUCED (no macOS 15 here): on 15.8.1 Preview puts the phrase in its find field
+  without running the search, where 26's Preview searches and lands on the page. The event is the
+  same either way, and there is no other public way into Preview.
 
 ## Search while long files stream (2026-10-08)
 - Seen on the live index during 0.15.7's first pass: searches 20 ms to 11 s, median 103 ms (Oct 3
