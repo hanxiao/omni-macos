@@ -1064,6 +1064,15 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
   quarter of the old default total for the machine (VectorStore.fullBaseCeilingBytes), so headroom
   is speed only and never changes which candidates a query sees.
 
+## The read lanes raced on first use (2026-10-07)
+- The full suite died once with SIGTRAP in `_os_object_retain` under onReader, from
+  BrowseReaderTests.testConcurrentBrowsesAgree. The two browse lanes were `lazy var`s; Swift lazy
+  initialization is not thread-safe, so two first browses each built a lane and one thread used a
+  queue already freed. In the app, the first sidebar count and the first folder listing race the
+  same way. Built in init now (a queue each; the connection still opens on first use).
+  ReadLaneRaceTests (300 fresh stores, 8 concurrent first browses each) crashed 3 of 3 runs before,
+  passes 3 of 3 after.
+
 ## Open a result where it matched (issue #26, 2026-10-07)
 - Preview has no public way to open at a page: no URL fragment, nothing in its dictionary, and
   "Go to Page" by GUI scripting needs Accessibility. The open-documents Apple Event's documented

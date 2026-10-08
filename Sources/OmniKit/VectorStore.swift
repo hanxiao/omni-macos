@@ -2018,6 +2018,8 @@ public final class VectorStore: @unchecked Sendable {
     public init(dbURL: URL, onLoadProgress: (@Sendable (Double) -> Void)? = nil,
                 onPhase: (@Sendable (StoreOpenPhase) -> Void)? = nil) throws {
         self.dbURL = dbURL
+        self.interactiveLane = ReadLane(dbURL: dbURL, label: "omni.vectorstore.read")
+        self.aggregateLane = ReadLane(dbURL: dbURL, label: "omni.vectorstore.read.agg")
         self.onLoadProgress = onLoadProgress
         self.onPhase = onPhase
         let tOpen = Date()
@@ -4194,8 +4196,13 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    private lazy var interactiveLane = ReadLane(dbURL: dbURL, label: "omni.vectorstore.read")
-    private lazy var aggregateLane = ReadLane(dbURL: dbURL, label: "omni.vectorstore.read.agg")
+    /// Built in init, NOT `lazy`: a Swift lazy var is not thread-safe, and the first two browses
+    /// on a fresh store each built a lane, one assignment won, and the other thread went on to use
+    /// a lane whose queue had been freed - `_os_object_retain` trapped under
+    /// BrowseReaderTests.testConcurrentBrowsesAgree. Building one costs a queue; the connection
+    /// still opens on first use (`handle()`), after init has migrated the schema.
+    private let interactiveLane: ReadLane
+    private let aggregateLane: ReadLane
 
     /// Close both lanes. Called from `close()` and from `deinit`, BEFORE the writer's own close so
     /// no browse is mid-statement when the writer checkpoints. A browse arriving in between takes
