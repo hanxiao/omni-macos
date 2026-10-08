@@ -177,6 +177,40 @@ final class HeavyCrudTests: XCTestCase {
         }
     }
 
+    /// An index on exact vectors has no coverage, and its tombstones used to be collected by a
+    /// compaction inside the very delete that passed the budget - one long hold in the middle of a
+    /// bulk delete. They now stay past the budget, every search still skips them, and the stamp
+    /// collects them once writes and searches have been quiet.
+    func testUncoveredTombstonesWaitForAQuietApp() throws {
+        let saved = (VectorStore.quantBaseOverride, VectorStore.reclaimQuietSeconds, VectorStore.reclaimIdleSeconds)
+        VectorStore.quantBaseOverride = 0
+        defer { (VectorStore.quantBaseOverride, VectorStore.reclaimQuietSeconds, VectorStore.reclaimIdleSeconds) = saved }
+        let (store, url) = try tempStore()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        for i in 0 ..< 200 { try store.replaceMany([("/u/\(i).txt", chunks("/u/\(i).txt", [3_000 + i]))]) }
+        _ = store.search(vec(3_000), filter: SearchFilter(), topK: 3)
+        XCTAssertFalse(store.hasVectorCoverage)
+        store.deletePaths(Set((0 ..< 100).map { "/u/\($0).txt" }))
+        XCTAssertEqual(store.deadRowsForTest, 100, "the delete compacted instead of leaving tombstones")
+        XCTAssertEqual(store.fileCount, 100)
+        XCTAssertNotEqual(store.search(vec(3_005), filter: SearchFilter(), topK: 1).first?.path, "/u/5.txt")
+        XCTAssertEqual(store.search(vec(3_150), filter: SearchFilter(), topK: 1).first?.path, "/u/150.txt")
+
+        VectorStore.reclaimQuietSeconds = 3600
+        store.stampCoverageForTest()
+        XCTAssertEqual(store.deadRowsForTest, 100, "collected while writes were recent")
+        VectorStore.reclaimQuietSeconds = 0
+        VectorStore.reclaimIdleSeconds = 0
+        store.stampCoverageForTest()
+        XCTAssertEqual(store.deadRowsForTest, 0, "an idle stamp did not collect")
+        XCTAssertEqual(store.search(vec(3_150), filter: SearchFilter(), topK: 1).first?.path, "/u/150.txt")
+        store.close()
+        let again = try VectorStore(dbURL: url)
+        defer { again.close() }
+        XCTAssertEqual(again.fileCount, 100)
+        XCTAssertEqual(again.search(vec(3_150), filter: SearchFilter(), topK: 1).first?.path, "/u/150.txt")
+    }
+
     /// A file peeled part-way and never finished - a quit, or a crash, between two slices - must
     /// come back as a file the next pass re-reads: modified 0, the streaming writer's convention
     /// for a file whose rows are not all there. Trusting its stored date instead would leave it

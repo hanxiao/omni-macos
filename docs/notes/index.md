@@ -1258,6 +1258,28 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
   finishes, and searchreal gives the same digest killed, uninterrupted, or not reclaimed at all.
   The whole-file copy remains for an index not yet on the split; the stamp waits 5 min without a
   search for it and 1 min for relocation.
+- AN INDEX ON EXACT VECTORS has no coverage, and its tombstones were collected by a compaction
+  inside whichever delete pushed them past the budget (5% of rows): the benchmark's 1M-row store on
+  the M3 Ultra (exact below a million contents there) showed it as a p99 of 1.3 s and a worst wait
+  of 1.8 s while deleting 50,000 files. Tombstones now have no budget at delete time; the stamp
+  collects them once writes have been quiet 30 s and searches 60 s (collectIfIdleLocked), and a
+  search skips them meanwhile.
+- THE RESTART WAITS FOR THE GATE (2026-10-08, the benchmark's 1M-row store). Under tryHold a
+  bulk delete's back-to-back slices left it no gap, the log grew to the 1 GB valve, and the valve's
+  TRUNCATE ran on the store queue: 190-340 ms, three times per 50,000-file delete. The checkpoint
+  queue now blocks on the gate (writers take it before the queue, so a waiting writer waits off
+  the queue): no valve in any run since. The restart then holds the writer 0.1-2.4 s, as long
+  after a 40 ms passive pass as after a 1.6 s one, so it is not the copy; repeating passive passes
+  first changed nothing and once let six passes (8.9 s) run while the log passed the valve.
+  Reverted to one pass. Bulk delete wall time 8.2 -> 6.9-12.8 s; searches do not see it.
+- EVERY WRITER TAKES THE GATE. deleteUnderFolder's closing transaction (the directory rows, after
+  the slices) did not, and its BEGIN waited out a restart on the store queue: 819 ms, a search
+  behind it. It and wipeChunks are gated now.
+- STILL OPEN: one snippet read in ~2,400 searches over four 1M-row runs took 2,085 ms, during a
+  2.4 s restart (an earlier run of the code before these changes had a 2,120 ms worst case on the
+  same scenario). The 570 ms snippet stall in "Heavy CRUD review" has the same shape: reads of the
+  database file during a checkpoint's F_FULLFSYNC. The writer maps 256 MB of a 2.26 GB file, so
+  most snippet reads are preads; whether mapped reads avoid the wait is unmeasured.
 - Tests: HeavyCrudTests (300 random ops at 3-row slices, reclaims among them, every invariant
   after each, positive control on the CSR), the partly peeled file, the reclaim gates, listMatching
   against a sort; testPatchedOnlyFoldMatchesFullRebuild at 1 and 3 bits; relocation stopped

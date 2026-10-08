@@ -872,6 +872,9 @@ public final class VectorStore: @unchecked Sendable {
     /// The actual dimension of the stored vectors (0 if empty). Ground truth for detecting an index
     /// built with a different model than the one now loaded - the meta fingerprint can go stale.
     public var vectorDim: Int { queue.sync { dim } }
+    /// Whether the vector file answers for the store's vectors (the coverage claim), which is what
+    /// makes positions reclaimable in place; an index on the exact representation has none.
+    public var hasVectorCoverage: Bool { queue.sync { coveredRows > 0 } }
     // Resident GPU score matrix, split so indexing inserts don't recopy it. `mlxBase` is an
     // MLX-OWNED copy of rows [0, baseRows) (mlx_array_new_data copies, so it's independent of
     // flat16's storage). Rows appended past baseRows are the "delta" - scored per query with one
@@ -1078,9 +1081,9 @@ public final class VectorStore: @unchecked Sendable {
     // isFinite checks the reducers already apply then discard. Rows in the delta [baseRows, n) are
     // tombstoned the same way (see tombstoneOnlyLocked).
     //
-    // Dead rows are collected only by a physical compaction, which a removal falls back to when it
-    // would push them past `deadBudget` - and only on an index with no coverage claim. Under
-    // coverage nothing collects them (see the note after maskDeadLocked). Paths that walk `rows`
+    // Dead rows are collected only by a physical compaction, which the stamp runs once the app is
+    // quiet when they are past `deadBudget` - and only on an index with no coverage claim. Under
+    // coverage the reclaim takes their positions back instead. Paths that walk `rows`
     // directly rather than through a score filter dead rows themselves.
     nonisolated(unsafe) public static var tombstones =
         ProcessInfo.processInfo.environment["OMNI_TOMBSTONE"] != "0"
@@ -1098,8 +1101,8 @@ public final class VectorStore: @unchecked Sendable {
     /// Was the resident dead-row index list for the GPU mask. Never set any more: maskDeadLocked
     /// masks orphaned slots instead. Still cleared where tombstone state resets.
     private var deadIdxCache: MLXArray?
-    /// Past this many tombstones a removal falls back to a physical compaction, which collects
-    /// them (not under coverage, where the budget does not apply): 5% of the rows, never fewer
+    /// Past this many tombstones an idle stamp collects them by a physical compaction (not under
+    /// coverage, where the budget does not apply): 5% of the rows, never fewer
     /// than 4096, so a small store does not compact on every save and a large one cannot accumulate
     /// a scan whose rows are mostly discarded.
     /// Sized off the WHOLE row table, not the base. Tombstones now cover the delta as well, and a
@@ -3735,10 +3738,13 @@ public final class VectorStore: @unchecked Sendable {
         // resolver's: a file it declines is left to the single transaction, never deleted wrongly.
         let prefix = Array((folder.hasSuffix("/") ? folder : folder + "/").utf8)
         deleteFilesInSlices(.ids(ids) { p in p == folder || p.utf8.starts(with: prefix) })
-        queue.sync {
+        // BEHIND THE GATE like the slices: it runs right after them, which is when the Checkpointer
+        // is most likely restarting the log, and outside the gate its BEGIN waited out that restart
+        // on the store queue - 819 ms, a search behind it.
+        writeGate.hold { queue.sync {
             guard dbOpen() else { return }
             deleteUnderFolderLocked(folder)
-        }
+        } }
     }
 
     private func deleteUnderFolderLocked(_ folder: String) {
@@ -3892,7 +3898,7 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Drop all vectors (e.g. before a forced full reindex into a new embedding space).
     public func wipeChunks() {
-        queue.sync {
+        writeGate.hold { queue.sync {
             guard dbOpen() else { return }
             beginTxnLocked()
             for t in StoreSchema.allTables { exec("DELETE FROM \(t);") }   // every row is an orphan now
@@ -3912,7 +3918,7 @@ public final class VectorStore: @unchecked Sendable {
             invalidateTagFilterCacheLocked()   // wipe bypasses fileChunkDec; keep the invariant
             dim = 0
             checkpointIfDueLocked()
-        }
+        } }
     }
 
     /// The files the index knows, answerable by path WITHOUT a String per file.
@@ -4906,17 +4912,28 @@ public final class VectorStore: @unchecked Sendable {
             // BEHIND THE WRITE GATE. A RESTART holds the writer lock while it runs - copying what
             // arrived since the passive pass and syncing the database file - and a slice that hit
             // it waited 942 ms in BEGIN IMMEDIATE, on the store queue, with a search behind it
-            // (index.md, "Heavy CRUD review"). Skipped, not waited for, when a writer holds the
-            // gate; the next request tries again.
+            // (index.md, "Heavy CRUD review"). WAITED FOR, here on the checkpoint queue: a bulk
+            // write runs its slices back to back, so a try almost never found the gate free, the
+            // log grew to the 1 GB valve, and the valve's TRUNCATE ran on the store queue. The wait
+            // is one slice; the writer waits on the gate meanwhile, off the store queue. The restart
+            // itself then holds the writer 0.1-2.4 s on a bulk delete at 1M rows, and as long after a
+            // 40 ms pass as after a 1.6 s one, so the time is not the copy: repeating passive passes
+            // to shrink it changed nothing, and once let the log pass the valve (index.md, "Heavy CRUD").
             var truncated = false
+            let passiveMs = t.map { -$0.timeIntervalSinceNow * 1000 } ?? 0
+            var waitMs = 0.0, restartMs = 0.0
             if rc == SQLITE_OK, log > 0, log == copied {
-                _ = gate.tryHold {
+                let w = Date()
+                gate.hold {
+                    waitMs = -w.timeIntervalSinceNow * 1000
+                    let r = Date()
                     sqlite3_busy_timeout(db, 0)
                     truncated = sqlite3_wal_checkpoint_v2(db, nil, SQLITE_CHECKPOINT_RESTART, nil, nil) == SQLITE_OK
+                    restartMs = -r.timeIntervalSinceNow * 1000
                 }
             }
             lock.lock(); completed += 1; lock.unlock()
-            if let t { print(String(format: "[ckpt] passive rc=%d frames=%d copied=%d restarted=%@ %.1fms (off the store queue)", rc, log, copied, truncated ? "yes" : "no", -t.timeIntervalSinceNow * 1000)) }
+            if t != nil { print(String(format: "[ckpt] passive rc=%d frames=%d copied=%d %.1fms, gate wait %.1fms, restart=%@ %.1fms (off the store queue)", rc, log, copied, passiveMs, waitMs, truncated ? "yes" : "no", restartMs)) }
         }
 
         /// Waits for a running checkpoint, then closes. Before the writer's own close, whose
@@ -11223,6 +11240,7 @@ public final class VectorStore: @unchecked Sendable {
     private func stampVectorCoverageLocked(budget: Int = VectorStore.coverageSlice, reclaim: Bool = true,
                                            allowSplitBuild: Bool = true) {
         guard Self.vecCoverage, Self.rowSidecarEnabled, dbOpen(), dim > 0, !rows.isEmpty else { return }
+        if reclaim { collectIfIdleLocked() }
         // COVERAGE CAUGHT UP is the steady state, and it is where the other half of the work lives:
         // the slots the tombstones hold. Checked here rather than on a timer of its own because
         // "writes have gone quiet" is exactly the condition it needs, and this is what runs then.
@@ -11359,6 +11377,25 @@ public final class VectorStore: @unchecked Sendable {
         // once the long-text catch-up's other costs were gone (index.md, "Search while long
         // files stream"); the next idle stamp catches up at full size.
         advanceCoverageLocked(budget: searchRecentlyActiveLocked() ? Swift.min(budget, Self.coverageSliceBusy) : budget)
+    }
+
+    /// TOMBSTONES PAST THE BUDGET, ON AN INDEX WITH NO COVERAGE, collected once writes and searches
+    /// are quiet. The collection is a physical compaction - every row and vector moved, every slot
+    /// rewritten - so it is one long hold, and it waits for an app nobody is using, as the reclaim
+    /// does. Until then a search skips the dead rows, which costs it scan work and nothing else.
+    /// Under coverage the reclaim takes the positions back instead.
+    private func collectIfIdleLocked() {
+        guard coveredRows == 0, Self.tombstones, deadRows.count > deadBudget else { return }
+        let waitWrites = Self.reclaimQuietSeconds + lastMutationAt.timeIntervalSinceNow
+        let waitSearch = Swift.min(60, Self.reclaimIdleSeconds) + lastSearchAt.timeIntervalSinceNow
+        guard waitWrites <= 0, waitSearch <= 0 else {
+            scheduleCoverageStampLocked(after: Swift.max(waitWrites, waitSearch) + 1)
+            return
+        }
+        let t = Self.searchTiming ? Date() : nil
+        let dead = deadRows.count
+        _ = compactRowsLocked { _ in false }
+        if let t { print(String(format: "[collect] %d tombstones in %.0f ms (idle)", dead, -t.timeIntervalSinceNow * 1000)) }
     }
 
     private func stampRowSidecarLocked(sync: Bool) {
@@ -13235,7 +13272,6 @@ public final class VectorStore: @unchecked Sendable {
     /// skips the O(rows) predicate pass entirely. Same budget rule and same bookkeeping.
     private func tombstoneOnlyLocked(victims: [Int32]) -> Set<String>? {
         guard Self.tombstones, dim > 0, !rows.isEmpty, !victims.isEmpty else { return nil }
-        guard coveredRows > 0 || deadRows.count + victims.count <= deadBudget else { return nil }
         return applyTombstonesLocked(victims)
     }
 
@@ -13251,13 +13287,12 @@ public final class VectorStore: @unchecked Sendable {
         for i in 0 ..< rows.count where shouldRemove(i) {
             if !deadRows.contains(Int32(i)) { hits.append(Int32(i)) }
         }
-        // Over budget, a removal used to fall through to a physical compaction. It must not while
-        // coverage is active: the holes for this removal were already committed by the caller, and a
-        // compaction would move every vector out from under them. Compaction is deferred to the
-        // maintenance pass instead, which restores the blobs first and can afford to.
-        guard !hits.isEmpty, coveredRows > 0 || deadRows.count + hits.count <= deadBudget else {
-            return nil
-        }
+        // NO BUDGET HERE. Over it, a removal used to fall through to a physical compaction inside
+        // the removal - under coverage that would move every vector out from under the holes just
+        // committed, and without coverage it was the 1.3-1.8 s stall a bulk delete hit on an
+        // exact-representation store (index.md, "Heavy CRUD review"). Past the budget the
+        // tombstones are collected by the stamp once the app is quiet (collectIfIdleLocked).
+        guard !hits.isEmpty else { return nil }
         return applyTombstonesLocked(hits)
     }
 
@@ -14039,6 +14074,8 @@ public final class VectorStore: @unchecked Sendable {
     var slotsForTest: [Int32] { queue.sync { occSlot } }
     /// Resident rows, tombstones included - what the loader actually built.
     public var rowCountForTest: Int { queue.sync { rows.count - deadRows.count } }
+    /// Tombstoned rows still held in memory.
+    var deadRowsForTest: Int { queue.sync { deadRows.count } }
     /// Positions in the vector file, which is not the row count once contents are shared.
     public var slotCountForTest: Int { queue.sync { slotCount } }
     /// WHICH MODEL THE RESIDENT STATE IS IN. Asserting on this is the difference between "the
