@@ -2695,7 +2695,10 @@ public final class VectorStore: @unchecked Sendable {
     /// file. The file-watcher update path can touch many already-indexed files at once (bulk edit,
     /// git checkout, synced folder); per-file replace() would be O(N) rebuild each = O(N*M). Result
     /// is identical: each path's old rows are removed and its new chunks appended.
-    public func replaceMany(_ items: [(path: String, chunks: [IndexedChunk])]) throws {
+    /// `keepExisting`: APPEND to each path's rows rather than replacing them - the later windows of
+    /// a streamed text file (Indexer.storeStreamedText), whose chunk indices continue from the
+    /// rows already written. The file's metadata is still the batch's, last write wins.
+    public func replaceMany(_ items: [(path: String, chunks: [IndexedChunk])], keepExisting: Bool = false) throws {
         let nonEmpty = items.filter { !$0.chunks.isEmpty }
         // One entry per path, keeping the LAST - which is what the SQL side already does, because
         // deletePathLocked runs per entry inside the loop and a later entry erases an earlier one's
@@ -2719,7 +2722,8 @@ public final class VectorStore: @unchecked Sendable {
             let tSql = Self.searchTiming ? Date() : nil
             // Same reason as replace(): the rows these paths already have become tombstones after
             // the commit, and the slots they hold on to must be recorded inside it.
-            let victims = victimRowsForPathsLocked(Set(work.map { $0.path }.filter { pathIsPresentLocked($0) }))
+            let victims = keepExisting ? []
+                : victimRowsForPathsLocked(Set(work.map { $0.path }.filter { pathIsPresentLocked($0) }))
             beginTxnLocked()
             recordAndReleaseLocked(releasedSlotsLocked(victims))
             setStoredDimLocked(dim)
@@ -2737,7 +2741,7 @@ public final class VectorStore: @unchecked Sendable {
                         ? OmniError.storeBusy("\(it.path): \(lastFileUpsertError)")
                         : OmniError.store("file id failed for \(it.path): \(lastFileUpsertError)")
                 }
-                deleteChunksOfFileLocked(fid)
+                if !keepExisting { deleteChunksOfFileLocked(fid) }
                 guard let written = writeChunksLocked(fileID: fid, chunks: it.chunks, bfs: bfs[wi], w: w) else {
                     rollbackTxnLocked()
                     throw OmniError.store("insert step failed")
@@ -2748,7 +2752,7 @@ public final class VectorStore: @unchecked Sendable {
             exec("COMMIT;")
             let tRm = Self.searchTiming ? Date() : nil
             let affected = Set(work.map { $0.path })
-            if affected.contains(where: { pathIsPresentLocked($0) }) {
+            if !keepExisting, affected.contains(where: { pathIsPresentLocked($0) }) {
                 removeRowsByPathsLocked(affected, victims: victims)   // one rebuild for the whole batch
             }
             // Accumulated across the WHOLE batch and written once. Per file it was one transaction

@@ -6757,7 +6757,12 @@ final class AppModel {
                         // change during the pass queues a catch-up that only this chain starts, and
                         // with no file event pending nothing else ever did - the library sat at
                         // "Waiting to be indexed" and its deletions stayed searchable.
-                        if !p.cancelled { self.drainDeferredAfterPass(store) }
+                        if !p.cancelled {
+                            // A full pass has now walked every root with streaming, so long text
+                            // files cut at 2 MB by earlier versions have been read to the end.
+                            Task.detached(priority: .utility) { store.metaSet(Indexer.textStreamMetaKey, "1") }
+                            self.drainDeferredAfterPass(store)
+                        }
                         self.refitFolderMapIfPending()
                     }
                 }

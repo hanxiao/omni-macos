@@ -159,7 +159,10 @@ final class DecodedItem: @unchecked Sendable {
                    // for an edited or slow-motion clip - there may be no file behind it at all),
                    // so the asset itself rides to the embed stage instead of a path to re-open.
                    photoVideoSegments(asset: AVAsset, duration: Double, maxFrames: Int, maxDimension: Int),
-                   duplicate([IndexedChunk]) }   // content-dedup hit: rows ready to store, no embed needed
+                   duplicate([IndexedChunk]),    // content-dedup hit: rows ready to store, no embed needed
+                   // A plain-text file over FileExtractor.maxTextBytes: nothing decoded here; the embed
+                   // stage reads, embeds and STORES it a window at a time (storeStreamedText).
+                   textStream }
     let file: CrawledFile
     let kind: String
     let payload: Payload
@@ -648,6 +651,7 @@ public final class Indexer: @unchecked Sendable {
                       settings: IndexSettings = .default, force: Bool = false,
                       onProgress: @escaping (IndexProgress) -> Void) {
         beginChunkReuse(settings)
+        retextLargeFiles = store.metaGet(Self.textStreamMetaKey) == nil
         queue.sync { cancelled = false; cancelReason = .discard }
         var p = IndexProgress()
         // The known-files snapshot is an O(rows) walk of the resident row table that shares no
@@ -1161,6 +1165,9 @@ public final class Indexer: @unchecked Sendable {
                         if stagedStores.count >= 256 { flushStagedStores() }
                     case .images, .imagePatches, .pdfScan:
                         storeChunks(path, self.embed(item))   // scanned PDF (streamed) / image pages (batched)
+                    case .textStream:
+                        if self.storeStreamedText(item, settings: settings) { p.embedded += 1 }
+                        else if !self.isCancelled { p.failed += 1 }
                     default:
                         p.skipped += 1
                     }
@@ -1287,7 +1294,11 @@ public final class Indexer: @unchecked Sendable {
             } else {
                 pipeline(files, force: force, known: known, settings: settings) { item in
                     p.currentPath = item.file.path
-                    if item.unchanged { p.unchanged += 1 } else { storeChunks(item.file.path, self.embed(item)) }
+                    if item.unchanged { p.unchanged += 1 }
+                    else if case .textStream = item.payload {
+                        if self.storeStreamedText(item, settings: settings) { p.embedded += 1 }
+                        else if !self.isCancelled { p.failed += 1 }
+                    } else { storeChunks(item.file.path, self.embed(item)) }
                     tick(item.file.path)
                 }
             }
@@ -1467,6 +1478,139 @@ public final class Indexer: @unchecked Sendable {
                            means.count, means.isEmpty ? 0 : median(means),
                            verdict.map { $0 ? "same" : "different" } ?? "undecided", -t0.timeIntervalSinceNow * 1000))
         return verdict
+    }
+
+    // MARK: - Long text files, streamed
+
+    /// A plain-text file too long to read in one piece. Below FileExtractor.maxTextBytes nothing
+    /// changes - the file is read whole and chunked exactly as before.
+    static func streamsText(_ file: CrawledFile) -> Bool {
+        !file.isPhoto && file.size > FileExtractor.maxTextBytes
+            && FileExtractor.textExtensions.contains(file.ext.lowercased())
+    }
+
+    /// Set by the app once a full pass has run with streaming: until then a long text file indexed
+    /// by an earlier version - which read its first 2 MB and no more - is re-read to the end even
+    /// though its mtime has not moved. Its first 2 MB come back from the stored vectors.
+    public static let textStreamMetaKey = "text_streamed_v1"
+    /// Read at the start of each pass (see index()).
+    var retextLargeFiles = false
+
+    /// Bytes to text, keeping a UTF-8 sequence split by the read for the next one. Not UTF-8 at all:
+    /// Latin-1, as the whole-file read always did.
+    static func decodeTextWindow(_ d: Data, final: Bool) -> (text: String, rest: Data) {
+        if d.isEmpty { return ("", Data()) }
+        if let s = String(data: d, encoding: .utf8) { return (s, Data()) }
+        if !final {
+            for drop in 1 ... 3 where d.count > drop {
+                if let s = String(data: d.prefix(d.count - drop), encoding: .utf8) { return (s, Data(d.suffix(drop))) }
+            }
+        }
+        return (String(data: d, encoding: .isoLatin1) ?? "", Data())
+    }
+
+    /// STREAM A LONG TEXT FILE TO THE END. It used to be read to FileExtractor.maxTextBytes (2 MB)
+    /// and the rest never indexed - a 100 MB chat export searchable in its first few dozen
+    /// conversations. Now read a window, cut it with the same chunker, embed it, and move on;
+    /// memory is one window whatever the file's length.
+    ///
+    /// - The window's LAST piece is held back and cut again with the next window: its end is where
+    ///   the read stopped, not a boundary in the text. Content-defined cuts depend only on the
+    ///   bytes around them, so the chunks - and their keys - are the ones a whole-file cut makes.
+    /// - Line numbers run on across windows.
+    /// - Vectors already stored under a chunk's key are reused (embedGroupsReusing): for a file
+    ///   that grew - a log, an export - that is everything but the tail.
+    ///
+    /// TWO PHASES, so that reuse works and nothing new is asked of the store. While embedding, the
+    /// file's old rows stay as they are - they are what the unchanged chunks are reused from - and
+    /// the finished chunks go to a SPILL FILE on disk, not memory. Then the spill is written a
+    /// window at a time: the first replaces the file's rows, the rest append (replaceMany with
+    /// keepExisting), each with modified = 0 until the last carries the real mtime. A cancel while
+    /// embedding leaves the index as it was; one while writing leaves the file reading as changed,
+    /// to be redone next pass - from the rows already written. true when the whole file is stored.
+    func storeStreamedText(_ item: DecodedItem, settings: IndexSettings) -> Bool {
+        let file = item.file
+        guard let handle = try? FileHandle(forReadingFrom: file.url) else { return false }
+        defer { try? handle.close() }
+        let spillURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("omni-stream-\(UUID().uuidString).spill")
+        guard FileManager.default.createFile(atPath: spillURL.path, contents: nil),
+              let spill = try? FileHandle(forWritingTo: spillURL) else { return false }
+        defer { try? spill.close(); try? FileManager.default.removeItem(at: spillURL) }
+
+        // Phase 1: embed, spilling each window's chunks as one length-prefixed block.
+        var undecoded = Data()
+        var carry = ""
+        var lineBase = 0
+        var total = 0
+        while true {
+            if isCancelled { return false }
+            let data = (try? handle.read(upToCount: FileExtractor.maxTextBytes)) ?? Data()
+            let eof = data.isEmpty
+            undecoded.append(data)
+            let (decoded, rest) = Self.decodeTextWindow(undecoded, final: eof)
+            undecoded = rest
+            let text = carry + decoded
+            var pieces = text.isEmpty ? [] : chunk(text, settings: settings, origin: .plain, filterOpaque: false)
+            carry = (!eof && !pieces.isEmpty) ? pieces.removeLast().text : ""
+            // Locators are relative to `text`; shift them by the lines already passed, then count
+            // this window's committed lines for the next.
+            let kept = OpaqueText.filter(pieces) { $0.text }.map { piece -> TextPiece in
+                guard lineBase > 0, piece.locator.hasPrefix("Line "), let n = Int(piece.locator.dropFirst(5)) else { return piece }
+                return TextPiece(text: piece.text, locator: "Line \(n + lineBase)")
+            }
+            lineBase += text.prefix(text.count - carry.count).reduce(0) { $1.isNewline ? $0 + 1 : $0 }
+            if !kept.isEmpty {
+                let keyed = kept.map { (text: $0.text, key: chunkKey($0.text, settings: settings)) }
+                var groups: [[(text: String, key: String)]] = []
+                var i = 0
+                while i < keyed.count { groups.append(Array(keyed[i ..< min(i + textBatchSize, keyed.count)])); i += textBatchSize }
+                let vecs = embedGroupsReusing(groups, width: textBatchSize).flatMap { $0 }
+                if isCancelled { return false }
+                guard vecs.count == kept.count, vecs.allSatisfy({ !$0.isEmpty && Self.isFinite($0) }) else {
+                    Self.log.error("stream embed failed \(file.path, privacy: .public); redone next pass")
+                    return false
+                }
+                var block = Data()
+                for (j, piece) in kept.enumerated() {
+                    StreamSpill.append(&block, index: total + j, locator: piece.locator, snippet: snippet(piece.text),
+                                       key: keyed[j].key, vector: vecs[j])
+                }
+                var n = UInt32(block.count)
+                guard (try? spill.write(contentsOf: Data(bytes: &n, count: 4))) != nil,
+                      (try? spill.write(contentsOf: block)) != nil else { return false }
+                total += kept.count
+            }
+            if eof { break }
+        }
+
+        // Phase 2: write. Nothing indexable after all: what was there goes.
+        guard total > 0 else { store.deletePaths([file.path]); return true }
+        try? spill.close()
+        guard let reader = try? FileHandle(forReadingFrom: spillURL) else { return false }
+        defer { try? reader.close() }
+        var written = 0
+        while written < total {
+            if isCancelled { return false }
+            guard let head = try? reader.read(upToCount: 4), head.count == 4 else { return false }
+            let n = head.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
+            guard let block = try? reader.read(upToCount: Int(n)), block.count == Int(n) else { return false }
+            let records = StreamSpill.records(block, dim: embedder.dim)
+            let last = written + records.count >= total
+            let chunks = records.map {
+                IndexedChunk(path: file.path, modified: last ? file.modified : 0, size: file.size, kind: item.kind,
+                             chunkIndex: $0.index, snippet: $0.snippet, embedding: $0.vector,
+                             locator: $0.locator, chunkKey: $0.key)
+            }
+            do {
+                try Self.writeWaitingOutLocks { try store.replaceMany([(file.path, chunks)], keepExisting: written > 0) }
+            } catch {
+                Self.log.error("stream store failed \(file.path, privacy: .public): \(String(describing: error), privacy: .public)")
+                return false
+            }
+            written += records.count
+        }
+        return true
     }
 
     /// Paths gone from disk, sorted into the indexed files among them and the folders with rows
@@ -1834,6 +1978,10 @@ public final class Indexer: @unchecked Sendable {
                 // staging byte ceiling stays what it was for plain images on low-RAM machines.
                 iStagedRaws += raws.count + item.hqCrops.count
                 if iStagedRaws >= 16 { flushImagesU() }
+            case .textStream:
+                // Stored window by window, never through acceptCompleted - whose empty-result
+                // branch would delete the file it just wrote.
+                _ = self.storeStreamedText(item, settings: settings)
             default:
                 acceptCompleted(path, self.embed(item))
             }
@@ -1902,7 +2050,7 @@ public final class Indexer: @unchecked Sendable {
                 cond.unlock()
                 let unchanged = !force && (known[file.path].map {
                     $0.modified == file.modified && $0.size == file.size
-                } ?? false)
+                } ?? false) && !(self.retextLargeFiles && Self.streamsText(file))
                 if self.isCancelled || unchanged {
                     // On cancel, mark abandoned (unless genuinely unchanged) so the consumer skips it
                     // instead of counting it as "skipped" - it just hasn't been processed yet.
@@ -2026,6 +2174,10 @@ public final class Indexer: @unchecked Sendable {
             }
         }
 
+        // A long plain-text file is streamed by the embed stage, not read here (see storeStreamedText).
+        if category == .text, Self.streamsText(file) {
+            return DecodedItem(file: file, kind: kind, payload: .textStream, meta: meta, contentKey: contentKey)
+        }
         if category == .video {
             guard let out = source.video(file, probe: probe, settings: settings) else { return DecodedItem(file: file) }
             return DecodedItem(file: file, kind: kind, payload: out.payload, meta: out.meta, contentKey: contentKey)
@@ -2084,8 +2236,12 @@ public final class Indexer: @unchecked Sendable {
     static func fileContentKey(_ file: CrawledFile, category: FileKind, dim: Int,
                                chunkOverlap: Int, settings: IndexSettings) -> String? {
         let ext = file.ext.lowercased()
-        let cap = (category == .text && FileExtractor.textExtensions.contains(ext)) ? FileExtractor.maxTextBytes : Int.max
-        guard let digest = sha256(file.url, cap: cap) else { return nil }
+        // THE WHOLE FILE, text included. Text used to hash its first 2 MB, which was all it ever
+        // indexed; now that a long file is streamed to the end, two files of one size that differ
+        // after 2 MB would have shared a key and the second copied the first's vectors. A file
+        // under 2 MB hashes exactly as before.
+        guard let digest = sha256(file.url, cap: Int.max) else { return nil }
+        _ = ext
         let fp: String
         switch category {
         // .scan grouped for exhaustiveness only - contentKey is always called with the
@@ -2157,6 +2313,8 @@ public final class Indexer: @unchecked Sendable {
             return []
         case .duplicate(let chunks):
             return chunks   // content-dedup hit: source rows already rewritten for this file
+        case .textStream:
+            return []       // stored by storeStreamedText, which every consumer calls instead
         case .text(let pieces):
             var out: [IndexedChunk] = []
             var i = 0
@@ -2396,7 +2554,7 @@ public final class Indexer: @unchecked Sendable {
         return isCancelled ? [] : out
     }
 
-    func chunk(_ text: String, settings: IndexSettings, origin: TextOrigin) -> [TextPiece] {   // internal for tests
+    func chunk(_ text: String, settings: IndexSettings, origin: TextOrigin, filterOpaque: Bool = true) -> [TextPiece] {   // internal for tests
         let limit = max(200, settings.maxCharsPerChunk)   // user-set; floor keeps chunks meaningful
         let totalCount = text.count
         // A single chunk still HAS a position - the top of the file - and an empty string made
@@ -2451,7 +2609,7 @@ public final class Indexer: @unchecked Sendable {
                 startOff += n
                 startIdx = text.index(startIdx, offsetBy: n, limitedBy: text.endIndex) ?? text.endIndex
             }
-            return OpaqueText.filter(pieces) { $0.text }
+            return filterOpaque ? OpaqueText.filter(pieces) { $0.text } : pieces
         }
         // No chunk-count cap: coverage is bounded only by FileExtractor.maxTextBytes at extraction.
         // Single FORWARD String.Index walk - no full Array(text) copy (that was a [Character] at
@@ -2507,5 +2665,43 @@ public final class Indexer: @unchecked Sendable {
     private func snippet(_ text: String) -> String {
         let collapsed = text.split(whereSeparator: { $0.isNewline || $0 == "\t" }).joined(separator: " ")
         return String(collapsed.prefix(snippetLength))
+    }
+}
+
+/// The on-disk form of a streamed file's finished chunks between embedding and writing
+/// (Indexer.storeStreamedText): per chunk, index, three length-prefixed strings and the fp32
+/// vector, exactly as embedded - the store rounds it to bf16 the same way either way.
+enum StreamSpill {
+    static func append(_ d: inout Data, index: Int, locator: String, snippet: String, key: String, vector: [Float]) {
+        func u32(_ v: Int) { var x = UInt32(truncatingIfNeeded: v); withUnsafeBytes(of: &x) { d.append(contentsOf: $0) } }
+        func str(_ s: String) { let b = Data(s.utf8); u32(b.count); d.append(b) }
+        u32(index); str(locator); str(snippet); str(key)
+        vector.withUnsafeBufferPointer { d.append(UnsafeBufferPointer(start: UnsafeRawPointer($0.baseAddress!).assumingMemoryBound(to: UInt8.self), count: $0.count * 4)) }
+    }
+
+    static func records(_ d: Data, dim: Int) -> [(index: Int, locator: String, snippet: String, key: String, vector: [Float])] {
+        var out: [(index: Int, locator: String, snippet: String, key: String, vector: [Float])] = []
+        d.withUnsafeBytes { raw in
+            var o = 0
+            func u32() -> Int? {
+                guard o + 4 <= raw.count else { return nil }
+                defer { o += 4 }
+                return Int(raw.loadUnaligned(fromByteOffset: o, as: UInt32.self))
+            }
+            func str() -> String? {
+                guard let n = u32(), o + n <= raw.count else { return nil }
+                defer { o += n }
+                return String(decoding: UnsafeRawBufferPointer(rebasing: raw[o ..< o + n]), as: UTF8.self)
+            }
+            while o < raw.count {
+                guard let index = u32(), let loc = str(), let snip = str(), let key = str(),
+                      o + dim * 4 <= raw.count else { return }
+                var v = [Float](repeating: 0, count: dim)
+                for k in 0 ..< dim { v[k] = raw.loadUnaligned(fromByteOffset: o + k * 4, as: Float.self) }
+                o += dim * 4
+                out.append((index, loc, snip, key, v))
+            }
+        }
+        return out
     }
 }

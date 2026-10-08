@@ -1093,6 +1093,25 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
   and quantized scans with a control that the unfiltered query does return the excluded files.
 - The HTTP search route takes `until` (epoch seconds) alongside `since`.
 
+## Long text files are read to the end (2026-10-07)
+- A text file was read to FileExtractor.maxTextBytes (2 MB) and the rest never indexed: a 100 MB
+  chat export was searchable in its first 2%. Now storeStreamedText reads 2 MB windows, cuts each
+  with the same content-defined chunker, holding the last piece back to be cut again with the next
+  window, so the chunks and keys are the ones a whole-file cut makes (TextStreamTests checks the
+  key sets are equal). Line locators run on across windows.
+- Two phases. Embedding first, with the file's old rows untouched - unchanged chunks are reused
+  from them - and finished chunks spilled to a temp file, not memory. Then the spill is written a
+  window at a time: the first replaces the file's rows, the rest append (replaceMany keepExisting),
+  modified = 0 until the last write carries the real mtime. A cancel while embedding leaves the
+  index as it was; one while writing leaves the file reading as changed, redone next pass.
+- The content key hashes the whole file. Files cut by older versions are re-read once: the first
+  pass after upgrade does not trust "unchanged" for text over 2 MB until a full pass has finished
+  (meta `text_streamed_v1`).
+- In app, 100 MB JSONL (212,892 lines): indexed in ~190 s, footprint 3.9-4.2 GB throughout (flat),
+  49,829 passages, the last line's marker found at "Line 212892". Appending 100 lines: one update,
+  8.4 s, the new text found at its line. Positive control: with streaming off, the test stores 659
+  of 1,731 chunks.
+
 ## The read lanes raced on first use (2026-10-07)
 - The full suite died once with SIGTRAP in `_os_object_retain` under onReader, from
   BrowseReaderTests.testConcurrentBrowsesAgree. The two browse lanes were `lazy var`s; Swift lazy
