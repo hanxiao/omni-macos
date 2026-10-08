@@ -1174,3 +1174,11 @@ drawing in `mole_family.py`, not the PNGs.
 - TESTING TRAP: a synthetic click posted into a background instance toggles a Button but selects
   no List row - the first click in a non-key window only activates it. Row selection was checked
   through `sidebarhistory:<n>` instead.
+
+## Update window release notes (issue #28, 2026-10-08)
+- The changelog jumped between two positions when scrolled. `NSTextView(frame:)` is TextKit 2,
+  which lays out only the visible text and estimates the rest; scrolling corrected the estimate,
+  the document grew under the scroll position (432 -> 447 -> 462 pt over one scroll of three
+  releases' notes, measured offscreen), and the text moved. TextKit 1 (`usingTextLayoutManager:
+  false`) laid out in full before the alert shows holds one height (462) throughout. Any other
+  scrolling NSTextView with more than a screen of text wants the same.

@@ -140,6 +140,12 @@ enum Updater {
     /// A read-only, selectable, vertically scrolling changelog for the NSAlert accessory. Version
     /// headers are bold so the multi-version list scans at a glance; colors are semantic so it adapts
     /// to light/dark mode.
+    ///
+    /// TEXTKIT 1, LAID OUT BEFORE IT IS SHOWN (#28). `NSTextView(frame:)` is TextKit 2, which lays
+    /// out only what is on screen and estimates the rest: scrolling corrected the estimate and the
+    /// document grew under the scroll position (432 -> 447 -> 462 pt over one scroll of three
+    /// releases' notes), so the text jumped between positions. Laid out in full up front, the
+    /// height is final before the first scroll; a changelog is a few kilobytes.
     private static func notesView(_ text: String) -> NSView {
         let w: CGFloat = 420, h: CGFloat = 240
         let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: w, height: h))
@@ -147,7 +153,8 @@ enum Updater {
         scroll.autohidesScrollers = true
         scroll.borderType = .bezelBorder
         scroll.drawsBackground = true
-        let tv = NSTextView(frame: NSRect(x: 0, y: 0, width: w, height: h))
+        let tv = NSTextView(usingTextLayoutManager: false)
+        tv.frame = NSRect(x: 0, y: 0, width: w, height: h)
         tv.isEditable = false
         tv.isSelectable = true
         tv.drawsBackground = true
@@ -161,6 +168,8 @@ enum Updater {
         tv.textContainer?.widthTracksTextView = true
         tv.textContainer?.containerSize = NSSize(width: w - 12, height: CGFloat.greatestFiniteMagnitude)
         scroll.documentView = tv
+        if let lm = tv.layoutManager, let tc = tv.textContainer { lm.ensureLayout(for: tc) }
+        tv.sizeToFit()
         return scroll
     }
 
