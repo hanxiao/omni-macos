@@ -1186,3 +1186,73 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
   ~6 s. Keyed per policy first, switching back found its old key set and cut nothing
   (TextStreamTests.testLongDataFilesFollowTheSetting).
 
+
+## Heavy CRUD review (2026-10-08)
+- Every bulk write and maintenance path, timed from the reader's side: `mutbench --crud <op>` on a
+  fresh APFS clone of the bench index (9.7M rows, 2.68M files, 6.2M contents; settled first with
+  `--crud settle`: split built, v4 dropped, holes reclaimed), a search every 50 ms and a folder
+  browse every 250 ms, 8 s after the op. Fresh clones start with a cold page cache, like a store
+  after a reboot. Baseline is 0.15.8's store code in the same harness.
+
+  | op (cold clone)                  | before: op / worst search | after: op / worst search |
+  |----------------------------------|---------------------------|--------------------------|
+  | re-index 5,000 files (256/batch) | 12.9 s / 1,096 ms (20 > 250 ms) | 12.6 s / 468 ms (1)  |
+  | rename 2,000 files               | 6.2 s / 692 ms            | 7.6 s / 435 ms           |
+  | delete 100k files, one call      | 19.4 s / 19,377 ms        | 43.3 s / 473 ms          |
+  | delete 100k files, 5k batches    | 37.9 s / 4,717 ms (20 > 1 s) | 53.7 s / 463 ms       |
+  | remove a 2.36M-file folder       | 36.1 s / 33,249 ms        | 248 s / 856 ms           |
+  | turn images off (570k files)     | 24.3 s / 24,304 ms        | 21.8 s / 137 ms          |
+  | turn .json off                   | 18.5 s / 18,559 ms        | 55.2 s / 877 ms          |
+  | stream 288k rows (pairs)         | p50 69 / p99 170-240 ms   | p50 8.6 / p99 62-68 ms   |
+
+  Browsing never waited (its own connections). searchreal on the clone: 134b9ff183fd2f29,
+  p50 3.6 ms. The bulk deletes take longer end to end and no longer hold anything for long.
+- What held the queue, and the fix for each:
+  - ONE TRANSACTION PER BULK DELETE. Deletes cost ~0.38 ms a row cold in SQLite (0.032 warm),
+    so 100k files held the queue 19 s. Now `deleteFilesInSlices`: slices sized by rows + files to
+    ~100 ms each, each its own complete delete (holes, SQL, tombstones), queue released between.
+    Folder, kind and extension deletes resolve file ids once (with each path's stored hash, so
+    a reload between slices skips a file rather than deletes another) and slice too; the
+    folder's single transaction still runs once, over what is left. A file is one kind (0 of
+    2.68M mix), so a kind purge is a file delete - the old one also joined on `chunk.kind`,
+    which has no index (9.8 s of its 24 s).
+  - COLD PAGES UNDER THE LOCK. `PageWarmer` reads what a slice will touch - occurrences, contents,
+    snippets, key/slot/occurrence index entries, file and dedup rows - on 4 read-only connections
+    first: 0.044 ms a row held instead of 0.38. One connection made the total 2.8x slower than the
+    single transaction; four bring it to ~2.2x.
+  - BIG FILES. Slices are by rows because a .json of 5,034 rows was a 1.3 s slice. A file of more
+    rows than a slice is peeled (`shrinkFileLocked`): highest ordinals first, files.modified = 0
+    meanwhile (the streaming writer's "unfinished" mark), so a crash mid-peel re-reads it.
+  - REPLACES. replaceMany runs as ~100 ms sub-batches, warmed and peeled the same way; dims are
+    checked for the whole call first. Not with keepExisting (a retry would append twice).
+  - THE SLOT -> ROWS CSR was keyed on the mutation generation: 33 ms rebuilt in every write AND in
+    the first search after it. That was most of the stream's 69 ms median, which the note above put
+    down to waiting behind the write. Now keyed on `occStructGen` and extended by appended rows.
+  - THE FOLD repacked patched positions one MLX call per run (150 runs, 50 ms) and, with no new
+    positions, took the full rebuild. One gather-pack and one scatter now, empty delta allowed;
+    the write's proactive refold also fires on the patched count.
+  - CHECKPOINTS. The RESTART blocks writers while it runs, and a slice waited 942 ms in BEGIN on the
+    queue; it now runs only under `WriteGate.tryHold`, which writers hold around their queue holds.
+    And `checkpointIfDueLocked` read the WAL FILE size, which a restart keeps (64 MB limit), so every
+    delete slice asked for a checkpoint - each ending in F_FULLFSYNC (Apple's SQLite defaults
+    checkpoint_fullfsync on), which stalled snippet reads up to 570 ms. The WAL hook's frame count
+    now decides, once per 64 MB of new log.
+  - THE HOLE RECLAIM started mid-delete as holes passed 10%: an audit walking every slot (600 ms),
+    a plan (800 ms), a copy stopped by the next slice's write - every 24 s through a folder removal.
+    Now it waits for 30 s without writes and 5 min without searches, re-arms itself when those
+    are what declined it, abandons its commit if a search arrived during the copy, and the audit
+    counts from the orphan cache's per-slot live counts.
+  - READERS. listMatching sorted all 2.68M files for 60 results: 6.4 s on the queue, now a bounded
+    heap (61 ms). allIndexedPaths (filename refresh, once a minute while indexing) built 2.68M
+    Strings in one 534 ms hold; now 100k files a hold.
+- STILL OPEN: the reclaim's commit renumbers every content's slot and reloads the store in one
+  hold - 19.7 + 19.1 s on the cold clone after the image purge (`mutbench --reclaim`, which sets
+  `reclaimIdleSeconds = 0` to measure it). The gates keep it to an idle app; the fix is a reclaim
+  that fills holes from the tail in slices, each like a free-list reuse (write the bytes, msync,
+  repoint the content, record its old position as the hole), then truncates. Its own crash tests.
+- Tests: HeavyCrudTests (300 random ops at 3-row slices, every invariant after each, positive
+  control on the CSR), the partly peeled file, the reclaim gates, listMatching against a sort;
+  testPatchedOnlyFoldMatchesFullRebuild at 1 and 3 bits.
+- Traps hit: `cp` over a binary that has run gets SIGKILL (137) at launch - remove it first. Two
+  benches on one clone directory finish each other's work. `pgrep -f pattern` inside a loop whose
+  own command line contains the pattern never ends.

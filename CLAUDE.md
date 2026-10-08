@@ -75,9 +75,13 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (711 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (716 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
+- Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|
+  delkind|delext|readers|settle> [n] [batch]` - one op on a fresh clone of the settled 9.7M-row
+  bench index, a search every 50 ms and a browse every 250 ms throughout (index.md, "Heavy CRUD
+  review"). Fresh clones are a COLD page cache; that is the case that matters.
 - Search digest on the real index (a CLONE, never the live one): `omni-verify searchreal
   ~/Library/Application\ Support/Omni/nano <index>` -> 134b9ff183fd2f29, p50 ~4 ms.
 - OCR quality gate (hard pages vs the torch oracle): `ocr-verify <ocrModel>
@@ -97,6 +101,12 @@ codebase were already measured there, and many were rejected.
   --probe-rowexact [--causal-sweep]`. Re-run them on any MLX or toolchain change.
 
 ## Rules that keep biting
+
+- NO STORE-QUEUE HOLD THAT GROWS WITH THE INDEX OR WITH THE INPUT. Searches wait on the same serial
+  queue as every write, so one long hold is a frozen search box. Bulk writes go through the slicers
+  (`deleteFilesInSlices`, replaceMany's sub-batches, the file peel), each slice ~100 ms and warmed
+  off the queue; caches over the row/slot mapping are kept incrementally, never rebuilt per write.
+  A new write or maintenance path is measured with `mutbench --crud` before it ships.
 
 - MEASURE, BACK TO BACK. This machine drifts ~25% over a long session; a number from earlier in the
   day is not a baseline. Interleave arms, repeat, and keep the GPU otherwise idle.
@@ -149,7 +159,8 @@ codebase were already measured there, and many were rejected.
   prefill, vision cache, memory, GPU lanes, transcript cache, serving, oMLX lessons, MLX 0.32.
 - `index.md` - store and search engine: v5 content sharing, migrations under load, locks, chunking,
   resident memory, launch, write path, Photos reconcile, multi-folder scope, ignore policy grammar
-  and defaults, renames, Recents, clipboard history, the 2026-10-02 speed review and media NaN.
+  and defaults, renames, Recents, clipboard history, the 2026-10-02 speed review and media NaN,
+  search while long files stream, the heavy CRUD review.
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
   and rejected, macOS 14/15 toolbar, site.

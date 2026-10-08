@@ -210,6 +210,60 @@ final class VectorStoreFoldPersistTests: XCTestCase {
         }
     }
 
+    /// THE SAME, WITH NOTHING APPENDED: every new vector lands on a freed position, so the fold has
+    /// patched rows and an empty delta. That case used to fall to the full rebuild; it now
+    /// refreshes the patched rows alone (one pack, one scatter), and must still equal a rebuild
+    /// - on the sign-code tier, which the 7.5M-row index runs, and on the affine one.
+    func testPatchedOnlyFoldMatchesFullRebuild() throws {
+        for bits in [1, 3] {
+            let savedBits = VectorStore.scanBitsOverride
+            let savedFree = VectorStore.freeListEnabled
+            VectorStore.scanBitsOverride = bits
+            VectorStore.freeListEnabled = true
+            defer { VectorStore.scanBitsOverride = savedBits; VectorStore.freeListEnabled = savedFree }
+            try withCap(quantCap) {
+                let url = tempDB()
+                let dim = 64
+                var rng = Rng(s: 11)
+                let store = try VectorStore(dbURL: url)
+                var shadow: [String: [[Float]]] = [:]
+                var batch: [(path: String, chunks: [IndexedChunk])] = []
+                for i in 0 ..< 3000 {
+                    let p = "/seed/f\(i).txt"
+                    let v = randUnit(dim, &rng)
+                    shadow[p] = [v]
+                    batch.append((p, [chunk(p, 0, v)]))
+                }
+                try store.replaceMany(batch)
+                let q = randUnit(dim, &rng)
+                _ = store.search(q, topK: 10)   // full build: the base is live and clean
+
+                // As many new files as deleted ones: every vector reuses a freed position.
+                for i in 0 ..< 40 { store.deletePath("/seed/f\(i).txt"); shadow["/seed/f\(i).txt"] = nil }
+                for i in 0 ..< 40 {
+                    let p = "/reused/f\(i).txt"
+                    let v = randUnit(dim, &rng)
+                    shadow[p] = [v]
+                    try store.replace(path: p, chunks: [chunk(p, 0, v)])
+                }
+                let hitsPatched = store.search(q, topK: 40)   // folds here: 40 patched, no delta
+                var reusedFound = 0
+                for i in 0 ..< 40 {
+                    let p = "/reused/f\(i).txt"
+                    if let v = shadow[p]?.first, store.search(v, topK: 3).first?.path == p { reusedFound += 1 }
+                }
+                store.close()
+                XCTAssertEqual(reusedFound, 40, "bits \(bits): a reused position does not answer for its own content")
+
+                let fresh = try VectorStore(dbURL: url)
+                let hitsFull = fresh.search(q, topK: 40)
+                assertEquivalentHits(hitsPatched, hitsFull, "bits \(bits): patched-only fold vs full rebuild")
+                assertMatchesShadow(hitsPatched, shadow, q, "bits \(bits): patched-only fold vs ground truth")
+                fresh.close()
+            }
+        }
+    }
+
     func testIncrementalFoldBitIdenticalToFullRebuild() throws {
         let savedBits = VectorStore.scanBitsOverride
         VectorStore.scanBitsOverride = 3

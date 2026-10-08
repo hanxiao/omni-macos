@@ -2946,18 +2946,10 @@ final class AppModel {
                 return excluded(path) ? path : nil
             }
             let tScan = -t0.timeIntervalSinceNow
-            // In batches: deletePaths holds the store queue for its whole run, and a search waits
-            // behind it. One call over 2.4M files held it for minutes.
-            let batch = 50_000
-            var tDel = 0.0
-            for start in stride(from: 0, to: drop.count, by: batch) {
-                let tb = Date()
-                store.deletePaths(Set(drop[start ..< min(drop.count, start + batch)]),
-                                  checkpoint: start + batch >= drop.count)
-                tDel += -tb.timeIntervalSinceNow
-                omniPerfLog(String(format: "ignore-prune batch %d/%d %.1fs", start / batch + 1,
-                                   (drop.count + batch - 1) / batch, -tb.timeIntervalSinceNow))
-            }
+            // One call: deletePaths slices itself, releasing the store queue every ~100 ms.
+            let tb = Date()
+            store.deletePaths(Set(drop))
+            let tDel = -tb.timeIntervalSinceNow
             let tc = Date()
             if !drop.isEmpty {
                 store.compact()

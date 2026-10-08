@@ -98,6 +98,10 @@ struct PathTable: Sendable {
 
     /// Does path `i` equal `s` under Swift's String equality? No allocation unless the hashes agree
     /// and one side is not ASCII.
+    /// The path's hash as stored: lets a caller holding an id across a reload of the table check
+    /// that the id still names the file it resolved, without building the path.
+    func hashOf(_ i: Int) -> Int { fileHash[i] }
+
     func equals(_ i: Int, _ s: String, hash: Int) -> Bool {
         guard fileHash[i] == hash else { return false }
         var s = s

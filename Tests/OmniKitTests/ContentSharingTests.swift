@@ -1343,10 +1343,15 @@ final class ContentSharingTests: XCTestCase {
         VectorStore.quantBaseOverride = VectorStore.scanBits     // the vector file only exists in quant mode
         VectorStore.holeReclaimFractionOverride = 0.01
         VectorStore.holeReclaimFloorOverride = 1
+        // The stamp starts a reclaim only once writes have been quiet; this one stamps right after.
+        let savedQuiet = (VectorStore.reclaimQuietSeconds, VectorStore.reclaimIdleSeconds)
+        VectorStore.reclaimQuietSeconds = 0
+        VectorStore.reclaimIdleSeconds = 0
         defer {
             VectorStore.quantBaseOverride = savedQuant
             VectorStore.holeReclaimFractionOverride = savedFraction
             VectorStore.holeReclaimFloorOverride = savedFloor
+            (VectorStore.reclaimQuietSeconds, VectorStore.reclaimIdleSeconds) = savedQuiet
         }
         let url = tempDB()
         let store = try VectorStore(dbURL: url); defer { store.close() }

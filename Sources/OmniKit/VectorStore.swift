@@ -1118,8 +1118,15 @@ public final class VectorStore: @unchecked Sendable {
     /// v4 and v5 tables have an explicit INTEGER PRIMARY KEY, which VACUUM keeps; only a v3 `chunks`
     /// has its rowids renumbered, in order. Loaded from meta at open, 0 for pre-counter indexes.
     private var mutationGen: Int64 = 0
+    /// When the last mutation committed: what "writes have gone quiet" is measured from.
+    private var lastMutationAt = Date.distantPast
+    /// How long writes must have been quiet, and searches absent, before a hole reclaim starts
+    /// (see the caught-up stamp). A search after its copy began abandons it at the commit.
+    nonisolated(unsafe) public static var reclaimQuietSeconds: TimeInterval = 30
+    nonisolated(unsafe) public static var reclaimIdleSeconds: TimeInterval = 300
     private func bumpGenLocked() {
         mutationGen += 1
+        lastMutationAt = Date()
         exec("INSERT OR REPLACE INTO meta(key, value) VALUES('mutation_gen','\(mutationGen)');")
         scheduleRowStampLocked()   // debounced: the sidecar re-stamps once writes go quiet
         scheduleIdleFoldLocked()   // debounced: fold the delta once writes go quiet
@@ -1335,34 +1342,75 @@ public final class VectorStore: @unchecked Sendable {
     }
     /// THE REVERSE EDGE: content -> the rows holding it, as CSR. A candidate chosen by the scan is a
     /// CONTENT and every consumer downstream wants FILES, so something has to expand one into the
-    /// other. Two Int32 columns, rebuilt in one pass, keyed on the mutation generation - NOT on
-    /// rows.count, because a replace that removes and adds the same number of rows leaves the count
-    /// identical and every pointer different.
+    /// other. Two Int32 columns over the rows that existed at the last build, plus the rows
+    /// appended since, kept per slot in `slotRowExtra`.
+    ///
+    /// KEYED ON THE ROW -> SLOT MAPPING, NOT ON THE MUTATION GENERATION. A row's slot never changes
+    /// in place except through `occSlot` (`occStructGen`); every other write appends rows, and a
+    /// tombstone changes neither. Keyed on `mutationGen`, every write - and then the first search
+    /// after it - rebuilt the whole CSR: 33 ms each on a 9.7M-row index, twice per indexing batch
+    /// (index.md, "Heavy CRUD review").
     private var slotRowStart: [Int32] = []
     private var slotRowIdx: [Int32] = []
-    private var slotRowGen: Int64 = -1
+    private var slotRowStruct: UInt64 = .max
+    private var slotRowBuiltRows = 0                    // rows in the CSR proper
+    private var slotRowBuiltSlots = 0                   // slots in the CSR proper
+    private var slotRowExtra: [Int32: [Int32]] = [:]   // slot -> rows appended since the build
+    private var slotRowExtraUpTo = 0                    // rows absorbed into `slotRowExtra`
+    private var slotRowExtraCount = 0
 
     private func ensureSlotRowsLocked() {
         let n = slotCount
-        guard slotRowGen != mutationGen || slotRowStart.count != n + 1 else { return }
+        let occ = _occSlot.count
+        if slotRowStruct == occStructGen, slotRowBuiltRows <= occ, slotRowExtraUpTo <= occ, n >= slotRowBuiltSlots,
+           slotRowExtraCount + (occ - slotRowExtraUpTo) <= Swift.max(65_536, slotRowBuiltRows / 8) {
+            for r in slotRowExtraUpTo ..< occ {
+                let sl = _occSlot[r]
+                guard sl >= 0, Int(sl) < n else { continue }
+                slotRowExtra[sl, default: []].append(Int32(r))
+                slotRowExtraCount += 1
+            }
+            slotRowExtraUpTo = occ
+            return
+        }
+        let tCSR = Self.searchTiming ? Date() : nil
+        defer { if let tCSR { print(String(format: "[csr] rebuild rows=%d slots=%d %.1fms", occ, n, -tCSR.timeIntervalSinceNow * 1000)) } }
         var start = [Int32](repeating: 0, count: n + 1)
-        for sl in occSlot where sl >= 0 && Int(sl) < n { start[Int(sl) + 1] += 1 }
+        for sl in _occSlot where sl >= 0 && Int(sl) < n { start[Int(sl) + 1] += 1 }
         if n > 0 { for i in 1 ... n { start[i] += start[i - 1] } }
         var idx = [Int32](repeating: 0, count: Int(start[n]))
         var cursor = start
-        for (r, sl) in occSlot.enumerated() where sl >= 0 && Int(sl) < n {
+        for (r, sl) in _occSlot.enumerated() where sl >= 0 && Int(sl) < n {
             idx[Int(cursor[Int(sl)])] = Int32(r); cursor[Int(sl)] += 1
         }
-        slotRowStart = start; slotRowIdx = idx; slotRowGen = mutationGen
+        slotRowStart = start; slotRowIdx = idx
+        slotRowStruct = occStructGen; slotRowBuiltRows = occ; slotRowBuiltSlots = n
+        slotRowExtra.removeAll(keepingCapacity: true); slotRowExtraUpTo = occ; slotRowExtraCount = 0
+    }
+
+    /// Forget the CSR: the next ensureSlotRowsLocked rebuilds it.
+    private func invalidateSlotRowsLocked() { slotRowStruct = .max }
+
+    /// The rows of one slot: the CSR's run, then any appended since.
+    struct SlotRows: Sequence {
+        let base: ArraySlice<Int32>
+        let extra: [Int32]?
+        func makeIterator() -> AnyIterator<Int32> {
+            var b = base.makeIterator()
+            var e = extra?.makeIterator()
+            return AnyIterator { b.next() ?? e?.next() }
+        }
+        var isEmpty: Bool { base.isEmpty && (extra?.isEmpty ?? true) }
     }
 
     /// The rows holding this content. Empty for one nothing points at - which is what a content
     /// whose last owner was deleted becomes.
-    @inline(__always) private func rowsOfSlotLocked(_ sl: Int) -> ArraySlice<Int32> {
-        guard sl >= 0, sl + 1 < slotRowStart.count else { return ArraySlice() }
+    @inline(__always) private func rowsOfSlotLocked(_ sl: Int) -> SlotRows {
+        let extra = slotRowExtra.isEmpty ? nil : slotRowExtra[Int32(truncatingIfNeeded: sl)]
+        guard sl >= 0, sl + 1 < slotRowStart.count else { return SlotRows(base: ArraySlice(), extra: extra) }
         let lo = Int(slotRowStart[sl]), hi = Int(slotRowStart[sl + 1])
-        guard lo <= hi, hi <= slotRowIdx.count else { return ArraySlice() }
-        return slotRowIdx[lo ..< hi]
+        guard lo <= hi, hi <= slotRowIdx.count else { return SlotRows(base: ArraySlice(), extra: extra) }
+        return SlotRows(base: slotRowIdx[lo ..< hi], extra: extra)
     }
 
     /// Contents below `n` that no LIVE row points at, as gather indices. This is what replaces
@@ -1473,6 +1521,24 @@ public final class VectorStore: @unchecked Sendable {
         orphanCacheRows = n
         if let c = orphanCache { MLX.eval(c) }
         return orphanCache
+    }
+
+    /// For tests: one peel slice, as shrinkFileInSlices takes it.
+    func shrinkFileForTest(_ path: String, drop: Int) -> Int {
+        writeGate.hold { queue.sync { dbOpen() ? shrinkFileLocked(path, drop: drop) : 0 } }
+    }
+
+    /// For tests: every slot's rows from the incrementally kept CSR, and the same rebuilt from
+    /// scratch. They must always be equal (as sets: the appended rows come after the CSR's run).
+    func slotRowsForTest() -> (kept: [[Int32]], rebuilt: [[Int32]]) {
+        queue.sync {
+            let n = slotCount
+            ensureSlotRowsLocked()
+            let kept = (0 ..< n).map { rowsOfSlotLocked($0).sorted() }
+            invalidateSlotRowsLocked()
+            ensureSlotRowsLocked()
+            return (kept, (0 ..< n).map { rowsOfSlotLocked($0).sorted() })
+        }
     }
 
     /// For tests: the cached orphan list as a search would see it, and the same list rebuilt from
@@ -2090,7 +2156,10 @@ public final class VectorStore: @unchecked Sendable {
         self.dbURL = dbURL
         self.interactiveLane = ReadLane(dbURL: dbURL, label: "omni.vectorstore.read")
         self.aggregateLane = ReadLane(dbURL: dbURL, label: "omni.vectorstore.read.agg")
-        self.checkpointer = Checkpointer(dbURL: dbURL)
+        let gate = WriteGate()
+        self.writeGate = gate
+        self.warmer = PageWarmer(dbURL: dbURL)
+        self.checkpointer = Checkpointer(dbURL: dbURL, gate: gate)
         self.onLoadProgress = onLoadProgress
         self.onPhase = onPhase
         let tOpen = Date()
@@ -2129,7 +2198,16 @@ public final class VectorStore: @unchecked Sendable {
         exec("PRAGMA wal_autocheckpoint=0;")
         // Checkpoints run on their own connection (Checkpointer) and never truncate; the WAL file
         // is cut back to this size when the writer restarts it instead.
-        exec("PRAGMA journal_size_limit=\(Self.walSoftCapBytes * 2);")
+        exec("PRAGMA journal_size_limit=\(Self.walFileLimitBytes);")
+        // THE LOG'S REAL LENGTH, from SQLite after every commit, for checkpointIfDueLocked. The file
+        // size cannot say it: a restarted WAL keeps its file (up to the limit above) and is
+        // rewritten from the start, so "file past the soft cap" stayed true after every restart and
+        // each slice of a bulk delete asked for a checkpoint - each one ending in a full drive flush.
+        sqlite3_wal_hook(db, { ctx, _, _, frames in
+            if let ctx { Unmanaged<VectorStore>.fromOpaque(ctx).takeUnretainedValue().walFrames = Int(frames) }
+            return SQLITE_OK
+        }, Unmanaged.passUnretained(self).toOpaque())
+        walPageBytes = Swift.max(512, scalarQuery("PRAGMA page_size;"))
         exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);")
         // The index is a rebuildable cache: on a schema change, drop and recreate.
         if !Self.compatibleSchemaVersions.contains(userVersion()) {
@@ -2570,8 +2648,11 @@ public final class VectorStore: @unchecked Sendable {
     private var dedupStmt: OpaquePointer?
     private var contentSelStmt: OpaquePointer?
     private var slotUpdStmt: OpaquePointer?     // cached `UPDATE chunks SET slot` for persistSlotsLocked
-    private var bytesWrittenSinceCkpt = 0     // in-process WAL-growth estimate, gates the per-write stat (F17)
-    private var ckptCounterSeeded = false
+    /// Frames in the WAL after the last commit (the writer's WAL hook), and at the last checkpoint
+    /// request. Written on `queue`: the hook runs inside the commit.
+    fileprivate var walFrames = 0
+    private var walFramesAtRequest = 0
+    private var walPageBytes = 4096
 
     /// Must be checked (on `queue`) before touching `db`: after `close()` a straggling call from an
     /// orphaned indexing pass would otherwise hand sqlite a NULL handle - defined-but-misuse on
@@ -2686,7 +2767,7 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Replace all chunks for a path with the given set (atomic per file).
     public func replace(path: String, chunks: [IndexedChunk]) throws {
-        try queue.sync {
+        try writeGate.hold { try queue.sync {
             guard dbOpen() else { throw OmniError.store("store closed") }
             // Dimension guard: all vectors must share the index dimension. Validated BEFORE `dim` is
             // assigned - see validateDimLocked for why a rejected write must not leave it set.
@@ -2738,7 +2819,7 @@ public final class VectorStore: @unchecked Sendable {
             // A pre-existing path already triggered removeRowsLocked above, which invalidates.
             proactiveRefoldLocked()
             checkpointIfDueLocked()
-        }
+        } }
     }
 
     /// Check every chunk against the index dimension, and only then adopt one on a fresh index.
@@ -2786,85 +2867,146 @@ public final class VectorStore: @unchecked Sendable {
         for it in nonEmpty.reversed() where seenPath.insert(it.path).inserted { work.append(it) }
         work.reverse()
         guard !work.isEmpty else { return }
+        // IN SUB-BATCHES OF ~bulkSliceBudget, RELEASING THE QUEUE BETWEEN THEM, for the reason the
+        // deletes are sliced: an indexing batch of 256 changed files is 0.3-0.7 s of SQL on a 9.7M-row
+        // index, and a search typed meanwhile waited all of it (index.md, "Heavy CRUD review"). Each
+        // sub-batch is a complete replace of its files. Not with `keepExisting`: that appends, so a
+        // caller retrying a partly committed call would write the committed part twice - and its one
+        // caller writes a single file's window per call anyway.
+        // The dimension check covers the whole call before any of it commits, as it did when the
+        // call was one transaction: a mismatch is a caller error, not a half-written batch.
         try queue.sync {
             guard dbOpen() else { throw OmniError.store("store closed") }
             try validateDimLocked(work.flatMap { $0.chunks })
-            let bfs = work.map { $0.chunks.map { bf16Row($0.embedding) } }   // fp32 -> bf16 once
-            let now = Date().timeIntervalSince1970                           // one indexed_at stamp per batch
-            let tSql = Self.searchTiming ? Date() : nil
-            // Same reason as replace(): the rows these paths already have become tombstones after
-            // the commit, and the slots they hold on to must be recorded inside it.
-            let victims = keepExisting ? []
-                : victimRowsForPathsLocked(Set(work.map { $0.path }.filter { pathIsPresentLocked($0) }))
-            beginTxnLocked()
-            recordAndReleaseLocked(releasedSlotsLocked(victims))
-            setStoredDimLocked(dim)
-            guard let w = prepareChunkInsertLocked() else {
-                rollbackTxnLocked()
-                throw OmniError.store("prepare insert failed")
-            }
-            defer { w.finalize() }
-            var writtenByWork: [Int: WrittenChunks] = [:]
-            for (wi, it) in work.enumerated() {
-                guard let first = it.chunks.first,
-                      let fid = upsertFileLocked(path: it.path, from: first, indexedAt: now, w: w) else {
-                    rollbackTxnLocked()
-                    throw lastFileUpsertWasBusy
-                        ? OmniError.storeBusy("\(it.path): \(lastFileUpsertError)")
-                        : OmniError.store("file id failed for \(it.path): \(lastFileUpsertError)")
+        }
+        var at = 0
+        var per = keepExisting ? work.count : (Self.bulkSliceRowsOverride ?? 32)
+        while at < work.count {
+            let sub = Array(work[at ..< Swift.min(work.count, at + per)])
+            // A file of more rows than a slice is peeled first, like a delete's (shrinkFileInSlices).
+            if !keepExisting {
+                let big: [String] = queue.sync {
+                    sub.compactMap { it in
+                        guard let id = filePaths.id(it.path), Int(id) < fileChunkCount.count,
+                              Int(fileChunkCount[Int(id)]) > Self.shrinkRowsAbove else { return nil }
+                        return it.path
+                    }
                 }
-                if !keepExisting { deleteChunksOfFileLocked(fid) }
-                guard let written = writeChunksLocked(fileID: fid, chunks: it.chunks, bfs: bfs[wi], w: w) else {
-                    rollbackTxnLocked()
-                    throw OmniError.store("insert step failed")
+                for path in big { shrinkFileInSlices(path, toAtMost: Self.shrinkRowsAbove / 2) }
+            }
+            // The rows a replace tombstones are read before they are written, like a delete's.
+            if !keepExisting {
+                let present: [(dir: String, name: String)] = queue.sync {
+                    sub.compactMap { pathIsPresentLocked($0.path) ? StoreSchema.splitPath(storedSpellingLocked($0.path)) : nil }
                 }
-                writtenByWork[wi] = written
+                if !present.isEmpty { warmer.warm(files: present) }
             }
-            bumpGenLocked()
-            exec("COMMIT;")
-            let tRm = Self.searchTiming ? Date() : nil
-            let affected = Set(work.map { $0.path })
-            if !keepExisting, affected.contains(where: { pathIsPresentLocked($0) }) {
-                removeRowsByPathsLocked(affected, victims: victims)   // one rebuild for the whole batch
-            }
-            // Accumulated across the WHOLE batch and written once. Per file it was one transaction
-            // each - 2000 of them for the store benchmark - and that, not the lookup, is what made
-            // the write path 4x slower: 5787 -> 1636 files/s.
-            var allIDs: [Int64] = []
-            var allContentIDs: [Int64] = []
-            var allSlots: [Int32] = []
-            // ONE map for the whole batch: see appendChunksLocked. Per file, two files in one
-            // batch holding the same passage stored it twice.
-            var seen: [Data: Int32] = [:]
-            beginTxnLocked()   // placement and slot records commit together - see replace()
-            for (wi, it) in work.enumerated() {
-                let written = writtenByWork[wi] ?? WrittenChunks()
-                let assigned = appendChunksLocked(it.chunks, bfs: bfs[wi], ids: written.residentIDs,
-                                                  seen: &seen)
-                if writtenByWork[wi] != nil {
-                    allIDs += written.rowIDs
-                    allContentIDs += written.contentIDs
-                    allSlots += assigned
+            let t = Date()
+            try writeGate.hold {
+                try queue.sync {
+                    guard dbOpen() else { throw OmniError.store("store closed") }
+                    try replaceManyLocked(sub, keepExisting: keepExisting)
                 }
             }
-            persistSlotsLocked(ids: allIDs, contentIDs: allContentIDs, slots: allSlots)
-            exec("COMMIT;")
-            rowWindowAuditLocked("replaceMany")
-            // No invalidateBase(): appended rows are scored as delta. Any pre-existing path in the
-            // batch already triggered removeRowsLocked above, which invalidates the base.
-            let tBeforeFold = Self.searchTiming ? Date() : nil
-            proactiveRefoldLocked()   // refold now if a search is active, off the search's latency path
-            checkpointIfDueLocked()
-            if let tSql, let tRm, let tBeforeFold {
-                print(String(format: "[replaceMany] paths=%d sql=%.1fms rebuildRows=%.1fms append+fold=%.1fms",
-                             work.count, tRm.timeIntervalSince(tSql) * 1000, tBeforeFold.timeIntervalSince(tRm) * 1000,
-                             -tBeforeFold.timeIntervalSinceNow * 1000))
+            at += sub.count
+            let perFile = Swift.max(-t.timeIntervalSinceNow, 0.000_1) / Double(sub.count)
+            if !keepExisting, Self.bulkSliceRowsOverride == nil {
+                per = Swift.min(Swift.max(Int(Self.bulkSliceBudget / perFile), 4), Swift.min(per * 2, 1024))
             }
         }
     }
 
+    private func replaceManyLocked(_ work: [(path: String, chunks: [IndexedChunk])], keepExisting: Bool) throws {
+        try validateDimLocked(work.flatMap { $0.chunks })
+        let bfs = work.map { $0.chunks.map { bf16Row($0.embedding) } }   // fp32 -> bf16 once
+        let now = Date().timeIntervalSince1970                           // one indexed_at stamp per batch
+        let tSql = Self.searchTiming ? Date() : nil
+        // Same reason as replace(): the rows these paths already have become tombstones after
+        // the commit, and the slots they hold on to must be recorded inside it.
+        var laps = Laps()
+        let victims = keepExisting ? []
+            : victimRowsForPathsLocked(Set(work.map { $0.path }.filter { pathIsPresentLocked($0) }))
+        laps.lap("victims")
+        beginTxnLocked()
+        let released = releasedSlotsLocked(victims)
+        laps.lap("released")
+        recordAndReleaseLocked(released)
+        laps.lap("holes")
+        setStoredDimLocked(dim)
+        guard let w = prepareChunkInsertLocked() else {
+            rollbackTxnLocked()
+            throw OmniError.store("prepare insert failed")
+        }
+        defer { w.finalize() }
+        var writtenByWork: [Int: WrittenChunks] = [:]
+        for (wi, it) in work.enumerated() {
+            guard let first = it.chunks.first,
+                  let fid = upsertFileLocked(path: it.path, from: first, indexedAt: now, w: w) else {
+                rollbackTxnLocked()
+                throw lastFileUpsertWasBusy
+                    ? OmniError.storeBusy("\(it.path): \(lastFileUpsertError)")
+                    : OmniError.store("file id failed for \(it.path): \(lastFileUpsertError)")
+            }
+            if !keepExisting { deleteChunksOfFileLocked(fid) }
+            guard let written = writeChunksLocked(fileID: fid, chunks: it.chunks, bfs: bfs[wi], w: w) else {
+                rollbackTxnLocked()
+                throw OmniError.store("insert step failed")
+            }
+            writtenByWork[wi] = written
+        }
+        laps.lap("sql")
+        bumpGenLocked()
+        exec("COMMIT;")
+        laps.lap("commit")
+        let tRm = Self.searchTiming ? Date() : nil
+        let affected = Set(work.map { $0.path })
+        if !keepExisting, affected.contains(where: { pathIsPresentLocked($0) }) {
+            removeRowsByPathsLocked(affected, victims: victims)   // one rebuild for the whole batch
+        }
+        laps.lap("rows")
+        // Accumulated across the WHOLE batch and written once. Per file it was one transaction
+        // each - 2000 of them for the store benchmark - and that, not the lookup, is what made
+        // the write path 4x slower: 5787 -> 1636 files/s.
+        var allIDs: [Int64] = []
+        var allContentIDs: [Int64] = []
+        var allSlots: [Int32] = []
+        // ONE map for the whole batch: see appendChunksLocked. Per file, two files in one
+        // batch holding the same passage stored it twice.
+        var seen: [Data: Int32] = [:]
+        beginTxnLocked()   // placement and slot records commit together - see replace()
+        for (wi, it) in work.enumerated() {
+            let written = writtenByWork[wi] ?? WrittenChunks()
+            let assigned = appendChunksLocked(it.chunks, bfs: bfs[wi], ids: written.residentIDs,
+                                              seen: &seen)
+            if writtenByWork[wi] != nil {
+                allIDs += written.rowIDs
+                allContentIDs += written.contentIDs
+                allSlots += assigned
+            }
+        }
+        laps.lap("append")
+        persistSlotsLocked(ids: allIDs, contentIDs: allContentIDs, slots: allSlots)
+        exec("COMMIT;")
+        laps.lap("slots")
+        rowWindowAuditLocked("replaceMany")
+        // No invalidateBase(): appended rows are scored as delta. Any pre-existing path in the
+        // batch already triggered removeRowsLocked above, which invalidates the base.
+        let tBeforeFold = Self.searchTiming ? Date() : nil
+        proactiveRefoldLocked()   // refold now if a search is active, off the search's latency path
+        laps.lap("fold")
+        checkpointIfDueLocked()
+        laps.lap("ckpt")
+        laps.print("replaceMany paths=\(work.count) victims=\(victims.count)")
+        if let tSql, let tRm, let tBeforeFold {
+            print(String(format: "[replaceMany] paths=%d sql=%.1fms rebuildRows=%.1fms append+fold=%.1fms",
+                         work.count, tRm.timeIntervalSince(tSql) * 1000, tBeforeFold.timeIntervalSince(tRm) * 1000,
+                         -tBeforeFold.timeIntervalSinceNow * 1000))
+        }
+
+    }
+
     public func deletePath(_ path: String) {
-        queue.sync {
+        writeGate.hold { queue.sync {
             guard dbOpen() else { return }
             let victims = victimRowsForPathsLocked([path])
             beginTxnLocked()
@@ -2875,8 +3017,8 @@ public final class VectorStore: @unchecked Sendable {
             exec("COMMIT;")
             removeRowsByPathsLocked([path])
             proactiveRefoldLocked()
-            checkpointIfDueLocked(forceStat: true)   // deletes carry no byte estimate (F17)
-        }
+            checkpointIfDueLocked()
+        } }
     }
 
     // MARK: - Content dedup (identical bytes never embed twice)
@@ -2886,7 +3028,7 @@ public final class VectorStore: @unchecked Sendable {
     /// simply never used as a duplicate source (duplicateChunks verifies lockstep before reuse).
     public func recordContentKeys(_ entries: [(path: String, key: String, modified: Double, size: Int)]) {
         guard !entries.isEmpty else { return }
-        queue.sync {
+        writeGate.hold { queue.sync {
             guard dbOpen() else { return }
             beginTxnLocked()
             var stmt: OpaquePointer?
@@ -2914,7 +3056,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             sqlite3_finalize(stmt)
             exec("COMMIT;")
-        }
+        } }
     }
 
     /// Prior per-chunk vectors for one path, keyed by chunk hash. The live-update path uses this
@@ -3164,29 +3306,304 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Delete many paths at once. Critical for reconcile: deleting K paths via deletePath would
     /// rebuild the in-memory vector buffer K times (O(N*K), multi-GB memmoves on a large index).
-    /// This deletes all rows in one transaction and rebuilds the buffer exactly once.
-    /// `checkpoint: false` for all but the last of a run of batches: the forced WAL checkpoint
-    /// copies the log back into the database, ~15 s per call on a 4.4 GB index on a spinning
-    /// disk, and a batched prune paid it once per batch.
-    public func deletePaths(_ paths: Set<String>, checkpoint: Bool = true) {
+    ///
+    /// IN SLICES, EACH ITS OWN TRANSACTION, RELEASING THE QUEUE BETWEEN THEM. A delete costs about
+    /// 0.3 ms per file in SQLite on a 9.7M-row index, and one hold over 100,000 files was a 19 s
+    /// wait for any search typed meanwhile (index.md, "Heavy CRUD review"). Each slice is a
+    /// complete delete - holes, SQL, tombstones - so a crash between two leaves an index that is
+    /// consistent and merely not finished, which the next pass or prune finishes.
+    public func deletePaths(_ paths: Set<String>) {
         guard !paths.isEmpty else { return }
-        queue.sync {
-            guard dbOpen() else { return }
-            let victims = victimRowsForPathsLocked(paths)
-            beginTxnLocked()
-            recordAndReleaseLocked(releasedSlotsLocked(victims))
-            guard deleteFileContentsLocked(paths) else {
-                rollbackTxnLocked()
-                FileHandle.standardError.write(Data("[omni] delete aborted: could not stage the victims\n".utf8))
-                return
+        // Sorted, so a slice is mostly neighbours: their rows share B-tree pages.
+        deleteFilesInSlices(.paths(paths.sorted()))
+    }
+
+    /// Queue time one slice of a bulk write aims at. Long enough that a slice's fixed costs stay
+    /// small next to its work; short enough that a search waiting behind it is not a visible stall.
+    static let bulkSliceBudget: TimeInterval = 0.1
+    /// Tests: a fixed slice size in rows (files, for replaceMany), so a small store slices too.
+    nonisolated(unsafe) static var bulkSliceRowsOverride: Int? = nil
+
+    /// Where a bulk delete's files come from. `ids` are resident file ids with the hash of the path
+    /// each named when resolved; a slice resolves the id to its path on the queue, and takes it only
+    /// if the stored hash still matches and `keep` accepts the path. A reload between slices - a
+    /// reclaim commit reloads the store and renumbers every id - then makes the delete skip a file,
+    /// never take the wrong one.
+    private enum BulkSource {
+        case paths([String])
+        case ids([(id: Int32, hash: Int)], keep: (String) -> Bool)
+        var count: Int { switch self { case .paths(let p): p.count; case .ids(let i, _): i.count } }
+    }
+
+    /// Drive a bulk delete a slice at a time, each slice its own transaction.
+    ///
+    /// SIZED BY ROWS, not files: a delete costs per row, and a file is anything from one row to
+    /// tens of thousands - sized by files, one .json of 5,034 rows made a 1.3 s slice. The budget
+    /// follows the measured cost per row, so a hold stays near `bulkSliceBudget` on any disk.
+    ///
+    /// WARMED FIRST, OFF THE QUEUE. A delete reads before it writes - the file's occurrences, each
+    /// content's row, snippet, key and slot entries - and on a cold page cache those reads are
+    /// most of its cost: 0.38 ms a row cold against 0.032 ms warm, same rows (index.md, "Heavy CRUD
+    /// review"). The PageWarmer reads the same pages on its own connection first, so the slice that
+    /// holds the queue finds them in memory.
+    private func deleteFilesInSlices(_ source: BulkSource) {
+        var at = 0
+        var budget = Self.bulkSliceRowsOverride ?? 512
+        while at < source.count {
+            // Pick on the queue: whole files up to the row budget, and at least one.
+            let pick: [(path: String, dir: String, name: String, rows: Int)] = queue.sync {
+                guard dbOpen() else { at = source.count; return [] }
+                var out: [(String, String, String, Int)] = []
+                var sum = 0
+                while at < source.count, out.isEmpty || sum < budget {
+                    let path: String
+                    let rows: Int
+                    switch source {
+                    case .paths(let list):
+                        path = list[at]
+                        rows = filePaths.id(path).map { Int($0) < fileChunkCount.count ? Int(fileChunkCount[Int($0)]) : 0 } ?? 0
+                    case .ids(let ids, let keep):
+                        let id = Int(ids[at].id)
+                        guard id < filePaths.count, id < fileChunkCount.count, fileChunkCount[id] > 0,
+                              filePaths.hashOf(id) == ids[at].hash else { at += 1; continue }
+                        path = filePaths[id]
+                        guard keep(path) else { at += 1; continue }
+                        rows = Int(fileChunkCount[id])
+                    }
+                    // A file far past the budget goes alone, so the peel below can take it apart;
+                    // behind smaller ones it would be one long transaction.
+                    if !out.isEmpty, rows > 2 * budget { break }
+                    at += 1
+                    let (dir, name) = StoreSchema.splitPath(storedSpellingLocked(path))
+                    out.append((path, dir, name, rows))
+                    sum += rows + 1   // a file costs a row's worth on its own: its file, dedup and dir rows
+                }
+                return out
             }
-            pruneFileRowsLocked(paths)
-            bumpGenLocked()
-            exec("COMMIT;")
-            removeRowsByPathsLocked(paths, victims: victims)   // one rebuild for the whole set
-            proactiveRefoldLocked()
-            if checkpoint { checkpointIfDueLocked(forceStat: true) }   // deletes carry no byte estimate (F17)
+            guard !pick.isEmpty else { continue }
+            // ONE FILE PAST THE BUDGET is peeled first, so its delete is a slice like the others.
+            if pick.count == 1, pick[0].rows > 2 * budget { shrinkFileInSlices(pick[0].path, toAtMost: budget) }
+            warmer.warm(files: pick.map { ($0.dir, $0.name) })
+            let t = Date()
+            writeGate.hold {
+                queue.sync {
+                    guard dbOpen() else { return }
+                    deletePathsLocked(Set(pick.map(\.path)))
+                }
+            }
+            guard Self.bulkSliceRowsOverride == nil else { continue }
+            let units = pick.reduce(0) { $0 + $1.rows + 1 }
+            let perRow = Swift.max(-t.timeIntervalSinceNow, 0.000_1) / Double(units)
+            budget = Swift.min(Swift.max(Int(Self.bulkSliceBudget / perRow), 64), Swift.min(budget * 2, 65_536))
         }
+    }
+
+    /// Rows past which a file is peeled before it is deleted or replaced (shrinkFileInSlices).
+    static var shrinkRowsAbove: Int { shrinkRowsAboveOverride ?? 4096 }
+    nonisolated(unsafe) static var shrinkRowsAboveOverride: Int? = nil
+
+    /// Take a file's rows off a slice at a time, highest ordinal first, until at most `keep` are
+    /// left - so deleting or replacing a file of tens of thousands of rows (a long text read to the
+    /// end) is a run of short holds and not one long one. Stops early, leaving the rest to the
+    /// caller's single transaction, wherever a slice cannot be proven exact (shrinkFileLocked).
+    private func shrinkFileInSlices(_ path: String, toAtMost keep: Int) {
+        var step = Self.bulkSliceRowsOverride ?? 2048
+        var warmed = false
+        while true {
+            let left: (rows: Int, dir: String, name: String)? = queue.sync {
+                guard dbOpen(), let id = filePaths.id(path), Int(id) < fileChunkCount.count else { return nil }
+                let (dir, name) = StoreSchema.splitPath(storedSpellingLocked(path))
+                return (Int(fileChunkCount[Int(id)]), dir, name)
+            }
+            guard let left, left.rows > keep else { return }
+            if !warmed { warmer.warm(files: [(left.dir, left.name)]); warmed = true }
+            let t = Date()
+            let took: Int = writeGate.hold {
+                queue.sync { dbOpen() ? shrinkFileLocked(path, drop: Swift.min(step, left.rows - keep)) : 0 }
+            }
+            guard took > 0 else { return }
+            guard Self.bulkSliceRowsOverride == nil else { continue }
+            let perRow = Swift.max(-t.timeIntervalSinceNow, 0.000_1) / Double(took)
+            step = Swift.min(Swift.max(Int(Self.bulkSliceBudget / perRow), 256), Swift.min(step * 2, 65_536))
+        }
+    }
+
+    /// Delete the `drop` highest-ordinal rows of one file, in one transaction. Returns how many,
+    /// or 0 - having changed nothing - when it cannot be done exactly: no split, tombstones not
+    /// available (a removal could then compact the whole file away), or SQLite deleting a
+    /// different number of occurrences than memory holds rows past the cut.
+    ///
+    /// THE FILE IS MARKED UNFINISHED, modified 0, in memory and in SQLite - the streaming writer's
+    /// convention for a file whose rows are not all there. So a crash between two slices leaves a
+    /// file the next pass re-reads, not a truncated one it trusts; and a duplicate of it elsewhere
+    /// cannot borrow its rows meanwhile, because chunksForCurrentPathLocked checks `modified`.
+    private func shrinkFileLocked(_ path: String, drop: Int) -> Int {
+        guard drop > 0, splitBuilt, v4Dropped, Self.tombstones, coveredRows > 0,
+              let rid = filePaths.id(path), let fid = fileIDLocked(path, insert: false) else { return 0 }
+        let live = victimRowsForPathsLocked([path])
+        guard live.count > drop else { return 0 }
+        let victims = Array(live.sorted { rows[Int($0)].chunkIndex < rows[Int($1)].chunkIndex }.suffix(drop))
+        let cutoff = rows[Int(victims[0])].chunkIndex
+        var laps = Laps()
+        beginTxnLocked()
+        recordAndReleaseLocked(releasedSlotsLocked(victims))
+        exec("CREATE TEMP TABLE IF NOT EXISTS split_aff(chunk_id INTEGER PRIMARY KEY);")
+        exec("DELETE FROM split_aff;")
+        exec("INSERT OR IGNORE INTO split_aff SELECT chunk_id FROM occurrence WHERE file_id = \(fid) AND ordinal >= \(cutoff);")
+        guard execChecked("DELETE FROM occurrence WHERE file_id = \(fid) AND ordinal >= \(cutoff);"),
+              Int(sqlite3_changes(db)) == victims.count else {
+            rollbackTxnLocked()
+            return 0
+        }
+        dropOrphanedContentsLocked()
+        exec("UPDATE files SET modified = 0 WHERE id = \(fid);")
+        bumpGenLocked()
+        exec("COMMIT;")
+        laps.lap("sql")
+        removeRowsByPathsLocked([path], victims: victims)
+        if Int(rid) < fileMeta.count { fileMeta[Int(rid)].modified = 0 }
+        checkpointIfDueLocked()
+        laps.lap("rows")
+        laps.print("shrink rows=\(victims.count) left=\(live.count - victims.count)")
+        return victims.count
+    }
+
+    /// Reads, on its own read-only connection, the pages a delete of these files will touch, so
+    /// the delete itself - which holds the store queue - finds them in the page cache. Pure
+    /// prefetch: it changes nothing, and a failure here costs only the speed it was buying.
+    final class PageWarmer: @unchecked Sendable {
+        private let dbURL: URL
+        private var lanes: [OpaquePointer] = []
+        private var opened = false
+        private let lock = NSLock()
+        private var shut = false
+        private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        /// Connections reading at once. The reads are random and independent, and an SSD answers
+        /// several in flight far faster than one at a time; one connection made a cold 100k-file
+        /// delete 2.8x slower end to end than the single transaction it replaced.
+        static let laneCount = 4
+        init(dbURL: URL) { self.dbURL = dbURL }
+
+        func warm(files: [(dir: String, name: String)]) {
+            lock.lock(); defer { lock.unlock() }
+            guard !shut, !files.isEmpty else { return }
+            if !opened {
+                opened = true
+                for _ in 0 ..< Self.laneCount {
+                    var h: OpaquePointer?
+                    if sqlite3_open_v2(dbURL.path, &h, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let h { lanes.append(h) }
+                    else if let h { sqlite3_close(h) }
+                }
+            }
+            guard let first = lanes.first else { return }
+            // The files themselves, on one connection: their rows are few and their occurrences
+            // contiguous. What they collect - one content id per occurrence - is the random part.
+            var contents: [Int64] = []
+            filesPass(first, files, into: &contents)
+            guard !contents.isEmpty else { return }
+            let lanes = self.lanes
+            let all = contents
+            let per = (all.count + lanes.count - 1) / lanes.count
+            DispatchQueue.concurrentPerform(iterations: lanes.count) { i in
+                let lo = i * per, hi = Swift.min(all.count, lo + per)
+                if lo < hi { contentsPass(lanes[i], all[lo ..< hi]) }
+            }
+        }
+
+        private func filesPass(_ db: OpaquePointer, _ files: [(dir: String, name: String)], into contents: inout [Int64]) {
+            var fidQ: OpaquePointer?, file: OpaquePointer?, occ: OpaquePointer?, dedup: OpaquePointer?, dedupKey: OpaquePointer?
+            defer { for st in [fidQ, file, occ, dedup, dedupKey] { sqlite3_finalize(st) } }
+            guard sqlite3_prepare_v2(db, "SELECT \(StoreSchema.fileIDByPath);", -1, &fidQ, nil) == SQLITE_OK,
+                  sqlite3_prepare_v2(db, "SELECT dir_id, modified FROM files WHERE id = ?;", -1, &file, nil) == SQLITE_OK,
+                  sqlite3_prepare_v2(db, "SELECT chunk_id FROM occurrence WHERE file_id = ?;", -1, &occ, nil) == SQLITE_OK,
+                  sqlite3_prepare_v2(db, "SELECT key FROM dedup WHERE file_id = ?;", -1, &dedup, nil) == SQLITE_OK,
+                  sqlite3_prepare_v2(db, "SELECT 1 FROM dedup WHERE key = ?;", -1, &dedupKey, nil) == SQLITE_OK
+            else { return }   // a layout without the split: nothing to warm
+            sqlite3_exec(db, "BEGIN;", nil, nil, nil)
+            defer { sqlite3_exec(db, "COMMIT;", nil, nil, nil) }
+            for f in files {
+                // The file's own rows: the files row, its dedup entry under both its keys.
+                sqlite3_reset(fidQ)
+                sqlite3_bind_text(fidQ, 1, f.dir, -1, transient)
+                sqlite3_bind_text(fidQ, 2, f.name, -1, transient)
+                guard sqlite3_step(fidQ) == SQLITE_ROW, sqlite3_column_type(fidQ, 0) != SQLITE_NULL else { continue }
+                let fid = sqlite3_column_int64(fidQ, 0)
+                sqlite3_reset(file); sqlite3_bind_int64(file, 1, fid); _ = sqlite3_step(file)
+                sqlite3_reset(dedup); sqlite3_bind_int64(dedup, 1, fid)
+                if sqlite3_step(dedup) == SQLITE_ROW {
+                    sqlite3_reset(dedupKey)
+                    sqlite3_bind_blob(dedupKey, 1, sqlite3_column_blob(dedup, 0), sqlite3_column_bytes(dedup, 0), transient)
+                    _ = sqlite3_step(dedupKey)
+                }
+                sqlite3_reset(occ); sqlite3_bind_int64(occ, 1, fid)
+                while sqlite3_step(occ) == SQLITE_ROW { contents.append(sqlite3_column_int64(occ, 0)) }
+            }
+        }
+
+        /// Each content through every index a delete updates: its row, snippet, key, slot, and
+        /// the occurrence index its reference recount walks.
+        private func contentsPass(_ db: OpaquePointer, _ ids: ArraySlice<Int64>) {
+            var row: OpaquePointer?, key: OpaquePointer?, slot: OpaquePointer?
+            defer { for st in [row, key, slot] { sqlite3_finalize(st) } }
+            guard sqlite3_prepare_v2(db, """
+                    SELECT k.key, k.slot, (SELECT length(snippet) FROM chunk_snippet WHERE chunk_id = k.id),
+                           (SELECT COUNT(*) FROM occurrence WHERE chunk_id = k.id) FROM chunk k WHERE k.id = ?;
+                    """, -1, &row, nil) == SQLITE_OK,
+                  sqlite3_prepare_v2(db, "SELECT 1 FROM chunk WHERE key = ?;", -1, &key, nil) == SQLITE_OK,
+                  sqlite3_prepare_v2(db, "SELECT 1 FROM chunk WHERE slot = ? AND slot >= 0;", -1, &slot, nil) == SQLITE_OK
+            else { return }
+            sqlite3_exec(db, "BEGIN;", nil, nil, nil)
+            defer { sqlite3_exec(db, "COMMIT;", nil, nil, nil) }
+            for cid in ids {
+                sqlite3_reset(row); sqlite3_bind_int64(row, 1, cid)
+                guard sqlite3_step(row) == SQLITE_ROW else { continue }
+                sqlite3_reset(key)
+                sqlite3_bind_blob(key, 1, sqlite3_column_blob(row, 0), sqlite3_column_bytes(row, 0), transient)
+                _ = sqlite3_step(key)
+                sqlite3_reset(slot); sqlite3_bind_int64(slot, 1, sqlite3_column_int64(row, 1))
+                _ = sqlite3_step(slot)
+            }
+        }
+
+        func close() {
+            lock.lock(); defer { lock.unlock() }
+            shut = true
+            for h in lanes { sqlite3_close(h) }
+            lanes = []
+        }
+    }
+
+    private func deletePathsLocked(_ paths: Set<String>) {
+        var laps = Laps()
+        let victims = victimRowsForPathsLocked(paths)
+        laps.lap("victims")
+        beginTxnLocked()
+        laps.lap("begin")
+        let released = releasedSlotsLocked(victims)
+        laps.lap("released")
+        recordAndReleaseLocked(released)
+        laps.lap("holes")
+        guard deleteFileContentsLocked(paths) else {
+            rollbackTxnLocked()
+            FileHandle.standardError.write(Data("[omni] delete aborted: could not stage the victims\n".utf8))
+            return
+        }
+        laps.lap("contents")
+        pruneFileRowsLocked(paths)
+        laps.lap("files")
+        bumpGenLocked()
+        exec("COMMIT;")
+        laps.lap("commit")
+        removeRowsByPathsLocked(paths, victims: victims)   // one rebuild for the whole set
+        laps.lap("rows")
+        proactiveRefoldLocked()
+        laps.lap("fold")
+        // Every slice: past the soft cap this only asks the Checkpointer, off the queue. Skipping
+        // it between the batches of a long prune let the log reach the hard cap instead, and that
+        // checkpoint runs on the queue - 2.3 GB and 3.4 s at the end of a folder removal.
+        checkpointIfDueLocked()
+        laps.lap("ckpt")
+        laps.print("deletePaths n=\(paths.count) rows=\(victims.count)")
     }
 
     /// Every stored trace of these files except the `files` rows themselves (the caller prunes
@@ -3243,78 +3660,113 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     /// Delete every chunk whose path is under `folder` (path-boundary aware).
+    ///
+    /// The folder's indexed files go first, IN SLICES (deleteInSlices): removing a 2.36M-file
+    /// folder in one transaction held the queue 36 s. The single transaction below then runs once
+    /// over what is left - files with no rows, anything indexed meanwhile, the directory rows -
+    /// which after the slices is small.
     public func deleteUnderFolder(_ folder: String) {
         // Destructive-op guard: an empty (or root "/") folder would match every absolute path and
         // silently wipe the whole index. A legitimate folder is never empty.
         guard !folder.isEmpty, folder != "/" else { return }
+        let ids: [(id: Int32, hash: Int)] = queue.sync {
+            guard dbOpen() else { return [] }
+            let under = filePaths.filesUnder(folder, semantics: .bytes)
+            var out: [(id: Int32, hash: Int)] = []
+            for i in 0 ..< Swift.min(under.count, fileChunkCount.count) where under[i] && fileChunkCount[i] > 0 {
+                out.append((Int32(i), filePaths.hashOf(i)))
+            }
+            return out
+        }
+        // Re-checked per slice by the plain byte prefix, which can only be stricter than the
+        // resolver's: a file it declines is left to the single transaction, never deleted wrongly.
+        let prefix = Array((folder.hasSuffix("/") ? folder : folder + "/").utf8)
+        deleteFilesInSlices(.ids(ids) { p in p == folder || p.utf8.starts(with: prefix) })
         queue.sync {
             guard dbOpen() else { return }
-            // Decided ONCE PER DIRECTORY, then read per row by file id: the same byte-prefix test
-            // (plus canonical `==` for a folder that is itself a file) the per-row predicate ran,
-            // without a path String per row.
-            let under = filePaths.filesUnder(folder, semantics: .bytes)
-            let victims = victimRowsMatchingLocked { Int($0.fid) < under.count && under[Int($0.fid)] }
-            beginTxnLocked()
-            recordAndReleaseLocked(releasedSlotsLocked(victims))
-            var stmt: OpaquePointer?
-            // Range form of `path LIKE folder||'/%'`: SQLite's default case-insensitive LIKE (plus
-            // the OR) defeats the index and scans; `>= '<folder>/' AND < '<folder>0'` is
-            // index-driven ('0' is the successor of '/' in ASCII; no path byte sorts between).
-            // It now runs over `dirs` - 220k rows and 27 MB on the measured index, against 746k
-            // full paths and 113 MB - and the file set follows from the directory set by id.
-            // The victim files are resolved ONCE, into a temp table, and every delete below reads
-            // that. Spelling the folder subquery into each statement instead makes the directory
-            // range scan and the file lookup run four times over - measured at +75 ms per call on a
-            // real index, and paid even by the repeat delete that removes nothing.
-            exec("DROP TABLE IF EXISTS temp.victims;")
-            stmt = nil
-            // CHECKED, because everything below reads this table by name. If the create fails, the
-            // unchecked deletes that follow each fail too - silently, since exec() swallows errors -
-            // and then removeRowsLocked drops the rows from MEMORY anyway. SQLite would still have
-            // them, so the folder would reappear at the next launch after a whole session of the
-            // in-memory state saying otherwise. Bail before touching anything instead.
-            var built = false
-            if sqlite3_prepare_v2(db, "CREATE TEMP TABLE victims AS \(StoreSchema.fileIDsUnderFolder);", -1, &stmt, nil) == SQLITE_OK {
-                sqlite3_bind_text(stmt, 1, folder, -1, SQLITE_TRANSIENT)
-                built = sqlite3_step(stmt) == SQLITE_DONE
-            }
-            sqlite3_finalize(stmt); stmt = nil
-            guard built else {
-                rollbackTxnLocked()
-                FileHandle.standardError.write(Data("[omni] folder delete aborted: could not resolve the files under \(folder)\n".utf8))
-                return
-            }
-            // THE SPLIT'S POINTERS GO TOO. A delete that leaves occurrence rows behind is worse
-            // than a leak: file-level reuse reads occurrences, so a stale one makes the indexer
-            // hand back chunks for content that is gone - and those rows then have no pending
-            // blob while coverage has never covered them, which is the "bookkeeping is off by N
-            // rows" refusal. Found exactly that way: 48 vectors live, the index accounting for 36.
-            // THROUGH THE ONE REMOVAL, not a second spelling of it: refs recounted, positions
-            // returned to the free list, snippet and staged vector dropped with the content.
-            dropSplitWhereLocked(fileIDs: "SELECT id FROM temp.victims")
-            // THE v4 BLOB DELETE IS NOT A NO-OP ON A SPLIT INDEX, IT IS A WRONG ONE. Under the
-            // split `pending_vecs` is keyed on the content, and this names v4 row ids - two
-            // spaces that overlap numerically, so the statement does not miss, it deletes some
-            // unrelated live content's staged vector. For an uncovered position that blob is the
-            // only copy of the bytes. Same reasoning at every other site that clears a blob by
-            // v4 row id.
-            for sql in (v4Dropped ? [] :
-                        ["DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));"])
-                + (splitPendingKeyedLocked ? []
-                   : ["DELETE FROM pending_vecs WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));"])
-                + ["DELETE FROM dedup WHERE file_id IN (SELECT id FROM temp.victims);"]
-                + (v4Dropped ? [] : ["DELETE FROM chunks WHERE file_id IN (SELECT id FROM temp.victims);"])
-                + ["DELETE FROM files WHERE id IN (SELECT id FROM temp.victims);"] {
-                exec(sql)
-            }
-            exec("DROP TABLE IF EXISTS temp.victims;")
-            pruneEmptyDirsLocked(where: "path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')", bind: folder)
-            bumpGenLocked()
-            exec("COMMIT;")
-            removeRowsLocked(victims: victims) { Int($0.fid) < under.count && under[Int($0.fid)] }
-            proactiveRefoldLocked()
-            checkpointIfDueLocked(forceStat: true)   // deletes carry no byte estimate (F17)
+            deleteUnderFolderLocked(folder)
         }
+    }
+
+    private func deleteUnderFolderLocked(_ folder: String) {
+        // Decided ONCE PER DIRECTORY, then read per row by file id: the same byte-prefix test
+        // (plus canonical `==` for a folder that is itself a file) the per-row predicate ran,
+        // without a path String per row.
+        var laps = Laps()
+        let under = filePaths.filesUnder(folder, semantics: .bytes)
+        laps.lap("under")
+        let victims = victimRowsMatchingLocked { Int($0.fid) < under.count && under[Int($0.fid)] }
+        laps.lap("victims")
+        beginTxnLocked()
+        let released = releasedSlotsLocked(victims)
+        laps.lap("released")
+        recordAndReleaseLocked(released)
+        laps.lap("holes")
+        var stmt: OpaquePointer?
+        // Range form of `path LIKE folder||'/%'`: SQLite's default case-insensitive LIKE (plus
+        // the OR) defeats the index and scans; `>= '<folder>/' AND < '<folder>0'` is
+        // index-driven ('0' is the successor of '/' in ASCII; no path byte sorts between).
+        // It now runs over `dirs` - 220k rows and 27 MB on the measured index, against 746k
+        // full paths and 113 MB - and the file set follows from the directory set by id.
+        // The victim files are resolved ONCE, into a temp table, and every delete below reads
+        // that. Spelling the folder subquery into each statement instead makes the directory
+        // range scan and the file lookup run four times over - measured at +75 ms per call on a
+        // real index, and paid even by the repeat delete that removes nothing.
+        exec("DROP TABLE IF EXISTS temp.victims;")
+        stmt = nil
+        // CHECKED, because everything below reads this table by name. If the create fails, the
+        // unchecked deletes that follow each fail too - silently, since exec() swallows errors -
+        // and then removeRowsLocked drops the rows from MEMORY anyway. SQLite would still have
+        // them, so the folder would reappear at the next launch after a whole session of the
+        // in-memory state saying otherwise. Bail before touching anything instead.
+        var built = false
+        if sqlite3_prepare_v2(db, "CREATE TEMP TABLE victims AS \(StoreSchema.fileIDsUnderFolder);", -1, &stmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(stmt, 1, folder, -1, SQLITE_TRANSIENT)
+            built = sqlite3_step(stmt) == SQLITE_DONE
+        }
+        sqlite3_finalize(stmt); stmt = nil
+        guard built else {
+            rollbackTxnLocked()
+            FileHandle.standardError.write(Data("[omni] folder delete aborted: could not resolve the files under \(folder)\n".utf8))
+            return
+        }
+        // THE SPLIT'S POINTERS GO TOO. A delete that leaves occurrence rows behind is worse
+        // than a leak: file-level reuse reads occurrences, so a stale one makes the indexer
+        // hand back chunks for content that is gone - and those rows then have no pending
+        // blob while coverage has never covered them, which is the "bookkeeping is off by N
+        // rows" refusal. Found exactly that way: 48 vectors live, the index accounting for 36.
+        // THROUGH THE ONE REMOVAL, not a second spelling of it: refs recounted, positions
+        // returned to the free list, snippet and staged vector dropped with the content.
+        dropSplitWhereLocked(fileIDs: "SELECT id FROM temp.victims")
+        // THE v4 BLOB DELETE IS NOT A NO-OP ON A SPLIT INDEX, IT IS A WRONG ONE. Under the
+        // split `pending_vecs` is keyed on the content, and this names v4 row ids - two
+        // spaces that overlap numerically, so the statement does not miss, it deletes some
+        // unrelated live content's staged vector. For an uncovered position that blob is the
+        // only copy of the bytes. Same reasoning at every other site that clears a blob by
+        // v4 row id.
+        for sql in (v4Dropped ? [] :
+                    ["DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));"])
+            + (splitPendingKeyedLocked ? []
+               : ["DELETE FROM pending_vecs WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (SELECT id FROM temp.victims));"])
+            + ["DELETE FROM dedup WHERE file_id IN (SELECT id FROM temp.victims);"]
+            + (v4Dropped ? [] : ["DELETE FROM chunks WHERE file_id IN (SELECT id FROM temp.victims);"])
+            + ["DELETE FROM files WHERE id IN (SELECT id FROM temp.victims);"] {
+            exec(sql)
+        }
+        exec("DROP TABLE IF EXISTS temp.victims;")
+        laps.lap("sql")
+        pruneEmptyDirsLocked(where: "path = ?1 OR (path >= ?1 || '/' AND path < ?1 || '0')", bind: folder)
+        laps.lap("dirs")
+        bumpGenLocked()
+        exec("COMMIT;")
+        laps.lap("commit")
+        removeRowsLocked(victims: victims) { Int($0.fid) < under.count && under[Int($0.fid)] }
+        laps.lap("rows")
+        proactiveRefoldLocked()
+        laps.lap("fold")
+        checkpointIfDueLocked()
+        laps.lap("ckpt")
+        laps.print("deleteUnderFolder rows=\(victims.count)")
     }
 
     /// Delete every chunk of a given file kind (used when a content type is disabled).
@@ -3331,79 +3783,57 @@ public final class VectorStore: @unchecked Sendable {
 
     public func deleteKind(_ kind: String) { deleteKinds([kind]) }
 
-    /// Multi-kind delete in ONE pass: one SQL predicate, one in-memory compaction - a text+scan
-    /// purge would otherwise pay two full-table scans and two O(N) buffer compactions.
+    /// Every file of these kinds, deleted as files, IN SLICES (deleteInSlices).
+    ///
+    /// A file is exactly one kind (the indexer writes a document as text or as scanned pages,
+    /// never both; 0 of 2.68M files on the measured index mix them), so this is a delete of the
+    /// files that hold these kinds - which is what the single-transaction version already did in
+    /// SQL, through `dropSplitWhereLocked` by file. That version held the queue 24 s on a 570k-row
+    /// image purge, 9.8 s of it a join on `chunk.kind`, which has no index, plus a sweep of every
+    /// file row in the index for orphans (index.md, "Heavy CRUD review").
+    ///
+    /// Rounds, because files of the kind can be indexed between slices: each round resolves what
+    /// is live now, and a round that finds nothing ends it.
     public func deleteKinds(_ kinds: [String]) {
         guard !kinds.isEmpty else { return }
-        queue.sync {
-            guard dbOpen() else { return }
-            let set = Set(kinds)
-            // Holes for the rows this is about to orphan, inside the same transaction - the same
-            // rule every other removal follows. A settings toggle that purges a whole kind is a
-            // bulk delete like any other, and skipping it here would leave the vector file holding
-            // slots no row owns with nothing recording which.
-            let victims = victimRowsMatchingLocked { set.contains(kindOf($0)) }
-            beginTxnLocked()
-            recordAndReleaseLocked(releasedSlotsLocked(victims))
-            // Kinds are codes on the row now, so the predicate is a small IN over integers.
-            let codes = kinds.map { String(kindCodeLocked($0)) }.joined(separator: ",")
-            // Side rows first, while the chunk rows they hang off are still there to name them.
-            // A WHOLE KIND IS A BULK DELETE LIKE ANY OTHER. It used to drop the `occurrence` rows
-            // and stop there - no refcount, no freed position, and `chunk` / `chunk_snippet` rows
-            // left behind that nothing could reach. Routed through the one removal, by the files
-            // those contents occur in.
-            if splitPendingKeyedLocked {
-                dropSplitWhereLocked(fileIDs: "SELECT DISTINCT o.file_id FROM occurrence o "
-                                     + "JOIN chunk k ON k.id = o.chunk_id WHERE k.kind IN (\(codes))")
-            }
-            for sql in (v4Dropped ? [] :
-                        ["DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE kind IN (\(codes)));"])
-                + (splitPendingKeyedLocked ? []
-                   : ["DELETE FROM pending_vecs WHERE chunk_id IN (SELECT id FROM chunks WHERE kind IN (\(codes)));"])
-                + (v4Dropped
-                   ? ["DELETE FROM dedup WHERE file_id NOT IN (SELECT DISTINCT file_id FROM occurrence);"]
-                   : ["DELETE FROM dedup WHERE file_id IN (SELECT DISTINCT file_id FROM chunks WHERE kind IN (\(codes)));",
-                      "DELETE FROM chunks WHERE kind IN (\(codes));"]) {
-                exec(sql)
-            }
-            bumpGenLocked()
-            pruneOrphanFileRowsLocked()   // whole-table sweep: a kind purge names no path range
-            exec("COMMIT;")
-            removeRowsLocked(victims: victims) { set.contains(kindOf($0)) }
-            checkpointIfDueLocked(forceStat: true)   // bulk delete inflates the WAL; fold it (self-review fix)
+        let set = Set(kinds)
+        for _ in 0 ..< 4 {
+            let ids = liveFileIDs { _, kind in set.contains(kind) }
+            guard !ids.isEmpty else { return }
+            deleteFilesInSlices(.ids(ids) { _ in true })
         }
     }
 
     /// Drop all vectors for files with one of these extensions (the user turned an extension off
-    /// within an enabled kind). There is no extension column, so victims are matched by path.
+    /// within an enabled kind). There is no extension column, so files are matched by path - the
+    /// same NSString extension rule as before, decided once per file.
     public func deleteExtensions(_ exts: Set<String>) {
         guard !exts.isEmpty else { return }
+        let lower = Set(exts.map { $0.lowercased() })
+        func off(_ p: String) -> Bool { lower.contains((p as NSString).pathExtension.lowercased()) }
+        for _ in 0 ..< 4 {
+            let ids = liveFileIDs { [self] f, _ in lower.contains(filePaths.lowercasedExtension(f)) }
+            guard !ids.isEmpty else { return }
+            deleteFilesInSlices(.ids(ids, keep: off))
+        }
+    }
+
+    /// Resident ids of the files with live rows that `match` accepts, read on the queue: the file
+    /// id and the kind of its first live row. No path String per file unless `match` builds one.
+    private func liveFileIDs(_ match: (Int, String) -> Bool) -> [(id: Int32, hash: Int)] {
         queue.sync {
-            guard dbOpen() else { return }
-            let lower = Set(exts.map { $0.lowercased() })
-            // One decision per FILE, with the same NSString extension rule, read per row by id.
-            var off = [Bool](repeating: false, count: filePaths.count)
-            for i in 0 ..< filePaths.count {
-                off[i] = lower.contains((filePaths[i] as NSString).pathExtension.lowercased())
+            guard dbOpen(), dim > 0 else { return [] }
+            let hasDead = !deadRows.isEmpty
+            var seen = [Bool](repeating: false, count: fileChunkCount.count)
+            var out: [(id: Int32, hash: Int)] = []
+            for i in 0 ..< Swift.min(rows.count, fileID.count) {
+                let f = Int(fileID[i])
+                guard f < seen.count, !seen[f], fileChunkCount[f] > 0 else { continue }
+                if hasDead, deadRows.contains(Int32(i)) { continue }
+                seen[f] = true
+                if f < filePaths.count, match(f, idKind[Int(rows[i].kc)]) { out.append((Int32(f), filePaths.hashOf(f))) }
             }
-            func disabled(_ r: Row) -> Bool { Int(r.fid) < off.count && off[Int(r.fid)] }
-            var victimIDs = Set<Int32>()
-            for r in rows where disabled(r) { victimIDs.insert(r.fid) }
-            let victims = Set(victimIDs.map { filePaths[Int($0)] })
-            guard !victims.isEmpty else { return }
-            let victimRows = victimRowsMatchingLocked { disabled($0) }
-            beginTxnLocked()
-            recordAndReleaseLocked(releasedSlotsLocked(victimRows))
-            guard deleteFileContentsLocked(victims) else {
-                rollbackTxnLocked()
-                FileHandle.standardError.write(Data("[omni] extension delete aborted: could not stage the victims\n".utf8))
-                return
-            }
-            pruneFileRowsLocked(victims)
-            bumpGenLocked()
-            exec("COMMIT;")
-            removeRowsLocked(victims: victimRows) { disabled($0) }
-            checkpointIfDueLocked(forceStat: true)   // bulk delete inflates the WAL; fold it (self-review fix)
+            return out
         }
     }
 
@@ -3428,7 +3858,7 @@ public final class VectorStore: @unchecked Sendable {
             resetAggregatesLocked()
             invalidateTagFilterCacheLocked()   // wipe bypasses fileChunkDec; keep the invariant
             dim = 0
-            checkpointIfDueLocked(forceStat: true)   // a full wipe inflates the WAL; fold it (self-review fix)
+            checkpointIfDueLocked()
         }
     }
 
@@ -3713,31 +4143,61 @@ public final class VectorStore: @unchecked Sendable {
             let f = resolveTagFilterLocked(filter)
             let dead = deadRows
             let hasDead = !dead.isEmpty
-            var firstRow: [Int32: Int] = [:]   // fid -> first row index (carries the file's metadata)
             // The path clauses once per FILE; kind and date per row, exactly as `accepts` ordered them.
             let pathFiltered = !f.folderPrefixes.isEmpty || (f.ext?.isEmpty == false)
                 || f.tagAllow != nil || f.tagDeny != nil
             let pathOK = pathFiltered ? acceptedFilesLocked(f, count: filePaths.count) : []
-            for i in rows.indices {
-                if hasDead, dead.contains(Int32(i)) { continue }   // see indexedFiles: filter, never compact
-                let r = rows[i]
-                if !f.kinds.isEmpty, !f.kinds.contains(kindOf(r)) { continue }
-                if pathFiltered, !(Int(r.fid) < pathOK.count && pathOK[Int(r.fid)]) { continue }
-                if let since = f.since, metaOf(r).modified < since { continue }
-                if let until = f.until, metaOf(r).modified >= until { continue }
-                let fid = fileID[i]
-                if firstRow[fid] == nil { firstRow[fid] = i }
-            }
+            // Kind by CODE, one table lookup a row - not a String hashed into a Set per row.
+            var kindOK = [Bool](repeating: f.kinds.isEmpty, count: 256)
+            for k in f.kinds { if let c = kindID[k] { kindOK[Int(c)] = true } }
+            // The first live row of each file, by file id: an array, not a 2.7M-entry dictionary.
+            var seen = [Bool](repeating: false, count: fileChunkCount.count)
             // Sorted on mtime alone, files that share one - a checkout, an unpack, a synced folder,
             // any corpus whose timestamps were not preserved - ordered by Dictionary iteration,
             // which is seeded per process. The browse list therefore reshuffled between launches
             // for no visible reason. Path is the deterministic secondary key, the same fix the two
             // score reducers already carry for tied scores.
-            let winners = firstRow.values
-                .sorted { metaOf(rows[$0]).modified != metaOf(rows[$1]).modified
-                          ? metaOf(rows[$0]).modified > metaOf(rows[$1]).modified
-                          : filePaths.less(Int(rows[$0].fid), Int(rows[$1].fid)) }
-                .prefix(topK)
+            func before(_ a: Int, _ b: Int) -> Bool {
+                let ma = metaOf(rows[a]).modified, mb = metaOf(rows[b]).modified
+                return ma != mb ? ma > mb : filePaths.less(Int(rows[a].fid), Int(rows[b].fid))
+            }
+            // TOP K BY A BOUNDED HEAP, not a sort of every file. Sorting all 2.68M files - path
+            // comparisons on every mtime tie - held the store queue 6.4 s for 60 results (index.md,
+            // "Heavy CRUD review"). The heap's root is the worst kept so far.
+            var heap: [Int] = []
+            heap.reserveCapacity(topK + 1)
+            func siftDown(_ i0: Int) {
+                var i = i0
+                while true {
+                    let l = 2 * i + 1, r = l + 1
+                    var m = i
+                    if l < heap.count, before(heap[m], heap[l]) { m = l }
+                    if r < heap.count, before(heap[m], heap[r]) { m = r }
+                    if m == i { return }
+                    heap.swapAt(i, m); i = m
+                }
+            }
+            for i in rows.indices {
+                if hasDead, dead.contains(Int32(i)) { continue }   // see indexedFiles: filter, never compact
+                let r = rows[i]
+                guard kindOK[Int(r.kc)] else { continue }
+                if pathFiltered, !(Int(r.fid) < pathOK.count && pathOK[Int(r.fid)]) { continue }
+                if let since = f.since, metaOf(r).modified < since { continue }
+                if let until = f.until, metaOf(r).modified >= until { continue }
+                let fid = Int(fileID[i])
+                guard fid < seen.count, !seen[fid] else { continue }
+                seen[fid] = true
+                guard topK > 0 else { continue }
+                if heap.count < topK {
+                    heap.append(i)
+                    var c = heap.count - 1
+                    while c > 0 { let p = (c - 1) / 2; guard before(heap[p], heap[c]) else { break }; heap.swapAt(p, c); c = p }
+                } else if before(i, heap[0]) {
+                    heap[0] = i
+                    siftDown(0)
+                }
+            }
+            let winners = heap.sorted(by: before)
             let hits = winners.map { i -> SearchHit in
                 let r = rows[i]
                 return SearchHit(path: pathOf(r), score: 0, snippet: "", kind: kindOf(r),
@@ -3792,11 +4252,25 @@ public final class VectorStore: @unchecked Sendable {
     /// table and live chunk counts already say the same thing: a file is listed while it has a live
     /// chunk. `OMNI_VERIFY_PATHS=1` computes both and logs any difference.
     public func allIndexedPaths() -> [String] {
-        let fromMemory: [String]? = queue.sync {
-            guard !rows.isEmpty, fileChunkCount.count <= filePaths.count else { return nil }
-            var out: [String] = []; out.reserveCapacity(liveFiles)
-            for fid in fileChunkCount.indices where fileChunkCount[fid] > 0 { out.append(filePaths[fid]) }
-            return out
+        // IN CHUNKS, the queue released between them: a String per file for 2.68M files held it
+        // 534 ms, and the filename refresh asks once a minute while indexing runs. Not a snapshot
+        // of the table built off the queue: holding a second reference makes the next write that
+        // interns a path copy the whole table, on the queue. A file written between two chunks is
+        // simply in or out of this list; the caller stamps before it reads, so it refreshes again.
+        var fromMemory: [String]? = []
+        var from = 0
+        while fromMemory != nil {
+            let more: [String]?? = queue.sync {
+                guard !rows.isEmpty, fileChunkCount.count <= filePaths.count else { return .some(nil) }
+                guard from < fileChunkCount.count else { return .none }
+                let to = Swift.min(fileChunkCount.count, from + 100_000)
+                var out: [String] = []
+                for fid in from ..< to where fileChunkCount[fid] > 0 { out.append(filePaths[fid]) }
+                from = to
+                return .some(out)
+            }
+            guard let more else { break }
+            if let more { fromMemory! += more } else { fromMemory = nil }
         }
         if let fromMemory, ProcessInfo.processInfo.environment["OMNI_VERIFY_PATHS"] != "1" { return fromMemory }
         let fromSQL = allIndexedPathsFromSQL()
@@ -4293,6 +4767,7 @@ public final class VectorStore: @unchecked Sendable {
         interactiveLane.close()
         aggregateLane.close()
         checkpointer.close()
+        warmer.close()
     }
 
     /// WAL CHECKPOINTS RUN HERE, NOT ON `queue`. A checkpoint used to run inside a write, holding the
@@ -4302,8 +4777,21 @@ public final class VectorStore: @unchecked Sendable {
     /// "Search while long files stream"). PASSIVE on a connection of its own takes no lock that
     /// the writer or a reader waits on: it copies what it can and returns. The writer restarts
     /// the WAL once it is fully copied, and `journal_size_limit` gives the file back then.
+    /// Held by a bulk writer from just before it takes the store queue until it lets go, so the
+    /// Checkpointer's RESTART - which blocks every writer while it runs - starts only between two
+    /// slices, never under one. Taken OFF the queue (lock order: gate, then queue), so a writer that
+    /// waits for a RESTART to finish waits without holding what searches need.
+    final class WriteGate: @unchecked Sendable {
+        private let lock = NSLock()
+        func hold<T>(_ body: () throws -> T) rethrows -> T { lock.lock(); defer { lock.unlock() }; return try body() }
+        func tryHold(_ body: () -> Void) -> Bool { guard lock.try() else { return false }; body(); lock.unlock(); return true }
+    }
+    private let writeGate: WriteGate
+    private let warmer: PageWarmer
+
     final class Checkpointer: @unchecked Sendable {
         private let dbURL: URL
+        private let gate: WriteGate
         private let queue = DispatchQueue(label: "omni.vectorstore.checkpoint", qos: .utility)
         private var db: OpaquePointer?
         private var shut = false
@@ -4312,7 +4800,7 @@ public final class VectorStore: @unchecked Sendable {
         /// Checkpoints completed, for tests and the bench.
         private(set) var completed = 0
 
-        init(dbURL: URL) { self.dbURL = dbURL }
+        init(dbURL: URL, gate: WriteGate) { self.dbURL = dbURL; self.gate = gate }
 
         /// Ask for one. Coalesced: requests while one runs fold into a single follow-up.
         func request() {
@@ -4361,10 +4849,18 @@ public final class VectorStore: @unchecked Sendable {
             // TRUNCATE (index.md): both cap the WAL at ~300 MB with no hard-cap stall and no
             // difference in search or write speed; RESTART reuses the file, journal_size_limit
             // trims it to 64 MB.
+            //
+            // BEHIND THE WRITE GATE. A RESTART holds the writer lock while it runs - copying what
+            // arrived since the passive pass and syncing the database file - and a slice that hit
+            // it waited 942 ms in BEGIN IMMEDIATE, on the store queue, with a search behind it
+            // (index.md, "Heavy CRUD review"). Skipped, not waited for, when a writer holds the
+            // gate; the next request tries again.
             var truncated = false
             if rc == SQLITE_OK, log > 0, log == copied {
-                sqlite3_busy_timeout(db, 0)
-                truncated = sqlite3_wal_checkpoint_v2(db, nil, SQLITE_CHECKPOINT_RESTART, nil, nil) == SQLITE_OK
+                _ = gate.tryHold {
+                    sqlite3_busy_timeout(db, 0)
+                    truncated = sqlite3_wal_checkpoint_v2(db, nil, SQLITE_CHECKPOINT_RESTART, nil, nil) == SQLITE_OK
+                }
             }
             lock.lock(); completed += 1; lock.unlock()
             if let t { print(String(format: "[ckpt] passive rc=%d frames=%d copied=%d restarted=%@ %.1fms (off the store queue)", rc, log, copied, truncated ? "yes" : "no", -t.timeIntervalSinceNow * 1000)) }
@@ -5931,6 +6427,11 @@ public final class VectorStore: @unchecked Sendable {
     /// Runs rather than individual rows because the packers take a range and the free list hands
     /// positions out lowest-first, so they cluster - and because one MLX call per row would trade
     /// the full repack this exists to avoid for thousands of tiny ones.
+    /// The same positions, ascending and unique: one gather for the sign-code tier's refresh.
+    private func patchedPositionsLocked() -> [Int] {
+        Set(patchedSlots.filter { Int($0) < baseRows }).map(Int.init).sorted()
+    }
+
     private func patchedRunsLocked() -> [Range<Int>] {
         let ps = Set(patchedSlots.filter { Int($0) < baseRows }).map(Int.init).sorted()
         guard !ps.isEmpty else { return [] }
@@ -6305,6 +6806,17 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     static let searchTiming = ProcessInfo.processInfo.environment["OMNI_SEARCH_TIMING"] == "1"
+    /// Phase laps for one store-queue hold, printed under OMNI_SEARCH_TIMING: "[delete] victims=12ms
+    /// sql=840ms ...". Every bulk mutation logs one line, so a stall names its phase.
+    struct Laps {
+        private var t = Date(), parts: [String] = []
+        let on = VectorStore.searchTiming
+        mutating func lap(_ name: String) {
+            guard on else { return }
+            parts.append(String(format: "%@=%.0fms", name, -t.timeIntervalSinceNow * 1000)); t = Date()
+        }
+        func print(_ label: String) { if on { Swift.print("[\(label)] " + parts.joined(separator: " ")) } }
+    }
 
     /// Fill the lazily-loaded snippets for a search's winners: <=topK primary-key point lookups
     /// (PRIMARY KEY(path, chunk_index) is the table's btree, so each is O(log N) with hot pages).
@@ -7821,24 +8333,18 @@ public final class VectorStore: @unchecked Sendable {
         // The position is owned again, so it is not a hole. Committed inside the caller's
         // transaction with the row that now owns it; a rollback re-reads the table.
         if vecHoles.remove(Int32(p)) != nil { exec("DELETE FROM vec_holes WHERE slot = \(p);") }
-        // AND THE POSITION -> ROWS INDEX IS NOW WRONG. It is cached on (mutationGen, slotCount),
-        // and reusing a freed position changes NEITHER: nothing is appended so the count is the
-        // same, and the generation was already bumped before this row was added. Every other way
-        // of gaining a row appends, which grows slotCount and forces the rebuild - so this cache
-        // key worked for as long as reuse did not exist.
+        // THE POSITION -> ROWS INDEX SEES THIS ROW AS AN APPEND. It was cached on (mutationGen,
+        // slotCount), and reusing a freed position changes NEITHER - the audit then asked that map
+        // who owns a position, was told nobody, and reported "position N inside coverage has no
+        // live row and no recorded hole" for a position just legitimately reused. It now follows
+        // `occSlot` itself: the row this position goes to is appended there, and
+        // ensureSlotRowsLocked files every appended row under its slot, old or new.
         //
-        // The cost of missing it is not a stale read, it is an index that will not open: the
-        // audit asks that map who owns a position, is told nobody, and reports
-        // "position N inside coverage has no live row and no recorded hole" for a position that
-        // was just legitimately reused. Which is exactly what it did.
-        //
-        // ALL THREE, not just the one that was caught. Every cache over the row -> position
-        // mapping is keyed the same way, and reuse is invisible to all of them for the same
-        // reason: `orphanSlotsLocked` on (dead set, structure, n), and `occSlotIsIdentityLocked` on
-        // (gen, baseOccCount) - which would answer "positions are still the row's own index"
-        // after a reuse has made that false, and that answer decides whether whole scans can skip
-        // the indirection. Found by looking for siblings of the bug rather than only fixing it.
-        slotRowGen = -1
+        // ALL THREE caches over the row -> position mapping were keyed the same way and blind to
+        // reuse for the same reason: `orphanSlotsLocked` on (dead set, structure, n), and
+        // `occSlotIsIdentityLocked` on (gen, baseOccCount) - which would answer "positions are
+        // still the row's own index" after a reuse has made that false, and that answer decides
+        // whether whole scans can skip the indirection.
         // Not orphanSlotsLocked's cache: the reused position was an orphan, and the row now on it
         // is an append, which that cache checks for and drops from its list.
         identityCacheGen = -1
@@ -8193,9 +8699,11 @@ public final class VectorStore: @unchecked Sendable {
         coverageArmed = true
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
-            self.queue.sync {
-                self.coverageArmed = false
-                self.stampVectorCoverageLocked()
+            self.writeGate.hold {
+                self.queue.sync {
+                    self.coverageArmed = false
+                    self.stampVectorCoverageLocked()
+                }
             }
         }
     }
@@ -8207,10 +8715,12 @@ public final class VectorStore: @unchecked Sendable {
         let token = stampToken
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
-            self.queue.sync {
-                guard self.stampToken == token else { return }   // superseded: more mutations arrived
-                self.stampVectorCoverageLocked()
-                self.stampRowSidecarLocked(sync: false)
+            self.writeGate.hold {
+                self.queue.sync {
+                    guard self.stampToken == token else { return }   // superseded: more mutations arrived
+                    self.stampVectorCoverageLocked()
+                    self.stampRowSidecarLocked(sync: false)
+                }
             }
         }
     }
@@ -9996,6 +10506,13 @@ public final class VectorStore: @unchecked Sendable {
     public func reclaimVectorHolesForTest() -> Bool { reclaimVectorHoles() }
 
     /// Are the holes worth a copy of the live file?
+    /// Enough recorded holes to be worth a reclaim: the cheap half of shouldReclaimHolesLocked.
+    private func holesPastThresholdLocked() -> Bool {
+        let units = slotCount
+        guard Self.vecCoverage, Self.holeReclaimFraction > 0, units > 0, coveredRows == units else { return false }
+        return vecHoles.count >= Swift.max(Self.holeReclaimFloor, Int(Double(units) * Self.holeReclaimFraction))
+    }
+
     private func shouldReclaimHolesLocked() -> Bool {
         // POSITIONS, like everything else about coverage. `units` is what the file holds and what
         // the claim is measured in.
@@ -10010,26 +10527,28 @@ public final class VectorStore: @unchecked Sendable {
               // switch is two writes to `meta` instead of an UPDATE over millions of rows.
               coveredRows == units, !vecHoles.isEmpty
         else { return false }
-        // THE THRESHOLD FIRST. The audit below walks every position and hashes every row (515 ms on
-        // the 10M-position bench index, under the store queue), and the stamp that asks runs two
-        // seconds after every write. Asked in the other order it paid that cost on every write to
+        // THE THRESHOLD FIRST. The audit below used to walk every position and hash every row
+        // (515 ms on the 10M-position bench index, under the store queue), and the stamp that asks
+        // runs two seconds after every write. Asked in the other order it paid that cost on every write to
         // reach a "no" the hole count alone gives: a live index whose watched folders take steady
         // writes held a core at 100% for days, 15,877 holes against a threshold of 420,820.
-        let threshold = Swift.max(Self.holeReclaimFloor, Int(Double(units) * Self.holeReclaimFraction))
-        guard vecHoles.count >= threshold else { return false }
+        guard holesPastThresholdLocked() else { return false }
         // An audit that disagrees is not repeated on the next write: nothing about the next write
         // makes it more likely to agree, and the reclaim is never urgent.
         if let retry = holeAuditRetryAt, Date() < retry { return false }
         // The hole list has to account for every position nothing owns, or the copy below would
         // keep bytes it thinks are live. A tombstone releases a POINTER, not a position, so the
         // question is asked of the positions.
+        //
+        // COUNTED OFF THE ORPHAN CACHE'S LIVE-ROW COUNT PER POSITION, brought up to date by what
+        // changed since the last search. Same question - positions no live row points at - without
+        // the walk through every position's rows, which held the queue 600 ms per ask on a 9.7M-row
+        // index (index.md, "Heavy CRUD review"). Updated at the cache's own range: asking for
+        // `units` would move it past `baseRows`, and the next search would rebuild the cache.
         holeAuditsForTest += 1
-        ensureSlotRowsLocked()
-        let dead = deadRows
+        _ = orphanSlotsLocked(upTo: orphanCacheRows > 0 ? orphanCacheRows : units)
         var unowned = 0
-        for sl in 0 ..< units where !rowsOfSlotLocked(sl).contains(where: { !dead.contains($0) }) {
-            unowned += 1
-        }
+        for sl in 0 ..< units where sl >= orphanLive.count || orphanLive[sl] == 0 { unowned += 1 }
         guard vecHoles.count == unowned else {
             holeAuditRetryAt = Date().addingTimeInterval(600)
             return false
@@ -10138,6 +10657,7 @@ public final class VectorStore: @unchecked Sendable {
         // resume path with no remap table to carry across the crash.
         // PHASE 1 - the plan, under the queue.
         struct Plan { var writes: [(off: Int, dst: Int, len: Int)]; var newCount: Int; var deadCount: Int; var gen: Int64 }
+        let tPlan = Date()
         let plan: Plan? = queue.sync {
             guard shouldReclaimHolesLocked() else { return nil }
             // Under sharing, every stored slot is about to be rewritten by rank, so the column has
@@ -10194,6 +10714,7 @@ public final class VectorStore: @unchecked Sendable {
             return Plan(writes: writes, newCount: newCount, deadCount: units - newCount, gen: mutationGen)
         }
         guard let plan else { return false }
+        if Self.searchTiming { print(String(format: "[reclaim] plan %.0f ms (on the store queue)", -tPlan.timeIntervalSinceNow * 1000)) }
         let t0 = Date()
         if Self.searchTiming {
             let total = plan.writes.reduce(0) { $0 + $1.len }
@@ -10206,11 +10727,15 @@ public final class VectorStore: @unchecked Sendable {
         guard fm.createFile(atPath: vecCompactURL.path, contents: nil),
               let fh = FileHandle(forWritingAtPath: vecCompactURL.path) else { return false }
         var ok = true
+        var longest = 0.0
         for w in plan.writes {
+            let tw = Date()
             ok = queue.sync { writeVectorChunkLocked(fh.fileDescriptor, srcOffset: w.off,
                                                      dstOffset: w.dst, length: w.len, gen: plan.gen) }
+            longest = Swift.max(longest, -tw.timeIntervalSinceNow)
             if !ok { break }
         }
+        if Self.searchTiming { print(String(format: "[reclaim] copy %.1f s, longest chunk hold %.0f ms", -t0.timeIntervalSinceNow, longest * 1000)) }
         // THE FILE HAS TO BE THE LENGTH THE PLAN SAID. Checked before anything durable records that
         // it exists, because the rename after it is the commit point and a short file there is an
         // index that will not open.
@@ -10239,13 +10764,16 @@ public final class VectorStore: @unchecked Sendable {
         }
 
         // PHASE 3 - the switch. Short, and one turn of the queue.
-        return queue.sync { commitReclaimLocked(plan.newCount, deadCount: plan.deadCount, gen: plan.gen, since: t0) }
+        return writeGate.hold { queue.sync { commitReclaimLocked(plan.newCount, deadCount: plan.deadCount, gen: plan.gen, since: t0) } }
     }
 
     private func commitReclaimLocked(_ newCount: Int, deadCount: Int, gen: Int64, since t0: Date) -> Bool {
         // A mutation during the copy invalidates the plan: the file describes rows that have moved.
-        guard mutationGen == gen else {
+        // A SEARCH during it means someone is back, and the commit is one long hold - so it is
+        // abandoned too, while nothing durable has changed, and the next idle stamp starts over.
+        guard mutationGen == gen, lastSearchAt < t0 || Self.reclaimIdleSeconds == 0 else {
             try? FileManager.default.removeItem(at: vecCompactURL)
+            scheduleCoverageStampLocked(after: Self.reclaimIdleSeconds + 1)   // and try again once idle
             return false
         }
         // FULL, for this one commit. The whole protocol rests on the marker being on disk before
@@ -10254,6 +10782,8 @@ public final class VectorStore: @unchecked Sendable {
         // reads that as "nothing to resume", and leaves the OLD claim describing the NEW compacted
         // file: every row past the first hole then returns its neighbour's vector, silently. One
         // fsync, once per reclaim, is the price of the ordering the comments already claim.
+        var laps = Laps()
+        defer { laps.print("reclaim commit") }
         exec("PRAGMA synchronous=FULL;")
         defer { exec("PRAGMA synchronous=NORMAL;") }
         guard execChecked("BEGIN IMMEDIATE;"),
@@ -10280,6 +10810,7 @@ public final class VectorStore: @unchecked Sendable {
         // be the old one after a power loss while the claim below says otherwise.
         let dirFD = open(dbURL.deletingLastPathComponent().path, O_RDONLY)
         if dirFD >= 0 { fsync(dirFD); Darwin.close(dirFD) }
+        laps.lap("marker+rename")
         if Self.compactStopAfter == "rename" { return false }   // TEST: crash before the claim
 
         guard execChecked("BEGIN IMMEDIATE;"),
@@ -10295,6 +10826,7 @@ public final class VectorStore: @unchecked Sendable {
             loadIntoMemory()
             return false
         }
+        laps.lap("renumber")
         coveredRows = newCount
         vecHoles.removeAll()
 
@@ -10302,6 +10834,7 @@ public final class VectorStore: @unchecked Sendable {
         // live rows in order, which is what loading from the claim expects - so this is the same
         // path a launch takes rather than a special case.
         loadIntoMemory()
+        laps.lap("load")
         let reclaimed = Int64(deadCount) * Int64(dim * MemoryLayout<UInt16>.size)
         FileHandle.standardError.write(Data(String(format:
             "[omni] reclaimed %d vector slots (%.1f MB) in %.1fs; rows %d -> %d\n",
@@ -10454,8 +10987,29 @@ public final class VectorStore: @unchecked Sendable {
             // the split does it by construction: `chunk.key` is unique, so there are no
             // duplicate contents left for a pass to find. See docs/schema-v5.md.
             // Off the queue: the reclaim takes it one chunk at a time, and this call is holding it.
-            if reclaim, !yieldToSearchLocked("reclaim"), shouldReclaimHolesLocked() {
-                DispatchQueue.global(qos: .utility).async { [weak self] in self?.reclaimVectorHoles() }
+            // AND ONLY ONCE WRITES HAVE GONE QUIET. The copy stops at the first write after it
+            // starts (the generation check), so a reclaim begun inside a bulk delete planned -
+            // 0.8 s on the queue - copied a few positions, and stopped: every 24 s for the whole
+            // of a folder removal, each time a stall and nothing gained.
+            //
+            // AND NOBODY SEARCHING FOR MINUTES, not the 20 s other maintenance yields before it
+            // goes ahead anyway. The commit renumbers every content and reloads the store in one
+            // hold: 39 s on a cold 9.7M-row clone after an image purge (index.md, "Heavy CRUD
+            // review"). It is never urgent, so it waits for an app nobody is using.
+            //
+            // DECLINED ONLY FOR THOSE TWO, it asks again when they would pass: nothing else re-arms
+            // a caught-up stamp, so without this a user who searched within the window after a big
+            // delete kept its holes until the next launch.
+            if reclaim {
+                let waitWrites = Self.reclaimQuietSeconds + lastMutationAt.timeIntervalSinceNow
+                let waitSearch = Self.reclaimIdleSeconds + lastSearchAt.timeIntervalSinceNow
+                if waitWrites <= 0, waitSearch <= 0 {
+                    if shouldReclaimHolesLocked() {
+                        DispatchQueue.global(qos: .utility).async { [weak self] in self?.reclaimVectorHoles() }
+                    }
+                } else if holesPastThresholdLocked() {
+                    scheduleCoverageStampLocked(after: Swift.max(waitWrites, waitSearch) + 1)
+                }
             }
             return
         }
@@ -10976,6 +11530,32 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     /// Pack rows into sign bits, in slabs so the fp32 rotation transient stays bounded.
+    /// The sign codes of scattered positions, gathered into one tile first. Same math as the range
+    /// form, so a row packs to the same code either way.
+    private func packSignBitsLocked(positions: [Int]) -> MLXArray? {
+        guard dim > 0, dim % 32 == 0, !positions.isEmpty, positions.allSatisfy({ $0 >= 0 && ($0 + 1) * dim <= flat16.count })
+        else { return nil }
+        let words = bitWords
+        let pow2 = MLXArray((0 ..< 32).map { UInt32(1) << UInt32($0) }, [1, 1, 32])
+        let count = positions.count
+        let tile = [UInt16](unsafeUninitializedCapacity: count * dim) { pb, initialized in
+            flat16.withUnsafeBufferPointer { fb in
+                guard let src = fb.baseAddress, let dst = pb.baseAddress else { pb.initialize(repeating: 0); return }
+                for (j, p) in positions.enumerated() { (dst + j * dim).update(from: src + p * dim, count: dim) }
+            }
+            initialized = count * dim
+        }
+        let packed: MLXArray = tile.withUnsafeBytes { raw in
+            let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!), count: raw.count, deallocator: .none)
+            let r = rotateForBitsLocked(MLXArray(data, [count, dim], dtype: .bfloat16))
+            let bit = MLX.which(r .>= MLXArray(Float(0)), MLXArray(UInt32(1)), MLXArray(UInt32(0)))
+            let out = (bit.reshaped([count, words, 32]) * pow2).sum(axis: 2).asType(.uint32)
+            MLX.eval(out)
+            return out
+        }
+        return packed
+    }
+
     private func packSignBitsLocked(_ range: Range<Int>) -> MLXArray? {
         guard dim > 0, dim % 32 == 0, !range.isEmpty else { return nil }
         let words = bitWords
@@ -11168,39 +11748,56 @@ public final class VectorStore: @unchecked Sendable {
         // cannot repair afterwards because it only rescores what was already selected. Repacking
         // just those rows and scattering them in is O(patched) and leaves the base correct, so the
         // selection is too.
+        // AN EMPTY DELTA FOLDS TOO. A save that rewrites a file's passages frees positions and the
+        // free list hands them straight back, so the rows can all be patched with no new position
+        // at all; requiring a delta sent that case down the FULL rebuild below - every position
+        // repacked, on the search that found 17 patched rows.
+        // ONE PACK AND ONE SCATTER for the patched rows, not one per run: a run is often a single
+        // position, and 150 of them per indexing batch cost 50 ms of separate MLX calls on the
+        // first search after the write (index.md, "Heavy CRUD review").
+        var foldLaps = Laps()
         if bits == 1, quantBits == 1, let bb = bitBase, !baseDirty,
-           rowCount > baseRows, flat16.count >= rowCount * dim,
-           let add = packSignBitsLocked(baseRows ..< rowCount) {
+           rowCount >= baseRows, flat16.count >= rowCount * dim {
             let deltaRows = rowCount - baseRows
-            var merged = MLX.concatenated([bb, add], axis: 0)
+            var merged = bb
             var refreshed = true
-            for r in patchedRunsLocked() {
-                guard let rows = packSignBitsLocked(r) else { refreshed = false; break }
-                merged[MLXArray(r.map { Int32($0) })] = rows
+            if deltaRows > 0 {
+                if let add = packSignBitsLocked(baseRows ..< rowCount) { merged = MLX.concatenated([bb, add], axis: 0) }
+                else { refreshed = false }
             }
+            foldLaps.lap("pack")
+            let patched = patchedPositionsLocked()
+            if refreshed, !patched.isEmpty {
+                if let rows = packSignBitsLocked(positions: patched) { merged[MLXArray(patched.map { Int32($0) })] = rows }
+                else { refreshed = false }
+            }
+            foldLaps.lap("patch\(patched.count)")
             // A failure falls THROUGH to the full rebuild below rather than committing a base with
             // known-stale rows in it.
             if refreshed {
                 MLX.eval(merged)
+                foldLaps.lap("eval")
                 bitBase = merged
                 patchedSlots.removeAll(keepingCapacity: true)
                 baseRows = rowCount; baseOccCount = occCountCoveringSlotsLocked(baseRows)
+                foldLaps.lap("occ")
                 ensureVecScratchLocked()
                 quantReplicaChangedLocked()
-                if let tR { print(String(format: "[search] FOLD(1bit) delta=%d rows=%d %.1fms", deltaRows, rowCount, -tR.timeIntervalSinceNow * 1000)) }
+                foldLaps.print("fold")
+                if let tR { print(String(format: "[search] FOLD(1bit) delta=%d patched=%d rows=%d %.1fms", deltaRows, patched.count, rowCount, -tR.timeIntervalSinceNow * 1000)) }
                 return
             }
         }
         // Same treatment for the affine tier - see the sign-code path above for why a patched row
         // must be refreshed rather than refused.
         if bits > 0, bits != 1, bits == quantBits, let qb = quantBase, !baseDirty,
-           rowCount > baseRows, dim % Self.quantGroup == 0, flat16.count >= rowCount * dim {
+           rowCount >= baseRows, dim % Self.quantGroup == 0, flat16.count >= rowCount * dim {
             let deltaRows = rowCount - baseRows
-            let (wqs, scs, bss) = quantizeRowsLocked(baseRows ..< rowCount, bits: bits)
-            if !wqs.isEmpty, (qb.biases == nil) == bss.isEmpty {
-                var wq = MLX.concatenated([qb.wq] + wqs, axis: 0)
-                var sc = MLX.concatenated([qb.scales] + scs, axis: 0)
-                var bi: MLXArray? = qb.biases.map { MLX.concatenated([$0] + bss, axis: 0) }
+            let (wqs, scs, bss) = deltaRows > 0 ? quantizeRowsLocked(baseRows ..< rowCount, bits: bits) : ([], [], [])
+            if deltaRows == 0 || (!wqs.isEmpty && (qb.biases == nil) == bss.isEmpty) {
+                var wq = wqs.isEmpty ? qb.wq : MLX.concatenated([qb.wq] + wqs, axis: 0)
+                var sc = scs.isEmpty ? qb.scales : MLX.concatenated([qb.scales] + scs, axis: 0)
+                var bi: MLXArray? = qb.biases.map { bss.isEmpty ? $0 : MLX.concatenated([$0] + bss, axis: 0) }
                 var refreshed = true
                 for r in patchedRunsLocked() {
                     let (pw, ps2, pb) = quantizeRowsLocked(r, bits: bits)
@@ -11366,8 +11963,11 @@ public final class VectorStore: @unchecked Sendable {
         // bitBase too, as both search paths check: a sign-bit base (the live 7M-row index) left
         // the other two nil, so every write - one saved file - rebuilt all 3.9M slots, ~390 ms on
         // the store queue with searches behind it (measured 2026-10-07).
+        // AND THE PATCHED COUNT, the search path's third reason to rebuild. Missing here, a save
+        // that reused freed positions left the fold to the next search every time.
         guard baseDirty || (mlxBase == nil && quantBase == nil && bitBase == nil)
-                || (n - baseRows) + patchedSlots.count > Self.foldThreshold else { return }
+                || (n - baseRows) + patchedSlots.count > Self.foldThreshold
+                || patchedSlots.count > Self.patchedRebuildThreshold else { return }
         // Rate limit: the high-rate writers (text full pass, reconcile) batch many files per write, so
         // in practice this fires at most ~once per flush window. The floor only matters for residual
         // PER-FILE writers (media stores) - without it, ~10 stores/s during active search would spend
@@ -11391,24 +11991,18 @@ public final class VectorStore: @unchecked Sendable {
     /// frames under continuous writes - does a TRUNCATE run here, on the queue, as before.
     /// Crash-durability is unchanged in kind - the index is a rebuildable cache, and a lost WAL tail
     /// just means the next pass re-embeds those files.
-    private func checkpointIfDueLocked(forceStat: Bool = false) {
-        // The WAL only grows by the bytes we insert, so below the soft cap we cannot be due. Gate the
-        // per-write attributesOfItem stat (a syscall + a ~12-entry NSDictionary alloc) behind a cheap
-        // in-process byte counter: ~99% of indexing writes oscillate well under the soft cap and now
-        // skip the syscall entirely. The estimate UNDER-counts real WAL growth (row text + frame +
-        // page overhead), so crossing it only ever fires the exact stat LATE - still far below the
-        // hard cap - never early, so no checkpoint is missed. Deletes carry no byte estimate, so they
-        // force the exact stat. Seed once from the real WAL size (a prior crash can leave a tail). (F17)
-        if !ckptCounterSeeded {
-            bytesWrittenSinceCkpt = ((try? FileManager.default.attributesOfItem(atPath: dbURL.path + "-wal")[.size]) as? Int) ?? 0
-            ckptCounterSeeded = true
-        }
-        guard forceStat || bytesWrittenSinceCkpt >= Self.walSoftCapBytes else { return }
-        let wal = ((try? FileManager.default.attributesOfItem(atPath: dbURL.path + "-wal")[.size]) as? Int) ?? 0
-        guard wal > Self.walSoftCapBytes else { return }
+    ///
+    /// THE LENGTH IS THE WAL HOOK'S FRAME COUNT (see the writer's open), not the file size, and
+    /// a checkpoint is asked for once per soft cap of NEW log - not on every write past the cap.
+    /// A passive checkpoint does not reset the log, so "past the cap" stays true until a restart
+    /// lands; asking each time made a checkpoint, and its full drive flush, per delete slice.
+    private func checkpointIfDueLocked() {
+        if walFrames < walFramesAtRequest { walFramesAtRequest = 0 }   // the log restarted
+        let wal = walFrames * walPageBytes
+        guard wal - walFramesAtRequest * walPageBytes > Self.walSoftCapBytes else { return }
         // Off this queue, whether or not a search is active: it no longer blocks anything.
         checkpointer.request()
-        bytesWrittenSinceCkpt = 0
+        walFramesAtRequest = walFrames
         // The safety valve. A passive checkpoint cannot copy frames a reader still needs, and the
         // writer cannot restart a WAL that is not fully copied, so a long-lived reader under
         // continuous writes could grow it without bound. Past the hard cap, fold it back here,
@@ -11418,8 +12012,10 @@ public final class VectorStore: @unchecked Sendable {
         exec("PRAGMA wal_checkpoint(TRUNCATE);")
         if let t { print(String(format: "[ckpt] HARD CAP wal=%dMB %.1fms", wal >> 20, -t.timeIntervalSinceNow * 1000)) }
     }
-    private static let walSoftCapBytes = 32 << 20
+    private static let walSoftCapBytes = 64 << 20
     private static let walHardCapBytes = 1 << 30
+    /// What a restarted WAL's file is cut back to.
+    private static let walFileLimitBytes = 64 << 20
 
     public func kinds() -> Set<String> { queue.sync { Set(kindFileCounts.keys) } }
 
@@ -13790,7 +14386,6 @@ public final class VectorStore: @unchecked Sendable {
             bfs[i].withUnsafeBytes { _ = sqlite3_bind_blob(w.vec, 2, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
             guard sqlite3_step(w.vec) == SQLITE_DONE else { return nil }
 
-            bytesWrittenSinceCkpt += c.embedding.count * 2 + c.snippet.utf8.count + 160   // WAL-growth estimate (F17)
         }
         out.rowIDs = ids
         return out

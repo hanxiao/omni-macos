@@ -20,6 +20,7 @@ if args[2] == "--reclaim" {
     // No threshold: this measures the operation, not the policy that decides to run it.
     VectorStore.holeReclaimFractionOverride = 0
     VectorStore.holeReclaimFloorOverride = 1
+    VectorStore.reclaimIdleSeconds = 0   // measure the commit even with the probe searching
     let store = try VectorStore(dbURL: url)
     print("mutbench rows=\(store.count)  vecs=\(vecBytes()) bytes")
     VectorStore.holeReclaimFractionOverride = 0.000_001
@@ -139,6 +140,178 @@ if args[2] == "--stream" {
     store.close()
     // _exit, as the app quits: exit() runs MLX's C++ destructors while a scheduled idle fold may
     // still be on the store queue, and that race segfaulted the first runs of this mode.
+    fflush(stdout)
+    _exit(0)
+}
+
+if args[2] == "--crud" {
+    // EVERY HEAVY MUTATION, timed from the reader's side (index.md, "Heavy CRUD review"). One op
+    // per run on a fresh clone; a search every 50 ms and a folder browse every 250 ms run
+    // throughout, and keep running `tail` seconds after the op returns, so upkeep the op leaves
+    // behind (fold, collect, checkpoint) is charged to it too. Synthetic vectors, no model.
+    // usage: mutbench <dbPath> --crud <op> [n] [batch]
+    //   update n batch   re-embed n existing files, batch files per replaceMany
+    //   rename n batch   move n files: their vectors written under a new path, the old deleted
+    //   delpaths n batch delete n files, batch per deletePaths (reconcile prune)
+    //   delfolder        delete the folder holding the most files (removed source folder)
+    //   delext ext       deleteExtensions([ext])
+    //   delkind kind     deleteKinds([kind])
+    //   known n          knownFiles(), n times (the indexer's pass start)
+    //   settle           run every pending one-time migration to the end, then idle `tail` s
+    let op = args.count > 3 ? args[3] : "update"
+    let n = args.count > 4 ? Int(args[4]) ?? 2000 : 2000
+    let batch = args.count > 5 ? Int(args[5]) ?? 64 : 64
+    let tail = Double(ProcessInfo.processInfo.environment["MUT_TAIL"] ?? "5") ?? 5
+    let tOpen = Date()
+    let store = try VectorStore(dbURL: url)
+    if op == "settle" {
+        print(String(format: "settle: open %.1f s rows=%d schema=%d migration=%@", -tOpen.timeIntervalSinceNow, store.count,
+                     store.schemaVersion, store.storageMigration.map { "\($0.done)/\($0.total)" } ?? "none"))
+        let s = store.migrateSlotsToCompletion()
+        print(String(format: "  slots %.1f s", s.seconds))
+        let c = store.advanceCoverageToCompletion()
+        print(String(format: "  coverage %d/%d %.1f s", c.covered, c.positions, c.seconds))
+        let t = Date()
+        print(String(format: "  vacuum owed freed %lld in %.1f s", store.reclaimAfterCoverageMigration(), -t.timeIntervalSinceNow))
+        usleep(UInt32(tail * 1_000_000))
+        print("  migration=\(store.storageMigration.map { "\($0.done)/\($0.total)" } ?? "none")")
+        if let bad = store.coverageAudit() { print("  AUDIT FAILED: \(bad)") } else { print("  audit clean") }
+        store.close()
+        fflush(stdout)
+        _exit(0)
+    }
+    let dim = store.vectorDim
+    print(String(format: "mutbench --crud %@ rows=%d files=%d dim=%d n=%d batch=%d open %.1f s", op, store.count,
+                 store.fileCount, dim, n, batch, -tOpen.timeIntervalSinceNow))
+    var seed: UInt64 = 0x9E3779B97F4A7C15
+    func vec() -> [Float] {
+        var v = [Float](repeating: 0, count: dim)
+        for i in 0 ..< dim { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; v[i] = Float(seed % 2048) / 1024 - 1 }
+        let nn = (v.reduce(0) { $0 + $1 * $1 }).squareRoot()
+        return nn > 0 ? v.map { $0 / nn } : v
+    }
+    let all = store.allIndexedPaths().sorted()
+    // A fixed-seed sample spread over the whole index, not a run of neighbours.
+    var pick: [String] = []
+    var rng = UInt64(42)
+    var chosen = Set<Int>()
+    while pick.count < Swift.min(n, all.count) {
+        rng = rng &* 6364136223846793005 &+ 1442695040888963407
+        let i = Int(rng >> 33) % all.count
+        if chosen.insert(i).inserted { pick.append(all[i]) }
+    }
+    // The browse target: the parent folder of the median file, a folder the UI would show.
+    let browseFolder = (all[all.count / 2] as NSString).deletingLastPathComponent
+    let queries = (0 ..< 64).map { _ in vec() }
+    _ = store.search(queries[0], filter: SearchFilter(), topK: 10)   // warm, as a running app is
+    _ = store.indexedChildrenDetailed(ofFolder: browseFolder)
+
+    final class Probe: @unchecked Sendable {
+        let lock = NSLock(); var samples: [(t: Double, ms: Double)] = []; var running = true
+        func go() -> Bool { lock.lock(); defer { lock.unlock() }; return running }
+        func add(_ t: Double, _ ms: Double) { lock.lock(); samples.append((t, ms)); lock.unlock() }
+        func stop() -> [(t: Double, ms: Double)] { lock.lock(); running = false; defer { lock.unlock() }; return samples }
+    }
+    let t0 = Date()
+    func prober(_ p: Probe, every us: UInt32, _ body: @escaping (Int) -> Void) -> Thread {
+        let th = Thread {
+            var k = 0
+            while p.go() {
+                let t = Date(); body(k); p.add(-t0.timeIntervalSinceNow, -t.timeIntervalSinceNow * 1000)
+                k += 1; usleep(us)
+            }
+        }
+        th.start(); return th
+    }
+    let sp = Probe(), bp = Probe()
+    let st = prober(sp, every: 50_000) { k in _ = store.search(queries[k % queries.count], filter: SearchFilter(), topK: 10) }
+    let bt = prober(bp, every: 250_000) { _ in _ = store.indexedChildrenDetailed(ofFolder: browseFolder) }
+    usleep(1_000_000)   // a second of the steady state before the op
+    let tOp = Date()
+    var detail = ""
+    switch op {
+    case "update", "rename":
+        var i = 0
+        while i < pick.count {
+            let slice = pick[i ..< Swift.min(pick.count, i + batch)]
+            var items: [(path: String, chunks: [IndexedChunk])] = []
+            for path in slice {
+                let k = Swift.max(1, store.chunkCount(path: path))
+                let dst = op == "rename" ? (path as NSString).deletingLastPathComponent + "/moved-" + (path as NSString).lastPathComponent : path
+                if op == "rename" {
+                    // The move keeps its content: the same vectors under the new path.
+                    let old = store.chunkVectors(path: path, dim: dim)
+                    let keys = old.keys.sorted()
+                    items.append((dst, keys.enumerated().map { j, key in
+                        IndexedChunk(path: dst, modified: 3, size: 1, kind: "text", chunkIndex: j, snippet: "moved \(j)",
+                                     embedding: old[key]!, chunkKey: key) }))
+                } else {
+                    items.append((dst, (0 ..< k).map { j in
+                        IndexedChunk(path: dst, modified: 3, size: 1, kind: "text", chunkIndex: j, snippet: "upd \(j)",
+                                     embedding: vec(), chunkKey: "crud-\(path.hashValue)-\(j)") }))
+                }
+            }
+            try store.replaceMany(items)
+            if op == "rename" { store.deletePaths(Set(slice)) }
+            i += batch
+        }
+    case "delpaths":
+        var i = 0
+        while i < pick.count {
+            store.deletePaths(Set(pick[i ..< Swift.min(pick.count, i + batch)]))
+            i += batch
+        }
+    case "delfolder":
+        // The direct child of a root-level folder holding the most files: a source folder.
+        var counts: [String: Int] = [:]
+        for p in all {
+            let parts = p.split(separator: "/", maxSplits: 4)
+            if parts.count >= 4 { counts["/" + parts[0 ..< 4].joined(separator: "/"), default: 0] += 1 }
+        }
+        let target = args.count > 4 && args[4].hasPrefix("/") ? args[4] : counts.max { $0.value < $1.value }!.key
+        detail = "folder \(target) files \(counts[target] ?? -1)"
+        store.deleteUnderFolder(target)
+    case "delext": store.deleteExtensions([args.count > 4 ? args[4] : "json"])
+    case "delkind": store.deleteKinds([args.count > 4 ? args[4] : "image"])
+    case "known": for _ in 0 ..< Swift.max(1, n) { _ = store.knownFiles() }
+    case "readers":
+        // The app's periodic readers, each timed on its own: what one call holds the queue for.
+        let roots = Array(Set(all.prefix(50_000).compactMap { p -> String? in
+            let parts = p.split(separator: "/", maxSplits: 3)
+            return parts.count >= 3 ? "/" + parts[0 ..< 3].joined(separator: "/") : nil
+        })).sorted()
+        func time(_ label: String, _ body: () -> Void) {
+            let t = Date(); body()
+            detail += String(format: "\n    %@ %.0f ms", label, -t.timeIntervalSinceNow * 1000)
+        }
+        time("allIndexedPaths") { _ = store.allIndexedPaths() }
+        time("prepareLexicalIndex") { store.prepareLexicalIndex() }
+        time("indexSummary(\(roots.count) roots)") { _ = store.indexSummary(folders: roots) }
+        time("fileStatus(256)") { _ = store.fileStatus(paths: Array(pick.prefix(256))) }
+        time("knownFiles") { _ = store.knownFiles() }
+        time("listMatching") { _ = store.listMatching(filter: SearchFilter(), topK: 60) }
+    default: print("unknown op \(op)"); _exit(2)
+    }
+    let opSec = -tOp.timeIntervalSinceNow
+    usleep(UInt32(tail * 1_000_000))
+    let s = sp.stop(), b = bp.stop()
+    while !st.isFinished || !bt.isFinished { usleep(1000) }
+    print(String(format: "  op %.2f s  rows %d  files %d  %@", opSec, store.count, store.fileCount, detail))
+    func report(_ name: String, _ p: [(t: Double, ms: Double)]) {
+        let start = tOp.timeIntervalSince(t0)
+        let during = p.filter { $0.t >= start - 0.5 }   // samples that overlapped the op or its tail
+        let ms = during.map(\.ms).sorted()
+        func pct(_ q: Double) -> Double { ms.isEmpty ? 0 : ms[Swift.min(ms.count - 1, Int(Double(ms.count) * q))] }
+        print(String(format: "  %@ n=%d  p50 %.1f  p90 %.1f  p99 %.1f  max %.1f ms  >250ms %d  >1s %d", name,
+                     ms.count, pct(0.5), pct(0.9), pct(0.99), ms.last ?? 0,
+                     ms.filter { $0 > 250 }.count, ms.filter { $0 > 1000 }.count))
+        let slow = during.filter { $0.ms > 250 }.prefix(10).map { String(format: "%.1fs:%.0fms", $0.t - start, $0.ms) }
+        if !slow.isEmpty { print("    slow at (s after op start): " + slow.joined(separator: " ")) }
+    }
+    report("search", s)
+    report("browse", b)
+    if let bad = store.coverageAudit() { print("  AUDIT FAILED: \(bad)") } else { print("  audit clean") }
+    store.close()
     fflush(stdout)
     _exit(0)
 }
