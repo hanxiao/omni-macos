@@ -651,7 +651,7 @@ public final class Indexer: @unchecked Sendable {
                       settings: IndexSettings = .default, force: Bool = false,
                       onProgress: @escaping (IndexProgress) -> Void) {
         beginChunkReuse(settings)
-        retextLargeFiles = store.metaGet(Self.textStreamMetaKey) == nil
+        retextLargeFiles = store.metaGet(Self.textStreamMetaKey) != Self.longTextPolicy(settings)
         queue.sync { cancelled = false; cancelReason = .discard }
         var p = IndexProgress()
         // The known-files snapshot is an O(rows) walk of the resident row table that shares no
@@ -1482,17 +1482,33 @@ public final class Indexer: @unchecked Sendable {
 
     // MARK: - Long text files, streamed
 
-    /// A plain-text file too long to read in one piece. Below FileExtractor.maxTextBytes nothing
-    /// changes - the file is read whole and chunked exactly as before.
-    static func streamsText(_ file: CrawledFile) -> Bool {
+    /// A plain-text file past FileExtractor.maxTextBytes. Below it nothing changes - the file is
+    /// read whole and chunked exactly as before.
+    static func isLongText(_ file: CrawledFile) -> Bool {
         !file.isPhoto && file.size > FileExtractor.maxTextBytes
             && FileExtractor.textExtensions.contains(file.ext.lowercased())
     }
 
-    /// Set by the app once a full pass has run with streaming: until then a long text file indexed
-    /// by an earlier version - which read its first 2 MB and no more - is re-read to the end even
-    /// though its mtime has not moved. Its first 2 MB come back from the stored vectors.
-    public static let textStreamMetaKey = "text_streamed_v1"
+    /// Formats machines write in bulk. Long ones keep the 2 MB cut unless the user asks
+    /// (IndexSettings.readLongDataFiles). On a real index the text past 2 MB was 15.5 GB in
+    /// 1,311 files, 94% of it .log, .jsonl and .json: agent runs, caches, model weights.
+    public static let dataTextExtensions: Set<String> = ["log", "json", "jsonl", "ndjson"]
+
+    /// A long text file that is read to the end (storeStreamedText) rather than cut at 2 MB.
+    static func streamsText(_ file: CrawledFile, settings: IndexSettings) -> Bool {
+        isLongText(file) && (settings.readLongDataFiles || !dataTextExtensions.contains(file.ext.lowercased()))
+    }
+
+    /// The long-text policy the index was last brought in line with, written by the app once a
+    /// full pass completes (value: `longTextPolicy`). While it differs from the current one, a
+    /// long text file is re-read even though its mtime has not moved - to the end if the policy
+    /// streams it, back to 2 MB if not - reusing the vectors it already has. One key whose VALUE
+    /// is the policy: keyed per policy, switching the setting back found its old key still set
+    /// and cut nothing back (TextStreamTests.testLongDataFilesFollowTheSetting).
+    public static let textStreamMetaKey = "text_streamed_v2"
+    public static func longTextPolicy(_ settings: IndexSettings) -> String {
+        settings.readLongDataFiles ? "data=1" : "data=0"
+    }
     /// Read at the start of each pass (see index()).
     var retextLargeFiles = false
 
@@ -2050,7 +2066,7 @@ public final class Indexer: @unchecked Sendable {
                 cond.unlock()
                 let unchanged = !force && (known[file.path].map {
                     $0.modified == file.modified && $0.size == file.size
-                } ?? false) && !(self.retextLargeFiles && Self.streamsText(file))
+                } ?? false) && !(self.retextLargeFiles && Self.isLongText(file))
                 if self.isCancelled || unchanged {
                     // On cancel, mark abandoned (unless genuinely unchanged) so the consumer skips it
                     // instead of counting it as "skipped" - it just hasn't been processed yet.
@@ -2175,7 +2191,7 @@ public final class Indexer: @unchecked Sendable {
         }
 
         // A long plain-text file is streamed by the embed stage, not read here (see storeStreamedText).
-        if category == .text, Self.streamsText(file) {
+        if category == .text, Self.streamsText(file, settings: settings) {
             return DecodedItem(file: file, kind: kind, payload: .textStream, meta: meta, contentKey: contentKey)
         }
         if category == .video {
@@ -2236,12 +2252,13 @@ public final class Indexer: @unchecked Sendable {
     static func fileContentKey(_ file: CrawledFile, category: FileKind, dim: Int,
                                chunkOverlap: Int, settings: IndexSettings) -> String? {
         let ext = file.ext.lowercased()
-        // THE WHOLE FILE, text included. Text used to hash its first 2 MB, which was all it ever
-        // indexed; now that a long file is streamed to the end, two files of one size that differ
-        // after 2 MB would have shared a key and the second copied the first's vectors. A file
-        // under 2 MB hashes exactly as before.
-        guard let digest = sha256(file.url, cap: Int.max) else { return nil }
-        _ = ext
+        // WHAT IS INDEXED, AND NO MORE. A streamed text file hashes whole: two files of one size
+        // that differ after 2 MB must not share a key (the second would copy the first's vectors).
+        // Text that keeps the 2 MB cut hashes its first 2 MB, as it always did - its old keys stay
+        // valid, and an appended-to 900 MB log is not re-hashed end to end on every change.
+        let cut = category == .text && FileExtractor.textExtensions.contains(ext)
+            && !streamsText(file, settings: settings)
+        guard let digest = sha256(file.url, cap: cut ? FileExtractor.maxTextBytes : Int.max) else { return nil }
         let fp: String
         switch category {
         // .scan grouped for exhaustiveness only - contentKey is always called with the

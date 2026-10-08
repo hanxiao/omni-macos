@@ -1171,3 +1171,18 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
   old structure serving (Milvus, Lance, Qdrant, Lucene, FreshDiskANN). None recompute on the query.
 - MLX + `exit()`: a benchmark that exits while an idle fold is queued segfaults in MLX's
   scheduler during static destruction. mutbench ends with `_exit`, as the app does.
+
+## Long logs and data files keep the 2 MB cut (2026-10-08)
+- 0.15.7 read every long text file to the end. On the live index that was 1,311 files past 2 MB
+  and 15.5 GB of new text: .log 7.7 GB (agent runs up to 946 MB), .jsonl 5.0 GB, .json 2.0 GB
+  (a 929 MB cache, model weights, tokenizers), everything else 0.8 GB. At 1,800 characters a
+  chunk that is up to ~8.6M chunks on a 7.6M-chunk index, and hours of embedding.
+- Now .log, .json, .jsonl and .ndjson past 2 MB keep their first 2 MB unless Settings > Content >
+  "Read long logs and data files to the end" is on; prose and code are read to the end as before.
+  Their content key hashes what is indexed: the first 2 MB, the pre-0.15.7 key.
+- The meta key `text_streamed_v2` holds the policy last applied (`data=0|1`). While it differs, a
+  full pass re-reads every long text file whatever its mtime - to the end or back to 2 MB - from the
+  stored vectors. In app, the 100 MB export.jsonl streamed by 0.15.7: 49,834 -> 994 passages in
+  ~6 s. Keyed per policy first, switching back found its old key set and cut nothing
+  (TextStreamTests.testLongDataFilesFollowTheSetting).
+

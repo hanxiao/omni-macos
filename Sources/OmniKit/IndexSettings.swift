@@ -50,6 +50,10 @@ public struct IndexSettings: Sendable, Equatable {
     /// file that later gets evicted KEEPS its index entry (eviction does not change content), so it
     /// stays searchable. `false` restores read-through behavior: indexing downloads as it goes.
     public var skipDataless: Bool = true
+    /// Read long logs and data files (Indexer.dataTextExtensions) to the end, as long prose is.
+    /// Off: they keep the 2 MB cut. A 946 MB agent log or a model's weights as JSON is not text
+    /// anyone searches by meaning, and read to the end it doubled a real index (index.md).
+    public var readLongDataFiles: Bool = false
 
     /// Open-vocabulary image tags (OmniTagger): images indexed while the tagger is ready get a
     /// content-tag snippet ("kitty, cosy, plush") instead of the bare filename. Rides the same

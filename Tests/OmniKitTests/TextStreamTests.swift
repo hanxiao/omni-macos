@@ -47,7 +47,7 @@ final class TextStreamTests: XCTestCase {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         if let rp = realpath(root.path, nil) { root = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
         defer { try? FileManager.default.removeItem(at: root) }
-        let url = root.appendingPathComponent("big.log")
+        let url = root.appendingPathComponent("big.txt")
         let text = lines(0 ..< 70_000)                          // ~6 MB: three windows and more
         try text.write(to: url, atomically: true, encoding: .utf8)
         XCTAssertGreaterThan(try FileManager.default.attributesOfItem(atPath: url.path)[.size] as! Int, 2 * FileExtractor.maxTextBytes)
@@ -84,6 +84,43 @@ final class TextStreamTests: XCTestCase {
         XCTAssertGreaterThan(reembedded, 0)
         XCTAssertLessThan(reembedded, 40, "an append re-embeds its tail, not the file (\(reembedded) chunks)")
         XCTAssertGreaterThan(store.chunkVectors(path: url.path, dim: embedder.dim, cap: 1_000_000).count, stored.count)
+    }
+
+    /// Long logs and data files keep the 2 MB cut unless the setting is on - and a change of
+    /// policy re-reads a file whose mtime never moved, to the end or back to 2 MB.
+    func testLongDataFilesFollowTheSetting() throws {
+        var root = FileManager.default.temporaryDirectory.appendingPathComponent("stream-data-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        if let rp = realpath(root.path, nil) { root = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("agent.log")
+        try lines(0 ..< 50_000).write(to: url, atomically: true, encoding: .utf8)     // ~4.4 MB
+        let dbDir = root.deletingLastPathComponent().appendingPathComponent("stream-data-db-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dbDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dbDir) }
+        let store = try VectorStore(dbURL: dbDir.appendingPathComponent("index.sqlite"))
+        let embedder = CountingEmbedder()
+        let indexer = Indexer(store: store, embedder: embedder)
+        func pass(_ data: Bool) {
+            var settings = IndexSettings(enabledKinds: [.text]); settings.readLongDataFiles = data
+            let done = expectation(description: "pass")
+            indexer.index(roots: [root], settings: settings) { p in if p.done { done.fulfill() } }
+            wait(for: [done], timeout: 300)
+            store.metaSet(Indexer.textStreamMetaKey, Indexer.longTextPolicy(settings))   // what the app records after a full pass
+        }
+        func rows() -> Int { store.chunkVectors(path: url.path, dim: embedder.dim, cap: 1_000_000).count }
+        let perTwoMB = Double(FileExtractor.maxTextBytes) / Double(IndexSettings(enabledKinds: [.text]).maxCharsPerChunk)
+
+        pass(false)
+        let cut = rows()
+        XCTAssertLessThan(Double(cut), perTwoMB * 1.3, "a long log keeps its first 2 MB by default")
+        pass(true)
+        let whole = rows()
+        XCTAssertGreaterThan(Double(whole), Double(cut) * 1.8, "read to the end with the setting on (\(cut) -> \(whole))")
+        let before = embedder.embedded
+        pass(false)
+        XCTAssertEqual(rows(), cut, "cut back to 2 MB when it goes off, with no file change")
+        XCTAssertLessThan(embedder.embedded - before, 5, "cutting back reuses the stored vectors")
     }
 
     func testAnInterruptedStreamLeavesTheIndexAsItWas() throws {

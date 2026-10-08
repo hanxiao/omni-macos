@@ -1955,6 +1955,17 @@ final class AppModel {
         }
     }
 
+    /// Long logs and data files read to the end (IndexSettings.readLongDataFiles). Off by default.
+    /// Either way a change re-reads them once - to the end, or back to 2 MB - via the long-text
+    /// policy key, which the next full pass checks.
+    var readLongDataFiles: Bool = false {
+        didSet {
+            guard oldValue != readLongDataFiles else { return }
+            persistPerf()
+            requestIndexPass()
+        }
+    }
+
     /// Search-as-you-type (default). OFF = the search runs on Return only; typing still parses
     /// filters and offers suggestions. Kinder to low-end GPUs, where every keystroke's embed +
     /// scan is noticeable.
@@ -3469,6 +3480,7 @@ final class AppModel {
         if d.object(forKey: "omni.minVideoSec") != nil { minVideoSeconds = max(0, d.double(forKey: "omni.minVideoSec")) }
         if d.object(forKey: "omni.minTextChars") != nil { minTextChars = max(0, d.integer(forKey: "omni.minTextChars")) }
         if d.object(forKey: "omni.skipDataless") != nil { skipDatalessFiles = d.bool(forKey: "omni.skipDataless") }
+        if d.object(forKey: "omni.readLongDataFiles") != nil { readLongDataFiles = d.bool(forKey: "omni.readLongDataFiles") }
         if d.object(forKey: "omni.imageTags") != nil { imageTagsEnabled = d.bool(forKey: "omni.imageTags") }
         if d.object(forKey: "omni.instantSearch") != nil { instantSearchEnabled = d.bool(forKey: "omni.instantSearch") }
     }
@@ -3485,6 +3497,7 @@ final class AppModel {
         OmniPrefs.set(minVideoSeconds, forKey: "omni.minVideoSec")
         OmniPrefs.set(minTextChars, forKey: "omni.minTextChars")
         OmniPrefs.set(skipDatalessFiles, forKey: "omni.skipDataless")
+        OmniPrefs.set(readLongDataFiles, forKey: "omni.readLongDataFiles")
         OmniPrefs.set(imageTagsEnabled, forKey: "omni.imageTags")
         OmniPrefs.set(instantSearchEnabled, forKey: "omni.instantSearch")
     }
@@ -6266,6 +6279,7 @@ final class AppModel {
         s.minVideoSeconds = minVideoSeconds
         s.minTextChars = minTextChars
         s.skipDataless = skipDatalessFiles
+        s.readLongDataFiles = readLongDataFiles
         s.imageTags = imageTagsEnabled
         return s
     }
@@ -6764,9 +6778,10 @@ final class AppModel {
                         // with no file event pending nothing else ever did - the library sat at
                         // "Waiting to be indexed" and its deletions stayed searchable.
                         if !p.cancelled {
-                            // A full pass has now walked every root with streaming, so long text
-                            // files cut at 2 MB by earlier versions have been read to the end.
-                            Task.detached(priority: .utility) { store.metaSet(Indexer.textStreamMetaKey, "1") }
+                            // A full pass has now walked every root under this long-text policy,
+                            // so every long text file has been read to it.
+                            let policy = Indexer.longTextPolicy(settings)
+                            Task.detached(priority: .utility) { store.metaSet(Indexer.textStreamMetaKey, policy) }
                             self.drainDeferredAfterPass(store)
                         }
                         self.refitFolderMapIfPending()

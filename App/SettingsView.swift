@@ -382,6 +382,16 @@ private struct ContentTypesTab: View {
             }
 
             Section {
+                Toggle("Read long logs and data files to the end", isOn: Binding(get: { model.readLongDataFiles },
+                                                                           set: { model.readLongDataFiles = $0 }))
+            } header: {
+                Text("Long files")
+            } footer: {
+                Text("Text, Markdown, web pages and code are always read to the end. Logs and JSON past 2 MB keep their first 2 MB unless this is on.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section {
                 // ONE ROW, not two. A second row makes the Form draw a separator straight across
                 // the section, between the editor and the controls that act on it - a rule with
                 // nothing on either side of it worth separating.
