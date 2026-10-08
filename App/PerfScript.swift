@@ -157,6 +157,11 @@ enum PerfScript {
             }
         case "pressure":    // what macOS's memory-pressure source reports: warning | critical | normal
             model.memoryPressureChanged(arg == "critical" ? .critical : arg == "warning" ? .warning : .normal)
+        case "cliinstall":  // Settings > Serving > Install... (point -omni.cliLinkDir at a scratch folder)
+            let err = CommandLineTool.install()
+            omniPerfLog("cli install \(err.map { $0.isEmpty ? "cancelled" : "failed: \($0)" } ?? "ok") state=\(CommandLineTool.state)")
+        case "skill":       // the Settings SKILL.md sheet's text, written to a file
+            try? CommandLineTool.skillMarkdown.write(toFile: arg, atomically: true, encoding: .utf8)
         case "gentags":     // File > Generate Tags on one file
             model.requestTags([arg])
         case "addfolder":   // what Add... in the sidebar does with the chosen folder

@@ -11,6 +11,8 @@ struct ServingTab: View {
     @State private var embedSchema: EmbedSchema = .openai
     @State private var showMCPSheet = false
     @State private var showSkillSheet = false
+    @State private var cliState = CommandLineTool.state
+    @State private var cliError = ""
     @State private var logHasLines = false
     /// The token as typed. Committed on Return or when the field loses focus: every keystroke used
     /// to restart a running server, and on the LAN scope clearing the field to paste a new token
@@ -37,6 +39,7 @@ struct ServingTab: View {
 
     var body: some View {
         Form {
+            commandLineSection
             serverSection
             exampleSection
             logsSection
@@ -157,8 +160,6 @@ struct ServingTab: View {
                 Spacer()
                 Button("MCP") { showMCPSheet = true }
                     .help("Config for MCP clients")
-                Button("SKILL.md") { showSkillSheet = true }
-                    .help("Skill file for agents")
             }
             .buttonStyle(.bordered).controlSize(.small)
             .disabled(!model.serving.enabled)
@@ -167,6 +168,44 @@ struct ServingTab: View {
         } footer: {
             Text("Local network access requires a token.")
                 .font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: - Command line
+
+    /// The `omni` command and its skill file. Not tied to the server above: the command reaches
+    /// the app over a private socket that is up whenever Omni runs.
+    private var commandLineSection: some View {
+        Section {
+            HStack(spacing: 8) {
+                Text(cliState == .installed ? "omni" : CommandLineTool.bundledPath)
+                    .font(.callout.monospaced())
+                    .textSelection(.enabled)
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer()
+                Button(cliState == .installed ? "Installed" : "Install\u{2026}") {
+                    cliError = CommandLineTool.install() ?? ""
+                    cliState = CommandLineTool.state
+                }
+                .disabled(cliState == .installed)
+                .help("Link omni into \((CommandLineTool.linkPath as NSString).deletingLastPathComponent)")
+                Button("SKILL.md") { showSkillSheet = true }
+                    .help("Skill file for agents")
+            }
+            .buttonStyle(.bordered).controlSize(.small)
+        } header: {
+            Text("Command Line")
+        } footer: {
+            Group {
+                if !cliError.isEmpty {
+                    Text(cliError).foregroundStyle(.red)
+                } else if case .stale(let other) = cliState {
+                    Text("\(CommandLineTool.linkPath) points to \(other). Install again to use this copy of Omni.")
+                } else {
+                    Text("Agents run `omni search \"...\"` against this app, with or without the server on.")
+                }
+            }
+            .font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -250,203 +289,7 @@ struct ServingTab: View {
         return out
     }
 
-    /// A complete SKILL.md an instruction-following agent can use to call the HTTP API.
-    private var skillMarkdown: String {
-        let base = exampleBase
-        let token = model.serving.bearerToken
-        let isLAN = model.serving.scope == .public
-        let authNote = isLAN && !token.isEmpty
-            ? "All requests need the header `Authorization: Bearer \(token)`."
-            : "No auth needed from this Mac (loopback)."
-        let authFlag = isLAN && !token.isEmpty ? " -H 'Authorization: Bearer \(token)'" : ""
-        return """
-        ---
-        name: omni-local-search
-        description: Semantic search over the user's own files - text, code, PDFs, images, audio and video - through the Omni app's local HTTP API. Use it when the user asks to find, locate or recall their own files by content: find my notes about X, that invoice from February, photos of the beach.
-        ---
-
-        # Omni - local semantic file search
-
-        Omni indexes the user's files into one embedding space, so describe the CONTENT you want
-        in natural language. Any language works and keywords are not required. Results are
-        absolute file paths; read the files yourself if you need their contents.
-
-        Base URL: \(base)
-        \(authNote)
-
-        ## Search
-
-        ```bash
-        curl -s \(base)/v1/search\(authFlag) -H 'Content-Type: application/json' \\
-          -d '{"query": "invoice from Anthropic in February", "top_k": 10}'
-        ```
-
-        Optional `filters`: `{"kinds": ["text"|"image"|"audio"|"video"|"scan"], "folder": "/abs/path",
-        "folders": ["/abs/one", "/abs/two"], "since": <epoch seconds>}`.
-        `"text"` includes scanned PDFs; `"scan"` is scanned PDFs only.
-        Use `folders` to search two or more folders at once. Asking the user to add them as sources
-        instead does not work, because an indexed parent folder already covers its children.
-
-        Response: `{"results": [{"path", "score", "snippet", "kind", "modified", "locator",
-        "chunk_count", ...}]}`.
-        `score` runs 0 to 1. Compare it only within a kind: a text query scores a photo on a
-        different scale than a document, so a 0.50 image and a 0.80 document are comparable matches.
-        Hits below the app's relevance floor are dropped: 0.5 unless the user changed it in the
-        window, scaled per kind so media is not deleted by a text-shaped floor. Pass `min_score` to
-        set it per request in `filters` - `0` returns everything. `locator` is where the best
-        match sits inside the file, such as `Page 3` or `Line 1240`, and is empty when the file has no meaningful position. `chunk_count` is how
-        many pages or passages the file has in the index. Hits also carry `bytes` for the indexed
-        file size and `mime_type`. Media hits add `width` and `height` in pixels and `duration` in
-        seconds, recorded at index time, so you can prefer a 4032x3024 original over a 192px
-        thumbnail without opening either.
-
-        Copies of one file are already collapsed. A hit standing for several carries
-        `duplicate_count`, the other `duplicates` paths, and a `duplicate_kind` of `exact` for
-        byte-identical files or `near` for the same kind and extension within 10% in size and at
-        cosine 0.98 or above. So `top_k` counts distinct files. Pass `"group_duplicates": false`
-        for the flat list, or group differently yourself with `content_key`, which is
-        identity-per-size.
-
-        An image indexed with tagging on carries a few content words as its `snippet`, such as
-        `cat, couch, crib`, in place of the filename. Read those as a list, or tag an untagged
-        picture, through the tag calls below. Fields are omitted when unknown.
-
-        ## File status
-
-        ```bash
-        curl -s \(base)/v1/files/status\(authFlag) -H 'Content-Type: application/json' \\
-          -d '{"paths": ["/abs/file1.pdf", "/abs/file2.png"]}'
-        ```
-
-        Response: `{"files": [{"path", "indexed", and when indexed: "exists", "kind", "chunk_count",
-        "modified", "bytes", "up_to_date", "indexed_at"?}]}`. `up_to_date` compares the on-disk
-        mtime and size with the indexed version; false means the file changed or was deleted after
-        it was indexed, and `exists` tells you which. `indexed_at` is epoch seconds and is absent on
-        files indexed by older app versions. Files only, not folders, up to 2048 paths. A path Omni
-        does not hold returns just `{"path", "indexed": false}`.
-
-        ## Image tags
-
-        ```bash
-        curl -s \(base)/v1/files/tags\(authFlag) -H 'Content-Type: application/json' \\
-          -d '{"paths": ["/abs/photo.jpg"]}'
-        ```
-
-        Response: `{"files": [{"path", "indexed", "kind", "taggable", "tags": [...]}]}`. These are
-        the tags Omni generated at index time, the same words `tag:` matches in a search, so the
-        call is instant and costs nothing. `taggable` is false for text and audio, which carry no
-        tags. An empty `tags` on taggable media means it has not been tagged yet.
-
-        To tag an image Omni has not indexed, or to re-tag a changed file, compute on demand:
-
-        ```bash
-        curl -s \(base)/v1/tag\(authFlag) -H 'Content-Type: application/json' \\
-          -d '{"path": "/abs/photo.jpg", "top_k": 5}'
-        ```
-
-        `path` must be inside the user's indexed folders; otherwise send the bytes as
-        `{"image": "<base64 or data: URI>"}`. Multi-crop refinement is on by default so the result
-        matches what the index would store; pass `"hq": false` for one forward pass per image
-        instead of six. Nothing is written to the index. Max 4 images per request, or 16 with
-        `hq: false`.
-
-        ## Sources - what Omni indexes
-
-        ```bash
-        curl -s \(base)/v1/sources\(authFlag)
-        ```
-
-        Response: `{"indexing", "photos_authorized", "sources": [{"key", "kind", "name", "paused",
-        "indexing", "queued", "indexed_files", "progress"?: {"done", "total"}}],
-        "available_photo_albums": [{"id", "title", "count", "smart"}]}`. `kind` is `folder` or
-        `photos`; `key` is the folder path or `photos://<id>`. A folder that is not a source is not
-        indexed. `available_photo_albums` lists the albums not yet added, with the ids
-        `{"album": ...}` takes.
-
-        Add a folder, or the Apple Photos library whole or by album:
-
-        ```bash
-        curl -s \(base)/v1/sources/add\(authFlag) -H 'Content-Type: application/json' \\
-          -d '{"path": "/abs/folder"}'
-        ```
-
-        Send `{"album": "all"}` or an album id from the list instead of `path`; give one or the
-        other, never both. Indexing starts immediately. `POST \(base)/v1/sources/pause` takes
-        `{"key": "...", "paused": true|false}` and keeps what is already indexed;
-        `POST \(base)/v1/sources/remove` takes `{"key": "..."}` and drops the source and its rows.
-        Both keys come from the list above. Adding and especially removing change what the user
-        sees in the app, so do them on request, not on your own initiative.
-
-        ## OCR
-
-        Transcribes a scanned PDF or an image to Markdown on this Mac: tables as HTML, formulas as
-        LaTeX, headers and footers dropped. The model's instruction is fixed, so text parts in a
-        request are ignored. A page takes seconds; the first call also loads the model.
-
-        OpenAI chat shape, streamable:
-
-        ```bash
-        curl -sN \(base)/v1/chat/completions\(authFlag) -H 'Content-Type: application/json' \\
-          -d '{"model": "jina-ocr-v1", "stream": true, "messages": [{"role": "user", "content":
-               [{"type": "image_url", "image_url": {"url": "file:///abs/scan.pdf"}}]}]}'
-        ```
-
-        An attachment is an `image_url` part or a `file` part with `file_data`. Its URL is a
-        `file://` path inside the indexed folders, or a `data:` URI of an image or a PDF
-        (`data:application/pdf;base64,...`). Remote URLs are refused. Every page of every
-        attachment is transcribed, in order, joined by `\n\n---\n\n`; at most 200 pages, request
-        bodies up to 48 MB. `finish_reason` is `length` when a page hit the token budget. The
-        stream is standard `chat.completion.chunk` events ending in `data: [DONE]`;
-        `stream_options.include_usage` adds a usage chunk.
-
-        Page by page, Mistral OCR shape:
-
-        ```bash
-        curl -s \(base)/v1/ocr\(authFlag) -H 'Content-Type: application/json' \\
-          -d '{"document": {"type": "document_url", "document_url": "file:///abs/scan.pdf"}, "pages": "0-4"}'
-        ```
-
-        `document` is `{"type": "document_url", "document_url": ...}` or
-        `{"type": "image_url", "image_url": ...}` with the same URL forms; `{"path": "/abs/scan.pdf"}`
-        is shorthand. `pages` counts from 0: a list `[0, 2]` or a string `"0,2-4"`; default all.
-        Response: `{"pages": [{"index", "markdown", "images": [], "dimensions": {"dpi", "height",
-        "width"}}], "model", "usage_info": {"pages_processed", "doc_size_bytes"}}`. `dimensions` is
-        null for a page answered by the transcript cache.
-
-        Pages the app has transcribed before, in its OCR workspace or here, return from the cache
-        at once. 503 with `Retry-After` means the app's OCR workspace is transcribing a document;
-        503 without it means the OCR model is not installed (it downloads from OCR mode in the app).
-
-        ## Health and model
-
-        `GET \(base)/health` -> `{"status":"ok", ...}`. A refused connection means the server is
-        off; ask the user to enable Settings -> Serving in the Omni app.
-        `GET \(base)/v1/models` lists the embedding model, and the OCR model when it is installed.
-
-        ## Embeddings
-
-        L2-normalized vectors from the model behind the index, for your own similarity logic;
-        searching Omni's index does not need them. Queries and documents are embedded differently:
-        embed what you search WITH as a query and what you search IN as a document. A missing role
-        means document.
-
-        | Schema | Endpoint | Query | Document |
-        |---|---|---|---|
-        | OpenAI, Jina | `POST /v1/embeddings` | `"input_type": "query"` or `"task": "retrieval.query"` | `"input_type": "document"` or `"task": "retrieval.passage"` |
-        | Cohere v1, v2 | `POST /v1/embed`, `POST /v2/embed` | `"input_type": "search_query"` | `"input_type": "search_document"` |
-        | Gemini | `POST /v1beta/models/omni:embedContent`, `:batchEmbedContents` | `"taskType": "RETRIEVAL_QUERY"` | `"taskType": "RETRIEVAL_DOCUMENT"` |
-
-        ```bash
-        curl -s \(base)/v1/embeddings\(authFlag) -H 'Content-Type: application/json' \\
-          -d '{"model": "omni", "input": ["what to find"], "input_type": "query"}'
-        curl -s \(base)/v1/embeddings\(authFlag) -H 'Content-Type: application/json' \\
-          -d '{"model": "omni", "input": ["text to be found", "another passage"], "input_type": "document"}'
-        ```
-
-        An unknown role is a 400. A Gemini batch takes each request's own `taskType`. Gemini
-        authenticates with `x-goog-api-key` rather than a bearer header.
-        """
-    }
+    private var skillMarkdown: String { CommandLineTool.skillMarkdown }
 
     /// Base URL for examples: the live bound address, or the configured local address when stopped.
     private var exampleBase: String {

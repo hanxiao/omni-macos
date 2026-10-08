@@ -97,6 +97,37 @@ final class HTTPServer: @unchecked Sendable {
         l.start(queue: queue)
     }
 
+    /// Serve on a Unix domain socket at `path` - the `omni` command line's way in (CLI.md). The
+    /// same parsing, limits and router as the TCP listener; only the transport differs. The file
+    /// is owner-only (0600: connecting needs write permission on it), so no token is asked for,
+    /// and it is removed on stop. A path left by a crash is the caller's to clear first.
+    func start(unixPath path: String) throws {
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = NWEndpoint.unix(path: path)
+        let l = try NWListener(using: params)
+        self.listener = l
+        unixPath = path
+        l.stateUpdateHandler = { [weak self] state in
+            guard let self else { return }
+            switch state {
+            case .ready:
+                chmod(path, 0o600)
+                Self.log.info("serving socket ready at \(path, privacy: .public)")
+                self.onReady?()
+            case .failed(let error), .waiting(let error):
+                Self.log.error("serving socket failed: \(String(describing: error), privacy: .public)")
+                self.onFailure?(self.describe(error))
+            default:
+                break
+            }
+        }
+        l.newConnectionHandler = { [weak self] conn in self?.accept(conn) }
+        l.start(queue: queue)
+    }
+
+    /// Set by start(unixPath:), so stop() removes the socket file - a listener's cancel leaves it.
+    private var unixPath: String?
+
     /// True if the connection's peer is the loopback interface (127.0.0.1 / ::1 / localhost).
     private func isLoopback(_ conn: NWConnection) -> Bool {
         guard case .hostPort(let host, _) = conn.endpoint else { return false }
@@ -109,6 +140,9 @@ final class HTTPServer: @unchecked Sendable {
     }
 
     func stop() {
+        // The socket file goes NOW, on the caller's thread, not on `queue` with the rest: a restart
+        // binds the same path straight after, and a late unlink would delete the new socket.
+        if let path = unixPath { unlink(path); unixPath = nil }
         // Tear down on the serving queue (which owns listener/conns): cancel the listener AND every
         // accepted connection (idle keep-alives leak fds otherwise), and flag cancellation so any
         // in-flight read loop stops re-arming and stops feeding the GPU gate after "Stopped".
@@ -353,6 +387,8 @@ final class HTTPServer: @unchecked Sendable {
         switch conn.endpoint {
         case .hostPort(let host, _):
             return "\(host)"
+        case .unix:
+            return "omni cli"
         default:
             return "\(conn.endpoint)"
         }

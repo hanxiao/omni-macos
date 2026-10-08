@@ -477,9 +477,12 @@
       <div class="wrap">
         <div class="head-center">
           <h2 id="agents-title">Built for agents.</h2>
-          <p class="sub">HTTP and MCP, on this Mac.</p>
+          <p class="sub">Command line, MCP and HTTP, on this Mac.</p>
         </div>
-        <pre class="code"><span class="c"># Claude Code</span>
+        <pre class="code"><span class="c"># Any shell or agent</span>
+omni search "invoice from february" --top-k 5
+
+<span class="c"># Claude Code over MCP</span>
 claude mcp add --transport http omni http://127.0.0.1:51234/mcp
 
 <span class="c"># Any HTTP client</span>
@@ -490,7 +493,8 @@ curl http://127.0.0.1:51234/v1/search -d '{"query": "invoice from february", "to
           <div class="api-row"><dt>Embeddings</dt><dd>OpenAI &middot; Jina &middot; Cohere &middot; Gemini</dd></div>
           <div class="api-row"><dt>Tags</dt><dd><code>/v1/tag</code> &middot; <code>/v1/files/tags</code></dd></div>
           <div class="api-row"><dt>Index</dt><dd><code>/v1/sources</code> &middot; <code>/v1/files/status</code></dd></div>
-          <div class="api-row"><dt>MCP</dt><dd>9 tools &middot; SKILL.md</dd></div>
+          <div class="api-row"><dt>Command line</dt><dd><code>omni</code> &middot; SKILL.md</dd></div>
+          <div class="api-row"><dt>MCP</dt><dd>9 tools</dd></div>
         </dl>
       </div>
     </section>

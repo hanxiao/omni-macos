@@ -50,6 +50,9 @@ final class ServingController {
 
     private var backend: (any ServingBackend)?
     private var server: HTTPServer?
+    /// The `omni` command line's socket: the same router, ALWAYS up while a backend is, whatever
+    /// the Serving toggle says - the toggle is about opening a port, and the socket opens none.
+    private var socketServer: HTTPServer?
 
     /// The log lives only in the file; the Serving tab tails it.
     private let logFile = ServingLogFile()
@@ -80,12 +83,89 @@ final class ServingController {
         } else {
             reconcile()
         }
+        startSocket()
     }
 
     /// Tear down on model teardown: stop the server and drop the backend.
     func detach() {
         stopServer()
+        stopSocket()
         backend = nil
+    }
+
+    /// Stop the socket at quit, so the file goes with the app rather than waiting for the next
+    /// launch to find it dead.
+    func shutdown() { stopSocket() }
+
+    // MARK: The command line socket
+
+    /// Where the `omni` command line finds the app. Fixed - not beside a moved index - so the
+    /// command needs no configuration. An isolated run (`-omni.dbDir`) is not the user's app and
+    /// gets no socket unless its own arguments name one (`-omni.socketPath`).
+    nonisolated static var socketPath: String? {
+        let args = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+        if let p = args["omni.socketPath"] as? String, !p.isEmpty { return p }
+        guard ServingLogFile.isolatedDir == nil,
+              let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+        else { return nil }
+        return support.appendingPathComponent("Omni/omni.sock").path
+    }
+
+    private func startSocket() {
+        stopSocket()
+        guard let backend, let path = Self.socketPath else { return }
+        // sockaddr_un holds 104 bytes with the terminator; a longer path cannot be bound at all.
+        guard path.utf8.count < 104 else { note(.error, "Command line socket path too long: \(path)"); return }
+        try? FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
+                                                 withIntermediateDirectories: true)
+        // A file already there is either another live Omni's (leave it: two apps on one socket
+        // would answer from whichever index the kernel picked) or left by a crash (clear it).
+        if FileManager.default.fileExists(atPath: path) {
+            if Self.socketAnswers(path) {
+                note(.error, "Command line socket in use by another Omni: \(path)")
+                return
+            }
+            unlink(path)
+        }
+        let router = Router(backend: backend, auth: { _ in true }, appVersion: AppModel.appVersion, sources: sources)
+        let sink: @Sendable (LogEntry) -> Void = { [weak self] entry in
+            Task { @MainActor in self?.ingest(entry) }
+        }
+        let srv = HTTPServer(handler: { req in await router.handle(req) }, onLog: sink)
+        srv.admitsLargeBody = { _ in true }
+        srv.onFailure = { [weak self] msg in
+            Task { @MainActor in self?.note(.error, "Command line socket failed: \(msg)") }
+        }
+        do {
+            try srv.start(unixPath: path)
+            socketServer = srv
+        } catch {
+            note(.error, "Command line socket failed: \(error)")
+        }
+    }
+
+    private func stopSocket() {
+        socketServer?.stop()
+        socketServer = nil
+    }
+
+    /// Whether something is accepting on the socket at `path` right now.
+    nonisolated static func socketAnswers(_ path: String) -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let bytes = Array(path.utf8)
+        guard bytes.count < MemoryLayout.size(ofValue: addr.sun_path) else { return false }
+        withUnsafeMutableBytes(of: &addr.sun_path) { raw in
+            raw.copyBytes(from: bytes)
+            raw[bytes.count] = 0
+        }
+        let len = socklen_t(MemoryLayout<sockaddr_un>.size)
+        return withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, len) == 0 }
+        }
     }
 
     // MARK: Reconciliation

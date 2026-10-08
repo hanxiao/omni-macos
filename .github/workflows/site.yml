@@ -64,7 +64,7 @@ jobs:
           CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
         run: |
           if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ]; then echo "no Cloudflare secrets; CF catches up on TTL"; exit 0; fi
-          FILES=$( { echo "https://hanxiao.io/omni/"; echo "https://hanxiao.io/omni/index.html"; echo "https://hanxiao.io/omni/faq.json";
+          FILES=$( { echo "https://hanxiao.io/omni/"; echo "https://hanxiao.io/omni/index.html"; echo "https://hanxiao.io/omni/faq.json"; echo "https://hanxiao.io/omni/llms.txt";
                      for a in site/omni/assets/*; do echo "https://hanxiao.io/omni/assets/$(basename "$a")"; done; } \
                    | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
           # Cloudflare takes at most 30 URLs per purge call.

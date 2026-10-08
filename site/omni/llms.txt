@@ -1,0 +1,19 @@
+# Omni
+
+> Omni is a native macOS app for semantic search over the files on a Mac: text, code, PDFs (scanned ones through on-device OCR), images, audio and video, in one embedding space. Everything runs on the Mac; nothing is uploaded. Agents reach it through a command line, MCP or HTTP.
+
+## For agents
+
+- Command line: `omni search "what you are looking for"` against the running app (it starts the app if needed and never loads a second model). `omni tools` lists the tools and `omni <tool> --help` shows their options. The command ships at `/Applications/Omni.app/Contents/Helpers/omni`; Settings > Serving > Install puts it on PATH.
+- Skill file: `omni skill` prints a SKILL.md generated from the app's own tool definitions (also Settings > Serving > SKILL.md).
+- MCP: turn on Serving in Settings, then `claude mcp add --transport http omni http://127.0.0.1:51234/mcp`. Tools: search, search_inline, file_status, tag_image, ocr, list_sources, add_source, pause_source, remove_source.
+- HTTP: `POST /v1/search` with `{"query": "...", "top_k": 10, "filters": {...}}`, plus OpenAI, Jina, Cohere and Gemini embedding endpoints and OCR endpoints.
+
+Describe the content you want in natural language, in any language; results are absolute file paths with scores, snippets and positions (page or line). Read the files yourself for their full contents.
+
+## Links
+
+- [Omni](https://hanxiao.io/omni/): download and overview
+- [Source](https://github.com/hanxiao/omni-macos): Apache 2.0
+- [Command line design](https://github.com/hanxiao/omni-macos/blob/main/docs/CLI.md)
+- [FAQ](https://hanxiao.io/omni/faq.json)

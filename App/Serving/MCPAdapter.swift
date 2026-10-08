@@ -36,6 +36,23 @@ enum MCPAdapter {
         return f.string(from: Date(timeIntervalSince1970: epoch))
     }
 
+    /// What `initialize` tells a client about the whole server. Also the body of SKILL.md
+    /// (AgentSkill), so it is written for an agent reading it cold.
+    static let instructions = "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, snippets, and media metadata (resolution, duration, size); read the files yourself if you need their full contents.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
+
+    /// Every tool, as `tools/list` returns them - and as the `omni` command line and SKILL.md
+    /// present them. The source tools are only advertised once the app has wired the control:
+    /// a tool a client can see but not call is worse than one that is absent.
+    static func tools(withSources: Bool) -> [[String: Any]] {
+        var tools = [searchToolDescriptor(), searchInlineToolDescriptor(),
+                     fileStatusToolDescriptor(), tagImageToolDescriptor(), ocrToolDescriptor()]
+        if withSources {
+            tools += [listSourcesDescriptor(), addSourceDescriptor(),
+                      pauseSourceDescriptor(), removeSourceDescriptor()]
+        }
+        return tools
+    }
+
     static func handle(_ req: HTTPRequest, _ backend: any ServingBackend, appVersion: String,
                        sources: SourcesControl? = nil) async -> HTTPResponse {
         // GET is the SSE stream in the full spec; this server has no server-initiated
@@ -71,22 +88,14 @@ enum MCPAdapter {
                 "capabilities": ["tools": [:] as [String: Any]],
                 "serverInfo": ["name": "omni", "title": "Omni - local semantic file search",
                                "version": appVersion],
-                "instructions": "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, snippets, and media metadata (resolution, duration, size); read the files yourself if you need their full contents.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
+                "instructions": instructions
             ])
 
         case "ping":
             return result(id: id, [:])
 
         case "tools/list":
-            var tools = [searchToolDescriptor(), searchInlineToolDescriptor(),
-                         fileStatusToolDescriptor(), tagImageToolDescriptor(), ocrToolDescriptor()]
-            // Only advertised when the app has wired the control: a tool a client can see but not
-            // call is worse than one that is absent.
-            if sources != nil {
-                tools += [listSourcesDescriptor(), addSourceDescriptor(),
-                          pauseSourceDescriptor(), removeSourceDescriptor()]
-            }
-            return result(id: id, ["tools": tools])
+            return result(id: id, ["tools": tools(withSources: sources != nil)])
 
         case "tools/call":
             guard let name = params["name"] as? String else {

@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "OmniKit", targets: ["OmniKit"]),
+        .executable(name: "omni", targets: ["omni"]),
         .executable(name: "omni-verify", targets: ["omni-verify"]),
         .executable(name: "ocr-verify", targets: ["ocr-verify"]),
         .executable(name: "profbench", targets: ["profbench"]),
@@ -34,6 +35,12 @@ let package = Package(
                 .product(name: "MLXLinalg", package: "mlx-swift"),
                 .product(name: "Tokenizers", package: "swift-tokenizers"),
             ]
+        ),
+        // The `omni` command line (docs/CLI.md). Foundation only - it is a client of the running
+        // app, never a second copy of the engine - and shipped inside the app bundle.
+        .executableTarget(
+            name: "omni",
+            path: "Sources/OmniCLI"
         ),
         .executableTarget(
             name: "omni-verify",
@@ -69,6 +76,10 @@ let package = Package(
         .executableTarget(
             name: "searchbench",
             dependencies: ["OmniKit"]
+        ),
+        .testTarget(
+            name: "OmniCLITests",
+            dependencies: ["omni"]
         ),
         .testTarget(
             name: "OmniKitTests",

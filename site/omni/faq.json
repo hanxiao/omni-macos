@@ -285,8 +285,12 @@
         },
         {
           "q": "What is the SKILL.md button for?",
-          "a": "It generates a skill file documenting the HTTP API with your port and token filled in, for agents that follow written instructions. Save it where your agent reads skills, such as ~/.claude/skills/omni-local-search/SKILL.md.",
+          "a": "It shows a skill file for agents that follow written instructions, generated from Omni's own tool definitions so it always matches the app. It tells the agent to use the omni command line, which works whether or not the server is on. Save it where your agent reads skills, such as ~/.claude/skills/omni-local-search/SKILL.md, or print it with omni skill.",
           "shortcut": ""
+        },
+        {
+          "q": "Is there a command line?",
+          "a": "Yes. omni search \"invoice from february\" searches through the running app, starting it if needed, so no model is loaded twice. omni tools lists the tools, omni <tool> --help shows their options, and --json gives raw output. It ships inside Omni.app; Settings > Serving > Install puts it on your PATH. It talks to the app over a private socket, so Serving does not need to be on."
         },
         {
           "q": "Which embedding APIs are supported?",
