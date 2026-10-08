@@ -218,6 +218,7 @@ public struct SearchFilter: Sendable {
     }
     public var ext: String? = nil             // restrict to a file extension (no dot)
     public var since: Double? = nil           // modified >= since (epoch seconds)
+    public var until: Double? = nil           // modified < until (epoch seconds): the other end of a date range
     /// Content-tag terms (`tag:bear` / `-tag:cat`): the file's generated tag snippet must
     /// contain (any of) `tagTerms` and none of `tagExcludeTerms`, matched as whole tags.
     /// Snippets are not resident, so the store resolves these into path sets at search entry
@@ -251,7 +252,7 @@ public struct SearchFilter: Sendable {
 
     /// No constraints set - the common plain-query case (enables the GPU candidate fast path).
     var isEmpty: Bool {
-        kinds.isEmpty && folderPrefixes.isEmpty && (ext?.isEmpty ?? true) && since == nil
+        kinds.isEmpty && folderPrefixes.isEmpty && (ext?.isEmpty ?? true) && since == nil && until == nil
             && !needsPathSets
     }
 
@@ -279,6 +280,7 @@ public struct SearchFilter: Sendable {
         if !underAnyFolder(path) { return false }
         if let e = ext, !e.isEmpty, !Self.hasExtensionCI(path, e) { return false }
         if let s = since, modified < s { return false }
+        if let u = until, modified >= u { return false }
         if let allow = tagAllow, !allow.contains(path) { return false }
         if let deny = tagDeny, deny.contains(path) { return false }
         return true
@@ -3646,6 +3648,7 @@ public final class VectorStore: @unchecked Sendable {
                 if !f.kinds.isEmpty, !f.kinds.contains(kindOf(r)) { continue }
                 if pathFiltered, !(Int(r.fid) < pathOK.count && pathOK[Int(r.fid)]) { continue }
                 if let since = f.since, metaOf(r).modified < since { continue }
+                if let until = f.until, metaOf(r).modified >= until { continue }
                 let fid = fileID[i]
                 if firstRow[fid] == nil { firstRow[fid] = i }
             }
@@ -5566,7 +5569,7 @@ public final class VectorStore: @unchecked Sendable {
             // unmasked candidate selection would pick the GLOBAL top-C and silently drop every
             // in-scope match outside it - the `offer` re-check keeps such results sound, so the
             // loss would show up as missing results and nothing else.
-            let needsMask = !filter.kinds.isEmpty || pathFilter || filter.since != nil
+            let needsMask = !filter.kinds.isEmpty || pathFilter || filter.since != nil || filter.until != nil
             let tMask = Self.searchTiming ? Date() : nil
             let selectMask = needsMask ? selectMaskLocked(filter, pathFilter: pathFilter) : nil
             if let tMask, needsMask { print(String(format: "[search] select-mask %.1fms", -tMask.timeIntervalSinceNow * 1000)) }
@@ -5970,6 +5973,7 @@ public final class VectorStore: @unchecked Sendable {
             if let ka = kindAllowed, Int(row) < kindCode.count, !ka[Int(kindCode[Int(row)])] { return }
             if pathFiltered, !compiledPath.accepts(Int(rows[Int(row)].fid)) { return }
             if let s = filter.since, metaOf(rows[Int(row)]).modified < s { return }
+            if let u = filter.until, metaOf(rows[Int(row)]).modified >= u { return }
             let f = fileID[Int(row)]
             if let cur = best[f], cur.score >= score { return }
             best[f] = (score, row)
@@ -6036,7 +6040,7 @@ public final class VectorStore: @unchecked Sendable {
     /// base has <= C rows every row is a candidate and the result is exactly the full bf16 search.
     private func rerankLocked(coarse: [Float], n: Int, query: [Float], filter: SearchFilter, topK: Int) -> [Float] {
         let C = min(baseRows, Self.candidateCount(topK: topK))
-        let kinds = filter.kinds, hasKind = !kinds.isEmpty, since = filter.since
+        let kinds = filter.kinds, hasKind = !kinds.isEmpty, since = filter.since, until = filter.until
         // tagAllow/tagDeny are path-based prefilters exactly like folder/ext: they MUST gate
         // candidate selection here, or a tag-filtered quant-mode query silently loses every
         // match whose coarse score falls outside the global top-C.
@@ -6087,6 +6091,7 @@ public final class VectorStore: @unchecked Sendable {
                     if hScore.count >= C && sc <= hScore[0] { continue }
                     if hasKind && !kindAllowed[Int(kc[i])] { continue }
                     if let since, metaOf(rows[i]).modified < since { continue }
+                    if let until, metaOf(rows[i]).modified >= until { continue }
                     if let pa = pathAllow {
                         let gid = Int(fileID[i])
                         if gid >= pa.count || !pa[gid] { continue }
@@ -6463,12 +6468,15 @@ public final class VectorStore: @unchecked Sendable {
 
     private func selectMaskLocked(_ f: SearchFilter, pathFilter: Bool) -> MLXArray? {
         let hasKind = !f.kinds.isEmpty
-        guard hasKind || pathFilter || f.since != nil else { return nil }
+        guard hasKind || pathFilter || f.since != nil || f.until != nil else { return nil }
         let sinceCut = f.since.map { Int32(clamping: Int(($0 - Self.modifiedEpochBase).rounded(.down))) }
+        // `until` is exclusive and per-second like `since`: a file modified within the cut second
+        // compares on whole seconds, the same quantisation the lower bound has.
+        let untilCut = f.until.map { Int32(clamping: Int(($0 - Self.modifiedEpochBase).rounded(.up))) }
         // A nil path key means "not identifiable", so this mask must not be cached either.
         let pathKey: String? = pathFilter ? Self.pathAllowKey(f, nGlobal: max(1, fileChunkCount.count)) : ""
         let key: String? = (pathFilter && pathKey == nil) ? nil
-            : "\(f.kinds.sorted().joined(separator: ","))|\(sinceCut.map(String.init) ?? "")"
+            : "\(f.kinds.sorted().joined(separator: ","))|\(sinceCut.map(String.init) ?? "")|\(untilCut.map(String.init) ?? "")"
               + "|\(pathKey ?? "")|\(baseRows)|\(baseOccCount)"
         if let key, key == selectMaskKey, let m = selectMaskGPU { return m }
 
@@ -6487,6 +6495,10 @@ public final class VectorStore: @unchecked Sendable {
         if let cut = sinceCut {
             guard let fid = fileIDGPULocked(), let md = modifiedGPULocked() else { return nil }
             combine((md .>= MLXArray(cut)).asType(Float.self)[fid].reshaped([baseOccCount]))
+        }
+        if let cut = untilCut {
+            guard let fid = fileIDGPULocked(), let md = modifiedGPULocked() else { return nil }
+            combine((md .< MLXArray(cut)).asType(Float.self)[fid].reshaped([baseOccCount]))
         }
         guard let mask = keep else { return nil }
         MLX.eval(mask)
@@ -6533,7 +6545,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func onlyKindFiltered(_ f: SearchFilter) -> Bool {
-        f.folderPrefixes.isEmpty && (f.ext?.isEmpty ?? true) && f.since == nil
+        f.folderPrefixes.isEmpty && (f.ext?.isEmpty ?? true) && f.since == nil && f.until == nil
             && !f.needsPathSets
     }
 
@@ -6858,7 +6870,7 @@ public final class VectorStore: @unchecked Sendable {
         // Total rows per file (counted before any filter/finite check: it is the FILE's chunk
         // count, not the count of matching chunks). One extra write per row in the pass below.
         var rowCount = [Int32](repeating: 0, count: fileCount)
-        let kinds = filter.kinds, hasKind = !filter.kinds.isEmpty, since = filter.since
+        let kinds = filter.kinds, hasKind = !filter.kinds.isEmpty, since = filter.since, until = filter.until
         // `type:` filters compare the dense per-row kind code against a 256-slot mask instead of
         // hashing the kind String per row, when the caller maintains kindCode in lockstep (the
         // store always does; callers without it fall back to the string compare).
@@ -6878,7 +6890,7 @@ public final class VectorStore: @unchecked Sendable {
         bestScore.withUnsafeMutableBufferPointer { bs in
         bestRow.withUnsafeMutableBufferPointer { br in
         rowCount.withUnsafeMutableBufferPointer { rc in
-            if hasKind || since != nil {
+            if hasKind || since != nil || until != nil {
                 kindCode.withUnsafeBufferPointer { kc in
                 kindAllowed.withUnsafeBufferPointer { ka in
                 for i in 0 ..< n {
@@ -6894,6 +6906,7 @@ public final class VectorStore: @unchecked Sendable {
                         else if !kinds.contains(tables.kind(rows[i])) { continue }
                     }
                     if let s = since, tables.meta(rows[i]).modified < s { continue }
+                    if let u = until, tables.meta(rows[i]).modified >= u { continue }
                     if dot > bs[f] { bs[f] = dot; br[f] = Int32(i) }
                 }
                 }}
@@ -6944,6 +6957,7 @@ public final class VectorStore: @unchecked Sendable {
             // every query.
             if !filter.kinds.isEmpty, !filter.kinds.contains(tables.kind(r)) { continue }
             if let s = filter.since, tables.meta(r).modified < s { continue }
+            if let u = filter.until, tables.meta(r).modified >= u { continue }
             if let pf = pathFilter {
                 if !pf.accepts(Int(r.fid)) { continue }
             } else if !filter.acceptsPath(tables.path(r)) { continue }

@@ -375,6 +375,9 @@ enum SearchAdapter {
             if let ext = filters["ext"] as? String, !ext.isEmpty { filter.ext = ext }
             if let since = filters["since"] as? Double { filter.since = since }
             else if let sinceInt = filters["since"] as? Int { filter.since = Double(sinceInt) }
+            // The other end of a date range, exclusive, epoch seconds like `since`.
+            if let until = filters["until"] as? Double { filter.until = until }
+            else if let untilInt = filters["until"] as? Int { filter.until = Double(untilInt) }
             if let ms = filters["min_score"] as? Double { filter.minScore = Swift.max(0, Swift.min(1, ms)) }
             else if let ms = filters["min_score"] as? Int { filter.minScore = Swift.max(0, Swift.min(1, Double(ms))) }
         }

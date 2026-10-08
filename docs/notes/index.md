@@ -1082,6 +1082,17 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
   cleared at once; it comes back after 30 s at normal. Verified in an isolated instance with the
   perf script's `pressure:` step: "headroom 0, cache cleared", then "headroom back to 1.0 GB".
 
+## Date and type filters on the agent tool (MCP, 2026-10-07)
+- `search` takes `modified_after`, `modified_before` (ISO 8601 date, local midnight, or date-time)
+  and `ext` (case and leading dot ignored). Malformed dates and a reversed range are tool errors
+  that say what is expected. SearchFilter gained `until` (modified < until), applied at every
+  place `since` was, including the quantized mask (its cache key carries the rounded-up cut).
+- In an isolated instance, 11,640 files with three backdated to 2025-01-15: before 2025-02-01 gives
+  those three plus the older PDFs; 2025-01-15T00:00Z .. 2025-01-16 gives exactly the three;
+  `ext: ".PDF"` with after 2025-01-16 gives only later PDFs. DateRangeFilterTests covers full-base
+  and quantized scans with a control that the unfiltered query does return the excluded files.
+- The HTTP search route takes `until` (epoch seconds) alongside `since`.
+
 ## The read lanes raced on first use (2026-10-07)
 - The full suite died once with SIGTRAP in `_os_object_retain` under onReader, from
   BrowseReaderTests.testConcurrentBrowsesAgree. The two browse lanes were `lazy var`s; Swift lazy

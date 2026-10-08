@@ -155,6 +155,18 @@ enum MCPAdapter {
                         "items": ["type": "string"],
                         "description": "Restrict to files under ANY of these absolute folder paths. Use this to search two or more folders at once - adding them as sources instead does not work, because an indexed parent folder already covers its children."
                     ],
+                    "modified_after": [
+                        "type": "string",
+                        "description": "Only files modified at or after this time. ISO 8601: a date ('2026-10-01', local midnight) or a date-time ('2026-10-01T09:30:00Z'). With modified_before, a range - e.g. last week is modified_after = 7 days ago."
+                    ],
+                    "modified_before": [
+                        "type": "string",
+                        "description": "Only files modified before this time (exclusive). Same formats as modified_after; a date means before that day starts."
+                    ],
+                    "ext": [
+                        "type": "string",
+                        "description": "Only files with this extension, e.g. 'pdf' or '.md' (case-insensitive)."
+                    ],
                     "min_score": [
                         "type": "number",
                         "description": "Relevance floor, 0 to 1. Defaults to the floor the app's window applies (0.5 unless the user changed it), so weak matches are dropped rather than padding the page - semantic search always returns its nearest neighbours, and most of them are not answers. The floor is scaled per kind (a text query scores a photo on a lower scale than a document), so images are not deleted by a text-shaped cut. Pass 0 for everything.",
@@ -170,6 +182,22 @@ enum MCPAdapter {
             "annotations": ["readOnlyHint": true, "destructiveHint": false,
                             "idempotentHint": true, "openWorldHint": false]
         ]
+    }
+
+    /// An ISO 8601 date (local midnight) or date-time (with or without fractional seconds), as
+    /// epoch seconds; nil when it is neither.
+    static func parseTime(_ s: String) -> Double? {
+        let text = s.trimmingCharacters(in: .whitespaces)
+        let full = ISO8601DateFormatter()
+        if let d = full.date(from: text) { return d.timeIntervalSince1970 }
+        full.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let d = full.date(from: text) { return d.timeIntervalSince1970 }
+        let day = DateFormatter()
+        day.calendar = Calendar(identifier: .gregorian)
+        day.locale = Locale(identifier: "en_US_POSIX")
+        day.timeZone = .current
+        day.dateFormat = "yyyy-MM-dd"
+        return day.date(from: text)?.timeIntervalSince1970
     }
 
     // MARK: - Filter input validation
@@ -268,6 +296,24 @@ enum MCPAdapter {
             }
         }
         filter.folderPrefixes = scoped
+        // Date range and extension: the window's `date:`/`after:` and `ext:` qualifiers, which an
+        // agent could not reach - "what was I working on last week" needs a range, not a query.
+        for (key, apply) in [("modified_after", { (t: Double) in filter.since = t }),
+                             ("modified_before", { (t: Double) in filter.until = t })] as [(String, (Double) -> Void)] {
+            guard let raw = args[key] else { continue }
+            guard let text = raw as? String, let t = Self.parseTime(text) else {
+                return toolError(id: id, "search failed: '\(key)' must be an ISO 8601 date ('2026-10-01') or date-time ('2026-10-01T09:30:00Z')")
+            }
+            apply(t)
+        }
+        if let since = filter.since, let until = filter.until, since >= until {
+            return toolError(id: id, "search failed: modified_after must be earlier than modified_before")
+        }
+        if let raw = args["ext"] {
+            guard let ext = raw as? String else { return toolError(id: id, "search failed: 'ext' must be a string like 'pdf'") }
+            let clean = ext.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+            if !clean.isEmpty { filter.ext = clean }
+        }
 
         // INDEX STATE, FETCHED CONCURRENTLY. An agent cannot tell an empty result set caused by
         // "not on this Mac" from one caused by "not indexed yet", and the second reading is the
