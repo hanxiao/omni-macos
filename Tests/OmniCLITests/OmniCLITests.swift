@@ -1,16 +1,17 @@
 import XCTest
 @testable import omni
 
-/// The `omni` command turns any tool's input schema into a subcommand: these pin the mapping, so
-/// a tool added to the app is usable from the command line and the skill without code here.
+/// The `omni` command turns any tool's input schema into a subcommand: these pin the mapping, the
+/// help layers and the error wording, so a tool added to the app is usable from the command line
+/// and the skill without code here.
 final class OmniCLITests: XCTestCase {
     let search: [String: Any] = [
-        "name": "search", "title": "Search", "description": "Find files.",
+        "name": "search", "title": "Search", "description": "Find files. Longer explanation here.",
         "inputSchema": [
             "type": "object",
             "properties": [
                 "query": ["type": "string", "description": "What to find."],
-                "top_k": ["type": "integer", "description": "How many."],
+                "top_k": ["type": "integer", "description": "How many. At most 50."],
                 "min_score": ["type": "number"],
                 "group_duplicates": ["type": "boolean"],
                 "kinds": ["type": "array", "items": ["type": "string", "enum": ["text", "image"]]],
@@ -18,9 +19,11 @@ final class OmniCLITests: XCTestCase {
             ] as [String: Any],
             "required": ["query"],
         ] as [String: Any],
+        "_meta": [CLIProtocol.examplesKey: [["query": "red car", "kinds": ["image"], "top_k": 5],
+                                            ["query": "notes", "group_duplicates": false]]],
     ]
     let status: [String: Any] = [
-        "name": "file_status",
+        "name": "file_status", "title": "Status",
         "inputSchema": ["type": "object",
                         "properties": ["paths": ["type": "array", "items": ["type": "string"]]],
                         "required": ["paths"]] as [String: Any],
@@ -45,27 +48,43 @@ final class OmniCLITests: XCTestCase {
         XCTAssertEqual(try arguments(for: search, ["q", "--top_k", "3"])["top_k"] as? Int, 3)   // the schema's spelling too
     }
 
-    func testMistakesSayWhatIsExpected() {
-        XCTAssertThrowsError(try arguments(for: search, ["q", "--topk", "3"])) {
-            XCTAssertTrue(($0 as? Failure)?.message.contains("--top-k") ?? false, "lists the real options")
+    /// One bad command should cost one retry: every mistake names the fix.
+    func testMistakesSayHowToFixThem() {
+        func message(_ words: [String]) -> String {
+            do { _ = try arguments(for: search, words); return "" } catch { return (error as? Failure)?.message ?? "" }
         }
-        XCTAssertThrowsError(try arguments(for: search, ["q", "--top-k", "five"])) {
-            XCTAssertTrue(($0 as? Failure)?.message.contains("whole number") ?? false)
-        }
-        XCTAssertThrowsError(try arguments(for: search, ["--top-k", "3"])) {
-            XCTAssertTrue(($0 as? Failure)?.message.contains("missing <query>") ?? false)
-        }
+        XCTAssertTrue(message(["q", "--topk", "3"]).contains("Did you mean --top-k?"))
+        XCTAssertTrue(message(["q", "--top-k", "five"]).contains("whole number"))
+        XCTAssertTrue(message(["q", "--kinds", "imgae"]).contains("Did you mean image?"))
+        let missing = message(["--top-k", "3"])
+        XCTAssertTrue(missing.contains("missing <query>") && missing.contains("Example: omni search"), missing)
+        XCTAssertEqual(suggestion("serach", ["search", "search_inline", "ocr"]), "search")
+        XCTAssertNil(suggestion("zzzzzz", ["search", "ocr"]))
     }
 
-    func testTheSkillHasEveryToolAndFlag() {
+    func testServerErrorsAreRewordedAsFlags() {
+        let m = inCLITerms("search failed: 'modified_after' must be an ISO 8601 date; 'query' is required", tool: search)
+        XCTAssertEqual(m, "omni search: --modified-after must be an ISO 8601 date; <query> is required")
+    }
+
+    func testHelpComesInLayers() {
+        let short = toolHelp(search, full: false), full = toolHelp(search, full: true)
+        XCTAssertTrue(short.contains("Find files.") && !short.contains("Longer explanation"))
+        XCTAssertTrue(short.contains("omni search 'red car' --kinds image --top-k 5"), short)
+        XCTAssertTrue(short.contains("omni search notes --no-group-duplicates"), short)
+        XCTAssertTrue(short.contains("How many.") && !short.contains("At most 50"))
+        XCTAssertTrue(short.contains("--help-all"))
+        XCTAssertTrue(full.contains("Longer explanation") && full.contains("At most 50"))
+    }
+
+    /// The skill names the commands and shows examples; options stay behind --help.
+    func testTheSkillIsProgressive() {
         let md = AgentSkill.render(instructions: "Use it well.", tools: [search, status], command: "/X/omni")
         XCTAssertTrue(md.hasPrefix("---\nname: omni-local-search\n"))
         XCTAssertTrue(md.contains("Use it well."))
-        XCTAssertTrue(md.contains("## search") && md.contains("## file_status"))
-        XCTAssertTrue(md.contains("/X/omni search <query> [options]"))
-        XCTAssertTrue(md.contains("/X/omni file_status <paths>..."))
-        for flag in ["--top-k <integer>", "--min-score <number>", "--group-duplicates`", "--kinds <text|image>", "--modified-after <string>"] {
-            XCTAssertTrue(md.contains(flag), flag)
-        }
+        XCTAssertTrue(md.contains("  search       Search") && md.contains("  file_status  Status"), md)
+        XCTAssertTrue(md.contains("/X/omni search 'red car' --kinds image --top-k 5"))
+        XCTAssertTrue(md.contains("--help-all") && md.contains("--json") && md.contains("Exit codes"))
+        XCTAssertFalse(md.contains("--min-score"), "options are for --help, not the skill")
     }
 }

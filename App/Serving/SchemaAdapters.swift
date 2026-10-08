@@ -368,9 +368,17 @@ enum SearchAdapter {
         let fetch = group ? min(topK * 3, 300) : topK
         let hits = backend.search(query, topK: fetch, filter: filter, surface: .rest)
         let groups = backend.groupedResults(hits, enabled: group, limit: topK)
+        return HTTPResponse.json(["query": query, "results": rows(groups, backend: backend),
+                                  "grouped": group])
+    }
+
+    /// The JSON row for each result - REST's `results`, and the MCP search tool's
+    /// structuredContent for the `omni` command line, so `omni search --json` and /v1/search
+    /// answer in the same shape.
+    static func rows(_ groups: [ResultGroup], backend: any ServingBackend) -> [[String: Any]] {
         // Lockstep rule as duplicateChunks: only trust a key whose modified matches the hit's.
         let contentKeys = backend.contentKeys(paths: groups.map { $0.representative.path })
-        let results: [[String: Any]] = groups.map { g in
+        return groups.map { g in
             let hit = g.representative
             var row: [String: Any] = [
                 "path": hit.path,
@@ -403,8 +411,6 @@ enum SearchAdapter {
             }
             return row
         }
-        return HTTPResponse.json(["query": query, "results": results,
-                                  "grouped": group])
     }
 }
 

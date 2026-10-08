@@ -129,7 +129,8 @@ enum SourcesAdapter {
         return t.isEmpty ? nil : t
     }
 
-    private static func snapshotBody(_ s: SourcesSnapshot) -> [String: Any] {
+    /// Also the sources tools' structuredContent for the `omni` command line (MCPAdapter).
+    static func snapshotBody(_ s: SourcesSnapshot) -> [String: Any] {
         [
             "indexing": s.indexing,
             "photos_authorized": s.photosAuthorized,

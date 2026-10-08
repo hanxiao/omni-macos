@@ -50,6 +50,35 @@ are the same file on a case-insensitive volume. Settings > Serving > Install lin
 `/usr/local/bin`, asking for an administrator password when that folder is not writable. The
 skill uses the absolute path, so agents need no install.
 
+## Design principles, and how each is met
+
+From "CLI is All Agents Need", reviewed 2026-10-07:
+
+- One tool. `omni` is one command; the skill names its subcommands and shows examples, and every
+  option stays behind `--help`. The skill went from 125 lines (every flag of every tool) to 44.
+- stdout is data, stderr diagnostics. The server marks blocks that are about the answer rather
+  than the answer - "No results for ...", the empty-index note, the image cap, the OCR page range
+  - with `_meta` `io.hanxiao.omni/stderr`, only on calls the CLI marks with
+  `io.hanxiao.omni/cli`. So `omni ocr scan.pdf > scan.md` is Markdown, and an empty search leaves
+  stdout empty and explains itself on stderr. Other MCP clients get the same bytes as before.
+- Progressive help. `omni --help`: the commands and two examples. `omni <tool> --help`: usage, the
+  first sentence, examples, one line per option. `--help-all`: every description in full.
+  Examples live once, as argument sets in each tool's `_meta`, and are rendered as commands. A
+  boolean that defaults on (JSON Schema `default`) shows as `--[no-]flag`.
+- Errors that course-correct. Unknown commands, options and enum values suggest the closest
+  match; a missing argument shows usage and an example; server errors are reworded into the
+  CLI's terms (`'modified_after'` becomes `--modified-after`, `'query'` becomes `<query>`).
+- Consistent output. Plain text is the same "N. path  (meta)" lines MCP clients read; `--json` is
+  structuredContent, built by the same row builders as REST, so `omni search --json` and
+  `/v1/search` have the same fields.
+- Exit codes: 0 done, 1 the command needs fixing (bad option, or the tool rejected an input),
+  2 Omni unavailable or failed, 130 interrupted (default SIGINT, measured as a kill by signal 2).
+- Raw at the pipe: blocks are joined by single newlines; `--json` carries full snippets, the text
+  output a preview set by `--max-snippet`.
+
+Not met: plain output is meant for reading, so a script wanting paths uses `--json` (`omni search
+x --json | jq -r '.results[].path'`) rather than cutting lines.
+
 ## Commands
 
     omni search "invoice from february" --top-k 5 --modified-after 2026-02-01 --ext pdf
@@ -59,5 +88,4 @@ skill uses the absolute path, so agents need no install.
     omni skill            # SKILL.md
     --json                # the raw MCP result instead of text
 
-Exit codes: 0 ok, 1 the tool reported an error, 64 bad arguments, 69 Omni unavailable, 77 refused
-token.
+Exit codes: 0 done, 1 fix the command, 2 Omni unavailable, 130 interrupted.

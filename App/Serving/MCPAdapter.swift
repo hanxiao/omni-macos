@@ -50,8 +50,33 @@ enum MCPAdapter {
             tools += [listSourcesDescriptor(), addSourceDescriptor(),
                       pauseSourceDescriptor(), removeSourceDescriptor()]
         }
-        return tools
+        return tools.map { tool in
+            guard let name = tool["name"] as? String, let ex = examples[name] else { return tool }
+            var t = tool
+            t["_meta"] = [examplesMetaKey: ex]
+            return t
+        }
     }
+
+    /// Example arguments per tool, in the tool's `_meta`. Arguments rather than command lines, so
+    /// the one place they live stays true to the schema: `omni <tool> --help` renders them as
+    /// commands, and an MCP client may show them as they are.
+    static let examplesMetaKey = CLIProtocol.examplesKey
+    nonisolated(unsafe) private static let examples: [String: [[String: Any]]] = [   // immutable
+        "search": [
+            ["query": "invoice from anthropic in february"],
+            ["query": "photos of a red sports car", "kinds": ["image"], "top_k": 5],
+            ["query": "meeting notes about the launch", "modified_after": "2026-09-01", "ext": "md"],
+        ],
+        "search_inline": [["query": "termination clause", "paths": ["/Users/me/Documents/contract.pdf"]]],
+        "file_status": [["paths": ["/Users/me/Documents/report.pdf", "/Users/me/Desktop/notes.md"]]],
+        "tag_image": [["paths": ["/Users/me/Pictures/IMG_0001.jpg"]]],
+        "ocr": [["path": "/Users/me/Downloads/scan.pdf"], ["path": "/Users/me/Downloads/scan.pdf", "pages": "11-20"]],
+        "list_sources": [[:]],
+        "add_source": [["path": "/Users/me/Projects"], ["album": "all"]],
+        "pause_source": [["key": "/Users/me/Downloads"], ["key": "/Users/me/Downloads", "paused": false]],
+        "remove_source": [["key": "/Users/me/Old Projects"]],
+    ]
 
     static func handle(_ req: HTTPRequest, _ backend: any ServingBackend, appVersion: String,
                        sources: SourcesControl? = nil, surface: ServedSurface = .mcp) async -> HTTPResponse {
@@ -102,17 +127,21 @@ enum MCPAdapter {
                 return HTTPResponse.json(jsonRPCError(id: id, code: -32602, message: "missing tool name"))
             }
             let args = params["arguments"] as? [String: Any] ?? [:]
+            // The `omni` command line marks its calls (CLI.md): it gets structuredContent and the
+            // diagnostic blocks marked for stderr. Every other client's answer is unchanged.
+            let cli = (params["_meta"] as? [String: Any])?[cliMetaKey] as? Bool == true
+            let surface: ServedSurface = cli ? .cli : surface
             switch name {
-            case "search":        return await callSearch(id: id, args: args, backend: backend, sources: sources, surface: surface)
-            case "search_inline": return callSearchInline(id: id, args: args, backend: backend, surface: surface)
-            case "file_status":   return callFileStatus(id: id, args: args, backend: backend)
-            case "tag_image":     return callTagImage(id: id, args: args, backend: backend)
-            case "ocr":           return await callOCR(id: id, args: args)
+            case "search":        return await callSearch(id: id, args: args, backend: backend, sources: sources, surface: surface, cli: cli)
+            case "search_inline": return callSearchInline(id: id, args: args, backend: backend, surface: surface, cli: cli)
+            case "file_status":   return callFileStatus(id: id, args: args, backend: backend, cli: cli)
+            case "tag_image":     return callTagImage(id: id, args: args, backend: backend, cli: cli)
+            case "ocr":           return await callOCR(id: id, args: args, cli: cli)
             case "list_sources", "add_source", "pause_source", "remove_source":
                 guard let sources else {
                     return toolError(id: id, "\(name) failed: indexing control is unavailable (the index is still loading)")
                 }
-                return await callSources(id: id, tool: name, args: args, sources: sources)
+                return await callSources(id: id, tool: name, args: args, sources: sources, cli: cli)
             default:
                 return HTTPResponse.json(jsonRPCError(id: id, code: -32602, message: "unknown tool: \(name)"))
             }
@@ -182,7 +211,7 @@ enum MCPAdapter {
                         "minimum": 0, "maximum": 1
                     ],
                     "group_duplicates": [
-                        "type": "boolean",
+                        "type": "boolean", "default": true,
                         "description": "Collapse copies of the same file into one result (default true). A collapsed result carries duplicate_count, duplicates (the other paths) and duplicate_kind ('exact' = byte-identical, 'near' = same kind and extension, sizes within 10%, cosine >= 0.98). Set false for the flat list with every copy as its own result."
                     ]
                 ] as [String: Any],
@@ -194,7 +223,7 @@ enum MCPAdapter {
     }
 
     private static func callSearch(id: Any, args: [String: Any], backend: any ServingBackend,
-                                   sources: SourcesControl?, surface: ServedSurface) async -> HTTPResponse {
+                                   sources: SourcesControl?, surface: ServedSurface, cli: Bool) async -> HTTPResponse {
         guard let query = args["query"] as? String, !query.isEmpty else {
             // Tool-level (not protocol-level) failure: isError true with a readable message.
             return result(id: id, [
@@ -244,7 +273,7 @@ enum MCPAdapter {
         let note = indexStateLine(snap)
 
         var content: [[String: Any]] = []
-        if let note { content.append(["type": "text", "text": note]) }
+        if let note { content.append(diagnostic(note)) }
         if hits.isEmpty {
             // Say WHICH kind of nothing this is, so the agent's next move is right.
             var text = "No results for \"\(query)\"."
@@ -254,7 +283,7 @@ enum MCPAdapter {
                         + " - add_source indexes a folder or the Photos library."
                 }
             }
-            content.append(["type": "text", "text": text])
+            content.append(diagnostic(text))
         } else {
             var inlined = 0          // thumbnails emitted so far (capped)
             var cappedSkips = 0      // media hits skipped specifically because the cap was already reached
@@ -297,15 +326,13 @@ enum MCPAdapter {
                 }
             }
             if cappedSkips > 0 {
-                content.append(["type": "text",
-                                 "text": "(\(cappedSkips) more image result(s) not inlined; cap is \(maxInlineImages). Open them by path.)"])
+                content.append(diagnostic("(\(cappedSkips) more image result(s) not inlined; cap is \(maxInlineImages). Open them by path.)"))
             }
         }
 
-        return result(id: id, [
-            "content": content,
-            "isError": false
-        ])
+        return answer(id: id, content, cli: cli) {
+            ["query": query, "results": SearchAdapter.rows(groups, backend: backend), "grouped": group]
+        }
     }
 
     // MARK: - The search_inline tool
@@ -346,7 +373,7 @@ enum MCPAdapter {
     }
 
     private static func callSearchInline(id: Any, args: [String: Any], backend: any ServingBackend,
-                                         surface: ServedSurface) -> HTTPResponse {
+                                         surface: ServedSurface, cli: Bool) -> HTTPResponse {
         guard let query = args["query"] as? String, !query.isEmpty else {
             return result(id: id, [
                 "content": [["type": "text", "text": "search_inline failed: 'query' is required"]],
@@ -369,8 +396,7 @@ enum MCPAdapter {
 
         var content: [[String: Any]] = []
         if hits.isEmpty {
-            content.append(["type": "text",
-                             "text": "No indexed passages in the given paths matched \"\(query)\". (search_inline only reads files Omni has already indexed; unindexed paths are skipped.)"])
+            content.append(diagnostic("No indexed passages in the given paths matched \"\(query)\". (search_inline only reads files Omni has already indexed; unindexed paths are skipped.)"))
         } else {
             for (i, h) in hits.enumerated() {
                 let score = Int((max(0, min(1, h.score)) * 100).rounded())
@@ -383,10 +409,12 @@ enum MCPAdapter {
                 content.append(["type": "text", "text": text])
             }
         }
-        return result(id: id, [
-            "content": content,
-            "isError": false
-        ])
+        return answer(id: id, content, cli: cli) {
+            ["query": query, "results": hits.map { h -> [String: Any] in
+                ["path": h.path, "kind": h.kind, "chunk_index": h.chunkIndex,
+                 "score": Double(max(0, min(1, h.score))), "snippet": h.snippet, "locator": h.locator]
+            }]
+        }
     }
 
     // MARK: - The file_status tool
@@ -412,7 +440,7 @@ enum MCPAdapter {
         ]
     }
 
-    private static func callFileStatus(id: Any, args: [String: Any], backend: any ServingBackend) -> HTTPResponse {
+    private static func callFileStatus(id: Any, args: [String: Any], backend: any ServingBackend, cli: Bool) -> HTTPResponse {
         let paths = (args["paths"] as? [String])?.filter { !$0.isEmpty } ?? []
         guard !paths.isEmpty else {
             return result(id: id, [
@@ -446,10 +474,7 @@ enum MCPAdapter {
             }
             return ["type": "text", "text": line]
         }
-        return result(id: id, [
-            "content": content,
-            "isError": false
-        ])
+        return answer(id: id, content, cli: cli) { ["files": rows] }
     }
 
     // MARK: - The tag_image tool
@@ -487,7 +512,7 @@ enum MCPAdapter {
     /// and an agent cannot see that cost, so it gets a much tighter cap than servingMaxInputs.
     private static let mcpTagRecomputeMax = 4
 
-    private static func callTagImage(id: Any, args: [String: Any], backend: any ServingBackend) -> HTTPResponse {
+    private static func callTagImage(id: Any, args: [String: Any], backend: any ServingBackend, cli: Bool) -> HTTPResponse {
         let paths = (args["paths"] as? [String])?.filter { !$0.isEmpty } ?? []
         guard !paths.isEmpty else {
             return result(id: id, [
@@ -535,10 +560,7 @@ enum MCPAdapter {
             }
             return ["type": "text", "text": line]
         }
-        return result(id: id, [
-            "content": content,
-            "isError": false
-        ])
+        return answer(id: id, content, cli: cli) { ["files": rows] }
     }
 
     // MARK: - The ocr tool
@@ -567,7 +589,7 @@ enum MCPAdapter {
         ]
     }
 
-    private static func callOCR(id: Any, args: [String: Any]) async -> HTTPResponse {
+    private static func callOCR(id: Any, args: [String: Any], cli: Bool) async -> HTTPResponse {
         guard let path = args["path"] as? String, !path.isEmpty else {
             return toolError(id: id, "ocr failed: 'path' (an absolute file path) is required")
         }
@@ -607,7 +629,7 @@ enum MCPAdapter {
                 head += " Next: pages \"\(after + 1)-\(min(after + OCRServing.maxPagesMCP, count))\"."
             }
         }
-        var content: [[String: Any]] = [["type": "text", "text": head]]
+        var content: [[String: Any]] = [diagnostic(head)]
         for p in pages {
             let body: String
             if p.failed {
@@ -620,7 +642,19 @@ enum MCPAdapter {
             let label = count == 1 ? "" : "## Page \(p.index + 1)\n\n"
             content.append(["type": "text", "text": label + body])
         }
-        return result(id: id, ["content": content, "isError": false])
+        let next = (selected.max() ?? -1) + 1
+        return answer(id: id, content, cli: cli) {
+            var body: [String: Any] = [
+                "path": name, "page_count": count,
+                "pages": pages.map { p -> [String: Any] in
+                    var row: [String: Any] = ["index": p.index, "markdown": p.markdown]
+                    if p.failed { row["failed"] = true }
+                    return row
+                },
+            ]
+            if next < count { body["next_pages"] = "\(next + 1)-\(min(next + OCRServing.maxPagesMCP, count))" }
+            return body
+        }
     }
 
     /// "1-3, 7" for [1, 2, 3, 7].
@@ -785,7 +819,7 @@ enum MCPAdapter {
                 "type": "object",
                 "properties": [
                     "key": ["type": "string", "description": "The source's key from list_sources (a folder path, or 'photos://<id>')."],
-                    "paused": ["type": "boolean", "description": "true to pause (the default), false to resume."],
+                    "paused": ["type": "boolean", "default": true, "description": "true to pause (the default), false to resume."],
                 ] as [String: Any],
                 "required": ["key"],
             ] as [String: Any],
@@ -812,16 +846,16 @@ enum MCPAdapter {
     }
 
     private static func callSources(id: Any, tool: String, args: [String: Any],
-                                    sources: SourcesControl) async -> HTTPResponse {
+                                    sources: SourcesControl, cli: Bool) async -> HTTPResponse {
         func done(_ m: SourceMutation, _ verb: String) async -> HTTPResponse {
             if let err = m.error { return toolError(id: id, "\(tool) failed: \(err)") }
             let snap = await sources.snapshot()
-            return sourcesResult(id: id, snap, headline: "\(verb) \(m.key ?? "")")
+            return sourcesResult(id: id, snap, headline: "\(verb) \(m.key ?? "")", cli: cli)
         }
 
         switch tool {
         case "list_sources":
-            return sourcesResult(id: id, await sources.snapshot(), headline: nil)
+            return sourcesResult(id: id, await sources.snapshot(), headline: nil, cli: cli)
 
         case "add_source":
             let path = (args["path"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -855,7 +889,7 @@ enum MCPAdapter {
 
     /// One rendering for all four: the caller's next question after any of them is "so what is
     /// indexed now", and answering it in the same turn saves a round trip.
-    private static func sourcesResult(id: Any, _ snap: SourcesSnapshot, headline: String?) -> HTTPResponse {
+    private static func sourcesResult(id: Any, _ snap: SourcesSnapshot, headline: String?, cli: Bool) -> HTTPResponse {
         var lines: [String] = []
         if let headline { lines.append(headline) }
         if snap.sources.isEmpty {
@@ -876,9 +910,11 @@ enum MCPAdapter {
             lines.append("Omni has no access to the Apple Photos library; the user grants it in the app.")
         }
 
-        return result(id: id, [
-            "content": [["type": "text", "text": lines.joined(separator: "\n")]],
-        ])
+        return answer(id: id, [["type": "text", "text": lines.joined(separator: "\n")]], cli: cli) {
+            var body = SourcesAdapter.snapshotBody(snap)
+            if let headline { body["done"] = headline }
+            return body
+        }
     }
 
     // MARK: - Freshness
@@ -891,6 +927,34 @@ enum MCPAdapter {
     private static func indexStateLine(_ snap: SourcesSnapshot?) -> String? {
         guard let snap, snap.sources.isEmpty else { return nil }
         return "index: empty - no folders or photo sources are indexed yet (see list_sources / add_source)."
+    }
+
+    // MARK: - Answers for the command line
+
+    static let cliMetaKey = CLIProtocol.cliKey
+    static let stderrMetaKey = CLIProtocol.stderrKey
+    private static let diagnosticMark = "omni.diagnostic"
+
+    /// A text block that is ABOUT the answer - nothing found, an empty index, a cap, a page range -
+    /// rather than part of it. An MCP client reads it like any other block; the command line sends
+    /// it to stderr, so stdout stays data a pipe can use.
+    private static func diagnostic(_ text: String) -> [String: Any] {
+        ["type": "text", "text": text, diagnosticMark: true]
+    }
+
+    /// A tool's successful answer. For the command line only: `structured` becomes
+    /// structuredContent (the same shapes REST answers with) and diagnostic blocks are marked
+    /// for stderr. Any other client gets exactly the content blocks, as before.
+    private static func answer(id: Any, _ content: [[String: Any]], cli: Bool,
+                               structured: () -> [String: Any]) -> HTTPResponse {
+        let blocks = content.map { block -> [String: Any] in
+            var b = block
+            if b.removeValue(forKey: diagnosticMark) != nil, cli { b["_meta"] = [stderrMetaKey: true] }
+            return b
+        }
+        var value: [String: Any] = ["content": blocks, "isError": false]
+        if cli { value["structuredContent"] = structured() }
+        return result(id: id, value)
     }
 
     private static func toolError(id: Any, _ message: String) -> HTTPResponse {
