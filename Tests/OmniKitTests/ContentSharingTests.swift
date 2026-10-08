@@ -863,6 +863,9 @@ final class ContentSharingTests: XCTestCase {
     /// path simply run it again. This is the test of that claim: stop after the rename, reopen, and
     /// demand the index be correct rather than merely consistent.
     func testACrashBetweenTheRenameAndTheRenumberingRecovers() throws {
+        // The whole-file copy's own crash points: a split index otherwise reclaims by relocation.
+        VectorStore.copyReclaimForTest = true
+        defer { VectorStore.copyReclaimForTest = false }
         let savedQuant = VectorStore.quantBaseOverride
         let savedFloor = VectorStore.holeReclaimFloorOverride
         let savedFraction = VectorStore.holeReclaimFractionOverride

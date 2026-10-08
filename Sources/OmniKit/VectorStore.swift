@@ -638,7 +638,36 @@ final class Vec16Buffer {
     /// already clean; only the recent delta is dirty, so this is cheap in steady state.
     func msyncFile() {
         guard let base, fileBytes > 0 else { return }
-        msync(base, fileBytes, MS_SYNC)
+        _ = Darwin.msync(base, fileBytes, MS_SYNC)
+    }
+
+    /// Flush the pages holding these elements: what a relocation wrote, and nothing else.
+    func msync(elements lo: Int, _ hi: Int) {
+        guard let base, hi > lo, lo * 2 < fileBytes else { return }
+        let pageSize = Int(getpagesize())
+        let start = (lo * 2) / pageSize * pageSize
+        let end = Swift.min(fileBytes, (hi * 2 + pageSize - 1) / pageSize * pageSize)
+        guard end > start else { return }
+        _ = Darwin.msync(base.advanced(by: start), end - start, MS_SYNC)
+    }
+
+    /// Drop everything past `elements`, in memory and in the file. The region past the new end of
+    /// file is mapped anonymous BEFORE the file shrinks: a page of a shared mapping past EOF faults
+    /// with SIGBUS, and the next append writes exactly there. Returns false, with the logical count
+    /// already cut and the file merely longer than needed, if the file could not be shrunk.
+    @discardableResult
+    func truncate(toElements n: Int, shrinkFile: Bool = true) -> Bool {
+        guard n >= 0, n <= count else { return false }
+        removeLast(count - n)
+        guard shrinkFile, let base, fd >= 0 else { return true }
+        let pageSize = Int(getpagesize())
+        let newFileBytes = Swift.max(pageSize, (n * 2 + pageSize - 1) / pageSize * pageSize)
+        guard newFileBytes < fileBytes else { return true }
+        guard let m = mmap(base.advanced(by: newFileBytes), fileBytes - newFileBytes,
+                           PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED, -1, 0),
+              m != MAP_FAILED else { return false }
+        fileBytes = newFileBytes
+        return ftruncate(fd, off_t(newFileBytes)) == 0
     }
 
     private func fallbackToHeap() {
@@ -1392,25 +1421,41 @@ public final class VectorStore: @unchecked Sendable {
     private func invalidateSlotRowsLocked() { slotRowStruct = .max }
 
     /// The rows of one slot: the CSR's run, then any appended since.
+    ///
+    /// A row whose slot was moved in place since (the tail reclaim) is still listed under its old
+    /// slot, so a row is yielded only while `occSlot` still says this slot; the move files it under
+    /// its new one in `slotRowExtra`.
     struct SlotRows: Sequence {
         let base: ArraySlice<Int32>
         let extra: [Int32]?
-        func makeIterator() -> AnyIterator<Int32> {
-            var b = base.makeIterator()
-            var e = extra?.makeIterator()
-            return AnyIterator { b.next() ?? e?.next() }
+        let occ: [Int32]
+        let slot: Int32
+        struct Iterator: IteratorProtocol {
+            var b: ArraySlice<Int32>.Iterator
+            var e: IndexingIterator<[Int32]>?
+            let occ: [Int32]
+            let slot: Int32
+            mutating func next() -> Int32? {
+                while let r = b.next() ?? e?.next() {
+                    if Int(r) < occ.count, occ[Int(r)] == slot { return r }
+                }
+                return nil
+            }
         }
-        var isEmpty: Bool { base.isEmpty && (extra?.isEmpty ?? true) }
+        func makeIterator() -> Iterator {
+            Iterator(b: base.makeIterator(), e: extra?.makeIterator(), occ: occ, slot: slot)
+        }
     }
 
     /// The rows holding this content. Empty for one nothing points at - which is what a content
     /// whose last owner was deleted becomes.
     @inline(__always) private func rowsOfSlotLocked(_ sl: Int) -> SlotRows {
-        let extra = slotRowExtra.isEmpty ? nil : slotRowExtra[Int32(truncatingIfNeeded: sl)]
-        guard sl >= 0, sl + 1 < slotRowStart.count else { return SlotRows(base: ArraySlice(), extra: extra) }
+        let key = Int32(truncatingIfNeeded: sl)
+        let extra = slotRowExtra.isEmpty ? nil : slotRowExtra[key]
+        guard sl >= 0, sl + 1 < slotRowStart.count else { return SlotRows(base: ArraySlice(), extra: extra, occ: _occSlot, slot: key) }
         let lo = Int(slotRowStart[sl]), hi = Int(slotRowStart[sl + 1])
-        guard lo <= hi, hi <= slotRowIdx.count else { return SlotRows(base: ArraySlice(), extra: extra) }
-        return SlotRows(base: slotRowIdx[lo ..< hi], extra: extra)
+        guard lo <= hi, hi <= slotRowIdx.count else { return SlotRows(base: ArraySlice(), extra: extra, occ: _occSlot, slot: key) }
+        return SlotRows(base: slotRowIdx[lo ..< hi], extra: extra, occ: _occSlot, slot: key)
     }
 
     /// Contents below `n` that no LIVE row points at, as gather indices. This is what replaces
@@ -1436,6 +1481,11 @@ public final class VectorStore: @unchecked Sendable {
     private var orphanCacheOcc = 0                     // rows already counted
     private var orphanCacheLogged = 0                  // deadLog entries already applied
     private var orphanCacheRows = -1                   // slots covered
+    /// Slots whose live count a relocation moved (tail reclaim), merged by the next update.
+    private var orphanMovedSlots: [Int32] = []
+    private var orphanCacheValidLocked: Bool {
+        orphanCacheRows >= 0 && orphanCacheStruct == occStructGen && orphanCacheShrink == deadShrinkGen
+    }
     private func orphanSlotsLocked(upTo n: Int) -> MLXArray? {
         guard n > 0 else { return nil }
         let occ = _occSlot.count
@@ -1464,6 +1514,8 @@ public final class VectorStore: @unchecked Sendable {
             touched.append(sl)
         }
         if n > orphanCacheRows { grow(n - 1); touched.append(contentsOf: (orphanCacheRows ..< n).map(Int32.init)) }
+        touched += orphanMovedSlots
+        orphanMovedSlots.removeAll()
         orphanCacheOcc = occ
         orphanCacheLogged = deadLog.count
         orphanCacheRows = n
@@ -1492,6 +1544,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func rebuildOrphansLocked(upTo n: Int) -> MLXArray? {
+        orphanMovedSlots.removeAll()
         let occ = _occSlot.count
         var dead = [Bool](repeating: false, count: occ)
         for d in deadRows where Int(d) >= 0 && Int(d) < occ { dead[Int(d)] = true }
@@ -10640,8 +10693,228 @@ public final class VectorStore: @unchecked Sendable {
             return true
         }) else { return false }
         defer { queue.sync { reclaimInFlight = false } }
+        // A split index fills its holes from the tail in slices; the whole-file copy below is what
+        // an index not yet on the split still takes.
+        if !Self.copyReclaimForTest, queue.sync(execute: { splitBuilt && v4Dropped && shouldReclaimHolesLocked() }) {
+            return reclaimByTail()
+        }
         return reclaimVectorHolesBodyLocked()
     }
+
+    // MARK: - Hole reclaim by relocation from the tail
+    //
+    // THE WHOLE-FILE RECLAIM ENDS IN ONE HOLD that renumbers every content and reloads the store -
+    // 19.7 + 19.1 s on a cold 9.7M-row clone (index.md, "Heavy CRUD review"). This one never
+    // renumbers: it moves the live positions at the END of the file into the holes at its START, a
+    // slice at a time, until every hole is past every live position, and then cuts the file there.
+    // A move is what the free list already does for a new content - bytes into a position nobody
+    // owns, then the content repointed at it - applied to a content that exists. Each slice is a
+    // complete state: the bytes are written and synced before the transaction that points the
+    // content at them, and that transaction also records the position it left as the hole. So a
+    // crash anywhere leaves an index whose holes are merely somewhere else.
+
+    /// Tests: take the whole-file copy on a split index too, for the crash points only it has.
+    nonisolated(unsafe) static var copyReclaimForTest = false
+    /// Tests: stop after this many slices, before the cut - a reclaim the app quit in the middle of.
+    nonisolated(unsafe) static var tailReclaimStopAfterSlices: Int? = nil
+    /// Tests: commit the cut but leave the file long - a crash between the two.
+    nonisolated(unsafe) static var tailReclaimSkipTruncate = false
+
+    /// Holes ascending and the next live position from the top, kept across slices while nothing
+    /// else writes; any other mutation recomputes them.
+    private var tailPlan: (gen: Int64, holes: [Int32], next: Int, top: Int)?
+
+    private func reclaimByTail() -> Bool {
+        var moves = Self.bulkSliceRowsOverride ?? 64
+        var slices = 0
+        let t0 = Date()
+        while true {
+            if let stop = Self.tailReclaimStopAfterSlices, slices >= stop { return false }
+            let t = Date()
+            let moved: Int = writeGate.hold { queue.sync { dbOpen() ? relocateTailSliceLocked(maxMoves: moves) : -1 } }
+            if moved < 0 { return false }
+            if moved == 0 { break }
+            slices += 1
+            guard Self.bulkSliceRowsOverride == nil else { continue }
+            let perMove = Swift.max(-t.timeIntervalSinceNow, 0.000_1) / Double(moved)
+            moves = Swift.min(Swift.max(Int(Self.bulkSliceBudget / perMove), 16), Swift.min(moves * 2, 16_384))
+        }
+        let ok = writeGate.hold { queue.sync { dbOpen() && finishTailReclaimLocked() } }
+        if Self.searchTiming {
+            print(String(format: "[reclaim] by tail: %d slices, %.1f s, ok=%@", slices, -t0.timeIntervalSinceNow, ok ? "yes" : "no"))
+        }
+        return ok
+    }
+
+    /// Move up to `maxMoves` live positions from the tail into holes from the head. Returns how many
+    /// moved, 0 when no hole lies below a live position, -1 when it must not run.
+    private func relocateTailSliceLocked(maxMoves: Int) -> Int {
+        let n = slotCount
+        guard splitBuilt, v4Dropped, dim > 0, flat16.isPersistent, flat16.count == n * dim,
+              coveredRows == n, unsyncedReuse.isEmpty, !v4BackfillPending else { return -1 }
+        if tailPlan?.gen != mutationGen {
+            tailPlan = (mutationGen, vecHoles.sorted(), 0, n - 1)
+        }
+        guard var plan = tailPlan else { return -1 }
+        var pairs: [(src: Int32, dst: Int32)] = []
+        while pairs.count < maxMoves, plan.next < plan.holes.count {
+            let dst = Int(plan.holes[plan.next])
+            while plan.top > dst, vecHoles.contains(Int32(plan.top)) { plan.top -= 1 }
+            guard plan.top > dst else { break }
+            pairs.append((Int32(plan.top), Int32(dst)))
+            plan.next += 1; plan.top -= 1
+        }
+        guard !pairs.isEmpty else { tailPlan = plan; return 0 }
+        var laps = Laps()
+        // THE BYTES FIRST, AND DURABLE, before anything points at them: until the commit below the
+        // destination is a recorded hole, so a crash here leaves stale bytes nobody reads.
+        var lo = Int.max, hi = 0
+        flat16.withUnsafeMutableBufferPointer { fb in
+            guard let b = fb.baseAddress else { return }
+            for pr in pairs {
+                (b + Int(pr.dst) * dim).update(from: b + Int(pr.src) * dim, count: dim)
+                lo = Swift.min(lo, Int(pr.dst)); hi = Swift.max(hi, Int(pr.dst) + 1)
+            }
+        }
+        if pairs.count * 8 < hi - lo {
+            for pr in pairs { flat16.msync(elements: Int(pr.dst) * dim, (Int(pr.dst) + 1) * dim) }
+        } else {
+            flat16.msync(elements: lo * dim, hi * dim)
+        }
+        laps.lap("bytes")
+        // ONE TRANSACTION: each content repointed, the destination off the hole list and the source
+        // on it. Checked row by row - exactly one content at the source, none at the destination -
+        // and rolled back whole if the table says anything else.
+        guard execChecked("BEGIN IMMEDIATE;") else { return -1 }
+        var move: OpaquePointer?, owner: OpaquePointer?, unhole: OpaquePointer?, hole: OpaquePointer?
+        defer { for st in [move, owner, unhole, hole] { sqlite3_finalize(st) } }
+        guard sqlite3_prepare_v2(db, "UPDATE chunk SET slot = ?1 WHERE slot = ?2 AND slot >= 0;", -1, &move, nil) == SQLITE_OK,
+              sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM chunk WHERE slot = ?1 AND slot >= 0;", -1, &owner, nil) == SQLITE_OK,
+              sqlite3_prepare_v2(db, "DELETE FROM vec_holes WHERE slot = ?1;", -1, &unhole, nil) == SQLITE_OK,
+              sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO vec_holes(slot) VALUES(?1);", -1, &hole, nil) == SQLITE_OK
+        else { rollbackTxnLocked(); return -1 }
+        for pr in pairs {
+            sqlite3_reset(owner); sqlite3_bind_int(owner, 1, pr.dst)
+            guard sqlite3_step(owner) == SQLITE_ROW, sqlite3_column_int(owner, 0) == 0 else { rollbackTxnLocked(); return -1 }
+            sqlite3_reset(move); sqlite3_bind_int(move, 1, pr.dst); sqlite3_bind_int(move, 2, pr.src)
+            guard sqlite3_step(move) == SQLITE_DONE, sqlite3_changes(db) == 1 else { rollbackTxnLocked(); return -1 }
+            sqlite3_reset(unhole); sqlite3_bind_int(unhole, 1, pr.dst)
+            guard sqlite3_step(unhole) == SQLITE_DONE else { rollbackTxnLocked(); return -1 }
+            sqlite3_reset(hole); sqlite3_bind_int(hole, 1, pr.src)
+            guard sqlite3_step(hole) == SQLITE_DONE else { rollbackTxnLocked(); return -1 }
+        }
+        if !slotsOutOfOrder {
+            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.slotsOutOfOrderKey)', '1');")
+        }
+        bumpGenLocked()
+        guard execChecked("COMMIT;") else { rollbackTxnLocked(); return -1 }
+        laps.lap("sql")
+        slotsOutOfOrder = true
+        // The on-disk scan replica describes the destinations' old bytes, and its adoption check
+        // samples too few rows to notice: it goes, and the next quiet moment writes a fresh one.
+        if lastPersistedBaseRows != -1 { try? FileManager.default.removeItem(at: quantReplicaURL); lastPersistedBaseRows = -1 }
+        // MEMORY, IN PLACE. Each row of a moved content takes the new slot; the CSR files it under
+        // the new slot (rowsOfSlotLocked skips it under the old one), and the orphan cache moves the
+        // live count across and re-reads both slots at the next search.
+        ensureSlotRowsLocked()
+        let validOrphans = orphanCacheValidLocked
+        for pr in pairs {
+            let movedRows = Array(rowsOfSlotLocked(Int(pr.src)))
+            for r in movedRows {
+                _occSlot[Int(r)] = pr.dst
+                rows[Int(r)].slot = pr.dst
+                if Int(r) < slotRowExtraUpTo { slotRowExtra[pr.dst, default: []].append(r); slotRowExtraCount += 1 }
+            }
+            if validOrphans {
+                let need = Int(Swift.max(pr.src, pr.dst)) + 1
+                if orphanLive.count < need { orphanLive.append(contentsOf: repeatElement(0, count: need - orphanLive.count)) }
+                orphanLive[Int(pr.dst)] += orphanLive[Int(pr.src)]
+                orphanLive[Int(pr.src)] = 0
+                orphanMovedSlots.append(pr.src); orphanMovedSlots.append(pr.dst)
+            }
+            vecHoles.remove(pr.dst); vecHoles.insert(pr.src)
+            if Int(pr.dst) < baseRows { patchedSlots.append(pr.dst) }
+        }
+        // Everything else that read the old row -> slot mapping.
+        mlxOccSlot = nil; mlxOccSlotRows = 0
+        identityCacheGen = -1
+        baseOccCount = occCountCoveringSlotsLocked(baseRows)
+        invalidateFreeListLocked()
+        plan.gen = mutationGen
+        tailPlan = plan
+        laps.lap("memory")
+        laps.print("relocate moves=\(pairs.count)")
+        return pairs.count
+    }
+
+    /// Drop the tombstoned rows from memory without moving a vector: the four row-parallel arrays
+    /// close up, and everything indexed by row is rebuilt or dropped. Unlike compactRowsLocked no
+    /// position changes, so nothing has to come back out of the vector file first.
+    private func collectTombstonesInPlaceLocked() {
+        guard !deadRows.isEmpty else { return }
+        let dead = deadRows
+        var w = 0
+        for i in 0 ..< rows.count where !dead.contains(Int32(i)) {
+            if w != i { rows[w] = rows[i]; fileID[w] = fileID[i]; kindCode[w] = kindCode[i]; occSlot[w] = occSlot[i] }
+            w += 1
+        }
+        let removed = rows.count - w
+        rows.removeLast(removed); fileID.removeLast(removed); kindCode.removeLast(removed); occSlot.removeLast(removed)
+        deadRows.removeAll(keepingCapacity: true)
+        deadLog.removeAll(); deadShrinkGen &+= 1
+        deadIdxCache = nil
+        slotBackfillCursor = -1
+        rebuildRowWindowsLocked()
+        // Per-ROW arrays on the GPU; the scan base is per position and stays.
+        mlxFileID = nil; mlxFileIDRows = 0; mlxKindCode = nil; mlxKindCodeRows = 0; mlxModified = nil; mlxModifiedRows = 0
+        mlxOccSlot = nil; mlxOccSlotRows = 0; mlxDeadOcc = nil; mlxDeadOccRows = 0
+        identityCacheGen = -1
+        baseOccCount = occCountCoveringSlotsLocked(baseRows)
+        rowWindowAuditLocked("collectTombstones")
+    }
+
+    /// Every hole now lies past every live position: cut the file there. The claim and the hole list
+    /// change in one transaction FIRST, the file after - a crash between leaves a file longer than
+    /// the claim, which the next open truncates. Tombstoned rows still name positions past the cut,
+    /// so they are collected first; nothing in SQLite refers to them.
+    private func finishTailReclaimLocked() -> Bool {
+        let n = slotCount
+        guard splitBuilt, v4Dropped, dim > 0, flat16.isPersistent, coveredRows == n else { return false }
+        let keep = n - vecHoles.count
+        guard keep > 0, vecHoles.allSatisfy({ Int($0) >= keep }) else { return false }
+        guard keep < n else { tailPlan = nil; return true }
+        var laps = Laps()
+        collectTombstonesInPlaceLocked()
+        laps.lap("tombstones")
+        guard execChecked("BEGIN IMMEDIATE;"),
+              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(keep)');"),
+              execChecked("DELETE FROM vec_holes WHERE slot >= \(keep);")
+        else { rollbackTxnLocked(); return false }
+        bumpGenLocked()
+        guard execChecked("COMMIT;") else { rollbackTxnLocked(); return false }
+        coveredRows = keep
+        vecHoles.removeAll()
+        tailPlan = nil
+        // The scan base keeps its first `keep` positions: a slice, not a rebuild.
+        if baseRows > keep {
+            if let bb = bitBase { bitBase = bb[0 ..< keep]; MLX.eval(bitBase!) }
+            if let qb = quantBase {
+                quantBase = (qb.wq[0 ..< keep], qb.scales[0 ..< keep], qb.biases.map { $0[0 ..< keep] })
+            }
+            if let mb = mlxBase { mlxBase = mb[0 ..< keep] }
+            baseRows = keep
+        }
+        patchedSlots.removeAll { Int($0) >= keep }
+        flat16.truncate(toElements: keep * dim, shrinkFile: !Self.tailReclaimSkipTruncate)
+        baseOccCount = occCountCoveringSlotsLocked(baseRows)
+        mlxOccSlot = nil; mlxOccSlotRows = 0
+        invalidateFreeListLocked()
+        laps.lap("cut")
+        laps.print("reclaim cut to \(keep) of \(n)")
+        FileHandle.standardError.write(Data("[omni] reclaimed \(n - keep) vector slots by relocation\n".utf8))
+        return true
+    }
+
 
     private func reclaimVectorHolesBodyLocked() -> Bool {
         // WHAT MOVES IS A POSITION, NOT A ROW. This pass rebuilds the vector file as the live
@@ -11002,7 +11275,10 @@ public final class VectorStore: @unchecked Sendable {
             // delete kept its holes until the next launch.
             if reclaim {
                 let waitWrites = Self.reclaimQuietSeconds + lastMutationAt.timeIntervalSinceNow
-                let waitSearch = Self.reclaimIdleSeconds + lastSearchAt.timeIntervalSinceNow
+                // Relocation holds the queue a slice at a time, so it needs a minute of quiet, not
+                // the five the whole-file copy's single commit does.
+                let idle = (splitBuilt && v4Dropped) ? Swift.min(60, Self.reclaimIdleSeconds) : Self.reclaimIdleSeconds
+                let waitSearch = idle + lastSearchAt.timeIntervalSinceNow
                 if waitWrites <= 0, waitSearch <= 0 {
                     if shouldReclaimHolesLocked() {
                         DispatchQueue.global(qos: .utility).async { [weak self] in self?.reclaimVectorHoles() }

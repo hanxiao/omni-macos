@@ -160,9 +160,81 @@ final class HoleReclaimTests: XCTestCase {
         XCTAssertNil(store.coverageAudit(), "coverage bookkeeping after reclaim")
     }
 
+    /// THE RECLAIM BY RELOCATION, STOPPED PART-WAY. Every slice is a complete state, so a quit after
+    /// any of them leaves an index whose holes have moved and nothing else: the same files, each
+    /// finding its own vector, a clean audit, the same hole count - and a later reclaim finishes it.
+    func testRelocationStoppedPartWayKeepsEveryVector() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("reclaim-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+        let expect = try makeIndexWithHoles(dbURL)
+        let before = state(dbURL)
+        let bytesBefore = vecBytes(dir)
+
+        VectorStore.bulkSliceRowsOverride = 50
+        VectorStore.tailReclaimStopAfterSlices = 3
+        defer { VectorStore.bulkSliceRowsOverride = nil; VectorStore.tailReclaimStopAfterSlices = nil }
+        do {
+            let s = try VectorStore(dbURL: dbURL)
+            XCTAssertFalse(s.reclaimVectorHolesForTest(), "a reclaim told to stop finished")
+            assertEveryFileFindsItself(s, expect, "mid-relocation, same session")
+            s.close()
+        }
+        let mid = state(dbURL)
+        XCTAssertEqual(mid.holes, before.holes, "a move must leave exactly one hole for the one it fills")
+        XCTAssertEqual(mid.covered, before.covered, "the claim moved before the cut")
+        XCTAssertEqual(vecBytes(dir), bytesBefore, "the file changed length before the cut")
+        do {
+            let s = try VectorStore(dbURL: dbURL)
+            assertEveryFileFindsItself(s, expect, "mid-relocation, reopened")
+            XCTAssertNil(s.coverageAudit(), "coverage bookkeeping mid-relocation")
+            VectorStore.tailReclaimStopAfterSlices = nil
+            XCTAssertTrue(s.reclaimVectorHolesForTest(), "the second reclaim declined")
+            assertEveryFileFindsItself(s, expect, "after the relocation, same session")
+            s.close()
+        }
+        let after = state(dbURL)
+        XCTAssertEqual(after.holes, 0)
+        XCTAssertEqual(after.covered, after.rows, "the claim does not cover exactly the live rows")
+        XCTAssertLessThan(vecBytes(dir), bytesBefore, "the vector file did not shrink")
+        let store = try VectorStore(dbURL: dbURL)
+        defer { store.close() }
+        assertEveryFileFindsItself(store, expect, "after the relocation, reopened")
+        XCTAssertNil(store.coverageAudit())
+    }
+
+    /// A crash between the cut's transaction and the file's truncation: the claim says fewer
+    /// positions than the file holds. The next open maps what the claim says and nothing is lost.
+    func testRelocationCutWithTheFileStillLongOpens() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("reclaim-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+        let expect = try makeIndexWithHoles(dbURL)
+        let bytesBefore = vecBytes(dir)
+        VectorStore.tailReclaimSkipTruncate = true
+        defer { VectorStore.tailReclaimSkipTruncate = false }
+        do {
+            let s = try VectorStore(dbURL: dbURL)
+            XCTAssertTrue(s.reclaimVectorHolesForTest())
+            s.close()
+        }
+        VectorStore.tailReclaimSkipTruncate = false
+        XCTAssertEqual(state(dbURL).holes, 0)
+        XCTAssertGreaterThanOrEqual(vecBytes(dir), bytesBefore, "the fixture did not leave the file long")
+        let store = try VectorStore(dbURL: dbURL)
+        defer { store.close() }
+        assertEveryFileFindsItself(store, expect, "claim cut, file long")
+        XCTAssertNil(store.coverageAudit())
+    }
+
     /// CRASH BEFORE THE RENAME. The marker is durable and the copy exists, but the vector file and
     /// the claim still describe each other - so the only correct recovery is to throw the copy away.
     func testCrashBeforeRenameAbandonsTheCopy() throws {
+        // The whole-file copy's own crash points: a split index otherwise reclaims by relocation.
+        VectorStore.copyReclaimForTest = true
+        defer { VectorStore.copyReclaimForTest = false }
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("reclaim-crash1-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -194,6 +266,9 @@ final class HoleReclaimTests: XCTestCase {
     /// the old slots - so the only correct recovery is to finish, not to abandon. Getting this
     /// backwards would leave every row after the first hole reading its neighbour's vector.
     func testCrashAfterRenameFinishesTheReclaim() throws {
+        // The whole-file copy's own crash points: a split index otherwise reclaims by relocation.
+        VectorStore.copyReclaimForTest = true
+        defer { VectorStore.copyReclaimForTest = false }
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("reclaim-crash2-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }

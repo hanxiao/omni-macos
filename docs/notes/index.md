@@ -1245,14 +1245,24 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
   - READERS. listMatching sorted all 2.68M files for 60 results: 6.4 s on the queue, now a bounded
     heap (61 ms). allIndexedPaths (filename refresh, once a minute while indexing) built 2.68M
     Strings in one 534 ms hold; now 100k files a hold.
-- STILL OPEN: the reclaim's commit renumbers every content's slot and reloads the store in one
-  hold - 19.7 + 19.1 s on the cold clone after the image purge (`mutbench --reclaim`, which sets
-  `reclaimIdleSeconds = 0` to measure it). The gates keep it to an idle app; the fix is a reclaim
-  that fills holes from the tail in slices, each like a free-list reuse (write the bytes, msync,
-  repoint the content, record its old position as the hole), then truncates. Its own crash tests.
-- Tests: HeavyCrudTests (300 random ops at 3-row slices, every invariant after each, positive
-  control on the CSR), the partly peeled file, the reclaim gates, listMatching against a sort;
-  testPatchedOnlyFoldMatchesFullRebuild at 1 and 3 bits.
+- THE RECLAIM'S COMMIT renumbered every content's slot and reloaded the store in one hold:
+  19.7 + 19.1 s on the cold clone after the image purge. A split index now reclaims by relocation
+  instead: live positions at the end of the file move into holes at its start, a slice at a time
+  (bytes written and msync'd, then one transaction repoints each content and records the position
+  it left as the hole), and once every hole lies past every live position the claim is cut and the
+  file truncated. Memory follows in place: rows take the new slot, the CSR skips a row under a slot
+  it no longer holds, the orphan cache moves the live count. Same image purge, `mutbench --reclaim`:
+  42 s with a 38-40 s worst search before, 14.9 s with 597 ms after (142 slices, the longest 384 ms
+  cold; the cut 0.5 s, most of it collecting tombstones), the file 9.54 -> 8.67 GB either way.
+  SIGKILL at 1, 3, 6, 9 and 12 s: every reopen audits clean with the same rows, the next reclaim
+  finishes, and searchreal gives the same digest killed, uninterrupted, or not reclaimed at all.
+  The whole-file copy remains for an index not yet on the split; the stamp waits 5 min without a
+  search for it and 1 min for relocation.
+- Tests: HeavyCrudTests (300 random ops at 3-row slices, reclaims among them, every invariant
+  after each, positive control on the CSR), the partly peeled file, the reclaim gates, listMatching
+  against a sort; testPatchedOnlyFoldMatchesFullRebuild at 1 and 3 bits; relocation stopped
+  part-way and cut with the file left long (positive control: rows not repointed fails 1,698
+  checks).
 - Traps hit: `cp` over a binary that has run gets SIGKILL (137) at launch - remove it first. Two
   benches on one clone directory finish each other's work. `pgrep -f pattern` inside a loop whose
   own command line contains the pattern never ends.
