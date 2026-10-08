@@ -126,6 +126,62 @@ final class CoverageClaimRepairTests: XCTestCase {
         try body()
     }
 
+    /// THE WHOLE IDENTITY IS PROVEN WHERE COVERAGE COMPLETES, NOT IN EVERY SLICE.
+    ///
+    /// A slice used to re-count all of `pending_vecs` - 245-279 ms of a 330 ms queue hold on a
+    /// fresh 946,568-content store - to prove "every content past the claim has its blob, none
+    /// below it does". A slice now proves only its own range, and the slice that would complete
+    /// coverage proves the whole of it. A stray blob - one that names no content - must therefore
+    /// still stop coverage from ever COMPLETING; it no longer stops the slices before that. The
+    /// control, the same store without the stray blob, completes.
+    func testAStrayStagedBlobStopsCoverageCompletingNotAdvancing() throws {
+        try withQuantMode {
+            for stray in [false, true] {
+                let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+                let db = dir.appendingPathComponent("index.sqlite")
+                let files = 40
+                // Every vector staged, coverage held at zero; the fold makes the mapping persistent.
+                try {
+                    let saved = VectorStore.vecCoverage
+                    VectorStore.vecCoverage = false
+                    defer { VectorStore.vecCoverage = saved }
+                    let s = try VectorStore(dbURL: db)
+                    for f in 0 ..< files {
+                        let p = "/c/f\(f).txt"
+                        try s.replace(path: p, chunks: [IndexedChunk(path: p, modified: 1, size: 1, kind: "text",
+                                                                     chunkIndex: 0, snippet: "s\(f)", embedding: vec(f))])
+                        if f == files - 6 { _ = s.search(vec(0), topK: 5) }
+                    }
+                    _ = s.search(vec(0), topK: 5)
+                    s.close()
+                }()
+                let savedSlice = VectorStore.coverageSliceOverride
+                VectorStore.coverageSliceOverride = 8
+                defer { VectorStore.coverageSliceOverride = savedSlice }
+                let s = try VectorStore(dbURL: db)
+                s.stampCoverageForTest()          // the split, if it is still owed, and a first slice
+                let firstSlice = s.coveredRowsForTest
+                // Planted through a second connection with the store still open, so nothing on the
+                // open path (which repairs claims) runs between the plant and the slices.
+                if stray { sql(db, "INSERT INTO pending_vecs(chunk_id, vec) VALUES(999999, x'00');") }
+                let store = s
+                for _ in 0 ..< 20 { store.stampCoverageForTest() }
+                let covered = store.coveredRowsForTest, units = store.slotCountForTest
+                store.close()
+                XCTAssertGreaterThan(units, 0)
+                XCTAssertGreaterThan(firstSlice, 0, "coverage never moved; the fixture proves nothing")
+                if stray {
+                    XCTAssertEqual(scalar(db, "SELECT COUNT(*) FROM pending_vecs WHERE chunk_id = 999999"), 1,
+                                   "the stray blob was removed before the check could see it")
+                    XCTAssertGreaterThan(covered, firstSlice, "a stray blob outside the slice stopped the slices")
+                    XCTAssertLessThan(covered, units, "coverage completed with a stray staged blob")
+                } else {
+                    XCTAssertEqual(covered, units, "the control did not complete")
+                }
+            }
+        }
+    }
+
     /// A claim that lags with NO holes: derivable, so it is repaired and the index opens.
     func testLaggingClaimWithNoHolesIsRepairedAndOpens() throws {
         try withQuantMode {

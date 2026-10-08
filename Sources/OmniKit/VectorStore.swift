@@ -10312,6 +10312,7 @@ public final class VectorStore: @unchecked Sendable {
         let coverUnits = slotCount
         let target = Swift.min(coverUnits, coveredRows + Swift.max(1, budget))
         guard target > coveredRows else { return false }
+        var laps = Laps()
         // NO CLAIM OVER ROWS WHOSE POSITION SQLITE DOES NOT KNOW. The sharing clear works by
         // position range, so a row still carrying -1 is not reached by it - and the identity check
         // below would PASS anyway, because a row with no slot is missing from both sides of it.
@@ -10319,10 +10320,12 @@ public final class VectorStore: @unchecked Sendable {
         // SQLite. Backfill first; until it has run, coverage does not move.
         backfillSlotsLocked()
         guard slotsBackfilled else { return false }
+        laps.lap("backfill")
         // The covered prefix must correspond, row for row, to the live rows SQLite has in rowid
         // order. Holes are exactly the slots below `coveredRows` with no row, so this is the
         // arithmetic that has to balance - and if it does not, the claim is not extended.
         let live = liveRowCountLocked()
+        laps.lap("live")
         // THE HOLES THIS SLICE IS ABOUT TO RECORD, computed here rather than after the guard,
         // because the guard is counting them.
         //
@@ -10345,6 +10348,7 @@ public final class VectorStore: @unchecked Sendable {
             !rowsOfSlotLocked(sl).contains { !dead.contains($0) }
         }.map { Int32($0) }
         deadBelow = vecHoles.filter { Int($0) < target }.count + fresh.count
+        laps.lap("fresh")
         guard live == rows.count - deadRows.count, target - deadBelow <= live else { return false }
         // The watermark, derived now if the claim predates it - see ensureCoveredUpToIDLocked for
         // why this cannot be left to the point where the claim is first read.
@@ -10377,19 +10381,37 @@ public final class VectorStore: @unchecked Sendable {
         // its identity check and coverage would never advance at all.
         let onSplit = splitBuilt
         let unit = onSplit ? "chunk" : "chunks"
-        let staged = onSplit ? scalarQuery("SELECT COUNT(*) FROM chunk") : live
-        let clearedRows = scalarQuery("SELECT COUNT(*) FROM \(unit) WHERE slot >= 0 AND slot < \(target)")
+        laps.lap("holes")
         // `AND slot >= 0` LAST: it is what lets SQLite use the partial `idx_chunk_slot_v5`
         // (which cannot prove `slot >= C` implies it), and placed FIRST it becomes the range's
         // lower bound instead of C. On a 6.55M-content clone: 0.21 s scan, 0.004 s last, 0.08 s first.
-        guard execChecked("""
-            DELETE FROM pending_vecs WHERE chunk_id IN
-              (SELECT id FROM \(unit) WHERE slot >= \(coveredRows) AND slot < \(target) AND slot >= 0);
-            """),
-              scalarQuery("SELECT COUNT(*) FROM pending_vecs") == staged - clearedRows,
-              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(target)');"),
+        let range = "SELECT id FROM \(unit) WHERE slot >= \(coveredRows) AND slot < \(target) AND slot >= 0"
+        // THE SLICE PROVES ITS OWN PART, IN ITS OWN RANGE. The identity this transaction must keep -
+        // every content past the claim still has its staged blob, none below it does - used to be
+        // re-proven whole on every slice: `COUNT(*) FROM pending_vecs` walks every leaf of a table
+        // of 1.5 KB blobs, 245-279 ms of a 330 ms hold on a fresh 946,568-content store, the same
+        // whatever the slice size (index.md, "Coverage stamp"). A slice changes only its own
+        // range, so it checks that the blobs it deletes are exactly the ones the range held; the
+        // whole identity is proven once, by the slice that completes coverage, when the table is
+        // nearly empty and the count costs nothing. If it fails there, coverage does not complete.
+        let inRange = scalarQuery("SELECT COUNT(*) FROM pending_vecs WHERE chunk_id IN (\(range));")
+        laps.lap("range")
+        guard execChecked("DELETE FROM pending_vecs WHERE chunk_id IN (\(range));"),
+              Int(sqlite3_changes(db)) == inRange else { rollbackTxnLocked(); return false }
+        laps.lap("delete")
+        if target == coverUnits {
+            let staged = onSplit ? scalarQuery("SELECT COUNT(*) FROM chunk") : live
+            let clearedRows = scalarQuery("SELECT COUNT(*) FROM \(unit) WHERE slot >= 0 AND slot < \(target)")
+            guard scalarQuery("SELECT COUNT(*) FROM pending_vecs") == staged - clearedRows else {
+                rollbackTxnLocked(); return false
+            }
+            laps.lap("identity")
+        }
+        guard execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(target)');"),
               execChecked("COMMIT;")
         else { rollbackTxnLocked(); return false }
+        laps.lap("commit")
+        laps.print("advance \(target - coveredRows) split=\(onSplit)")
         coveredRows = target
         return finishIfCoverageCompleteLocked(target: target, coverUnits: coverUnits)
     }
@@ -11369,14 +11391,21 @@ public final class VectorStore: @unchecked Sendable {
         // and renumbers every position, which is a claim about the file that only means anything
         // once coverage describes it - and an index that cannot reach caught-up has no persistent
         // file to reclaim in the first place.
+        var laps = Laps()
         guard flat16.isPersistent, flat16.extendFileCoverage() else { return }
+        laps.lap("extend")
         flat16.msyncFile()
+        laps.lap("msync")
         clearSyncedReuseBlobsLocked()
+        laps.lap("clear")
         // Forced through after maxYieldToSearch of searching: a slice small enough not to be the
         // stall. The full slice (~1 s on a 7.5M-row clone) was the longest hold on the queue left
         // once the long-text catch-up's other costs were gone (index.md, "Search while long
         // files stream"); the next idle stamp catches up at full size.
-        advanceCoverageLocked(budget: searchRecentlyActiveLocked() ? Swift.min(budget, Self.coverageSliceBusy) : budget)
+        let slice = searchRecentlyActiveLocked() ? Swift.min(budget, Self.coverageSliceBusy) : budget
+        advanceCoverageLocked(budget: slice)
+        laps.lap("advance")
+        laps.print("stamp slice=\(slice)")
     }
 
     /// TOMBSTONES PAST THE BUDGET, ON AN INDEX WITH NO COVERAGE, collected once writes and searches

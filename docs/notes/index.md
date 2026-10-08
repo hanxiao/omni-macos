@@ -1294,6 +1294,16 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
   same scenario). The 570 ms snippet stall in "Heavy CRUD review" has the same shape: reads of the
   database file during a checkpoint's F_FULLFSYNC. The writer maps 256 MB of a 2.26 GB file, so
   most snippet reads are preads; whether mapped reads avoid the wait is unmeasured.
+- COVERAGE STAMP (2026-10-08, found by the benchmark on M4 Pro / M4, reproduced with
+  OMNI_QUANT_BASE=1): a 50,000-row slice held the store queue 317-345 ms on a fresh
+  946,568-content store, and a 25,000-row one 280 ms - not the slice. 245-279 ms of it was
+  `SELECT COUNT(*) FROM pending_vecs`, the per-slice identity check, which walks every leaf of a
+  table of 1.5 KB blobs: O(staged), and staged is the whole index right after a big write. A slice
+  now checks only its own range (the blobs it deletes are exactly the ones the range held) and the
+  whole identity is checked by the slice that completes coverage, when the table is nearly empty.
+  Slice hold 330 -> 57-61 ms. A stray blob still stops coverage completing
+  (CoverageClaimRepairTests.testAStrayStagedBlobStopsCoverageCompletingNotAdvancing; the old
+  code stopped at the first slice, the new one at the last, both short of completion).
 - Tests: HeavyCrudTests (300 random ops at 3-row slices, reclaims among them, every invariant
   after each, positive control on the CSR), the partly peeled file, the reclaim gates, listMatching
   against a sort; testPatchedOnlyFoldMatchesFullRebuild at 1 and 3 bits; relocation stopped
