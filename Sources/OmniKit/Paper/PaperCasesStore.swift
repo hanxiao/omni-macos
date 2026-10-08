@@ -646,8 +646,13 @@ public enum PaperCasesStore {
         // the same size emit the same key twice. The export dedupes rather than losing a row, but a
         // slope between a rung and itself is not a slope.
         let rungs = orderedUnique(p.ints("ladder").map { ($0 / perFile) * perFile })
-        for target in rungs {
-            for arm in ["tombstone_off", "tombstone_on"] {
+        // THE SHIPPED ARM FIRST, AT EVERY SIZE. The compacting arm rewrites the store on each
+        // delete - 0.39 s a delete at 125k rows and 2.4 s at 500k on the M3 Ultra in 0.15.10 - and
+        // run first it spent the case's budget before the shipped arm reached 500k, so the table
+        // lost its row. It also stops at `compact_deletes`: a median of a cost that size needs ten.
+        for arm in ["tombstone_on", "tombstone_off"] {
+            let armDeletes = arm == "tombstone_off" ? min(deletes, p.int("compact_deletes")) : deletes
+            for target in rungs {
                 try ctx.checkCancel()
                 guard ctx.shouldContinue else { out.truncated = true; break }
                 let name = "p21-\(arm)-n\(target).sqlite"
@@ -670,8 +675,8 @@ public enum PaperCasesStore {
                     var removals: [Double] = []
                     var searches: [Double] = []
                     let files = target / perFile
-                    let stride = max(1, files / max(1, deletes))
-                    for i in 0 ..< deletes {
+                    let stride = max(1, files / max(1, armDeletes))
+                    for i in 0 ..< armDeletes {
                         try ctx.checkCancel()
                         guard ctx.shouldContinue else { break }
                         // Spread across the row space rather than taken from one end: a delete near
@@ -686,7 +691,7 @@ public enum PaperCasesStore {
                         let s = Date()
                         _ = store.search(PaperVectors.query(i, dim: dim), filter: SearchFilter(), topK: searchTopK)
                         searches.append(-s.timeIntervalSinceNow * 1000)
-                        if i % 10 == 0 { ctx.progress("\(arm) rung \(target) - delete \(i + 1)/\(deletes)") }
+                        if i % 10 == 0 { ctx.progress("\(arm) rung \(target) - delete \(i + 1)/\(armDeletes)") }
                     }
                     return (removals, searches)
                 }

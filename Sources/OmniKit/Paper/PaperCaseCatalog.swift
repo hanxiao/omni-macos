@@ -90,7 +90,11 @@ public enum PaperCaseCatalog {
     /// v5 corrects two of its rows: per-file reuse turns both reuse layers off in its off arm (v4
     /// left the cross-file one on and compared reuse with reuse), and shaping interleaves 400
     /// searches an arm (v4's 120 in sequence swung from +55% to -104% between two runs).
-    public static let suiteId = "bench-v5"
+    /// v6 measures stores as a running app has them: the vector file read through after every
+    /// open (a copied store is cold to the page cache, and a one-bit store's searches read from
+    /// it: 50-70 ms idle against 5.7), and every search marking the store active, so upkeep yields
+    /// as it does to a user typing. Deletion runs the shipped arm first; scan speedup is a row per size.
+    public static let suiteId = "bench-v6"
     public static let schema = 4
 
     /// Global wall-clock cap, derived rather than fixed.
@@ -345,6 +349,7 @@ public enum PaperCaseCatalog {
             PaperParameter("ladder", .ints([big / 4, big]), scaling: .scaled(minimum: 10_000)),
             PaperParameter("dim", .int(768)),
             PaperParameter("deletes", .int(40), scaling: .scaled(minimum: 5)),
+            PaperParameter("compact_deletes", .int(10), scaling: .scaled(minimum: 3)),
             PaperParameter("chunks_per_file", .int(4)),
         ]).scaled(by: scale)
         return PaperCaseSpec(

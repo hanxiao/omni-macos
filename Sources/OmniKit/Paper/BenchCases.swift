@@ -176,12 +176,17 @@ public enum BenchCases {
         let topK = p.int("top_k"), textQueries = p.int("text_queries")
         let store = try ctx.fs.store(named: built.name)
         defer { store.close() }
+        warm(store, ctx)
+        // EVERY SEARCH HERE MARKS THE STORE ACTIVE, as the app's do. With `markActive: false` the
+        // store's upkeep could not tell anyone was searching and ran full slices in between: one
+        // 280-360 ms query per series on a one-bit store (M4 Pro, M4; reproduced forced on the M3
+        // Ultra) that no user typing into the app would meet.
         let engine = ctx.engine
 
-        let cold = timeMs { _ = store.search(engine.embedQuery(queryTexts[0]), topK: topK, markActive: false) }
+        let cold = timeMs { _ = store.search(engine.embedQuery(queryTexts[0]), topK: topK, markActive: true) }
         out.metrics.append(PaperMetric("cold_first_query", runs: [cold], unit: .milliseconds, aggregate: .single))
         for i in 0 ..< p.int("warmup_queries") {
-            _ = store.search(engine.embedQuery(queryTexts[i % queryTexts.count]), topK: topK, markActive: false)
+            _ = store.search(engine.embedQuery(queryTexts[i % queryTexts.count]), topK: topK, markActive: true)
         }
 
         var endToEnd: [Double] = [], encode: [Double] = [], scan: [Double] = []
@@ -190,7 +195,7 @@ public enum BenchCases {
             guard ctx.shouldContinue else { out.truncated = true; break }
             var v: [Float] = []
             let e = timeMs { v = engine.embedQuery(queryTexts[i % queryTexts.count]) }
-            let s = timeMs { _ = store.search(v, topK: topK, markActive: false) }
+            let s = timeMs { _ = store.search(v, topK: topK, markActive: true) }
             encode.append(e); scan.append(s); endToEnd.append(e + s)
             if i % 25 == 0 { ctx.progress("text query \(i + 1)/\(textQueries)") }
         }
@@ -209,7 +214,7 @@ public enum BenchCases {
                 let file = Int(BenchStore.mix(UInt64(i) &+ 77) % UInt64(Swift.max(1, built.files)))
                 var f = SearchFilter(); f.filenameQuery = "f\(file)"
                 let v = engine.embedQuery(queryTexts[i % queryTexts.count])
-                samples.append(timeMs { _ = store.search(v, filter: f, topK: topK, markActive: false) })
+                samples.append(timeMs { _ = store.search(v, filter: f, topK: topK, markActive: true) })
             }
             out.metrics += PaperMetric.distribution("filename_query", samples: samples, unit: .milliseconds,
                                                     note: "search alone, the query already encoded")
@@ -219,7 +224,7 @@ public enum BenchCases {
         for i in 0 ..< p.int("filtered_queries") where ctx.shouldContinue {
             var f = SearchFilter(); f.kinds = ["image"]
             let v = engine.embedQuery(queryTexts[i % queryTexts.count])
-            let t = timeMs { _ = store.search(v, filter: f, topK: topK, markActive: false) }
+            let t = timeMs { _ = store.search(v, filter: f, topK: topK, markActive: true) }
             if i == 0 {
                 out.metrics.append(PaperMetric("filtered_query_first", runs: [t], unit: .milliseconds,
                                                aggregate: .single, note: "builds the mask columns"))
@@ -232,7 +237,7 @@ public enum BenchCases {
         for i in 0 ..< textQueries where ctx.shouldContinue {
             let file = Int(BenchStore.mix(UInt64(i) &+ 991) % UInt64(Swift.max(1, built.files)))
             similar.append(timeMs {
-                if let v = store.fileVector(built.layout.path(file)) { _ = store.search(v, topK: topK, markActive: false) }
+                if let v = store.fileVector(built.layout.path(file)) { _ = store.search(v, topK: topK, markActive: true) }
             })
         }
         out.metrics += PaperMetric.distribution("find_similar", samples: similar, unit: .milliseconds,
@@ -254,7 +259,7 @@ public enum BenchCases {
                 var v: [Float]?
                 let e = timeMs { v = engine.embedFileQuery(files[i % files.count]) }
                 guard let vec = v else { continue }
-                samples.append(e + timeMs { _ = store.search(vec, topK: topK, markActive: false) })
+                samples.append(e + timeMs { _ = store.search(vec, topK: topK, markActive: true) })
                 if i % 5 == 0 { ctx.progress("\(label) \(i + 1)/\(p.int("media_queries"))") }
             }
             out.metrics += PaperMetric.distribution(label, samples: samples, unit: .milliseconds,
@@ -274,6 +279,7 @@ public enum BenchCases {
         let topK = p.int("top_k"), queries = p.int("queries")
         let store = try ctx.fs.store(named: built.name)
         defer { store.close() }
+        warm(store, ctx)
         let load = (0 ..< Swift.min(p.int("load_files"), corpus.spec.textFiles)).map { corpus.textFileURL($0).path }
 
         var idle: [Double] = []
@@ -398,6 +404,7 @@ public enum BenchCases {
             try ctx.fs.clone(named: built.name, as: copy)
             let store = try ctx.fs.store(named: copy)
             defer { ctx.fs.discard(store, named: copy) }
+            warm(store, ctx)
             _ = store.search(PaperVectors.query(0, dim: layout.dim), filter: SearchFilter(), topK: 10)
             ctx.progress("\(name): writing with searches every \(p.int("probe_interval_ms")) ms")
             try measure(name, store, interval: interval, tail: tail, out: &out) { try op(store) }
@@ -521,6 +528,16 @@ public enum BenchCases {
                                                    from: ["reuse_off.save.\(suffix)", "reuse_on.save.\(suffix)"]))
         }
         return out
+    }
+
+    /// Read the vector file through, as the app does at launch (prefetchVectorFile), before timing
+    /// anything on a store just opened. A copy of a store is a new file to the page cache, and on a
+    /// one-bit store every search reads its candidates' exact vectors from that file: without this
+    /// the idle probe on a copy ran 50-70 ms against 5.7 ms on the store itself (M3 Ultra forced to
+    /// the replica), and every under-load row on a replica Mac measured a cold cache no running app
+    /// has.
+    static func warm(_ store: VectorStore, _ ctx: PaperContext) {
+        _ = store.prefetchVectorFile(until: Date().addingTimeInterval(120), keepGoing: { !ctx.isCancelled }, progress: { _ in })
     }
 
     static func timeMs(_ body: () -> Void) -> Double {

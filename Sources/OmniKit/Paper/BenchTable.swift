@@ -94,15 +94,17 @@ public enum BenchTable {
             guard !cells.isEmpty else { continue }
             out.append(BenchRow(group: s.group, task: s.task, unit: s.unit, cells: cells))
         }
-        // Two derived rows whose metric key depends on the machine: the scan ladder's largest rung,
-        // and the recall grid's shipped point.
+        // Derived rows whose metric key depends on the machine: the scan ladder's rungs and the
+        // recall grid's shipped point.
+        // One row PER SIZE, not one for each machine's largest: the ladder's top rung follows the
+        // memory (500k at 16 GB, 2M at 32 GB and up), and a row named by it split the site's table
+        // into half-empty rows that no two machines shared.
         if let scan = result.cases.first(where: { $0.id == PaperCaseID.scan_ladder.rawValue }) {
-            let speedups = scan.metrics.filter { $0.key.hasSuffix(".bit1_speedup") }
-            if let top = speedups.max(by: { rung($0.key) < rung($1.key) }) {
-                let n = rung(top.key)
+            for m in scan.metrics.filter({ $0.key.hasSuffix(".bit1_speedup") }).sorted(by: { rung($0.key) < rung($1.key) }) {
+                let n = rung(m.key)
                 let size = n >= 1_000_000 && n % 1_000_000 == 0 ? "\(n / 1_000_000)M" : "\(n / 1000)k"
-                out.append(BenchRow(group: "Mechanisms", task: "One-bit scan at \(size) rows, speedup",
-                                    unit: "x", cells: ["value": top.value]))
+                out.append(BenchRow(group: "Mechanisms", task: "One-bit scan speedup, \(size) rows",
+                                    unit: "x", cells: ["value": m.value]))
             }
         }
         if let m = metric(.recall, "b1m\(VectorStore.bitCandidateMultiplier).recall_at_10") {

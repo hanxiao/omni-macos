@@ -6,8 +6,8 @@ the Omni macOS app POSTs anonymous profiling reports, the landing page GETs aggr
 ## Endpoints
 
 - `POST /omni/profiling` - ingest one report. Body must be JSON, `<= 8KB`, `datasetVersion` one of
-  `profiling-v1`, `profiling-v2` (indexing only) or `bench-v4`/`bench-v5` (app 0.15.9+, the table benchmark;
-  v5 from 0.15.10 corrects the reuse and shaping rows, which v4's aggregate leaves out:
+  `profiling-v1`, `profiling-v2` (indexing only) or `bench-v4`/`v5`/`v6` (app 0.15.9+, the table benchmark; every version is stored, the table
+  is built from the current one only:
   adds `model` and `table`, up to 64 rows of `{g, t, u, c}` with cells `p50 p95 p99 max value op`).
   Returns `204` on success, `400` on bad input, `429` when over the per-IP rate limit (~20/hour).
   Dedups on `runId` (`INSERT OR IGNORE`). Server sets `created_at` from its own clock; client time is ignored.

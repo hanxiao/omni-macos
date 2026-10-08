@@ -501,6 +501,21 @@ day later the same tour measured ZERO blocks over 250 ms (see "UI tests").
     gone: 64%, 35%, 27% over three runs, the case 73 -> 162 s.
   - Every latency row now carries its worst sample (the p50's largest run) instead of "max -".
   The collector aggregates v4 runs for every row but those two.
+- bench-v6 (0.15.11), after the first three 0.15.10 uploads (M3 Ultra, M4 Pro, M4):
+  - ONE-BIT MACS MEASURED A COLD CACHE under load: the write scenarios run on an APFS copy of the
+    store, a new file to the page cache, and a one-bit search reads its candidates' exact vectors
+    from it - idle probe 34 ms on the M4 Pro against 5.8 ms in its own query rows (forced on the M3
+    Ultra: 3.8 ms, then 50-70). Every store the benchmark opens is now read through first, as the
+    app does at launch (prefetchVectorFile).
+  - QUERY SPIKES (one 280-360 ms query per series, M4 up to 4 s): the case searched with
+    markActive: false, so the coverage stamp ran full slices underneath; it now marks activity like
+    the app. The stamp's own 330 ms hold was a real app cost and is fixed (index.md, "COVERAGE STAMP").
+  - DELETION ROW MISSING on the M3 Ultra: the compacting arm (0.39 s a delete at 125k, 2.4 s at
+    500k) ran first and timed the case out. The shipped arm now runs first at every size, and the
+    compacting arm stops at 10 deletes.
+  - Scan speedup is one row per size: the top rung follows memory, so a row named by it split the
+    site's table.
+  - The collector builds the site table from the current version only.
 - `--only store_build,search_under_writes` runs a subset (2 min); the report marks it SUBSET RUN.
   With OMNI_SEARCH_TIMING=1 every slice, checkpoint and slow search logs its phases.
 - WHAT IT FOUND ON ITS FIRST FULL RUN: a 1.3-1.8 s stall in the bulk delete (tombstones over budget

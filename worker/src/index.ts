@@ -20,16 +20,14 @@ export interface Env {
 // v1 (1000 files) and v2 (300 files, same modality mix) have comparable files/s and tokens/s RATES,
 // so the indexing history spans both. bench-v4/v5 are the table benchmark (app 0.15.9+): its
 // indexing pass is text only, so its rates are NOT comparable with v1/v2 and stay out of that
-// history; its table is aggregated on its own (`bench` in GET). v5 (0.15.10) corrected two rows
-// that v4 measured wrongly; v4 runs count for every other row.
+// history; its table is aggregated on its own (`bench` in GET). Every bench version is accepted
+// and stored, but the table is built from the CURRENT one only: v5 (0.15.10) corrected two rows v4
+// measured wrongly, and v6 (0.15.11) the under-load and query rows on one-bit Macs, which v5 took
+// on a cold page cache.
 const DATASET_VERSION = "profiling-v2";
 const HISTORY_DATASETS = ["profiling-v1", "profiling-v2"];
-const BENCH_DATASET = "bench-v5";
-const BENCH_DATASETS = ["bench-v4", BENCH_DATASET];
-/** Rows a dataset measured wrongly, left out of the aggregate (the stored table is kept as sent). */
-const BENCH_ROWS_DROPPED: Record<string, Set<string>> = {
-  "bench-v4": new Set(["Mechanisms/Per-file reuse, save p50 saved", "Mechanisms/Shaping, search p99 saved"]),
-};
+const BENCH_DATASET = "bench-v6";
+const BENCH_DATASETS = ["bench-v4", "bench-v5", BENCH_DATASET];
 const ACCEPTED_DATASETS = new Set([...HISTORY_DATASETS, ...BENCH_DATASETS]);
 const MAX_BODY_BYTES = 8 * 1024; // 8KB
 const RATE_LIMIT_PER_HOUR = 20;
@@ -500,7 +498,7 @@ async function handleGet(env: Env): Promise<Response> {
 }
 
 // ---------------------------------------------------------------------------
-// GET: the bench table (v4 and v5)
+// GET: the bench table (the current version)
 // ---------------------------------------------------------------------------
 
 interface BenchRunRow {
@@ -526,10 +524,10 @@ async function benchAggregate(env: Env) {
     `SELECT dataset_ver, chip, model, release_year, mem_bytes, vram_bytes, cpu_cores, app_version,
             macos_version, bench_table
        FROM profiling_runs
-      WHERE dataset_ver IN (${BENCH_DATASETS.map(() => "?").join(",")}) AND bench_table IS NOT NULL
+      WHERE dataset_ver = ? AND bench_table IS NOT NULL
       ORDER BY created_at DESC`
   )
-    .bind(...BENCH_DATASETS)
+    .bind(BENCH_DATASET)
     .all<BenchRunRow>();
   const runs = results ?? [];
 
@@ -549,10 +547,8 @@ async function benchAggregate(env: Env) {
     let m = machines.get(key);
     if (!m) machines.set(key, (m = { meta: [], cells: new Map() }));
     m.meta.push(r);
-    const dropped = BENCH_ROWS_DROPPED[r.dataset_ver];
     for (const row of table) {
       const id = row.g + "/" + row.t;
-      if (dropped?.has(id)) continue;
       if (!rowSeen.has(id)) {
         rowSeen.add(id);
         rows.push({ g: row.g, t: row.t, u: row.u, kind: "value" in row.c ? "value" : "latency" });

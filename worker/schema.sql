@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS profiling_runs (
   id              TEXT PRIMARY KEY,      -- runId (uuid v4), used for dedup via INSERT OR IGNORE
   created_at      INTEGER NOT NULL,      -- server-set epoch ms (worker runtime clock; client time ignored)
   app_version     TEXT,
-  dataset_ver     TEXT NOT NULL,         -- the dataset the run used (profiling-v1, profiling-v2, bench-v4, bench-v5)
+  dataset_ver     TEXT NOT NULL,         -- the dataset the run used (profiling-v1, profiling-v2, bench-v4..v6)
   -- hardware
   chip            TEXT,
   hw_model        TEXT,
@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS profiling_runs (
   tokens_per_sec  REAL,
   error_rate      REAL,
   peak_vram_delta INTEGER,
-  -- bench-v4/v5 (the table benchmark) only
+  -- bench-v4.. (the table benchmark) only
   model           TEXT,                  -- embedding model the run used: nano | small
   bench_table     TEXT                   -- JSON [{g, t, u, c: {p50, p95, p99, max, value, op}}]
 );
