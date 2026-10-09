@@ -344,13 +344,22 @@ final class Vec16Buffer {
     func reserveCapacity(_ n: Int) { if !isMapped { heap.reserveCapacity(n) } }
 
     func append(contentsOf src: [UInt16]) {
-        if let base {
+        if base != nil {
+            // PAST THE RESERVATION, GROW IT IN PLACE. This fell back to the heap, which copies every
+            // vector into anonymous memory and keeps them there: a bulk write of a million rows that
+            // outran its folds left the whole base on the heap (2026-10-09, store-build peak).
+            if (count + src.count) * 2 > reserveBytes { regrowReservation(tailSlackElements: src.count) }
             if (count + src.count) * 2 > reserveBytes { fallbackToHeap() ; heap.append(contentsOf: src); count = heap.count; return }
+            guard let base else { return }
             src.withUnsafeBufferPointer { sp in
                 guard let s = sp.baseAddress else { return }
                 memcpy(base.advanced(by: count * 2), s, src.count * 2)
             }
             count += src.count
+            // And the tail goes into the file every 64 MB rather than waiting for a fold, which a
+            // run of writes with no search between them never reaches: the tail is anonymous memory
+            // until then. One bounded pwrite per 64 MB, on the queue that is already writing.
+            if count * 2 - fileBytes >= 64 << 20 { growFileCoverage() }
         } else {
             heap.append(contentsOf: src); count = heap.count
         }
@@ -572,7 +581,8 @@ final class Vec16Buffer {
     /// the old reservation (appends past it fall back to heap - correct, as ever).
     private func regrowReservation(tailSlackElements: Int) {
         guard let oldBase = base, fd >= 0 else { return }
-        let newReserve = fileBytes + max(64 << 20, max(tailSlackElements * 2, fileBytes / 2))
+        let newReserve = max(fileBytes + max(64 << 20, max(tailSlackElements * 2, fileBytes / 2)),
+                             (count + tailSlackElements) * 2 + (64 << 20))
         guard newReserve > reserveBytes else { return }
         guard let resv = mmap(nil, newReserve, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0),
               resv != MAP_FAILED else { return }
@@ -3439,16 +3449,24 @@ public final class VectorStore: @unchecked Sendable {
             guard !pick.isEmpty else { continue }
             // ONE FILE PAST THE BUDGET is peeled first, so its delete is a slice like the others.
             if pick.count == 1, pick[0].rows > 2 * budget { shrinkFileInSlices(pick[0].path, toAtMost: budget) }
+            let tWarm = Date()
             warmer.warm(files: pick.map { ($0.dir, $0.name) })
             let t = Date()
+            var tHeld: Date?
             writeGate.hold {
                 queue.sync {
+                    tHeld = Date()
                     guard dbOpen() else { return }
                     deletePathsLocked(Set(pick.map(\.path)))
                 }
             }
-            guard Self.bulkSliceRowsOverride == nil else { continue }
             let units = pick.reduce(0) { $0 + $1.rows + 1 }
+            if Self.searchTiming, let tHeld {
+                print(String(format: "[delslice] files=%d units=%d warm=%.1fms wait=%.1fms hold=%.1fms",
+                             pick.count, units, t.timeIntervalSince(tWarm) * 1000,
+                             tHeld.timeIntervalSince(t) * 1000, -tHeld.timeIntervalSinceNow * 1000))
+            }
+            guard Self.bulkSliceRowsOverride == nil else { continue }
             let perRow = Swift.max(-t.timeIntervalSinceNow, 0.000_1) / Double(units)
             budget = Swift.min(Swift.max(Int(Self.bulkSliceBudget / perRow), 64), Swift.min(budget * 2, 65_536))
         }
@@ -8392,6 +8410,10 @@ public final class VectorStore: @unchecked Sendable {
             }
         }
         guard p < slotCount else {
+            // A NEW INDEX MAPS ITS VECTOR FILE AT ITS FIRST VECTOR. It stayed on the heap until the
+            // first fold, and a run of writes with no search between them never folds: a fresh
+            // million-row index held every vector on the heap and doubled it as it grew.
+            if !flat16.isMapped, dim > 0, dim % Self.quantGroup == 0 { ensureVecScratchLocked() }
             // The allocator extended the file; so does the buffer, and the two stay in step because
             // this is the only place either of them grows.
             flat16.append(contentsOf: v)
@@ -11596,7 +11618,6 @@ public final class VectorStore: @unchecked Sendable {
         }
         guard header.magic == "omni-rows-2", header.gen == mutationGen,
               header.rowCount > 0, header.dim > 0, header.dim % Self.quantGroup == 0,
-              Self.quantBitsFor(baseBytes: header.rowCount * header.dim * 2, rowCount: header.rowCount) > 0,
               header.recordBytes == header.rowCount * Self.rowRecordSize
                 || header.recordBytes == header.rowCount * Self.rowRecordSizeV1,
               header.pathCount > 0, header.kindCount > 0,
@@ -12207,6 +12228,10 @@ public final class VectorStore: @unchecked Sendable {
             ensureVecScratchLocked()
             quantReplicaChangedLocked()
         } else if bitBase == nil {
+            // The host bytes go to the file-backed mapping here too, as they do for the one-bit
+            // tier above: evictable, a vector file the coverage stamp can claim, and appends that
+            // grow the mapping instead of the heap.
+            ensureVecScratchLocked()
             flat16.withUnsafeBytes { raw in
                 let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: raw.baseAddress!),
                                 count: byteCount, deallocator: .none)
@@ -13121,6 +13146,9 @@ public final class VectorStore: @unchecked Sendable {
         // 173MB in FILE mode) - but on THIS connection it changes nothing at the default cache
         // (522MB either way), and once the cache is shrunk, FILE mode is strictly worse:
         // +167MB and 0.69s against +0MB and 0.42s. The page cache was the whole effect.
+        // Re-measured at the benchmark's million-content store (2026-10-09, two runs an arm,
+        // interleaved): whole-process compaction peak 4,997 / 5,082 MB in MEMORY mode against
+        // 5,178 / 4,971 in FILE mode, 6.8-7.3 s either way. Still nothing to buy.
         let restoreCache = OmniMemoryBudget.scaled(anchor6GB: 262_144, floor: 65_536, ceiling: 262_144)
         if Self.vacuumSmallCache { exec("PRAGMA cache_size=-2000;") }
         let tVac = Date()
@@ -13830,15 +13858,17 @@ public final class VectorStore: @unchecked Sendable {
         let d0 = storedDimLocked()
         if total > 0 && d0 > 0 {
             rows.reserveCapacity(total)
-            // SCRATCH-FIRST LOAD: when this index will run in quant mode (same predicate the fold
-            // uses), stream the bf16 bytes into the file-backed scratch mapping from the start
-            // instead of anonymous heap. A multi-GB heap load forced macOS to swap-storm a 16GB
+            // SCRATCH-FIRST LOAD: stream the bf16 bytes into the file-backed mapping from the
+            // start instead of anonymous heap. A multi-GB heap load forced macOS to swap-storm a 16GB
             // machine for the whole launch (measured: system swap +9GB, 99s to ready at 3.8M rows);
             // dirty file pages flush lazily and evict for free. Steady state is IDENTICAL to before
             // (the first fold moved these bytes to the same mapping anyway) - only the launch path
-            // changes. Small indexes (bf16 mode) keep the heap exactly as before. If the mapping
-            // fails, reserveCapacity below restores the historical heap path.
-            if Self.quantBitsFor(baseBytes: total * d0 * MemoryLayout<UInt16>.size, rowCount: total) > 0, d0 % Self.quantGroup == 0 {
+            // changes. If the mapping fails, reserveCapacity below restores the historical heap path.
+            // EVERY INDEX, exact or one-bit (2026-10-09). An exact index kept these bytes on the
+            // heap for its whole life: a second 1.4 GB copy beside its GPU base that the OS could
+            // never evict, doubled by the first new row, and no vector file - so no coverage, its
+            // blobs stayed in SQLite, and every bulk delete rewrote them.
+            if d0 % Self.quantGroup == 0 {
                 // Prefer the NAMED persistent file (it doubles as the vector sidecar - a later
                 // stamp makes the next open skip this whole scan); a second store on the same
                 // index fails the flock and gets the private unlinked scratch instead.

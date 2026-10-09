@@ -85,7 +85,8 @@ extension PaperCasesCompute {
                 ctx.progress("n=\(n) \(arm.id)")
                 let point = try ctx.withArm(arm.id) {
                     try Self.sdpaPoint(n: n, heads: heads, headDim: headDim, dtype: dtype,
-                                       iters: iters, warmup: warmup, ctx: ctx)
+                                       iters: iters, warmup: warmup,
+                                       warmupMilliseconds: Double(ctx.params.int("warmup_ms")), ctx: ctx)
                 }
                 guard !point.milliseconds.isEmpty else { out.truncated = true; continue }
                 out.ran(arm.id)
@@ -157,6 +158,35 @@ extension PaperCasesCompute {
         out.add(PaperMetric("canary", runs: point.milliseconds, unit: .milliseconds))
         if point.milliseconds.count < ctx.params.int("iters") { out.truncated = true }
         return out
+    }
+
+    /// The runner's clock probe: the canary's point (bf16 attention at n=1272) behind the same
+    /// wall-clock warm-up, as the median of 15 calls, in milliseconds. About 0.3 s.
+    ///
+    /// Taken once before the first case and again after every case. A display that slept 10 minutes
+    /// into a bench-v8 run left the M3 Ultra and the M4 Pro running every later case 5x slower with
+    /// thermal state nominal and nothing else busy (canary -46% and -48%), and nothing per case said
+    /// so. The probe is what lets the runner refuse to report such a case.
+    static func clockProbeMilliseconds() -> Double {
+        let n = 1272, heads = 12, headDim = 64
+        MLXRandom.seed(PaperCaseCatalog.mlxSeed)
+        let q = MLXRandom.normal([1, heads, n, headDim]).asType(.bfloat16)
+        let k = MLXRandom.normal([1, heads, n, headDim]).asType(.bfloat16)
+        let v = MLXRandom.normal([1, heads, n, headDim]).asType(.bfloat16)
+        MLX.eval(q, k, v)
+        let scale = Float(pow(Double(headDim), -0.5))
+        func attention() -> MLXArray {
+            MLXFast.scaledDotProductAttention(queries: q, keys: k, values: v, scale: scale, mask: .none)
+        }
+        let until = Date().addingTimeInterval(0.25)
+        while Date() < until { MLX.eval(attention()) }
+        var ms: [Double] = []
+        for _ in 0 ..< 15 {
+            let t0 = Date()
+            MLX.eval(attention())
+            ms.append(-t0.timeIntervalSinceNow * 1000)
+        }
+        return ms.sorted()[ms.count / 2]
     }
 
     private struct SDPAPoint {

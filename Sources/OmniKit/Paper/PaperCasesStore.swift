@@ -343,6 +343,10 @@ public enum PaperCasesStore {
         out.extraParameters.set("ladder_skipped_memory",
                                 skippedMemory.isEmpty ? .text("none") : .ints(skippedMemory))
         out.extraParameters.set("top_k", .int(searchTopK))
+        if completed.isEmpty, !skippedMemory.isEmpty {
+            throw PaperMemoryShort("every size needs more memory than is available: "
+                                   + skippedMemory.map(String.init).joined(separator: ","))
+        }
         if !skippedMemory.isEmpty {
             out.note = "rungs skipped for free memory: " + skippedMemory.map(String.init).joined(separator: ",")
         }
@@ -604,6 +608,10 @@ public enum PaperCasesStore {
             let peakMB = PaperCaseCatalog.measuredPeakMB(rows: target, bytesPerRow: PaperCaseCatalog.storeBuildBytesPerRow)
             let freeMB = SystemProbe.snapshot().memFreeMB
             if freeMB > 0, peakMB > freeMB - PaperCaseCatalog.memoryReserveMB { skipped.append(target); continue }
+            // The reference first, then the store: the vectors are a function of their index, so the
+            // answer is the same either way, and its slabs no longer sit on top of the store's peak.
+            guard let reference = try exactReference(rows: target, dim: dim, queries: queryCount, ctx: ctx),
+                  reference.contains(where: { !$0.isEmpty }) else { out.truncated = true; break }
             let name = "recall-n\(target).sqlite"
             let store = try ctx.fs.store(named: name)
             defer { ctx.fs.discard(store, named: name) }
@@ -613,8 +621,6 @@ public enum PaperCasesStore {
                 deadline: ctx.deadline, cancelled: { ctx.isCancelled },
                 progress: { ctx.progress("\(target) rows - built \($0)") })
             guard built == target else { out.truncated = true; break }
-            guard let reference = try exactReference(rows: target, dim: dim, queries: queryCount, ctx: ctx),
-                  reference.contains(where: { !$0.isEmpty }) else { out.truncated = true; break }
             let arm = "n\(target)"
             let r = try ctx.levers.withArm(arm, PaperLeverSet(quantBase: .bits(1), bitCandidateMultiplier: mult)) {
                 () -> (times: [Double], recall: Double) in
@@ -643,6 +649,10 @@ public enum PaperCasesStore {
             out.add(PaperFact("\(arm).candidates", VectorStore.candidateCount(topK: VectorStore.shippedTopK), arm: arm))
             MLX.Memory.clearCache()
         }
+        if measured.isEmpty, !skipped.isEmpty {
+            throw PaperMemoryShort("every size needs more memory than is available: "
+                                   + skipped.map(String.init).joined(separator: ","))
+        }
         out.extraParameters.set("ladder_measured", .ints(measured))
         out.extraParameters.set("ladder_skipped_memory", .ints(skipped))
         return out
@@ -663,13 +673,18 @@ public enum PaperCasesStore {
         // best chunk of each file before it ranks, so a row-level reference would count a row that
         // lost to its own file's better chunk as a miss.
         var best: [[(file: Int, score: Float)]] = Array(repeating: [], count: queries)
-        let slabRows = (65_536 / chunksPerFile) * chunksPerFile
+        // 16k rows a slab, built into one sized buffer: 65k rows through flatMap held a 200 MB array,
+        // its per-row pieces and the fp32 MLX copy at once.
+        let slabRows = (16_384 / chunksPerFile) * chunksPerFile
+        var flat: [Float] = []
+        flat.reserveCapacity(slabRows * dim)
         var slabStart = 0
         while slabStart < rows {
             try ctx.checkCancel()
             guard ctx.shouldContinue else { return nil }
             let slabEnd = min(rows, slabStart + slabRows)
-            let flat = (slabStart ..< slabEnd).flatMap { PaperVectors.vec($0, dim: dim) }
+            flat.removeAll(keepingCapacity: true)
+            for r in slabStart ..< slabEnd { flat.append(contentsOf: PaperVectors.vec(r, dim: dim)) }
             let slab = MLXArray(flat, [slabEnd - slabStart, dim]).asType(.float32)
             let scores = MLX.matmul(slab, queryMatrix)      // [slabRows, queries]
             let files = (slabEnd - slabStart) / chunksPerFile

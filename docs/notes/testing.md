@@ -489,8 +489,8 @@ day later the same tour measured ZERO blocks over 250 ms (see "UI tests").
   chunking ended the fixed grid it predicted). Recall now grids one and three bits (three is the
   shipped affine width); selection keeps only the shipped form and the primitive.
 - Smoke at `--scale 0.05`: 16 cases ok in 2 min 20 s. Full run on the M3 Ultra: 677-690 s. The
-  budgets sum to 4,795 s, the ceiling on any Mac; Settings quotes "10 to 80 minutes" until the
-  smaller Macs have measured numbers.
+  budgets sum to 4,795 s, the ceiling on any Mac; Settings quoted "10 to 80 minutes" until v9
+  measured 11.4 minutes in the app here; it now says "10 to 20 minutes".
 - bench-v5 (0.15.10) after the first in-app run (M3 Ultra, 0.15.9) showed two rows were wrong:
   - PER-FILE REUSE read 1.9%: its off arm turned off only the per-file cache and left the
     cross-file one on, so both arms reused every unchanged chunk (7.41 vs 7.27 ms). Both off:
@@ -572,6 +572,50 @@ day later the same tour measured ZERO blocks over 250 ms (see "UI tests").
   - THE RECLAIM ROW TIMED A NO-OP: reclaimVectorHoles declines until coverage has caught up, and
     right after the kind removal it has not (0.00 s on a 48 GB M4 Pro). Coverage is now brought
     up to date first, untimed, and a reclaim that still declines leaves no row (reclaim_ran).
+- bench-v9 (0.15.14), one release after four v8 reports (M3 Ultra, M4 Pro, M4, M2), with the
+  harness bugs fixed in the harness and the app bugs fixed in the app:
+  - THE DISPLAY WENT TO SLEEP MID-RUN. The M4 Pro's canary ran 46-48% slower after ten minutes:
+    `pmset -g log` showed "Display is turned off" at that minute, and the app ran ~5x slower
+    from there. The run now holds a ProcessInfo activity (userInitiated, idleDisplaySleepDisabled,
+    latencyCritical), and every case is bracketed by a clock probe (bf16 SDPA at n=1272, 250 ms
+    warm, median of 15): more than 20% slower than the fastest probe of the run so far (the first can land on
+    cold clocks: 0.669 ms against 0.475-0.594 after), re-probed after 5 s idle, and the
+    case is `throttled`, kept out of the table and the upload. Clean drift here: 0-4%.
+    POSITIVE CONTROL: `taskpolicy -b -p <pid>` 40 s into a `--scale 0.05` run (background
+    priority, what the app got with the display off): the six cases before it probed 0.48-0.51 ms
+    and stayed ok, every case after it read 55-102% slower and was marked throttled. A second GPU
+    job does NOT trip it (the probes got faster: a busy GPU stays clocked up).
+  - STATUSES SAY WHY: `skipped:dependency` (the store a case needs was not built),
+    `skipped:memory` when every rung of a ladder was skipped, `failed` for an ok case with no
+    metrics (it used to print an empty row). A run that starts short of memory asks first.
+  - THE CAP IS PINNED THE WAY THE APP PINS IT: headroom over what is resident, followed every 1 s
+    over the stores the benchmark has open (PaperMemoryFollower), not one total. The follower
+    leaked every store it touched at first (NSHashTable.allObjects is autoreleased, and a detached
+    thread never drains): 7 live stores and 12 GB after three cases. An autoreleasepool per tick:
+    0 live stores, 2,173 MB MLX after each case. The memory row is now peak over budget, budget =
+    idle after a search + the 1 GB working floor + headroom.
+  - WHAT THE TRACE FOUND IN THE APP (fixed in the app, not the harness):
+    - AN EXACT STORE KEPT ITS ROWS ON THE HEAP (flat16, no vector file, no coverage), so the
+      host copy grew with every write until the first fold and bulk writes had nothing to slice
+      against. Every store is now file-backed from its first vector; an append past the
+      reservation regrows it instead of falling to the heap, and the tail goes to the file every
+      64 MB. Back to back, two runs an arm, M3 Ultra: store_build peak delta 3.9-4.5 GB -> 1.7-1.8;
+      delete under search 11.0-11.8 s -> 4.4-4.7; remove folder 2.7 -> 1.3-1.4; remove kind
+      3.2-3.8 -> 1.3; reindex 4.5-4.9 -> 2.5-2.9; reclaim now runs (2.7-3.5 s); compaction wall
+      16.5-17.3 -> 4.9-6.6 s; peak over budget +2.1 GB -> +0.26-0.34 GB.
+    - THE SETTING DID NOT COUNT THE WORKING FLOOR. requiredMemoryBytes now includes the 1 GB one
+      indexing batch works in, and the Settings footer names it.
+  - TRIED AND NOT SHIPPED: forcing one bit on the M3 Ultra (delete 8.5-9.0 s against exact
+    11.0-12.6: the representation was not the cause); journal_size_limit -1 (delete 7.2 s
+    against 8.7-9.1, but the RESTART waits summed the same, 9.7-12.0 s over 61 checkpoints, and
+    the WAL then keeps its high-water size on disk). The RESTART checkpoint behind the write gate
+    holds writers 0.5-2 s here, where the disk is 87% full and a 64 MB scattered fsync takes
+    ~200 ms; it is an environment cost, not a design one.
+  - MACHINE-INDEPENDENT CASES LEFT THE PER-MAC RUN: tail_rows, recall_scale, compaction and
+    delete_cost gave the same numbers on every Mac (recall is a property of the vectors; the
+    slopes of the row counts). They run with `--only` and the paper quotes them once. Rows that
+    read the same everywhere went too: accelerator busy, cap in force, tagging overhead,
+    per-file reuse.
 - `--only store_build,search_under_writes` runs a subset (2 min); the report marks it SUBSET RUN.
   With OMNI_SEARCH_TIMING=1 every slice, checkpoint and slow search logs its phases.
 - WHAT IT FOUND ON ITS FIRST FULL RUN: a 1.3-1.8 s stall in the bulk delete (tombstones over budget

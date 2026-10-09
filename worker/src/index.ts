@@ -25,11 +25,12 @@ export interface Env {
 // measured wrongly, v6 (0.15.11) the under-load and query rows on one-bit Macs, which v5 took
 // on a cold page cache, and v7 (0.15.12) the rest of the store's cold files and the memory gate
 // that skipped search under writes on a 16 GB Mac, v8 (0.15.13) the same-store shaping, memory and
-// recall-at-scale rows and the fixes that let 16 GB Macs finish.
+// recall-at-scale rows and the fixes that let 16 GB Macs finish, v9 (0.15.14) runs that throttled
+// when the display slept, the app's headroom instead of a fixed cap, and file-backed exact stores.
 const DATASET_VERSION = "profiling-v2";
 const HISTORY_DATASETS = ["profiling-v1", "profiling-v2"];
-const BENCH_DATASET = "bench-v8";
-const BENCH_DATASETS = ["bench-v4", "bench-v5", "bench-v6", "bench-v7", BENCH_DATASET];
+const BENCH_DATASET = "bench-v9";
+const BENCH_DATASETS = ["bench-v4", "bench-v5", "bench-v6", "bench-v7", "bench-v8", BENCH_DATASET];
 const ACCEPTED_DATASETS = new Set([...HISTORY_DATASETS, ...BENCH_DATASETS]);
 const MAX_BODY_BYTES = 8 * 1024; // 8KB
 const RATE_LIMIT_PER_HOUR = 20;

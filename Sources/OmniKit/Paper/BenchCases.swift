@@ -137,12 +137,14 @@ public enum BenchCases {
             if (files / batch) % 8 == 0 { ctx.progress("writing \(rows) rows, \(files) of \(layout.files) files") }
         }
         let writeSeconds = -t0.timeIntervalSinceNow
-        // A settled index, as one is after the app has run a while: coverage claimed, the scan base
-        // built, the sidecars stamped by a clean close.
+        // A settled index, as one is after the app has run a while: the scan base built by a search,
+        // coverage claimed, the sidecars stamped by a clean close. In that order: coverage needs the
+        // file-backed vectors the first fold maps, so claimed before the search it did nothing and the
+        // bench-v8 store was never settled at all.
         ctx.progress("settling the store")
         let t1 = Date()
-        store.advanceCoverageToCompletion()
         _ = store.search(PaperVectors.query(0, dim: layout.dim), filter: SearchFilter(), topK: 10)
+        store.advanceCoverageToCompletion()
         PaperCasesLiveSupport.stampScanTier(store, into: &out)
         store.close()
         let settleSeconds = -t1.timeIntervalSinceNow
@@ -152,9 +154,13 @@ public enum BenchCases {
                 bytes += ((try? FileManager.default.attributesOfItem(atPath: base + suffix)[.size] as? Int) ?? 0) ?? 0
             }
         }
-        var built = layout
-        built.files = files
-        ctx.shared.builtStore = BenchStore.Built(name: name, layout: built, files: files, rows: rows)
+        // Shared only when complete. A store cut short by the budget is a smaller store, and every case
+        // that used it would report its numbers as the full-size store's.
+        if files == layout.files {
+            ctx.shared.builtStore = BenchStore.Built(name: name, layout: layout, files: files, rows: rows)
+        } else {
+            out.note = "the store stopped at \(files) of \(layout.files) files, so the cases that use it are skipped"
+        }
         out.metrics += [
             PaperMetric("write", runs: [Double(rows) / Swift.max(writeSeconds, 0.001)], unit: .chunksPerSecond,
                         aggregate: .single, note: "seeded vectors through replaceMany, no encoder"),
@@ -171,7 +177,7 @@ public enum BenchCases {
 
     static let queryBody: PaperCaseBody = { ctx in
         var out = PaperCaseOutput()
-        guard let built = ctx.shared.builtStore else { out.note = noStore; return out }
+        guard let built = ctx.shared.builtStore else { throw PaperDependencyMissing(noStore) }
         let corpus = try PaperCasesCompute.corpus(ctx)
         let p = ctx.params
         let topK = p.int("top_k"), textQueries = p.int("text_queries")
@@ -274,7 +280,7 @@ public enum BenchCases {
 
     static let loadBody: PaperCaseBody = { ctx in
         var out = PaperCaseOutput()
-        guard let built = ctx.shared.builtStore else { out.note = noStore; return out }
+        guard let built = ctx.shared.builtStore else { throw PaperDependencyMissing(noStore) }
         let corpus = try PaperCasesCompute.corpus(ctx)
         let p = ctx.params
         let topK = p.int("top_k"), queries = p.int("queries")
@@ -421,7 +427,7 @@ public enum BenchCases {
 
     static let writesBody: PaperCaseBody = { ctx in
         var out = PaperCaseOutput()
-        guard let built = ctx.shared.builtStore else { out.note = noStore; return out }
+        guard let built = ctx.shared.builtStore else { throw PaperDependencyMissing(noStore) }
         let p = ctx.params
         let layout = built.layout
         let interval = Double(p.int("probe_interval_ms")) / 1000
@@ -539,7 +545,7 @@ public enum BenchCases {
     /// transient on its own does not show their sum stays under the cap (reviewers, ODI 2026).
     static let traceBody: PaperCaseBody = { ctx in
         var out = PaperCaseOutput()
-        guard let built = ctx.shared.builtStore else { out.note = noStore; return out }
+        guard let built = ctx.shared.builtStore else { throw PaperDependencyMissing(noStore) }
         let corpus = try PaperCasesCompute.corpus(ctx)
         let p = ctx.params
         let layout = built.layout
@@ -552,6 +558,12 @@ public enum BenchCases {
             + (0 ..< corpus.spec.images).map { corpus.imageURL($0).path }
             + (0 ..< corpus.spec.audioClips).map { corpus.audioURL($0).path }
             + (0 ..< corpus.spec.videoClips).map { corpus.videoURL($0).path }
+
+        // At rest as a running app is: one search has built the GPU base, and the memory follower
+        // has had a tick to count it. bench-v8 sampled "idle" before any search, which left the
+        // base (1.4 GB on an exact store) out of the baseline.
+        _ = store.search(PaperVectors.query(0, dim: layout.dim), filter: SearchFilter(), topK: 10)
+        Thread.sleep(forTimeInterval: 2)
 
         let trace = FootprintTrace()
         var traced: [(phase: String, mb: Double)]?
@@ -607,7 +619,6 @@ public enum BenchCases {
         let samples = trace.stop()
         traced = samples
 
-        let capMB = Double(OmniMemoryBudget.capBytes) / 1_048_576
         func peak(_ phase: String?) -> Double? {
             samples.filter { phase == nil || $0.phase == phase }.map(\.mb).max()
         }
@@ -617,12 +628,19 @@ public enum BenchCases {
                                                note: "highest phys_footprint while \(phase == "idle" ? "nothing ran" : phase + " ran")"))
             }
         }
-        if let all = peak(nil) {
+        if let all = peak(nil), let rest = peak("idle") {
+            // The app's own promise: what it holds at rest (the model, the index on the GPU and the
+            // host, the app itself) plus the working floor one batch needs plus the headroom. The
+            // headroom is the run's pin, read back from the budget the app derives from it.
+            let headroomMB = Double(OmniMemoryBudget.capBytes - omniBudgetBaseBytes) / 1_048_576
+            let budgetMB = rest + Double(omniWorkingFloorBytes) / 1_048_576 + headroomMB
             out.metrics.append(PaperMetric("peak", runs: [all], unit: .megabytes, aggregate: .single))
-            out.metrics.append(PaperMetric("cap", runs: [capMB], unit: .megabytes, aggregate: .single,
-                                           note: "OmniMemoryBudget.capBytes, the cap the run pinned"))
-            out.metrics.append(PaperMetric.derived("peak_share_of_cap", value: 100 * all / capMB, unit: .percent,
-                                                   from: ["peak", "cap"]))
+            out.metrics.append(PaperMetric("budget", runs: [budgetMB], unit: .megabytes, aggregate: .single,
+                                           note: "at rest, plus the working floor, plus the headroom"))
+            out.metrics.append(PaperMetric("headroom", runs: [headroomMB], unit: .megabytes, aggregate: .single))
+            out.metrics.append(PaperMetric.derived("peak_over_budget", value: all - budgetMB, unit: .megabytes,
+                                                   from: ["peak", "budget"],
+                                                   note: "above zero: the process went past what the setting promises"))
             // The trace itself, one sample in ten (every 0.5 s), for the figure.
             let thinned = stride(from: 0, to: samples.count, by: 10).map { samples[$0].mb }
             out.metrics.append(PaperMetric("trace", runs: thinned, unit: .megabytes, aggregate: .maximum,

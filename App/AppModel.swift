@@ -1814,8 +1814,8 @@ final class AppModel {
     /// The footprint that is neither MLX nor the index: the app itself. Measured at rest; the
     /// value before that is the measured figure on a real index (648 MB).
     @ObservationIgnored private var appBaselineBytes = 650_000_000
-    /// Model + index + the app's own baseline: what Omni needs before any headroom, which the
-    /// headroom ceiling is computed against. 0 until measured.
+    /// Model + index + the app's own baseline + the working floor: what Omni needs before any
+    /// headroom, which the headroom ceiling is computed against. 0 until measured.
     private(set) var requiredMemoryBytes = 0
     /// Model + index alone - what Settings names, matching its breakdown's Model and Index
     /// slices. The app's own baseline moves with what the UI holds, and a caption that included
@@ -1824,7 +1824,8 @@ final class AppModel {
     /// The most headroom that keeps Omni within half of physical memory, so the setting can never
     /// be what pushes the Mac into swap. The same half the old total cap's ceiling used.
     var maxHeadroomGB: Double {
-        let required = Double(requiredMemoryBytes > 0 ? requiredMemoryBytes : (engineTotalBytes ?? 0) + appBaselineBytes)
+        let required = Double(requiredMemoryBytes > 0 ? requiredMemoryBytes
+                              : (engineTotalBytes ?? 0) + appBaselineBytes + omniWorkingFloorBytes)
         let fits = max(0, ((physicalMemoryGB * 0.5 - required / 1_000_000_000) * 2).rounded(.down) / 2)
         return min(Self.headroomUsefulCeilingGB, fits)
     }
@@ -3874,7 +3875,12 @@ final class AppModel {
         scheduleTagBackfill()
     }
 
-    private func applyMemoryLimit() {
+    private func applyMemoryLimit(force: Bool = false) {
+        // THE BENCHMARK OWNS MEMORY WHILE IT RUNS. It applies a fixed headroom and follows its own
+        // stores (PaperSuite's memory follower); the stats tick following the user's index, or a
+        // settings change, would put the user's headroom back under a case. The run's own restore
+        // passes `force` on the way out.
+        if isPaperRunning && !force { return }
         // NOT WHILE OCR HOLDS THE MEMORY. bootstrap() and loadPerf() both apply the user's cap, and
         // when OCR mode was entered first - a launch straight into OCR, a relaunch restoring it -
         // they put the 6 GB cap back underneath the run, which then spent its time in MLX's
@@ -3934,7 +3940,7 @@ final class AppModel {
     }
 
     /// For the paper run's restore, which pins absolute caps of its own while it runs.
-    func reapplyMemorySetting() { applyMemoryLimit() }
+    func reapplyMemorySetting() { applyMemoryLimit(force: true) }
 
     /// Measure what is resident, at rest: after the model has loaded and warmed, and after an
     /// engine reload. MLX's active bytes then are the weights and the index's GPU base; the
@@ -3948,7 +3954,10 @@ final class AppModel {
         engineRestBytes = max(0, active - search.gpu)
         residentMLXBytes = active
         appBaselineBytes = max(200_000_000, footprint - active - cache - search.cpu)
-        requiredMemoryBytes = active + search.cpu + appBaselineBytes
+        // AND THE WORKING FLOOR. MLX's limit is resident + floor + headroom (omniSetMemoryHeadroom),
+        // so one batch's floor is always on top of the headroom the user sees. Left out of what Omni
+        // needs, the process ran up to 1 GB past what Settings said it would (2026-10-09, memory trace).
+        requiredMemoryBytes = active + search.cpu + appBaselineBytes + omniWorkingFloorBytes
         modelIndexBytes = active + search.cpu
         omniPerfLog(String(format: "memory resident: mlx=%.0fMB (model %.0f, index gpu %.0f) index cpu=%.0fMB app=%.0fMB required=%.0fMB headroom=%.1fGB (max %.1f)",
                            Double(active) / 1e6, Double(engineRestBytes ?? 0) / 1e6, Double(search.gpu) / 1e6,
@@ -3965,7 +3974,7 @@ final class AppModel {
         let resident = engineRest + gpu
         if let r = residentMLXBytes, abs(r - resident) < 64_000_000 { return }
         residentMLXBytes = resident
-        let required = resident + cpu + appBaselineBytes
+        let required = resident + cpu + appBaselineBytes + omniWorkingFloorBytes
         if requiredMemoryBytes != required { requiredMemoryBytes = required }
         if modelIndexBytes != resident + cpu { modelIndexBytes = resident + cpu }
         applyMemoryLimit()

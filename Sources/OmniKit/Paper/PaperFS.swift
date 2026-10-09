@@ -47,8 +47,15 @@ public final class PaperFS: Sendable {
     public func store(named name: String) throws -> VectorStore {
         let url = storesDir.appendingPathComponent(name)
         try assertSafe(url)
-        return try VectorStore(dbURL: url)
+        let store = try VectorStore(dbURL: url)
+        opened.add(store)
+        return store
     }
+
+    /// Every store the run has open, for the memory follower: the app raises MLX's limit as its
+    /// index's GPU base grows, and the run has to do the same for the stores its cases open.
+    public var openStores: [VectorStore] { opened.all }
+    private let opened = PaperOpenStores()
 
     /// Close a store and delete it plus every sidecar it may have written (-wal/-shm, the row and
     /// vector sidecars, the quant replica). The suite builds several multi-hundred-MB stores in one
@@ -159,4 +166,12 @@ public final class PaperFS: Sendable {
         }
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     }
+}
+
+/// Weak references to the stores a run opened. A closed and released store drops out by itself.
+final class PaperOpenStores: @unchecked Sendable {
+    private let lock = NSLock()
+    private let table = NSHashTable<VectorStore>.weakObjects()
+    func add(_ store: VectorStore) { lock.withLock { table.add(store) } }
+    var all: [VectorStore] { lock.withLock { table.allObjects } }
 }

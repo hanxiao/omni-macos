@@ -78,14 +78,16 @@ final class PathAllowCacheKeyTests: XCTestCase {
         XCTAssertEqual(fresh.first?.path, "/c/f\(betaFile).png",
                        "control: tag:beta alone must find its own file")
 
-        // Now prime the cache with a DIFFERENT tag of the same set size, and repeat.
+        // Now prime the cache with a DIFFERENT tag of the same set size, and repeat. On a fresh
+        // store, opened after the first closes: one open store per index (index.md), and a store
+        // whose rows live in its vector file holds that file's lock while it is open.
+        store.close()
         let store2 = try VectorStore(dbURL: db)
         defer { store2.close() }
         _ = store2.search(qBeta, topK: 10)
         _ = store2.search(unit(alphaFile, dim), filter: fAlpha, topK: 10, markActive: false)
         let afterAlpha = store2.search(qBeta, filter: fBeta, topK: 10, markActive: false)
 
-        store.close()
         XCTAssertEqual(afterAlpha.first?.path, "/c/f\(betaFile).png",
                        "tag:beta returned \(afterAlpha.first?.path ?? "nothing") after tag:alpha "
                        + "(same allow-set size) primed the path-allow mask cache")

@@ -30,6 +30,16 @@ public enum PaperCapClass: String, Sendable, Codable {
         }
     }
 
+    /// The headroom the run applies, as the shipped app applies the user's setting. The nano model's
+    /// default (AppModel.defaultHeadroomGB, 1 GB) at 16 GB and above; half of it below, where the
+    /// app's own ceiling (half of physical memory) leaves less.
+    public var headroomBytes: Int {
+        switch self {
+        case .cap3: 500_000_000
+        case .cap6: 1_000_000_000
+        }
+    }
+
     public static func forMachine(memoryBytes: Int) -> PaperCapClass {
         PaperCaseCatalog.gibibytes(memoryBytes) < PaperCaseCatalog.tier16GiB ? .cap3 : .cap6
     }
@@ -102,7 +112,12 @@ public enum PaperCaseCatalog {
     /// memory trace against the cap; recall of the shipped point up to 8 million rows; the attention
     /// points carry their spread. The read-through no longer leaks what it reads, the run stops on
     /// paging rather than swap growth, and the memory gate uses measured peaks.
-    public static let suiteId = "bench-v8"
+    /// v9 is measured as the app runs and checks itself: memory is the app's headroom over what is
+    /// resident, following the open stores, and the memory trace is held to that promise; the run
+    /// keeps the display awake, probes the clock after every case and reports a slowed case as
+    /// throttled; a case that measured nothing is never "ok". Cases whose numbers are the same on
+    /// every Mac (tail rows, recall at scale, compaction, deletion cost) run only when named.
+    public static let suiteId = "bench-v9"
     public static let schema = 4
 
     /// Global wall-clock cap, derived rather than fixed.
@@ -207,9 +222,17 @@ public enum PaperCaseCatalog {
                    textLever(scale), sdpa(scale), gate(scale), scan(memoryBytes, scale),
                    recall(memoryBytes, scale), recallScale(scale), select(memoryBytes, scale), compact(scale),
                    deleteCost(memoryBytes, scale)]
-        guard let only = onlyCases else { return all }
+        guard let only = onlyCases else { return all.filter { !machineIndependent.contains($0.id) } }
         return all.filter { only.contains($0.id) }
     }
+
+    /// Cases whose numbers come out the same on every Mac, so running them per machine adds time and
+    /// memory pressure and no information. Measured on four Macs in bench-v8 (spread across
+    /// machines, max-min over mean): compaction's bounded peak 0.0% and saving 2.6% (memory
+    /// arithmetic), the deletion slopes 13% compacting and 23% marked dead around 3.3x and 1.3x,
+    /// tail-row narrowing 5.6-6.7%, and recall at scale 0.0% (seeded vectors: a property of the
+    /// code). The paper cites each once; they run only when named (`omni-verify bench --only`).
+    public static let machineIndependent: Set<PaperCaseID> = [.tail_rows, .recall_scale, .compaction, .delete_cost]
 
     /// The shipped shortlist width, from the shipped top-k and the shipped tier. The suite measures
     /// this rather than a width of its own: C is what decides how much the exact stage sees, so a
@@ -225,8 +248,13 @@ public enum PaperCaseCatalog {
             PaperParameter("sizes", .ints([256, 512, 1000, 1272, 2000, 4888])),
             PaperParameter("heads", .int(12)),
             PaperParameter("head_dim", .int(64)),
-            PaperParameter("iters", .int(20), scaling: .scaled(minimum: 3)),
+            // 60 timed calls after a wall-clock warm-up, per point. 20 calls behind a single warm-up
+            // call left the short points timing the GPU's clock ramp: the same M3 Ultra read 1.15 and
+            // 2.03 at n=1272 in two runs, and the M4 Pro's n=1000 point had an interquartile range of
+            // 142% of its median (bench-v8). The canary already warms by wall clock for this reason.
+            PaperParameter("iters", .int(60), scaling: .scaled(minimum: 3)),
             PaperParameter("warmup_iters", .int(1)),
+            PaperParameter("warmup_ms", .int(250)),
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .attention, title: "Fused attention curve",

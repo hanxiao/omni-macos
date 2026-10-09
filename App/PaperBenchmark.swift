@@ -86,6 +86,16 @@ extension AppModel {
         // a run that dies part-way still serves at the next launch.
         serving.pausedForBenchmark = true
 
+        // Awake and at full speed for the whole run. Without this, the display's idle sleep (10
+        // minutes by default) slowed every later case about 5x on an M3 Ultra and an M4 Pro, with
+        // thermal state nominal and nothing else running (bench-v8, canary -46% and -48%): a run is
+        // unattended by design, so the idle timers always fire part-way. The runner's clock probe
+        // still checks every case, in case something else slows the machine.
+        let activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .idleDisplaySleepDisabled, .latencyCritical],
+            reason: "Benchmark this Mac")
+        defer { ProcessInfo.processInfo.endActivity(activity) }
+
         // Quiesce the other half of the "no work in flight" contract the suite documents: every
         // embed pipeline paused AND awaited, the watcher stopped.
         //
@@ -138,7 +148,7 @@ extension AppModel {
         // the app can tell "Unlimited" from "capped at exactly physical RAM" on the way back.
         let capClass = PaperCapClass.forMachine(memoryBytes: Int(ProcessInfo.processInfo.physicalMemory))
         let config = PaperRunConfig(runId: runId,
-                                    pinMemoryCapBytes: capClass.capBytes,
+                                    pinHeadroomBytes: capClass.headroomBytes,
                                     restoreMemoryCap: { [weak self] in
                                         // The user's headroom against what is resident now.
                                         Task { @MainActor in self?.reapplyMemorySetting() }
@@ -253,6 +263,25 @@ extension AppModel {
                               Double(freeBytes) / 1_000_000_000))
             return false
         }
+        // Memory, asked up front rather than discovered case by case. A case that does not fit in the
+        // memory available now is skipped, along with every case that uses what it builds; a 16 GB
+        // M2 with its usual apps open missed the shared store by 61 MB and lost a third of the table
+        // to that (bench-v8). Asking first lets the owner quit an app instead of running twice.
+        let freeMB = snap.memFreeMB
+        let specs = PaperCaseCatalog.specs(memoryBytes: Int(ProcessInfo.processInfo.physicalMemory))
+        let reserve = PaperCaseCatalog.memoryReserveMB
+        let blocked = specs.filter { ($0.arithmeticPeakMB ?? 0) > freeMB - reserve }
+        if freeMB > 0, let worst = blocked.compactMap(\.arithmeticPeakMB).max() {
+            let a = NSAlert()
+            a.messageText = "Quit other apps first"
+            a.informativeText = String(format: "%d of the %d measurements need %.1f GB of memory available, and %.1f GB "
+                + "is available now. Quit other apps and run it again, or run anyway: those measurements, "
+                + "and the ones that use what they build, are left out.",
+                blocked.count, specs.count, (worst + reserve) / 1024, freeMB / 1024)
+            a.addButton(withTitle: "Cancel")
+            a.addButton(withTitle: "Run anyway")
+            if a.runModal() != .alertSecondButtonReturn { return false }
+        }
         // Battery alone: allowed, confirmed, and stamped in the export as env.begin.power_source so
         // the row can be discarded later if it looks off.
         if snap.powerSource == "battery" {
@@ -311,9 +340,10 @@ private func renderPaperOutcome(result: PaperSuiteResult, engine: OmniEngine, fs
     return PaperRunOutcome(report: report, text: text, savedTxtURL: saved?.txt)
 }
 
-/// How long a full run takes; shown in Settings and in the battery prompt. 11.5 minutes measured on
-/// the M3 Ultra (2026-10-08); the case budgets sum to 80 minutes, which no run can exceed. Replace
-/// the range with measured numbers once the smaller Macs have run it.
+/// How long a full run takes; shown in Settings and in the battery prompt. bench-v9 measured 11.4
+/// minutes in the app on the M3 Ultra (2026-10-09); the bench-v8 reports less the four cases v9 runs
+/// only once (recall at scale, delete cost, compaction, tail rows) give 10-11 on the M4 Pro and
+/// the M4. The 16 GB Macs skipped cases under v8 that v9 runs, hence the upper end.
 enum BenchmarkDuration {
-    static let minutesLabel = "10 to 80 minutes, depending on the Mac"
+    static let minutesLabel = "10 to 20 minutes, depending on the Mac"
 }

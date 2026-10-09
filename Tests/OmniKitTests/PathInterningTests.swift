@@ -193,7 +193,13 @@ final class PathInterningTests: XCTestCase {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let dbURL = dir.appendingPathComponent("test.sqlite")
-        _ = try makeIndex(dbURL)   // ordinary v3 index, every row carrying its blob
+        // Every row carrying its blob, as the builds before vector coverage wrote it. Coverage held
+        // off explicitly: every store is file-backed now (2026-10-09), so a small index is covered
+        // at close and its blobs cleared, which is the opposite of the state this test is about.
+        let savedCoverage = VectorStore.vecCoverage
+        VectorStore.vecCoverage = false
+        _ = try makeIndex(dbURL)
+        VectorStore.vecCoverage = savedCoverage
 
         // What the downgrade leaves behind: a claim (and holes) for rows that were rewritten by a
         // different binary, plus the vector file gone, which is exactly what 0.4.x's sidecar

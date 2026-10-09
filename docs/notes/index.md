@@ -1312,3 +1312,42 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
 - Traps hit: `cp` over a binary that has run gets SIGKILL (137) at launch - remove it first. Two
   benches on one clone directory finish each other's work. `pgrep -f pattern` inside a loop whose
   own command line contains the pattern never ends.
+
+## Every store is file-backed (2026-10-09, found by the benchmark's memory trace)
+- AN EXACT STORE (below the one-bit threshold: a million contents on the M3 Ultra, less on smaller
+  Macs) kept its bf16 rows on the heap for its whole life: no vector file, so no coverage, so every
+  blob stayed staged in SQLite, and every bulk delete rewrote them. The heap copy sat beside the
+  GPU base where the OS could never evict it, and the first new row doubled it (Array growth).
+  The open path's scratch-first load, the row sidecar adopt and the append path now apply to every
+  store whose width is a multiple of the quant group; an append past the reservation regrows the
+  mapping (max of 64 MB, twice the tail, half the file) instead of falling back to the heap, and
+  the tail is pushed to the file every 64 MB.
+- Measured, benchmark cases back to back, two runs an arm, M3 Ultra, 946,568-content exact store:
+  store_build peak delta 3.9-4.5 GB -> 1.7-1.8; under search: delete 50,000 files 11.0-11.8 s ->
+  4.4-4.7, remove a folder 2.7 -> 1.3-1.4, remove every image 3.2-3.8 -> 1.3, rewrite 5,000
+  4.5-4.9 -> 2.5-2.9; reclaim runs (it declined without coverage); compaction 16.5-17.3 -> 4.9-6.6 s;
+  whole-process peak over what the setting allows +2.1 GB -> +0.26-0.34 GB.
+- NOT THE REPRESENTATION: one bit forced on the same Mac deleted in 8.5-9.0 s against exact's
+  11.0-12.6. The rest of the delete is the WAL RESTART behind the write gate (testing.md, bench-v9).
+- MIGRATION PROVEN on a real exact index written by 0.15.13's own write path (`idxstat` with
+  OMNI_IDXSTAT_DB on 1,988 files of a Slack export: csv, xlsx, pdf, docx, md, py, png; 117,503
+  rows, 87,794 contents, every blob staged, no vector file). APFS clones, release builds:
+  - Answers: digest 6f0668f27144be5a from the old build, the new build's first open (the
+    migration) and its reopen, two rounds; all 299 answers byte identical (OMNI_SEARCHREAL_DUMP).
+    storeaudit after: 0 failing checks. The migration is 0.78 s here: the load writes the vector
+    file (store load 330 ms against the old build's 310-354), coverage clears the 87,794 staged blobs
+    in 0.1 s, and the vacuum owed frees 235 MB in 0.2 s. Reopen loads in 131-140 ms.
+  - Writes under search (mutbench --crud, old index vs migrated, two runs each): rewrite 600 files
+    3.07-3.13 s vs 3.20-3.32; delete 1,000 files 0.93-1.14 vs 0.93-1.02; remove every image
+    0.02-0.03 both; remove the folder 0.90-0.94 vs 1.02-1.08. Worst search 52-183 ms vs 25-178,
+    none over 250 ms. At this size the file costs a little on rewrites and folder removal; at a
+    million contents it halves every bulk write (above).
+  - SIGKILL at 15 points from 0.05 s to 2.5 s (during the load, before coverage with every blob
+    still staged, after coverage committed and during the vacuum, after completion): every reopen
+    0 failing checks, digest 6f0668f27144be5a, dump identical.
+- An unlimited headless run is not the app: `idxstat` set no memory limit, so every gate sized
+  from the cap opened to physical memory and indexing 3,000 real files reached a 221 GB footprint
+  in 89 s and died. It now applies the app's 1 GB headroom (5.2 GB footprint).
+- Two tests assumed the old shape: PathInterningTests' stale-claim fixture now holds coverage off
+  explicitly (a small store is covered at close, blobs cleared), and PathAllowCacheKeyTests opened
+  a second store on an open index, which a store with rows in its locked vector file refuses.

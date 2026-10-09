@@ -39,7 +39,6 @@ public enum BenchTable {
     private static let specs: [Spec] = [
         value("Indexing", "Text indexing", "tokens/s", .index_text, "fresh", .tokensPerSecond),
         value("Indexing", "Text indexing, files", "files/s", .index_text, "fresh", .filesPerSecond),
-        value("Indexing", "Accelerator busy while indexing", "%", .index_text, "fresh_gpu_busy", .percent),
         value("Indexing", "Peak memory while indexing", "MB", .index_text, "fresh_peak_rss_delta"),
         latency("Indexing", "Index one image", .index_image, "tags_on.index_image"),
         latency("Indexing", "Save one edit", .save_edit, "reuse_on.save"),
@@ -65,24 +64,22 @@ public enum BenchTable {
 
         value("Memory", "Peak process memory, indexing every kind while searching", "MB", .memory_trace, "index.peak"),
         value("Memory", "Peak process memory, deleting and compacting", "MB", .memory_trace, "compact.peak"),
-        value("Memory", "Memory cap in force", "MB", .memory_trace, "cap"),
-        value("Memory", "Peak, share of the cap", "%", .memory_trace, "peak_share_of_cap"),
+        value("Memory", "At rest, model and index loaded", "MB", .memory_trace, "idle.peak"),
+        value("Memory", "Peak over what the setting allows", "MB", .memory_trace, "peak_over_budget"),
 
-        value("Mechanisms", "Image tagging overhead", "%", .index_image, "tag_overhead_p50"),
-        value("Mechanisms", "Per-file reuse, save p50 saved", "%", .save_edit, "reuse_gain_p50"),
-        value("Mechanisms", "Tail-row narrowing, throughput gained", "%", .tail_rows, "tail_gain"),
         value("Mechanisms", "Shaping, search p99 saved", "%", .search_while_indexing, "shaping_gain_p99"),
         value("Mechanisms", "Shaping, indexing throughput lost", "%", .search_while_indexing, "shaping_index_cost"),
         value("Mechanisms", "Can't-win prune, latency saved", "%", .prune_fold, "cantwin_gain"),
         value("Mechanisms", "Idle fold, latency saved", "%", .prune_fold, "idlefold_gain"),
-        value("Mechanisms", "Compaction peak saved", "MB", .compaction, "peak_saved"),
-        value("Mechanisms", "Deletion cost slope, marked dead", "x", .delete_cost, "tombstone_on.delete_slope"),
     ]
 
     public static func rows(_ result: PaperSuiteResult) -> [BenchRow] {
         var out: [BenchRow] = []
+        // Only cases that produced numbers at the run's own clock. A throttled case keeps its metrics
+        // in the report for diagnosis; in the table (and so in the upload) it would read as a slow Mac.
+        let cases = result.cases.filter { $0.status.producedNumbers }
         func metric(_ c: PaperCaseID, _ key: String, _ unit: PaperUnit? = nil) -> PaperMetric? {
-            result.cases.first { $0.id == c.rawValue }?.metrics.first { $0.key == key && (unit == nil || $0.unit == unit) }
+            cases.first { $0.id == c.rawValue }?.metrics.first { $0.key == key && (unit == nil || $0.unit == unit) }
         }
         for s in specs {
             var cells: [String: Double] = [:]
@@ -105,21 +102,18 @@ public enum BenchTable {
         // One row PER SIZE, not one for each machine's largest: the ladder's top rung follows the
         // memory (500k at 16 GB, 2M at 32 GB and up), and a row named by it split the site's table
         // into half-empty rows that no two machines shared.
-        if let scan = result.cases.first(where: { $0.id == PaperCaseID.scan_ladder.rawValue }) {
+        if let scan = cases.first(where: { $0.id == PaperCaseID.scan_ladder.rawValue }) {
             for m in scan.metrics.filter({ $0.key.hasSuffix(".bit1_speedup") }).sorted(by: { rung($0.key) < rung($1.key) }) {
                 out.append(BenchRow(group: "Mechanisms", task: "One-bit scan speedup, \(sizeLabel(rung(m.key))) rows",
                                     unit: "x", cells: ["value": m.value]))
             }
         }
-        if let m = metric(.recall, "b1m\(VectorStore.bitCandidateMultiplier).recall_at_10") {
-            out.append(BenchRow(group: "Mechanisms", task: "One-bit funnel recall@10", unit: "%", cells: ["value": m.value]))
-        }
-        // The same shipped point at growing sizes, one row per size for the same reason as the scan.
-        if let scaleCase = result.cases.first(where: { $0.id == PaperCaseID.recall_scale.rawValue }) {
-            for m in scaleCase.metrics.filter({ $0.key.hasSuffix(".recall_at_10") }).sorted(by: { rung($0.key) < rung($1.key) }) {
-                out.append(BenchRow(group: "Mechanisms", task: "One-bit funnel recall@10, \(sizeLabel(rung(m.key))) rows",
-                                    unit: "%", cells: ["value": m.value]))
-            }
+        // The shipped funnel's search time at 500k rows. Its recall is not a row: the vectors are
+        // seeded, so recall is the same on every Mac (bench-v8: 95.78% on all four) and says nothing
+        // about the machine.
+        if let m = metric(.recall, "b1m\(VectorStore.bitCandidateMultiplier).query_p50") {
+            out.append(BenchRow(group: "Queries", task: "One-bit funnel search, 500k rows", unit: "ms",
+                                cells: ["p50": m.value]))
         }
         return out
     }

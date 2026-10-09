@@ -315,6 +315,12 @@ public enum PaperCaseStatus: String, Sendable, Codable {
     case skippedAborted = "skipped:aborted"
     /// No body is compiled in for this case on this build. Never a measured zero.
     case skippedUnimplemented = "skipped:unimplemented"
+    /// The case needs what an earlier case builds (the shared store) and that case did not build it.
+    case skippedDependency = "skipped:dependency"
+    /// The case ran, but the clock probe after it read the machine running slower than its fastest
+    /// earlier in the run (display sleep, App Nap, heat). Its metrics stay in the report for diagnosis and
+    /// never reach the table or the upload.
+    case throttled
 
     public var isSkip: Bool { rawValue.hasPrefix("skipped:") }
     /// Whether the case contributed usable numbers. A timeout did, partially, and says so.

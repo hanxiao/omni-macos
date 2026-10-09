@@ -679,8 +679,8 @@ private struct PerformanceTab: View {
                 Text(model.isPaperRunning ? "Locked while the benchmark runs."
                      : model.memoryPressureActive ? "Paused while your Mac is short of memory; Omni runs on what the model and index need, and the headroom comes back on its own."
                      : (model.modelIndexBytes > 0
-                        ? "On top of the model and index, which take \(ByteSize.memory(model.modelIndexBytes)). More headroom indexes faster; with none, Omni still works, a small batch at a time."
-                        : "On top of the model and index. More headroom indexes faster; with none, Omni still works, a small batch at a time."))
+                        ? "On top of the model and index, which take \(ByteSize.memory(model.modelIndexBytes)), and the \(ByteSize.memory(omniWorkingFloorBytes)) one batch of indexing always works in. More headroom indexes faster; with none, Omni still works, a small batch at a time."
+                        : "On top of the model and index, and the \(ByteSize.memory(omniWorkingFloorBytes)) one batch of indexing always works in. More headroom indexes faster; with none, Omni still works, a small batch at a time."))
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {

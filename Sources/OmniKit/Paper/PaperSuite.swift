@@ -52,6 +52,20 @@ public struct PaperCaseOutput: Sendable {
     public mutating func ran(_ arm: String) { if !arms.contains(arm) { arms.append(arm) } }
 }
 
+/// Thrown by a case that needs what an earlier case builds (the shared store) when that case did
+/// not build it. Recorded as `skipped:dependency`: a case that measured nothing must not read "ok".
+public struct PaperDependencyMissing: Error, CustomStringConvertible {
+    public let description: String
+    public init(_ reason: String) { description = reason }
+}
+
+/// Thrown by a ladder case whose every size was skipped for the memory available, so the case is
+/// recorded as `skipped:memory` rather than as an ok case with nothing in it.
+public struct PaperMemoryShort: Error, CustomStringConvertible {
+    public let description: String
+    public init(_ reason: String) { description = reason }
+}
+
 /// One case's measurement code. Synchronous on purpose: it is called from a detached task and may
 /// block on MLX, sleep and use semaphores, exactly as the omni-verify bench bodies it is ported
 /// from do. It must poll `ctx` for cancel and budget at a bounded granularity.
@@ -97,12 +111,22 @@ public struct PaperRunConfig: Sendable {
     public var swapAbortMB: Double
     /// A case may claim the memory actually free less this (PaperCaseCatalog.memoryReserveMB).
     public var memoryReserveMB: Double
-    /// Pin the memory cap for the run. nil leaves the cap alone (the app pins it itself, because
-    /// only the app can tell "Unlimited" from "capped at exactly physical RAM" on the way back).
-    public var pinMemoryCapBytes: Int?
+    /// The memory headroom the run applies, exactly as the shipped app applies the user's setting:
+    /// MLX's limit is what is resident plus the working floor plus this, and it follows the open
+    /// stores' GPU bases as they grow (AppModel.applyMemoryLimit, followIndexMemory). nil leaves
+    /// memory alone. bench-v8 pinned a fixed total through omniSetMemoryLimit instead, a mode the
+    /// app never runs in, and measured the memory trace against it.
+    public var pinHeadroomBytes: Int?
     public var restoreMemoryCap: (@Sendable () -> Void)?
     /// Worst case to acknowledge a cancel: one gemv, or one file's embed.
     public var cancelLatencyBoundSeconds: Double
+    /// Probe the clock before the first case and after every case, and record a case that ran
+    /// slower than the start as `throttled` (PaperCasesCompute.clockProbeMilliseconds).
+    public var clockCheck: Bool
+    /// How much slower than the start's probe a case's closing probe may read before the case is
+    /// `throttled`. Clean runs drift 0-4% start to end (bench-v8, five Macs); a slept display read
+    /// 46-49% slower.
+    public var clockSlowdownLimitPercent: Double
 
     public init(runId: String = UUID().uuidString,
                 scale: Double = 1.0,
@@ -111,14 +135,17 @@ public struct PaperRunConfig: Sendable {
                 armSettleSeconds: Double = 0.25,
                 swapAbortMB: Double = 512,
                 memoryReserveMB: Double = PaperCaseCatalog.memoryReserveMB,
-                pinMemoryCapBytes: Int? = nil,
+                pinHeadroomBytes: Int? = nil,
                 restoreMemoryCap: (@Sendable () -> Void)? = nil,
-                cancelLatencyBoundSeconds: Double = 3.0) {
+                cancelLatencyBoundSeconds: Double = 3.0,
+                clockCheck: Bool = true,
+                clockSlowdownLimitPercent: Double = 20) {
         self.runId = runId; self.scale = scale; self.maxWallSeconds = maxWallSeconds
         self.interCaseGapSeconds = interCaseGapSeconds; self.armSettleSeconds = armSettleSeconds
         self.swapAbortMB = swapAbortMB; self.memoryReserveMB = memoryReserveMB
-        self.pinMemoryCapBytes = pinMemoryCapBytes; self.restoreMemoryCap = restoreMemoryCap
+        self.pinHeadroomBytes = pinHeadroomBytes; self.restoreMemoryCap = restoreMemoryCap
         self.cancelLatencyBoundSeconds = cancelLatencyBoundSeconds
+        self.clockCheck = clockCheck; self.clockSlowdownLimitPercent = clockSlowdownLimitPercent
     }
 }
 
@@ -239,21 +266,30 @@ public enum PaperSuite {
         levers.pin(.suiteWide)
 
         let originalCap = omniMemoryLimitBytes()
-        if let pin = config.pinMemoryCapBytes {
-            omniSetMemoryLimit(pin)
-            // AND through the lever controller, so the run's cap becomes the pinned value the arms
-            // restore to. The levers capture the cap as part of their snapshot, so without this
-            // every arm scope would put the user's own setting back on the way in and the suite
-            // would measure at a cap it did not pin. The cap sweep depends on this: it is the one
-            // case that moves the cap deliberately, and it can only do that if the value it
-            // restores to is the run's pin rather than whatever the app was set to.
-            levers.pin(PaperLeverSet(memoryCapBytes: pin))
+        var follower: PaperMemoryFollower?
+        if let headroom = config.pinHeadroomBytes {
+            // What is resident before any case opens a store: the weights. The follower adds each
+            // open store's GPU base to it, as the app's stats tick adds its index's.
+            let engineRest = omniGPUActiveMemory()
+            omniSetMemoryHeadroom(headroom, residentBytes: engineRest)
+            // AND through the lever controller, so the budget the batch sizes scale from is the
+            // value every arm restores to, rather than the owner's own setting.
+            levers.pin(PaperLeverSet(memoryCapBytes: OmniMemoryBudget.capBytes))
+            follower = PaperMemoryFollower(headroom: headroom, engineRest: engineRest, fs: fs)
         }
         defer {
-            if config.pinMemoryCapBytes != nil {
+            follower?.stop()
+            if config.pinHeadroomBytes != nil {
                 if let restore = config.restoreMemoryCap { restore() } else { omniSetMemoryLimit(originalCap) }
             }
         }
+
+        // The clock every case is held to: the FASTEST probe of the run so far, first taken here
+        // after the cap is pinned. Not the first probe alone: it can land on cold clocks (0.669 ms
+        // against 0.475-0.594 for the rest of one run), and a baseline that slow hides a throttle
+        // of the same size. A machine that slows down later (display sleep, App Nap, heat) is
+        // caught case by case.
+        var clockBase = config.clockCheck ? PaperCasesCompute.clockProbeMilliseconds() : nil
 
         let startedAt = Date()
         let begin = SystemProbe.snapshot()
@@ -336,6 +372,12 @@ public enum PaperSuite {
                 } catch is CancellationError {
                     caseStatus = .cancelled
                     note = "cancelled mid-case"
+                } catch let missing as PaperDependencyMissing {
+                    caseStatus = .skippedDependency
+                    note = missing.description
+                } catch let short as PaperMemoryShort {
+                    caseStatus = .skippedMemory
+                    note = short.description
                 } catch {
                     caseStatus = .failed
                     note = "\(error)"
@@ -353,6 +395,34 @@ public enum PaperSuite {
                     }
                 }
                 if caseStatus == .cancelled { status = .cancelled }
+                // Never "ok" with nothing in it: a body that returned no measurement says why in its
+                // note, and the status says it did not measure.
+                if caseStatus == .ok, output.metrics.isEmpty {
+                    caseStatus = .failed
+                    note = output.note ?? "the case returned no measurements"
+                }
+
+                // The closing probe. A case that produced numbers at a slower clock than the run
+                // has shown it can do is not reported as measured: one retry after a pause separates a
+                // momentary dip from a machine that has changed clock domain.
+                if let base = clockBase, base > 0, caseStatus.producedNumbers, step.repetition == .only {
+                    var probe = PaperCasesCompute.clockProbeMilliseconds()
+                    if 100 * (probe - base) / base > config.clockSlowdownLimitPercent {
+                        idle(5, isCancelled: isCancelled)
+                        probe = PaperCasesCompute.clockProbeMilliseconds()
+                    }
+                    let slowdown = 100 * (probe - base) / base
+                    output.facts.append(PaperFact("clock_probe_ms", String(format: "%.3f", probe)))
+                    output.facts.append(PaperFact("clock_probe_best_ms", String(format: "%.3f", base)))
+                    if slowdown > config.clockSlowdownLimitPercent {
+                        caseStatus = .throttled
+                        note = String(format: "the machine ran %.0f%% slower after this case than its fastest earlier "
+                                      + "in the run (clock probe %.2f ms against %.2f ms); its numbers are kept in the "
+                                      + "report and left out of the table", slowdown, probe, base)
+                    } else {
+                        clockBase = min(base, probe)
+                    }
+                }
 
                 let envEnd = SystemProbe.snapshot()
                 let peakDelta = peak.stop()
@@ -415,7 +485,7 @@ public enum PaperSuite {
         return PaperSuiteResult(
             suite: PaperCaseCatalog.suiteId, schema: PaperCaseCatalog.schema, runId: config.runId,
             scale: config.scale, capClass: capClass,
-            pinnedCapBytes: config.pinMemoryCapBytes ?? originalCap,
+            pinnedCapBytes: config.pinHeadroomBytes != nil ? OmniMemoryBudget.capBytes : originalCap,
             startedAtUTC: startedAt, endedAtUTC: endedAt,
             wallSeconds: endedAt.timeIntervalSince(startedAt), status: status, cases: results,
             begin: begin, end: end, maxThermal: thermalName(maxThermalRank),
@@ -451,6 +521,51 @@ public enum PaperSuite {
             lock.withLock { running = false }
             done.wait()
             return lock.withLock { high } - base
+        }
+    }
+
+    /// The app's memory follower, for a run: every second, what is resident is the weights plus the
+    /// GPU base of every store the run has open, and MLX's limit is moved to that plus the working
+    /// floor plus the headroom once it has changed by 64 MB - the same rule and the same threshold as
+    /// AppModel.followIndexMemory. Without it a case that opens a store would run its MLX work in a
+    /// limit that does not count the store's base.
+    final class PaperMemoryFollower: @unchecked Sendable {
+        private let lock = NSLock()
+        private var running = true
+        private var gpu: [ObjectIdentifier: Int] = [:]
+        private let done = DispatchSemaphore(value: 0)
+        init(headroom: Int, engineRest: Int, fs: PaperFS) {
+            Thread.detachNewThread { [self] in
+                var applied = engineRest
+                while lock.withLock({ running }) {
+                    // IN A POOL: NSHashTable.allObjects hands the stores back autoreleased, and a
+                    // detached thread has no pool to drain them. Without this every store the run
+                    // ever opened stayed alive with its GPU base: seven stores, 12 GB of MLX
+                    // memory, after three cases.
+                    autoreleasepool {
+                        let stores = fs.openStores
+                        let live = Set(stores.map { ObjectIdentifier($0) })
+                        for s in stores {
+                            let id = ObjectIdentifier(s)
+                            s.residentSearchMemory { [self] m in lock.withLock { gpu[id] = m.gpu } }
+                        }
+                        let resident = engineRest + lock.withLock {
+                            gpu = gpu.filter { live.contains($0.key) }
+                            return gpu.values.reduce(0, +)
+                        }
+                        if abs(resident - applied) >= 64_000_000 {
+                            omniSetMemoryHeadroom(headroom, residentBytes: resident)
+                            applied = resident
+                        }
+                    }
+                    Thread.sleep(forTimeInterval: 1)
+                }
+                done.signal()
+            }
+        }
+        func stop() {
+            lock.withLock { running = false }
+            done.wait()
         }
     }
 

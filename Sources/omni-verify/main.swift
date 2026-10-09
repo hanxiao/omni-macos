@@ -368,7 +368,7 @@ func paperRun(engine: OmniEngine, scale: Double, maxWall: Double, outPath: Strin
 
     let progress = PaperConsoleProgress()
     let config = PaperRunConfig(runId: runId, scale: scale, maxWallSeconds: maxWall,
-                                pinMemoryCapBytes: pinCap ? capClass.capBytes : nil)
+                                pinHeadroomBytes: pinCap ? capClass.headroomBytes : nil)
     let result = PaperSuite.run(config: config, engine: engine, fs: fs, bodies: PaperAllCaseBodies(),
                                 isCancelled: { cancel.on },
                                 onProgress: { p in progress.apply(p) })
@@ -7146,10 +7146,18 @@ if args.count >= 4 && args[1] == "idxstat" {
     let engine = ProcessInfo.processInfo.environment["OMNI_VALIDATED"] == "1"
         ? try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
         : try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    // The app's setting: the nano default headroom over what is resident. Unset, the cap is
+    // physical memory and every gate sized from it opens wide (221 GB footprint on 3,000 files).
+    omniSetMemoryHeadroom(1_000_000_000, residentBytes: omniGPUActiveMemory())
     let target = URL(fileURLWithPath: args[3])
-    let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("idxs-\(UUID().uuidString).sqlite")
-    defer { try? FileManager.default.removeItem(at: tmp) }
+    // OMNI_IDXSTAT_DB=<path> keeps the index there: a real index built by this build's write path,
+    // for a migration to be proven on (CLAUDE.md, "A MIGRATION IS NOT DONE UNTIL...").
+    let keep = ProcessInfo.processInfo.environment["OMNI_IDXSTAT_DB"]
+    let tmp = keep.map { URL(fileURLWithPath: $0) }
+        ?? FileManager.default.temporaryDirectory.appendingPathComponent("idxs-\(UUID().uuidString).sqlite")
+    defer { if keep == nil { try? FileManager.default.removeItem(at: tmp) } }
     let store = try VectorStore(dbURL: tmp)
+    defer { store.close() }
     let idx = Indexer(store: store, embedder: engine)
     let final: IndexProgress = await withCheckedContinuation { cont in
         let done = NSLock(); var fired = false
@@ -7159,6 +7167,7 @@ if args.count >= 4 && args[1] == "idxstat" {
     }
     print(String(format: "IDXSTAT scanned=%d embedded=%d skipped=%d unchanged=%d failed=%d",
                  final.scanned, final.embedded, final.skipped, final.unchanged, final.failed))
+    store.close()
     exit(0)
 }
 
