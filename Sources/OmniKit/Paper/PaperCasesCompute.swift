@@ -77,6 +77,7 @@ extension PaperCasesCompute {
         // ramp during the case to whichever dtype ran second, and this case is the one the thermal
         // canary is calibrated against.
         for n in sizes {
+            var times: [String: [Double]] = [:]
             for arm in ctx.spec.arms {
                 guard ctx.shouldContinue else { out.truncated = true; break }
                 try ctx.checkCancel()
@@ -92,6 +93,27 @@ extension PaperCasesCompute {
                 out.add(PaperMetric(key, runs: point.milliseconds, unit: .milliseconds, arm: arm.id))
                 out.add(PaperMetric(key, runs: point.tflops, unit: .tflops, arm: arm.id))
                 if point.milliseconds.count < iters { out.truncated = true }
+                times[Self.armKeyPrefix(arm.id)] = point.milliseconds
+                // The spread of the point itself, so a ratio near one can be read against it: the
+                // interquartile range as a share of the median (reviewers, ODI 2026).
+                let sorted = point.milliseconds.sorted()
+                let q = { (f: Double) in sorted[Swift.min(sorted.count - 1, Int(f * Double(sorted.count)))] }
+                if q(0.5) > 0 {
+                    out.add(PaperMetric.derived("\(key)_iqr", value: 100 * (q(0.75) - q(0.25)) / q(0.5), unit: .percent,
+                                                from: [key], arm: arm.id, note: "interquartile range over the median"))
+                }
+            }
+            // fp32-operand time over bf16-operand time at this size, the paper's ratio, from the
+            // medians of the same interleaved series.
+            let keys = times.keys.sorted()
+            if keys.count == 2, let a = times[keys[0]], let b = times[keys[1]] {
+                let med = { (x: [Double]) in x.sorted()[x.count / 2] }
+                let (bf16, fp32) = keys[0].contains("bf16") ? (a, b) : (b, a)
+                if med(bf16) > 0 {
+                    out.add(PaperMetric.derived("n\(n).fp32_over_bf16", value: med(fp32) / med(bf16), unit: .speedup,
+                                                from: keys.map { "\($0)_n\(n)" },
+                                                note: "above one: bf16 operands are faster"))
+                }
             }
             if out.truncated { break }
         }

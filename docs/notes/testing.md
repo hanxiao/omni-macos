@@ -551,6 +551,27 @@ day later the same tour measured ZERO blocks over 250 ms (see "UI tests").
   - Serving is held off for the run (ServingController.pausedForBenchmark, never persisted) instead
     of refusing to start. Isolated instance on 51399: answered, closed for the 48 s the run took,
     answered after the cancel.
+- bench-v8 (0.15.13), for the ODI 2026 reviews (same-store shaping, memory against the cap, recall
+  at scale, attention spread). First full-scale numbers, M3 Ultra, exact store:
+  - SHAPING'S LOAD WAS NEVER ENCODER WORK. It re-indexed the same 60 files, and the store skips a
+    file whose bytes it holds (and reuses chunks it has): 1,150 files/s in both arms even with
+    reuse off, throughput cost 0.7%. The load now edits each copy before re-indexing it, with the
+    chunk cache and cross-file reuse off, and writes into a copy of the store being searched.
+    Then: 40.3 files/s unshaped, 38.3 shaped (5.0% lost), search p99 121.9 -> 111.2 ms (8.8%
+    saved), p50 35.6 / 34.0 against 6.4 idle. The old 58% p99 gain on this Mac was measured
+    against a load that reached the encoder only on its first pass over the 60 files.
+  - MEMORY TRACE: whole-process phys_footprint every 50 ms while every kind is indexed into a copy
+    of the store as it is searched, then a delete and a compaction. Peak 10,714 MB against a
+    pinned 5,722 MB budget (187%), 6,710 MB before the workload started. The exact store holds
+    its rows twice (host flat16 and the GPU base), so a total cap could not hold on this Mac; the
+    paper now describes the setting as headroom, which is what the app ships (issue #27).
+  - RECALL AT SCALE, shipped point (one bit, C = 7,680), seeded vectors: 95.31% at 1M, 94.06 at
+    2M, 89.84 at 4M, 88.28 at 8M; p50 7.3 to 10.2 ms. It falls as the shortlist becomes a smaller
+    share of the index. 8M took 750 s to build and score here; smaller Macs skip the rungs whose
+    measured peak does not fit.
+  - THE RECLAIM ROW TIMED A NO-OP: reclaimVectorHoles declines until coverage has caught up, and
+    right after the kind removal it has not (0.00 s on a 48 GB M4 Pro). Coverage is now brought
+    up to date first, untimed, and a reclaim that still declines leaves no row (reclaim_ran).
 - `--only store_build,search_under_writes` runs a subset (2 min); the report marks it SUBSET RUN.
   With OMNI_SEARCH_TIMING=1 every slice, checkpoint and slow search logs its phases.
 - WHAT IT FOUND ON ITS FIRST FULL RUN: a 1.3-1.8 s stall in the bulk delete (tombstones over budget

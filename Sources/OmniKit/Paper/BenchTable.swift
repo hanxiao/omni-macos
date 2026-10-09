@@ -15,7 +15,7 @@ public struct BenchRow: Sendable, Codable, Equatable, Identifiable {
 /// upload carries. The table is a view over the metrics: every cell names the metric it came from,
 /// so nothing here is measured or computed beyond picking one value.
 public enum BenchTable {
-    public static let groups = ["Indexing", "Queries", "Search under load", "Mechanisms"]
+    public static let groups = ["Indexing", "Queries", "Search under load", "Memory", "Mechanisms"]
     public static let latencyColumns = ["p50", "p95", "p99", "max"]
 
     private struct Spec {
@@ -63,10 +63,16 @@ public enum BenchTable {
         latency("Search under load", "While removing a kind", .search_under_writes, "kind.search", op: "kind.op"),
         latency("Search under load", "While reclaiming space", .search_under_writes, "reclaim.search", op: "reclaim.op"),
 
+        value("Memory", "Peak process memory, indexing every kind while searching", "MB", .memory_trace, "index.peak"),
+        value("Memory", "Peak process memory, deleting and compacting", "MB", .memory_trace, "compact.peak"),
+        value("Memory", "Memory cap in force", "MB", .memory_trace, "cap"),
+        value("Memory", "Peak, share of the cap", "%", .memory_trace, "peak_share_of_cap"),
+
         value("Mechanisms", "Image tagging overhead", "%", .index_image, "tag_overhead_p50"),
         value("Mechanisms", "Per-file reuse, save p50 saved", "%", .save_edit, "reuse_gain_p50"),
         value("Mechanisms", "Tail-row narrowing, throughput gained", "%", .tail_rows, "tail_gain"),
         value("Mechanisms", "Shaping, search p99 saved", "%", .search_while_indexing, "shaping_gain_p99"),
+        value("Mechanisms", "Shaping, indexing throughput lost", "%", .search_while_indexing, "shaping_index_cost"),
         value("Mechanisms", "Can't-win prune, latency saved", "%", .prune_fold, "cantwin_gain"),
         value("Mechanisms", "Idle fold, latency saved", "%", .prune_fold, "idlefold_gain"),
         value("Mechanisms", "Compaction peak saved", "MB", .compaction, "peak_saved"),
@@ -101,16 +107,25 @@ public enum BenchTable {
         // into half-empty rows that no two machines shared.
         if let scan = result.cases.first(where: { $0.id == PaperCaseID.scan_ladder.rawValue }) {
             for m in scan.metrics.filter({ $0.key.hasSuffix(".bit1_speedup") }).sorted(by: { rung($0.key) < rung($1.key) }) {
-                let n = rung(m.key)
-                let size = n >= 1_000_000 && n % 1_000_000 == 0 ? "\(n / 1_000_000)M" : "\(n / 1000)k"
-                out.append(BenchRow(group: "Mechanisms", task: "One-bit scan speedup, \(size) rows",
+                out.append(BenchRow(group: "Mechanisms", task: "One-bit scan speedup, \(sizeLabel(rung(m.key))) rows",
                                     unit: "x", cells: ["value": m.value]))
             }
         }
         if let m = metric(.recall, "b1m\(VectorStore.bitCandidateMultiplier).recall_at_10") {
             out.append(BenchRow(group: "Mechanisms", task: "One-bit funnel recall@10", unit: "%", cells: ["value": m.value]))
         }
+        // The same shipped point at growing sizes, one row per size for the same reason as the scan.
+        if let scaleCase = result.cases.first(where: { $0.id == PaperCaseID.recall_scale.rawValue }) {
+            for m in scaleCase.metrics.filter({ $0.key.hasSuffix(".recall_at_10") }).sorted(by: { rung($0.key) < rung($1.key) }) {
+                out.append(BenchRow(group: "Mechanisms", task: "One-bit funnel recall@10, \(sizeLabel(rung(m.key))) rows",
+                                    unit: "%", cells: ["value": m.value]))
+            }
+        }
         return out
+    }
+
+    private static func sizeLabel(_ n: Int) -> String {
+        n >= 1_000_000 && n % 1_000_000 == 0 ? "\(n / 1_000_000)M" : "\(n / 1000)k"
     }
 
     private static func rung(_ key: String) -> Int {

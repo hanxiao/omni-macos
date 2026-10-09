@@ -97,6 +97,7 @@ public enum BenchCases {
         case .queries: queryBody
         case .search_while_indexing: loadBody
         case .search_under_writes: writesBody
+        case .memory_trace: traceBody
         case .index_image: imageBody
         case .save_edit: saveBody
         default: nil
@@ -280,7 +281,20 @@ public enum BenchCases {
         let store = try ctx.fs.store(named: built.name)
         defer { store.close() }
         warm(store, ctx, built.name)
-        let load = (0 ..< Swift.min(p.int("load_files"), corpus.spec.textFiles)).map { corpus.textFileURL($0).path }
+        // EDITED COPIES, each one changed before it is re-indexed, as a save changes a file. Re-indexing
+        // the corpus files unchanged was not a load: the store skips a file whose bytes it already
+        // holds, so even with reuse off both arms indexed 1,150 files/s on an M3 Ultra, two orders
+        // of magnitude past what the encoder can do, and the throughput cost read 0.7%.
+        var loadDir = try ctx.fs.scratch(named: "load")
+        if let rp = realpath(loadDir.path, nil) { loadDir = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+        var load: [String] = []
+        for i in 0 ..< Swift.min(p.int("load_files"), corpus.spec.textFiles) {
+            let dst = loadDir.appendingPathComponent("l\(i).md")
+            try? FileManager.default.removeItem(at: dst)
+            try FileManager.default.copyItem(at: corpus.textFileURL(i), to: dst)
+            load.append(dst.path)
+        }
+        let revision = PaperCounter()
 
         var idle: [Double] = []
         for i in 0 ..< queries where ctx.shouldContinue {
@@ -292,6 +306,8 @@ public enum BenchCases {
 
         let arms = ctx.spec.arms.map(\.id)
         var loaded: [String: [Double]] = [:]
+        // What shaping costs the indexer: files it finished per second of the same window, per arm.
+        var indexed: [String: (files: Int, seconds: Double)] = [:]
         out.arms = arms
         let rounds = p.int("rounds")
         rounds: for round in 0 ..< rounds {
@@ -300,17 +316,42 @@ public enum BenchCases {
                 try ctx.checkCancel()
                 guard ctx.shouldContinue else { out.truncated = true; break rounds }
                 try ctx.withArm(arm) {
+                    // THE INDEXER WRITES INTO THE STORE BEING SEARCHED (v8), a fresh copy each round.
+                    // It used to write to a store of its own, which measured contention for the
+                    // accelerator and left out what writes do to the store a search reads: the
+                    // delta the scan has to cover and the folds that take it back (reviewers, ODI
+                    // 2026).
                     let name = "load-\(arm)-\(round).sqlite"
-                    let sink = try ctx.fs.store(named: name)
-                    defer { ctx.fs.discard(sink, named: name) }
-                    let indexer = Indexer(store: sink, embedder: ctx.engine)
+                    try ctx.fs.clone(named: built.name, as: name)
+                    let target = try ctx.fs.store(named: name)
+                    defer { ctx.fs.discard(target, named: name) }
+                    warm(target, ctx, name)
+                    let indexer = Indexer(store: target, embedder: ctx.engine)
                     let stop = PaperFlag(), done = DispatchSemaphore(value: 0)
+                    let finished = PaperCounter()
                     DispatchQueue.global(qos: .utility).async {
                         var i = 0
-                        while !stop.isOn { indexer.update(paths: [load[i % load.count]], settings: .paper, force: true); i += 1 }
+                        while !stop.isOn {
+                            let path = load[i % load.count]
+                            revision.add()
+                            if let h = FileHandle(forWritingAtPath: path) {
+                                h.seekToEndOfFile()
+                                h.write(Data("\nrevision \(revision.value)\n".utf8))
+                                try? h.close()
+                            }
+                            indexer.update(paths: [path], settings: .paper, force: true)
+                            if !stop.isOn { finished.add() }
+                            i += 1
+                        }
                         done.signal()
                     }
-                    defer { stop.turnOn(); indexer.cancel(); done.wait(); indexer.resetCancelled() }
+                    let window = Date()
+                    defer {
+                        let seconds = -window.timeIntervalSinceNow
+                        stop.turnOn(); indexer.cancel(); done.wait(); indexer.resetCancelled()
+                        let prior = indexed[arm] ?? (0, 0)
+                        indexed[arm] = (prior.files + finished.value, prior.seconds + seconds)
+                    }
                     for i in 0 ..< queries {
                         try ctx.checkCancel()
                         guard ctx.shouldContinue else { out.truncated = true; break }
@@ -318,7 +359,7 @@ public enum BenchCases {
                         Thread.sleep(forTimeInterval: p.double("debounce_s"))
                         let q = queryTexts[(round * queries + i) % queryTexts.count]
                         loaded[arm, default: []].append(timeMs {
-                            _ = store.search(ctx.engine.embedQuery(q), topK: topK, markActive: true)
+                            _ = target.search(ctx.engine.embedQuery(q), topK: topK, markActive: true)
                         })
                         if i % 25 == 0 { ctx.progress("round \(round + 1)/\(rounds), \(arm): query \(i + 1)/\(queries)") }
                     }
@@ -327,6 +368,17 @@ public enum BenchCases {
         }
         for arm in arms where !(loaded[arm] ?? []).isEmpty {
             out.metrics += PaperMetric.distribution("loaded", samples: loaded[arm]!, unit: .milliseconds, arm: arm)
+        }
+        for arm in arms {
+            guard let (files, seconds) = indexed[arm], seconds > 0 else { continue }
+            out.metrics.append(PaperMetric("\(arm).index_rate", runs: [Double(files) / seconds], unit: .filesPerSecond,
+                                           aggregate: .single, arm: arm,
+                                           note: "files the indexer finished while the searches ran, over that window"))
+        }
+        if let off = out.metrics.first(where: { $0.key == "unshaped.index_rate" })?.value,
+           let on = out.metrics.first(where: { $0.key == "shaped.index_rate" })?.value, off > 0 {
+            out.metrics.append(PaperMetric.derived("shaping_index_cost", value: 100 * (off - on) / off, unit: .percent,
+                                                   from: ["unshaped.index_rate", "shaped.index_rate"]))
         }
         for suffix in ["p50", "p95", "p99"] {
             func value(_ arm: String) -> Double? { out.metrics.first { $0.key == "\(arm).loaded.\(suffix)" }?.value }
@@ -416,8 +468,17 @@ public enum BenchCases {
                 VectorStore.holeReclaimFractionOverride = 0.000_001
                 VectorStore.holeReclaimFloorOverride = 1
                 defer { (VectorStore.holeReclaimFractionOverride, VectorStore.holeReclaimFloorOverride) = saved }
+                // THE RECLAIM ONLY RUNS ONCE COVERAGE HAS CAUGHT UP (shouldReclaimHolesLocked), and
+                // right after the removal it has not: the row read 0.00 s on a 48 GB M4 Pro, a no-op
+                // timed as a reclaim. Coverage is brought up to date first, untimed, as the app's
+                // stamp does in the quiet after a write; a reclaim that still declines leaves no row.
+                ctx.progress("reclaim: bringing coverage up to date")
+                _ = store.advanceCoverageToCompletion()
                 ctx.progress("reclaim: writing with searches every \(p.int("probe_interval_ms")) ms")
-                try measure("reclaim", store, interval: interval, tail: tail, out: &out) { _ = store.reclaimVectorHoles() }
+                var ran = false
+                try measure("reclaim", store, interval: interval, tail: tail, out: &out) { ran = store.reclaimVectorHoles() }
+                out.facts.append(PaperFact("reclaim_ran", ran))
+                if !ran { out.metrics.removeAll { $0.key.hasPrefix("reclaim.") } }
             }
             out.facts.append(PaperFact("\(name)_audit", store.coverageAudit() ?? "clean"))
         }
@@ -442,6 +503,135 @@ public enum BenchCases {
         if name != "idle" {
             out.metrics.append(PaperMetric("\(name).op", runs: [opSeconds], unit: .seconds, aggregate: .single))
         }
+    }
+
+    // MARK: - Memory under a mixed workload
+
+    /// phys_footprint every 50 ms, each sample tagged with the phase it fell in.
+    final class FootprintTrace: @unchecked Sendable {
+        private let lock = NSLock()
+        private var phase = ""
+        private var samples: [(phase: String, mb: Double)] = []
+        private var running = true
+        private let done = DispatchSemaphore(value: 0)
+        init() {
+            Thread.detachNewThread { [self] in
+                while lock.withLock({ running }) {
+                    let mb = Double(SystemProbe.footprintBytes()) / 1_048_576
+                    lock.withLock { samples.append((phase, mb)) }
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+                done.signal()
+            }
+        }
+        func enter(_ p: String) { lock.withLock { phase = p } }
+        func stop() -> [(phase: String, mb: Double)] {
+            lock.withLock { running = false }
+            done.wait()
+            return lock.withLock { samples }
+        }
+    }
+
+    /// The whole process against the memory cap while everything that allocates runs at once: every
+    /// kind of file indexed (image patches, decoded audio and video frames) into a copy of the
+    /// million-row store, a search every `search_interval_ms` on that store throughout (an encoded
+    /// query, every fourth a find-similar), then a bulk delete and a compaction. Bounding each
+    /// transient on its own does not show their sum stays under the cap (reviewers, ODI 2026).
+    static let traceBody: PaperCaseBody = { ctx in
+        var out = PaperCaseOutput()
+        guard let built = ctx.shared.builtStore else { out.note = noStore; return out }
+        let corpus = try PaperCasesCompute.corpus(ctx)
+        let p = ctx.params
+        let layout = built.layout
+        let name = "trace.sqlite"
+        try ctx.fs.clone(named: built.name, as: name)
+        let store = try ctx.fs.store(named: name)
+        defer { ctx.fs.discard(store, named: name) }
+        warm(store, ctx, name)
+        let files = (0 ..< Swift.min(p.int("text_files"), corpus.spec.textFiles)).map { corpus.textFileURL($0).path }
+            + (0 ..< corpus.spec.images).map { corpus.imageURL($0).path }
+            + (0 ..< corpus.spec.audioClips).map { corpus.audioURL($0).path }
+            + (0 ..< corpus.spec.videoClips).map { corpus.videoURL($0).path }
+
+        let trace = FootprintTrace()
+        var traced: [(phase: String, mb: Double)]?
+        defer { if traced == nil { _ = trace.stop() } }
+        trace.enter("idle")
+        Thread.sleep(forTimeInterval: 1)
+
+        trace.enter("index")
+        let engine = ctx.engine, topK = p.int("top_k")
+        let interval = Double(p.int("search_interval_ms")) / 1000
+        let stop = PaperFlag(), searching = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            var k = 0
+            while !stop.isOn {
+                if k % 4 == 3, let v = store.fileVector(layout.path(Int(BenchStore.mix(UInt64(k)) % UInt64(Swift.max(1, built.files))))) {
+                    _ = store.search(v, topK: topK, markActive: true)
+                } else {
+                    _ = store.search(engine.embedQuery(queryTexts[k % queryTexts.count]), topK: topK, markActive: true)
+                }
+                k += 1
+                Thread.sleep(forTimeInterval: interval)
+            }
+            searching.signal()
+        }
+        let indexer = Indexer(store: store, embedder: engine)
+        let t0 = Date()
+        var indexedFiles = 0
+        do {
+            defer { stop.turnOn(); searching.wait() }
+            let batch = 16
+            for at in stride(from: 0, to: files.count, by: batch) {
+                try ctx.checkCancel()
+                guard ctx.shouldContinue else { out.truncated = true; break }
+                let slice = Array(files[at ..< Swift.min(files.count, at + batch)])
+                indexer.update(paths: slice, settings: .profiling, force: true)
+                indexedFiles += slice.count
+                ctx.progress("indexing every kind, \(indexedFiles)/\(files.count), searching every \(p.int("search_interval_ms")) ms")
+            }
+        }
+        let indexSeconds = -t0.timeIntervalSinceNow
+
+        var compactSeconds = 0.0
+        if ctx.shouldContinue {
+            trace.enter("compact")
+            ctx.progress("deleting and compacting")
+            let n = Swift.min(p.int("delete_files"), built.files)
+            let doomed = (0 ..< n).map { layout.path(Int((Double($0) + 0.5) * Double(built.files) / Double(n))) }
+            let t1 = Date()
+            store.deletePaths(Set(doomed))
+            _ = store.compact(minFreeRatio: 0.05)
+            compactSeconds = -t1.timeIntervalSinceNow
+        }
+        let samples = trace.stop()
+        traced = samples
+
+        let capMB = Double(OmniMemoryBudget.capBytes) / 1_048_576
+        func peak(_ phase: String?) -> Double? {
+            samples.filter { phase == nil || $0.phase == phase }.map(\.mb).max()
+        }
+        for phase in ["idle", "index", "compact"] {
+            if let v = peak(phase) {
+                out.metrics.append(PaperMetric("\(phase).peak", runs: [v], unit: .megabytes, aggregate: .single,
+                                               note: "highest phys_footprint while \(phase == "idle" ? "nothing ran" : phase + " ran")"))
+            }
+        }
+        if let all = peak(nil) {
+            out.metrics.append(PaperMetric("peak", runs: [all], unit: .megabytes, aggregate: .single))
+            out.metrics.append(PaperMetric("cap", runs: [capMB], unit: .megabytes, aggregate: .single,
+                                           note: "OmniMemoryBudget.capBytes, the cap the run pinned"))
+            out.metrics.append(PaperMetric.derived("peak_share_of_cap", value: 100 * all / capMB, unit: .percent,
+                                                   from: ["peak", "cap"]))
+            // The trace itself, one sample in ten (every 0.5 s), for the figure.
+            let thinned = stride(from: 0, to: samples.count, by: 10).map { samples[$0].mb }
+            out.metrics.append(PaperMetric("trace", runs: thinned, unit: .megabytes, aggregate: .maximum,
+                                           note: "phys_footprint every 0.5 s: idle, index while searching, compact"))
+        }
+        out.metrics.append(PaperMetric("index_wall", runs: [indexSeconds], unit: .seconds, aggregate: .single))
+        out.metrics.append(PaperMetric("compact_wall", runs: [compactSeconds], unit: .seconds, aggregate: .single))
+        out.facts.append(PaperFact("indexed_files", indexedFiles))
+        return out
     }
 
     // MARK: - Index one image
@@ -574,6 +764,13 @@ enum PaperCasesLiveSupport {
         out.facts.append(PaperFact("candidates", VectorStore.candidateCount(topK: VectorStore.shippedTopK)))
         out.facts.append(PaperFact("memory_cap_mb", OmniMemoryBudget.capBytes / 1_000_000))
     }
+}
+
+final class PaperCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var n = 0
+    var value: Int { lock.lock(); defer { lock.unlock() }; return n }
+    func add() { lock.lock(); n += 1; lock.unlock() }
 }
 
 final class PaperFlag: @unchecked Sendable {

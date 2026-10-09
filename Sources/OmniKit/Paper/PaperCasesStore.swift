@@ -45,6 +45,7 @@ public enum PaperCasesStore {
         case .select: selectBody
         case .compaction: compactBody
         case .recall: recallBody
+        case .recall_scale: recallScaleBody
         case .delete_cost: deleteBody
         default: nil
         }
@@ -515,50 +516,8 @@ public enum PaperCasesStore {
             progress: { ctx.progress("built \($0) rows") })
         guard built == rows else { throw PaperCaseError("p20 built \(built) of \(rows) rows") }
 
-        // THE REFERENCE: an exact fp32 top-10 per query over the same rows, computed independently
-        // of the store so it cannot inherit an error from the tier under test. In fp32 slabs on the
-        // accelerator rather than on the host, because the host form is rows x dim x queries
-        // multiply-adds and would cost more than the whole rest of the suite.
-        ctx.progress("reference top-10 over \(queryCount) queries")
-        let queryMatrix = MLXArray((0 ..< queryCount).flatMap { PaperVectors.query($0, dim: dim) },
-                                   [queryCount, dim]).asType(.float32).transposed()
-        MLX.eval(queryMatrix)
-        // Per FILE, not per row, because that is the unit a search returns: the store reduces to the
-        // best chunk of each file before it ranks, so a row-level reference would count a row that
-        // lost to its own file's better chunk as a miss.
-        var best: [[(file: Int, score: Float)]] = Array(repeating: [], count: queryCount)
-        let slabRows = (65_536 / chunksPerFile) * chunksPerFile
-        var slabStart = 0
-        while slabStart < rows {
-            try ctx.checkCancel()
-            guard ctx.shouldContinue else { out.truncated = true; break }
-            let slabEnd = min(rows, slabStart + slabRows)
-            let flat = (slabStart ..< slabEnd).flatMap { PaperVectors.vec($0, dim: dim) }
-            let slab = MLXArray(flat, [slabEnd - slabStart, dim]).asType(.float32)
-            let scores = MLX.matmul(slab, queryMatrix)      // [slabRows, queries]
-            let files = (slabEnd - slabStart) / chunksPerFile
-            let perFile = MLX.max(scores.reshaped([files, chunksPerFile, queryCount]), axis: 1)
-            MLX.eval(perFile)
-            let host = perFile.asType(.float32).asArray(Float.self)
-            let fileBase = slabStart / chunksPerFile
-            for f in 0 ..< files {
-                for q in 0 ..< queryCount {
-                    let s = host[f * queryCount + q]
-                    if best[q].count < 10 {
-                        best[q].append((fileBase + f, s))
-                        if best[q].count == 10 { best[q].sort { $0.score > $1.score } }
-                    } else if s > best[q][9].score {
-                        best[q][9] = (fileBase + f, s)
-                        best[q].sort { $0.score > $1.score }
-                    }
-                }
-            }
-            slabStart = slabEnd
-            ctx.progress("reference \(slabStart)/\(rows) rows")
-            MLX.Memory.clearCache()
-        }
-        let reference: [[Int]] = best.map { $0.map(\.file) }
-        guard reference.contains(where: { !$0.isEmpty }) else { out.truncated = true; return out }
+        guard let reference = try exactReference(rows: rows, dim: dim, queries: queryCount, ctx: ctx),
+              reference.contains(where: { !$0.isEmpty }) else { out.truncated = true; return out }
 
         for bits in bitsList {
             for width in widths {
@@ -623,6 +582,118 @@ public enum PaperCasesStore {
         out.extraParameters.set("reference_queries", .int(reference.count))
         out.extraParameters.set("top_k", .int(searchTopK))
         return out
+    }
+
+    // MARK: - recall_scale: the shipped point as the index grows
+
+    /// The recall grid runs at one size, and at the shipped width the shortlist is a smaller share
+    /// of a larger index: 1.5% of 500,000 rows, 0.09% of 8.68 million. Whether recall holds as that
+    /// share shrinks is a separate measurement, so this case repeats the SHIPPED point (one bit,
+    /// the shipped multiplier) at each size the machine can build, each gated on its own measured
+    /// peak (reviewers, ODI 2026).
+    static let recallScaleBody: PaperCaseBody = { ctx in
+        var out = PaperCaseOutput()
+        let p = ctx.params
+        let dim = p.int("dim")
+        let queryCount = p.int("queries")
+        let mult = VectorStore.bitCandidateMultiplier
+        var measured: [Int] = [], skipped: [Int] = []
+        for target in p.ints("ladder").map({ ($0 / chunksPerFile) * chunksPerFile }) {
+            try ctx.checkCancel()
+            guard ctx.shouldContinue else { out.truncated = true; break }
+            let peakMB = PaperCaseCatalog.measuredPeakMB(rows: target, bytesPerRow: PaperCaseCatalog.storeBuildBytesPerRow)
+            let freeMB = SystemProbe.snapshot().memFreeMB
+            if freeMB > 0, peakMB > freeMB - PaperCaseCatalog.memoryReserveMB { skipped.append(target); continue }
+            let name = "recall-n\(target).sqlite"
+            let store = try ctx.fs.store(named: name)
+            defer { ctx.fs.discard(store, named: name) }
+            ctx.progress("\(target) rows - building")
+            let built = try PaperVectors.buildStore(
+                rows: target, into: store, chunksPerFile: chunksPerFile, snippetChars: 0, dim: dim,
+                deadline: ctx.deadline, cancelled: { ctx.isCancelled },
+                progress: { ctx.progress("\(target) rows - built \($0)") })
+            guard built == target else { out.truncated = true; break }
+            guard let reference = try exactReference(rows: target, dim: dim, queries: queryCount, ctx: ctx),
+                  reference.contains(where: { !$0.isEmpty }) else { out.truncated = true; break }
+            let arm = "n\(target)"
+            let r = try ctx.levers.withArm(arm, PaperLeverSet(quantBase: .bits(1), bitCandidateMultiplier: mult)) {
+                () -> (times: [Double], recall: Double) in
+                store.invalidateBaseForBenchmark()
+                MLX.Memory.clearCache()
+                for w in 0 ..< 2 { _ = store.search(PaperVectors.query(900 + w, dim: dim), filter: SearchFilter(), topK: searchTopK) }
+                var times: [Double] = [], hitSum = 0
+                for q in 0 ..< reference.count {
+                    try ctx.checkCancel()
+                    guard ctx.shouldContinue else { break }
+                    let t = Date()
+                    let hits = store.search(PaperVectors.query(q, dim: dim), filter: SearchFilter(), topK: searchTopK)
+                    times.append(-t.timeIntervalSinceNow * 1000)
+                    let returned = Set(hits.prefix(10).compactMap { Int($0.path.dropFirst()) })
+                    hitSum += reference[q].filter { returned.contains($0) }.count
+                }
+                return (times, times.isEmpty ? 0 : Double(hitSum) / Double(10 * times.count))
+            }
+            guard !r.times.isEmpty else { out.truncated = true; break }
+            out.ran(arm)
+            measured.append(target)
+            out.add("\(arm).query_p50", r.times, unit: .milliseconds, arm: arm)
+            out.add(PaperMetric.derived("\(arm).recall_at_10", value: 100 * r.recall, unit: .percent,
+                                        from: ["\(arm).query_p50"], arm: arm,
+                                        note: "shipped point (one bit, shipped shortlist): share of the exact fp32 top-10 in the funnel's top 10"))
+            out.add(PaperFact("\(arm).candidates", VectorStore.candidateCount(topK: VectorStore.shippedTopK), arm: arm))
+            MLX.Memory.clearCache()
+        }
+        out.extraParameters.set("ladder_measured", .ints(measured))
+        out.extraParameters.set("ladder_skipped_memory", .ints(skipped))
+        return out
+    }
+
+    /// An exact fp32 top-10 FILES per query over the seeded rows, independent of the store under test.
+    /// nil when the case ran out of time before it finished.
+    static func exactReference(rows: Int, dim: Int, queries: Int, ctx: PaperContext) throws -> [[Int]]? {
+        // THE REFERENCE: an exact fp32 top-10 per query over the same rows, computed independently
+        // of the store so it cannot inherit an error from the tier under test. In fp32 slabs on the
+        // accelerator rather than on the host, because the host form is rows x dim x queries
+        // multiply-adds and would cost more than the whole rest of the suite.
+        ctx.progress("reference top-10 over \(queries) queries, \(rows) rows")
+        let queryMatrix = MLXArray((0 ..< queries).flatMap { PaperVectors.query($0, dim: dim) },
+                                   [queries, dim]).asType(.float32).transposed()
+        MLX.eval(queryMatrix)
+        // Per FILE, not per row, because that is the unit a search returns: the store reduces to the
+        // best chunk of each file before it ranks, so a row-level reference would count a row that
+        // lost to its own file's better chunk as a miss.
+        var best: [[(file: Int, score: Float)]] = Array(repeating: [], count: queries)
+        let slabRows = (65_536 / chunksPerFile) * chunksPerFile
+        var slabStart = 0
+        while slabStart < rows {
+            try ctx.checkCancel()
+            guard ctx.shouldContinue else { return nil }
+            let slabEnd = min(rows, slabStart + slabRows)
+            let flat = (slabStart ..< slabEnd).flatMap { PaperVectors.vec($0, dim: dim) }
+            let slab = MLXArray(flat, [slabEnd - slabStart, dim]).asType(.float32)
+            let scores = MLX.matmul(slab, queryMatrix)      // [slabRows, queries]
+            let files = (slabEnd - slabStart) / chunksPerFile
+            let perFile = MLX.max(scores.reshaped([files, chunksPerFile, queries]), axis: 1)
+            MLX.eval(perFile)
+            let host = perFile.asType(.float32).asArray(Float.self)
+            let fileBase = slabStart / chunksPerFile
+            for f in 0 ..< files {
+                for q in 0 ..< queries {
+                    let s = host[f * queries + q]
+                    if best[q].count < 10 {
+                        best[q].append((fileBase + f, s))
+                        if best[q].count == 10 { best[q].sort { $0.score > $1.score } }
+                    } else if s > best[q][9].score {
+                        best[q][9] = (fileBase + f, s)
+                        best[q].sort { $0.score > $1.score }
+                    }
+                }
+            }
+            slabStart = slabEnd
+            ctx.progress("reference \(slabStart)/\(rows) rows")
+            MLX.Memory.clearCache()
+        }
+        return best.map { $0.map(\.file) }
     }
 
     // MARK: - p21: what a deletion costs, against index size

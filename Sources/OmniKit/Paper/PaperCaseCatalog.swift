@@ -37,8 +37,8 @@ public enum PaperCapClass: String, Sendable, Codable {
 
 public enum PaperCaseID: String, Sendable, Codable, CaseIterable {
     case canary, index_text, index_image, save_edit, store_build, queries
-    case search_while_indexing, search_under_writes
-    case tail_rows, attention, prune_fold, scan_ladder, recall, select, compaction, delete_cost
+    case search_while_indexing, search_under_writes, memory_trace
+    case tail_rows, attention, prune_fold, scan_ladder, recall, recall_scale, select, compaction, delete_cost
 }
 
 /// One arm of a case: a name that appears in every key the arm produced, plus the levers it moves.
@@ -97,7 +97,12 @@ public enum PaperCaseCatalog {
     /// v7 reads every file of a store through, not only the vector file (the hits' rows were cold:
     /// the delete row's p50 13.9 ms against 4.8 warm), and gates memory on what the kernel counts as
     /// available, so a 16 GB Mac no longer skips search under writes after the query case.
-    public static let suiteId = "bench-v7"
+    /// v8 answers the ODI 2026 reviews and runs on 16 GB Macs: the indexer in search-while-indexing
+    /// writes into the store being searched and its throughput is reported per arm; a mixed-workload
+    /// memory trace against the cap; recall of the shipped point up to 8 million rows; the attention
+    /// points carry their spread. The read-through no longer leaks what it reads, the run stops on
+    /// paging rather than swap growth, and the memory gate uses measured peaks.
+    public static let suiteId = "bench-v8"
     public static let schema = 4
 
     /// Global wall-clock cap, derived rather than fixed.
@@ -144,6 +149,11 @@ public enum PaperCaseCatalog {
     static let storeBuildBytesPerRow = 4_500.0
     static let storeCopyBytesPerRow = 1_600.0
     static let deleteCostBytesPerRow = 6_600.0
+    /// memory_trace: 4,007 MB at 1,000,000 rows (a copy of the store, every kind indexed into it
+    /// while it is searched, then a compaction; M3 Ultra, exact store). search_while_indexing holds
+    /// the store and one copy of it open at once: two copies' worth.
+    static let memoryTraceBytesPerRow = 4_200.0
+    static let twoStoresBytesPerRow = 2 * storeCopyBytesPerRow
 
     /// Exact arithmetic for a dim-768 store: a bf16 row costs 1,536 B and is held TWICE (the host
     /// flat16 source of truth plus the GPU base matrix); the int4 replica adds ~480 B/row on top.
@@ -193,9 +203,9 @@ public enum PaperCaseCatalog {
         // query and write row runs on, queries, search under load, then the mechanisms.
         let all = [canary(scale), indexPass(scale), indexImage(scale), saveEdit(scale),
                    storeBuild(scale), queries(scale), searchWhileIndexing(scale),
-                   searchUnderWrites(scale),
+                   searchUnderWrites(scale), memoryTrace(scale),
                    textLever(scale), sdpa(scale), gate(scale), scan(memoryBytes, scale),
-                   recall(memoryBytes, scale), select(memoryBytes, scale), compact(scale),
+                   recall(memoryBytes, scale), recallScale(scale), select(memoryBytes, scale), compact(scale),
                    deleteCost(memoryBytes, scale)]
         guard let only = onlyCases else { return all }
         return all.filter { only.contains($0.id) }
@@ -338,6 +348,23 @@ public enum PaperCaseCatalog {
     ///
     /// Recall is against an exact fp32 top-10 over the same rows, computed on the host, so the
     /// reference cannot inherit an error from the tier being judged.
+    /// The shipped point of the recall grid at growing sizes, each gated on the machine's memory.
+    private static func recallScale(_ scale: Double) -> PaperCaseSpec {
+        let p = PaperParams([
+            PaperParameter("ladder", .ints([1_000_000, 2_000_000, 4_000_000, 8_000_000]), scaling: .scaled(minimum: 20_000)),
+            PaperParameter("dim", .int(768)),
+            PaperParameter("queries", .int(64), scaling: .scaled(minimum: 8)),
+        ]).scaled(by: scale)
+        return PaperCaseSpec(
+            id: .recall_scale, title: "Coarse tier accuracy as the index grows",
+            deliverable: "Recall of the shipped point at 1, 2, 4 and 8 million rows, as far as memory allows",
+            budgetSeconds: 1_200,
+            arms: [], params: p,
+            // The smallest rung; each rung is gated again on its own.
+            arithmeticPeakMB: measuredPeakMB(rows: scaledInt(1_000_000, scale, minimum: 20_000), bytesPerRow: storeBuildBytesPerRow),
+            requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
+    }
+
     private static func recall(_ memoryBytes: Int, _ scale: Double) -> PaperCaseSpec {
         let rows = gibibytes(memoryBytes) >= tier16GiB ? 500_000 : 250_000
         let shipped = shippedCandidates
@@ -548,11 +575,34 @@ public enum PaperCaseCatalog {
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .search_while_indexing, title: "Search while indexing",
-            deliverable: "Task table, search-while-indexing rows: the idle floor and shaping",
-            budgetSeconds: 480,
-            arms: [PaperArm("unshaped", PaperLeverSet(adaptiveBatch: false)),
-                   PaperArm("shaped", PaperLeverSet(adaptiveBatch: true))],
-            params: p, arithmeticPeakMB: nil,
+            deliverable: "Task table, search-while-indexing rows: the idle floor, shaping, and what shaping costs the indexer",
+            budgetSeconds: 600,
+            // REUSE OFF IN BOTH ARMS (v8). The load re-indexes the same files, and with the chunk
+            // cache and cross-file reuse on, every pass after the first took its vectors from the
+            // store: 1,650 files/s with the encoder all but idle, so neither the shaping it was
+            // there to provoke nor the throughput it costs was measured against real work.
+            arms: [PaperArm("unshaped", PaperLeverSet(adaptiveBatch: false, chunkCache: false, globalChunkReuse: false)),
+                   PaperArm("shaped", PaperLeverSet(adaptiveBatch: true, chunkCache: false, globalChunkReuse: false))],
+            params: p,
+            arithmeticPeakMB: measuredPeakMB(rows: scaledInt(1_000_000, scale, minimum: 16_000), bytesPerRow: twoStoresBytesPerRow),
+            requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
+    }
+
+    /// The whole process against the cap under a mixed workload: every kind of file indexed into a
+    /// copy of the store while it is searched, then a bulk delete and a compaction.
+    private static func memoryTrace(_ scale: Double) -> PaperCaseSpec {
+        let p = PaperParams([
+            PaperParameter("text_files", .int(200), scaling: .scaled(minimum: 20)),
+            PaperParameter("delete_files", .int(50_000), scaling: .scaled(minimum: 800)),
+            PaperParameter("search_interval_ms", .int(100), unit: .milliseconds),
+            PaperParameter("top_k", .int(VectorStore.shippedTopK)),
+        ]).scaled(by: scale)
+        return PaperCaseSpec(
+            id: .memory_trace, title: "Memory under a mixed workload",
+            deliverable: "Memory rows: peak process memory against the cap while indexing every kind, searching and compacting",
+            budgetSeconds: 600,
+            arms: [], params: p,
+            arithmeticPeakMB: measuredPeakMB(rows: scaledInt(1_000_000, scale, minimum: 16_000), bytesPerRow: memoryTraceBytesPerRow),
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
 
