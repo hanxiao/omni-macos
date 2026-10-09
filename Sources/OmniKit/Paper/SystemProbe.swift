@@ -32,7 +32,13 @@ public struct SystemSnapshot: Sendable, Codable {
     public var loadAvg5m: Double
     public var loadAvg15m: Double
     public var swapUsedMB: Double
-    public var memFreeMB: Double          // free + inactive + speculative, i.e. reclaimable
+    /// Free + file-backed + purgeable: the pages the kernel can hand out without compressing or
+    /// swapping anything (vm_stat's "Pages free", "File-backed pages", "Pages purgeable"). Was free + inactive + speculative, which left
+    /// out the page cache a case had just read (active file pages, dropped at no cost) and counted
+    /// idle app memory (inactive anonymous, which has to be compressed or swapped). The memory gate
+    /// reads this right after the query case has warmed a million-row store, and on a 16 GB M4
+    /// search-under-writes produced no rows in bench-v6.
+    public var memFreeMB: Double
     public var memPressureLevel: Int      // 1 normal / 2 warn / 4 critical (-1 unknown)
     public var memCompressedMB: Double
     public var memWiredMB: Double
@@ -118,7 +124,7 @@ public enum SystemProbe {
             loadAvg5m: loadAverage().1,
             loadAvg15m: loadAverage().2,
             swapUsedMB: swapUsedBytes().map { Double($0) / 1_048_576 } ?? -1,
-            memFreeMB: vm.map { Double($0.free_count &+ $0.inactive_count &+ $0.speculative_count) * pageSize / 1_048_576 } ?? -1,
+            memFreeMB: vm.map { Double($0.free_count &+ $0.external_page_count &+ $0.purgeable_count) * pageSize / 1_048_576 } ?? -1,
             memPressureLevel: sysctlInt("kern.memorystatus_vm_pressure_level") ?? -1,
             memCompressedMB: vm.map { Double($0.compressor_page_count) * pageSize / 1_048_576 } ?? -1,
             memWiredMB: vm.map { Double($0.wire_count) * pageSize / 1_048_576 } ?? -1,

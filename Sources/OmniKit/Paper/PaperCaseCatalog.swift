@@ -94,7 +94,10 @@ public enum PaperCaseCatalog {
     /// open (a copied store is cold to the page cache, and a one-bit store's searches read from
     /// it: 50-70 ms idle against 5.7), and every search marking the store active, so upkeep yields
     /// as it does to a user typing. Deletion runs the shipped arm first; scan speedup is a row per size.
-    public static let suiteId = "bench-v6"
+    /// v7 reads every file of a store through, not only the vector file (the hits' rows were cold:
+    /// the delete row's p50 13.9 ms against 4.8 warm), and gates memory on what the kernel counts as
+    /// available, so a 16 GB Mac no longer skips search under writes after the query case.
+    public static let suiteId = "bench-v7"
     public static let schema = 4
 
     /// Global wall-clock cap, derived rather than fixed.

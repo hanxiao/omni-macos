@@ -55,7 +55,7 @@ public enum BenchTable {
         latency("Queries", "Audio query", .queries, "audio_query"),
         latency("Queries", "Video query", .queries, "video_query"),
 
-        latency("Search under load", "Idle", .search_under_writes, "idle.search"),
+        latency("Search under load", "No writes, a search every 50 ms", .search_under_writes, "idle.search"),
         latency("Search under load", "While indexing", .search_while_indexing, "shaped.loaded"),
         latency("Search under load", "While re-indexing changed files", .search_under_writes, "reindex.search", op: "reindex.op"),
         latency("Search under load", "While deleting files", .search_under_writes, "delete.search", op: "delete.op"),

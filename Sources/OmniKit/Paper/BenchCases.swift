@@ -176,7 +176,7 @@ public enum BenchCases {
         let topK = p.int("top_k"), textQueries = p.int("text_queries")
         let store = try ctx.fs.store(named: built.name)
         defer { store.close() }
-        warm(store, ctx)
+        warm(store, ctx, built.name)
         // EVERY SEARCH HERE MARKS THE STORE ACTIVE, as the app's do. With `markActive: false` the
         // store's upkeep could not tell anyone was searching and ran full slices in between: one
         // 280-360 ms query per series on a one-bit store (M4 Pro, M4; reproduced forced on the M3
@@ -279,7 +279,7 @@ public enum BenchCases {
         let topK = p.int("top_k"), queries = p.int("queries")
         let store = try ctx.fs.store(named: built.name)
         defer { store.close() }
-        warm(store, ctx)
+        warm(store, ctx, built.name)
         let load = (0 ..< Swift.min(p.int("load_files"), corpus.spec.textFiles)).map { corpus.textFileURL($0).path }
 
         var idle: [Double] = []
@@ -404,7 +404,7 @@ public enum BenchCases {
             try ctx.fs.clone(named: built.name, as: copy)
             let store = try ctx.fs.store(named: copy)
             defer { ctx.fs.discard(store, named: copy) }
-            warm(store, ctx)
+            warm(store, ctx, copy)
             _ = store.search(PaperVectors.query(0, dim: layout.dim), filter: SearchFilter(), topK: 10)
             ctx.progress("\(name): writing with searches every \(p.int("probe_interval_ms")) ms")
             try measure(name, store, interval: interval, tail: tail, out: &out) { try op(store) }
@@ -535,9 +535,17 @@ public enum BenchCases {
     /// one-bit store every search reads its candidates' exact vectors from that file: without this
     /// the idle probe on a copy ran 50-70 ms against 5.7 ms on the store itself (M3 Ultra forced to
     /// the replica), and every under-load row on a replica Mac measured a cold cache no running app
-    /// has.
-    static func warm(_ store: VectorStore, _ ctx: PaperContext) {
+    /// has. The rest of the store's files are read through too (v7): with only the vector file warm
+    /// the hits' rows came off the drive, idle 12.0 ms and the delete row's p50 13.9; warm, 9.9 and
+    /// 4.8 (M3 Ultra forced to the replica, back to back).
+    static func warm(_ store: VectorStore, _ ctx: PaperContext, _ name: String) {
         _ = store.prefetchVectorFile(until: Date().addingTimeInterval(120), keepGoing: { !ctx.isCancelled }, progress: { _ in })
+        guard let base = try? ctx.fs.storeURL(named: name).path else { return }
+        for suffix in PaperFS.storeSuffixes where !ctx.isCancelled {
+            guard let h = FileHandle(forReadingAtPath: base + suffix) else { continue }
+            defer { try? h.close() }
+            while !ctx.isCancelled, let chunk = try? h.read(upToCount: 8 << 20), !chunk.isEmpty {}
+        }
     }
 
     static func timeMs(_ body: () -> Void) -> Double {

@@ -22,12 +22,13 @@ export interface Env {
 // indexing pass is text only, so its rates are NOT comparable with v1/v2 and stay out of that
 // history; its table is aggregated on its own (`bench` in GET). Every bench version is accepted
 // and stored, but the table is built from the CURRENT one only: v5 (0.15.10) corrected two rows v4
-// measured wrongly, and v6 (0.15.11) the under-load and query rows on one-bit Macs, which v5 took
-// on a cold page cache.
+// measured wrongly, v6 (0.15.11) the under-load and query rows on one-bit Macs, which v5 took
+// on a cold page cache, and v7 (0.15.12) the rest of the store's cold files and the memory gate
+// that skipped search under writes on a 16 GB Mac.
 const DATASET_VERSION = "profiling-v2";
 const HISTORY_DATASETS = ["profiling-v1", "profiling-v2"];
-const BENCH_DATASET = "bench-v6";
-const BENCH_DATASETS = ["bench-v4", "bench-v5", BENCH_DATASET];
+const BENCH_DATASET = "bench-v7";
+const BENCH_DATASETS = ["bench-v4", "bench-v5", "bench-v6", BENCH_DATASET];
 const ACCEPTED_DATASETS = new Set([...HISTORY_DATASETS, ...BENCH_DATASETS]);
 const MAX_BODY_BYTES = 8 * 1024; // 8KB
 const RATE_LIMIT_PER_HOUR = 20;

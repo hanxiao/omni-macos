@@ -516,6 +516,23 @@ day later the same tour measured ZERO blocks over 250 ms (see "UI tests").
   - Scan speedup is one row per size: the top rung follows memory, so a row named by it split the
     site's table.
   - The collector builds the site table from the current version only.
+- bench-v7 (0.15.12), after the first two 0.15.11 uploads (M4 Pro 48 GB, M4 16 GB):
+  - THE M4 HAD NO SEARCH-UNDER-WRITES ROWS. The gate's free memory was free + inactive +
+    speculative, read right after the query case warmed the million-row store: those warm pages
+    are active file pages, dropped at no cost, and were not counted. The upload carries no case
+    status, so the skip itself is inferred, not seen. The case's real need, measured forced to the
+    replica here (debug build): footprint 3.2 GB before, 5.1 GB at its peak (sampled every 2 s), against the
+    3,552 MB the gate assumes. Free memory is now free + file-backed + purgeable.
+  - THE HITS' ROWS WERE COLD on every copied store: only the vector file was read through. Forced
+    to the replica, release, back to back: idle probe 12.0 -> 9.9 ms, delete p50 13.9 -> 4.8,
+    reindex p50 10.0 -> 6.9. Every file of the store is now read through.
+  - THE IDLE ROW IS SLOWER THAN THE ROWS UNDER WRITES (M4 Pro 20.3 ms idle, 13-16 under writes),
+    and that is the chip, not the harness: the same idle probe ran 2.2 ms back to back (two runs)
+    and 9.9 ms one search every 50 ms. A busy machine stays clocked up. The row is now named
+    "No writes, a search every 50 ms" so it reads as the cadence baseline. A single search on an
+    idle Mac costing ~4x a warm one is an app question worth its own look (not taken up here).
+  - Still unexplained, needs the M4's own report: its query tails (filtered p95 51.5 ms, text
+    search p99 59.7, find similar p50 19.9 against 6.9 on the M4 Pro).
 - `--only store_build,search_under_writes` runs a subset (2 min); the report marks it SUBSET RUN.
   With OMNI_SEARCH_TIMING=1 every slice, checkpoint and slow search logs its phases.
 - WHAT IT FOUND ON ITS FIRST FULL RUN: a 1.3-1.8 s stall in the bulk delete (tombstones over budget
