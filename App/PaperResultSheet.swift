@@ -194,12 +194,13 @@ struct PaperResultSheet: View {
         if r.maxThermal == "serious" || r.maxThermal == "critical" {
             w.append("Thermal state reached '\(r.maxThermal)': the machine throttled during the run.")
         }
-        if r.swapDeltaMB > 256 {
-            w.append(String(format: "Swap grew by %.0f MB: part of this run was a paging measurement.", r.swapDeltaMB))
-        }
         if !r.contendedCases.isEmpty {
             w.append("Contended (another process used more than a fifth of the machine): "
                      + r.contendedCases.joined(separator: ", "))
+        }
+        if !r.pagedCases.isEmpty {
+            w.append(String(format: "Paged (more than %.0f MB read back from swap while it ran): ", PaperSuiteResult.pagedThresholdMB)
+                     + r.pagedCases.joined(separator: ", "))
         }
         return w
     }

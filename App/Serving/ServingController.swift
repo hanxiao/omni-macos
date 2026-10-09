@@ -15,6 +15,11 @@ final class ServingController {
     // MARK: Persisted settings (UserDefaults "omni.serving.*")
 
     var enabled: Bool = false { didSet { persist(); reconcile() } }
+    /// Held off for a benchmark run. Never persisted and never written to `enabled`, so a run that
+    /// dies part-way leaves Serving exactly as the owner set it, and the next launch serves again.
+    var pausedForBenchmark = false { didSet { reconcile() } }
+    /// What the toolbar and the tab show: off while a benchmark holds it.
+    var isOn: Bool { enabled && !pausedForBenchmark }
     var scope: ServingScope = .local { didSet { persist(); if isRunning { restart() } } }
     var port: Int = 51234 { didSet { persist(); if isRunning { restart() } } }
     // The auth closure snapshots the token at start, so a running server MUST restart to apply a
@@ -172,9 +177,9 @@ final class ServingController {
     // MARK: Reconciliation
 
     private func reconcile() {
-        if enabled, !isRunning, backend != nil {
+        if isOn, !isRunning, backend != nil {
             startServer()
-        } else if !enabled, isRunning {
+        } else if !isOn, isRunning {
             stopServer()
         }
     }

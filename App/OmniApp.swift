@@ -446,8 +446,9 @@ struct OmniApp: App {
                 Button("Pause Indexing") { model.userPauseIndexing() }
                     .disabled(!model.canPauseIndexing || model.isPaused)
                 // The serving switch, same one as Settings and the toolbar toggle.
-                Toggle("Serve over HTTP", isOn: Binding(get: { model.serving.enabled },
+                Toggle("Serve over HTTP", isOn: Binding(get: { model.serving.isOn },
                                                         set: { model.serving.enabled = $0 }))
+                    .disabled(model.serving.pausedForBenchmark)
             }
             // Add to the SYSTEM View menu (which NavigationSplitView already provides with Show
             // Sidebar / Full Screen) instead of declaring a second "View" CommandMenu - otherwise

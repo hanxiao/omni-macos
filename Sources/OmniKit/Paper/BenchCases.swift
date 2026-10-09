@@ -541,10 +541,18 @@ public enum BenchCases {
     static func warm(_ store: VectorStore, _ ctx: PaperContext, _ name: String) {
         _ = store.prefetchVectorFile(until: Date().addingTimeInterval(120), keepGoing: { !ctx.isCancelled }, progress: { _ in })
         guard let base = try? ctx.fs.storeURL(named: name).path else { return }
+        // ONE buffer, read(2) into it. This was FileHandle.read(upToCount:), whose Data is
+        // autoreleased and never drained on a case's thread: every byte read stayed resident.
+        // Footprint went from 2.7 GB to 31.6 GB over one run (search under writes alone +19.8 GB);
+        // with the buffer, 2.7 to 5.4. On a 16 GB Mac that is a run stopped for swap.
+        let size = 8 << 20
+        let buffer = UnsafeMutableRawPointer.allocate(byteCount: size, alignment: 16_384)
+        defer { buffer.deallocate() }
         for suffix in PaperFS.storeSuffixes where !ctx.isCancelled {
-            guard let h = FileHandle(forReadingAtPath: base + suffix) else { continue }
-            defer { try? h.close() }
-            while !ctx.isCancelled, let chunk = try? h.read(upToCount: 8 << 20), !chunk.isEmpty {}
+            let fd = open(base + suffix, O_RDONLY)
+            guard fd >= 0 else { continue }
+            defer { close(fd) }
+            while !ctx.isCancelled, read(fd, buffer, size) > 0 {}
         }
     }
 

@@ -40,6 +40,10 @@ public struct SystemSnapshot: Sendable, Codable {
     /// search-under-writes produced no rows in bench-v6.
     public var memFreeMB: Double
     public var memPressureLevel: Int      // 1 normal / 2 warn / 4 critical (-1 unknown)
+    /// Cumulative pages read back from swap, system-wide, in MB. A DIFFERENCE of two snapshots is
+    /// paging that someone waited on; swap USED only grows when the kernel parks idle pages, which
+    /// on a 16 GB Mac is what it does to the owner's other apps whenever anything allocates.
+    public var swapInMB: Double?
     public var memCompressedMB: Double
     public var memWiredMB: Double
     public var footprintMB: Double        // our own phys_footprint
@@ -126,6 +130,7 @@ public enum SystemProbe {
             swapUsedMB: swapUsedBytes().map { Double($0) / 1_048_576 } ?? -1,
             memFreeMB: vm.map { Double($0.free_count &+ $0.external_page_count &+ $0.purgeable_count) * pageSize / 1_048_576 } ?? -1,
             memPressureLevel: sysctlInt("kern.memorystatus_vm_pressure_level") ?? -1,
+            swapInMB: vm.map { Double($0.swapins) * pageSize / 1_048_576 },
             memCompressedMB: vm.map { Double($0.compressor_page_count) * pageSize / 1_048_576 } ?? -1,
             memWiredMB: vm.map { Double($0.wire_count) * pageSize / 1_048_576 } ?? -1,
             footprintMB: Double(footprintBytes()) / 1_048_576,

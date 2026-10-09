@@ -71,6 +71,7 @@ extension AppModel {
             paperPhase = ""; paperDetail = ""; paperEnvLine = ""; paperCaseLine = ""
             paperFraction = nil; paperStartedAt = nil
             profilingShowsTiming = false
+            serving.pausedForBenchmark = false
             restartWatcherForPaperRun()
             // Resume where it left off (incremental) AND drain everything the run's guards deferred:
             // buffered FS events, added-folder catch-ups, folder removals, the tag backfill.
@@ -80,9 +81,13 @@ extension AppModel {
             if activeSheet == .progress { activeSheet = nil }
         }
 
+        // Serving off for the run and back on after: a client that embeds or searches mid-run would
+        // share the engine with every case. Held, not switched: the saved setting is untouched, so
+        // a run that dies part-way still serves at the next launch.
+        serving.pausedForBenchmark = true
+
         // Quiesce the other half of the "no work in flight" contract the suite documents: every
-        // embed pipeline paused AND awaited, the watcher stopped. Serving was refused in the
-        // preflight rather than stopped, because stopping it would mutate a user setting.
+        // embed pipeline paused AND awaited, the watcher stopped.
         //
         // isIndexWorkInFlight, not indexState: a watcher reconcile and a tag-backfill batch (armed
         // 3 s after any search) never set indexState, so waiting on it alone left one of them
@@ -211,14 +216,6 @@ extension AppModel {
         // The paper's reference checkpoint is Nano (Table 1). A mixed-variant table is worthless,
         // and Nano is also the only variant that leaves headroom at 8 GB. Never switched here:
         // switchVariant reloads the engine and can mark the real index obsolete.
-        // Refused, not stopped: stopping the server would mutate a user setting. An external client
-        // embedding or searching mid-run would use the benchmark's levers against the user's store.
-        guard !serving.isRunning else {
-            paperAlert("Turn off Serving first",
-                       "The HTTP server is running, and a client that embeds or searches during the "
-                       + "run would share the engine with it. Turn Serving off in Settings, then run it again.")
-            return false
-        }
 
         let snap = SystemProbe.snapshot()
         // The same refusal run_bench.sh already makes, for the same reason: a contended measurement

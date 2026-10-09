@@ -383,6 +383,8 @@ public struct PaperReport: Sendable, Codable {
                 b.put("case.\(c.id).env.mem_free_begin_mb", Self.probe(e.memFreeBeginMB, 1))
                 b.put("case.\(c.id).env.swap_delta_mb", e.swapDeltaMB, digits: 1)
                 b.put("case.\(c.id).env.footprint_delta_mb", e.footprintDeltaMB, digits: 1)
+                if let v = e.footprintPeakDeltaMB { b.put("case.\(c.id).env.footprint_peak_delta_mb", v, digits: 1) }
+                if let v = e.swapInMB { b.put("case.\(c.id).env.swap_in_mb", v, digits: 1) }
                 b.put("case.\(c.id).env.mlx_peak_mb", e.mlxPeakMB, digits: 1)
                 b.put("case.\(c.id).env.system_cpu_busy_pct", Self.probe(e.systemBusyPercent, 1))
                 b.put("case.\(c.id).env.own_cpu_cores", Self.probe(e.ownCPUCores, 2))
@@ -568,7 +570,7 @@ public struct PaperReport: Sendable, Codable {
                      + "Do not present this as a complete suite.")
         }
         if result.status == .abortedSwap {
-            w.append("ABORTED ON SWAP: the machine started paging mid-run. Every case after the abort is "
+            w.append("ABORTED ON SWAP: the machine read pages back from swap mid-run. Every case after the abort is "
                      + "missing and the last one measured before it may be a paging measurement.")
         }
         if result.scale < 1.0 {
@@ -592,6 +594,10 @@ public struct PaperReport: Sendable, Codable {
         if !result.contendedCases.isEmpty {
             w.append("Contended (another process used more than a fifth of the machine): "
                      + result.contendedCases.joined(separator: ", "))
+        }
+        if !result.pagedCases.isEmpty {
+            w.append(String(format: "Paged (more than %.0f MB read back from swap while it ran): ", PaperSuiteResult.pagedThresholdMB)
+                     + result.pagedCases.joined(separator: ", "))
         }
         if result.end.powerSource == "battery" || result.begin.powerSource == "battery" {
             w.append("On battery for at least part of the run: Apple silicon clocks differently on battery.")

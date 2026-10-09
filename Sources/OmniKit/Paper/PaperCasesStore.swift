@@ -67,10 +67,6 @@ public enum PaperCasesStore {
     /// store always crosses the gate - the case measures what VACUUM costs, not whether it fires.
     static let compactMinFreeRatio = 0.05
 
-    /// Share of free memory a single scan_ladder rung may claim. Mirrors `PaperRunConfig.memoryGuardFraction`,
-    /// which the runner applies to the case as a whole and which a body cannot read.
-    static let rungMemoryGuardFraction = 0.60
-
     /// Lead-in before a write whose debounced idle fold must actually fire. `VectorStore` skips the
     /// fold while a search happened inside its 2 s active window, so the preceding arm's queries have
     /// to age out first. Anything above 2 s works; 2.5 s is that with slack.
@@ -257,7 +253,7 @@ public enum PaperCasesStore {
             // comfortably along with the 500k row it cannot.
             let peakMB = PaperCaseCatalog.storePeakMB(rows: target, quantized: true)
             let freeMB = SystemProbe.snapshot().memFreeMB
-            if freeMB > 0, peakMB > rungMemoryGuardFraction * freeMB {
+            if freeMB > 0, peakMB > freeMB - PaperCaseCatalog.memoryReserveMB {
                 skippedMemory.append(target)
                 continue
             }

@@ -156,6 +156,10 @@ enum PerfScript {
             if let data = try? JSONSerialization.data(withJSONObject: payload) {
                 try? data.write(to: URL(fileURLWithPath: arg), options: .atomic)
             }
+        case "bench":       // Settings > Performance > Run benchmark (returns at once; the run goes on)
+            Task { await model.runPaperBenchmark() }
+        case "benchcancel": // the progress sheet's Cancel
+            model.cancelPaperRun()
         case "pressure":    // what macOS's memory-pressure source reports: warning | critical | normal
             model.memoryPressureChanged(arg == "critical" ? .critical : arg == "warning" ? .warning : .normal)
         case "cliinstall":  // Settings > Serving > Install... (point -omni.cliLinkDir at a scratch folder)

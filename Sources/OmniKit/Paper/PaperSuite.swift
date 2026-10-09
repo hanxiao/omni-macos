@@ -93,10 +93,10 @@ public struct PaperRunConfig: Sendable {
     /// Identical on every machine so case k never inherits case k-1's thermal state.
     public var interCaseGapSeconds: Double
     public var armSettleSeconds: Double
-    /// Growth in swap that aborts the run (Risk 1).
+    /// MB read back from swap since the run began that abort it (Risk 1).
     public var swapAbortMB: Double
-    /// A case may claim at most this share of the memory actually free.
-    public var memoryGuardFraction: Double
+    /// A case may claim the memory actually free less this (PaperCaseCatalog.memoryReserveMB).
+    public var memoryReserveMB: Double
     /// Pin the memory cap for the run. nil leaves the cap alone (the app pins it itself, because
     /// only the app can tell "Unlimited" from "capped at exactly physical RAM" on the way back).
     public var pinMemoryCapBytes: Int?
@@ -110,13 +110,13 @@ public struct PaperRunConfig: Sendable {
                 interCaseGapSeconds: Double = 3.0,
                 armSettleSeconds: Double = 0.25,
                 swapAbortMB: Double = 512,
-                memoryGuardFraction: Double = 0.60,
+                memoryReserveMB: Double = PaperCaseCatalog.memoryReserveMB,
                 pinMemoryCapBytes: Int? = nil,
                 restoreMemoryCap: (@Sendable () -> Void)? = nil,
                 cancelLatencyBoundSeconds: Double = 3.0) {
         self.runId = runId; self.scale = scale; self.maxWallSeconds = maxWallSeconds
         self.interCaseGapSeconds = interCaseGapSeconds; self.armSettleSeconds = armSettleSeconds
-        self.swapAbortMB = swapAbortMB; self.memoryGuardFraction = memoryGuardFraction
+        self.swapAbortMB = swapAbortMB; self.memoryReserveMB = memoryReserveMB
         self.pinMemoryCapBytes = pinMemoryCapBytes; self.restoreMemoryCap = restoreMemoryCap
         self.cancelLatencyBoundSeconds = cancelLatencyBoundSeconds
     }
@@ -302,7 +302,7 @@ public enum PaperSuite {
                 if isCancelled() {
                     precheck = (.cancelled, "cancelled during the inter-case gap")
                     status = .cancelled
-                } else if let block = memoryBlock(spec, fraction: config.memoryGuardFraction) {
+                } else if let block = memoryBlock(spec, reserve: config.memoryReserveMB) {
                     precheck = (.skippedMemory, block)
                 }
             }
@@ -327,6 +327,7 @@ public enum PaperSuite {
                                        deadline: Date().addingTimeInterval(spec.budgetSeconds),
                                        levers: levers, cancelled: isCancelled, relay: relay)
                 let t0 = Date()
+                let peak = FootprintPeak(from: envBegin.footprintMB)
                 var output = PaperCaseOutput()
                 var caseStatus = PaperCaseStatus.ok
                 var note: String?
@@ -354,6 +355,8 @@ public enum PaperSuite {
                 if caseStatus == .cancelled { status = .cancelled }
 
                 let envEnd = SystemProbe.snapshot()
+                let peakDelta = peak.stop()
+                let swapIn = envEnd.swapInMB.flatMap { e in envBegin.swapInMB.map { e - $0 } }
                 let busy = SystemProbe.busy(from: envBegin, to: envEnd)
                 maxBusy = max(maxBusy, busy.systemBusyPct)
                 maxThermalRank = max(maxThermalRank, thermalRank(envEnd.thermal))
@@ -368,14 +371,18 @@ public enum PaperSuite {
                         memFreeBeginMB: envBegin.memFreeMB,
                         swapDeltaMB: envEnd.swapUsedMB - envBegin.swapUsedMB,
                         footprintDeltaMB: envEnd.footprintMB - envBegin.footprintMB,
+                        footprintPeakDeltaMB: peakDelta, swapInMB: swapIn,
                         mlxPeakMB: envEnd.mlxPeakMB,
                         systemBusyPercent: busy.systemBusyPct, ownCPUCores: busy.ownCores,
                         contended: busy.contended))
 
-                // Swap is the primary wedge detector. Past the limit every later number would be a
-                // paging measurement, so the run stops rather than filling a table with them.
-                if begin.swapUsedMB >= 0, envEnd.swapUsedMB >= 0,
-                   envEnd.swapUsedMB - begin.swapUsedMB > config.swapAbortMB {
+                // Paging is the wedge detector: past the limit every later number would be a paging
+                // measurement, so the run stops rather than filling a table with them. It counts
+                // pages READ BACK from swap. It used to count swap USED, which grows whenever the
+                // kernel parks the owner's idle apps to make room - what a 16 GB Mac does as soon as
+                // the model loads - and stopped a 16 GB M4 after five cases (bench-v7) with nothing
+                // of the benchmark's own ever paged out.
+                if let now = envEnd.swapInMB, let start = begin.swapInMB, now - start > config.swapAbortMB {
                     aborted = true
                     status = .abortedSwap
                 }
@@ -420,15 +427,42 @@ public enum PaperSuite {
 
     // MARK: - Gates and helpers
 
-    /// A case may claim at most `fraction` of the memory actually free. The peak is arithmetic, not
-    /// estimated; a case without one (its peak is the model's activations, which the harness does
+    /// The highest phys_footprint a case reaches, sampled every 50 ms on its own thread, over the
+    /// footprint it started from. The case's end-to-end delta hides a transient it freed before
+    /// returning, and the transient is what the memory gate has to admit.
+    final class FootprintPeak: @unchecked Sendable {
+        private let lock = NSLock()
+        private var high: Double
+        private var running = true
+        private let base: Double
+        private let done = DispatchSemaphore(value: 0)
+        init(from base: Double) {
+            self.base = base; high = base
+            Thread.detachNewThread { [self] in
+                while lock.withLock({ running }) {
+                    let now = Double(SystemProbe.footprintBytes()) / 1_048_576
+                    lock.withLock { high = Swift.max(high, now) }
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
+                done.signal()
+            }
+        }
+        func stop() -> Double {
+            lock.withLock { running = false }
+            done.wait()
+            return lock.withLock { high } - base
+        }
+    }
+
+    /// A case may claim the memory actually free less `reserve`. The peak is arithmetic or measured,
+    /// never guessed; a case without one (its peak is the model's activations, which the harness does
     /// not size) is never blocked, because guessing a number here would be worse than not gating.
-    private static func memoryBlock(_ spec: PaperCaseSpec, fraction: Double) -> String? {
+    private static func memoryBlock(_ spec: PaperCaseSpec, reserve: Double) -> String? {
         guard let peak = spec.arithmeticPeakMB else { return nil }
         let free = SystemProbe.snapshot().memFreeMB
         guard free > 0 else { return nil }          // probe failed; do not block on an unknown
-        guard peak > fraction * free else { return nil }
-        return String(format: "needs %.0f MB, only %.0f MB free", peak, free)
+        guard peak > free - reserve else { return nil }
+        return String(format: "needs %.0f MB, only %.0f MB free (%.0f kept in reserve)", peak, free, reserve)
     }
 
     /// The fixed idle gap, polled so a cancel is acknowledged inside it rather than after it.

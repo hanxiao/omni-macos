@@ -253,7 +253,8 @@ struct SearchToolbar: ViewModifier {
     /// Names the port when it is actually listening, because that is what a reader needs next. No
     /// "click to stop": it is a toggle, and its filled state already says which way it is.
     private var servingHelp: String {
-        model.serving.state == .running ? "Serving on port \(model.serving.port)" : "Serve over HTTP"
+        model.serving.pausedForBenchmark ? "Off while the benchmark runs"
+            : model.serving.state == .running ? "Serving on port \(model.serving.port)" : "Serve over HTTP"
     }
 
     /// The four leading controls, emitted at whatever placement the running system actually
@@ -283,10 +284,11 @@ struct SearchToolbar: ViewModifier {
                 .accessibilityIdentifier("ocr.toggle")
         }
         ToolbarItem(id: "serve.mode", placement: placement) {
-            ToolbarToggle(isOn: Binding(get: { model.serving.enabled },
+            ToolbarToggle(isOn: Binding(get: { model.serving.isOn },
                                         set: { model.serving.enabled = $0 }),
                           symbol: "network",
                           title: "Serve over HTTP")
+                .disabled(model.serving.pausedForBenchmark)
                 .help(servingHelp)
                 .accessibilityLabel("Serve over HTTP")
         }

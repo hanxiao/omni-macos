@@ -125,6 +125,26 @@ public enum PaperCaseCatalog {
     static let tier32GiB = 31.5
     static func gibibytes(_ bytes: Int) -> Double { Double(bytes) / 1_073_741_824 }
 
+    /// What a case may claim: the memory the kernel can hand out without compressing or swapping
+    /// anything (SystemProbe.memFreeMB), less this. Was 60% of free memory, which on a 16 GB M2 left
+    /// 3.4 GB of a measured 5.7 GB unusable and skipped the store every query and write row needs.
+    /// Pages read back from swap stop the run (PaperRunConfig.swapAbortMB) if a gate is ever wrong.
+    public static let memoryReserveMB = 1_024.0
+
+    /// MEASURED peaks for the cases that build or copy the million-row store, as bytes per row:
+    /// phys_footprint sampled every 50 ms over the footprint the case began with (release build, the
+    /// one-bit store every Mac below 32 GPU cores adopts, M3 Ultra forced to it, 2026-10-08):
+    ///   store_build          4,248 MB at 1,000,000 rows
+    ///   search_under_writes  1,479 MB at 1,000,000 rows (a copy of it, one write at a time)
+    ///   delete_cost          3,129 MB at   500,000 rows (both arms' stores)
+    /// The arithmetic estimate below said 3,552, 3,552 and 1,536: twice too high for the copy and
+    /// twice too low for the deletion case. Rounded up about 5%. Re-measure when the store changes:
+    /// every case report prints env.footprint_peak_delta_mb.
+    static func measuredPeakMB(rows: Int, bytesPerRow: Double) -> Double { Double(rows) * bytesPerRow / 1e6 }
+    static let storeBuildBytesPerRow = 4_500.0
+    static let storeCopyBytesPerRow = 1_600.0
+    static let deleteCostBytesPerRow = 6_600.0
+
     /// Exact arithmetic for a dim-768 store: a bf16 row costs 1,536 B and is held TWICE (the host
     /// flat16 source of truth plus the GPU base matrix); the int4 replica adds ~480 B/row on top.
     /// This is the number the memory gate compares against free memory, so it must stay arithmetic.
@@ -301,7 +321,9 @@ public enum PaperCaseCatalog {
             arms: [PaperArm("bf16", PaperLeverSet(quantBase: .bits(0), bitCandidateMultiplier: 1)),
                    PaperArm("bit1", PaperLeverSet(quantBase: .bits(1), bitCandidateMultiplier: 2))],
             params: p,
-            arithmeticPeakMB: storePeakMB(rows: scaledLadder.max() ?? 0, quantized: true),
+            // The SMALLEST rung: each rung is gated again on its own as the case reaches it, so a
+            // Mac that cannot hold the top rung still measures the ones it can.
+            arithmeticPeakMB: storePeakMB(rows: scaledLadder.min() ?? 0, quantized: true),
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
 
@@ -362,7 +384,7 @@ public enum PaperCaseCatalog {
             arms: [PaperArm("tombstone_off", PaperLeverSet(tombstones: false)),
                    PaperArm("tombstone_on", PaperLeverSet(tombstones: true))],
             params: p,
-            arithmeticPeakMB: storePeakMB(rows: scaledInt(big, scale, minimum: 10_000), quantized: false),
+            arithmeticPeakMB: measuredPeakMB(rows: scaledInt(big, scale, minimum: 10_000), bytesPerRow: deleteCostBytesPerRow),
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
 
@@ -492,7 +514,7 @@ public enum PaperCaseCatalog {
             deliverable: "Task table, bulk write row; the store the query and write rows use",
             budgetSeconds: 420,
             arms: [], params: p,
-            arithmeticPeakMB: storePeakMB(rows: scaledInt(1_000_000, scale, minimum: 16_000), quantized: true),
+            arithmeticPeakMB: measuredPeakMB(rows: scaledInt(1_000_000, scale, minimum: 16_000), bytesPerRow: storeBuildBytesPerRow),
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
 
@@ -550,7 +572,7 @@ public enum PaperCaseCatalog {
             deliverable: "Task table, search-under-writes rows: re-index, bulk delete, folder removal, kind removal, reclaim",
             budgetSeconds: 600,
             arms: [], params: p,
-            arithmeticPeakMB: storePeakMB(rows: scaledInt(1_000_000, scale, minimum: 16_000), quantized: true),
+            arithmeticPeakMB: measuredPeakMB(rows: scaledInt(1_000_000, scale, minimum: 16_000), bytesPerRow: storeCopyBytesPerRow),
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
 

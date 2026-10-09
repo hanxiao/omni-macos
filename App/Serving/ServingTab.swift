@@ -74,10 +74,11 @@ struct ServingTab: View {
     @ViewBuilder private var serverSection: some View {
         Section {
             Toggle("Serve Omni over HTTP", isOn: Binding(
-                get: { model.serving.enabled },
+                get: { model.serving.isOn },
                 set: { model.serving.enabled = $0 }
             ))
             .toggleStyle(.switch)
+            .disabled(model.serving.pausedForBenchmark)
 
             // WHO CAN REACH IT and WITH WHAT - directly under the switch that turns it on, because
             // they are the same decision. As their own "Access" section they read as a separate

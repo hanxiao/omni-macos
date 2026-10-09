@@ -533,6 +533,24 @@ day later the same tour measured ZERO blocks over 250 ms (see "UI tests").
     idle Mac costing ~4x a warm one is an app question worth its own look (not taken up here).
   - Still unexplained, needs the M4's own report: its query tails (filtered p95 51.5 ms, text
     search p99 59.7, find similar p50 19.9 against 6.9 on the M4 Pro).
+- After the 0.15.12 runs on 16 GB Macs (same suite id, bench-v7: no timing method changed):
+  - M2 16 GB: store_build "skipped:memory: needs 3552 MB, only 5689 MB free", search_under_writes
+    likewise; M4 16 GB: "aborted:swap" after 5 of 16 cases. Everything that needs the store empty.
+  - THE BENCHMARK LEAKED WHAT IT READ. v7's read-through used FileHandle.read(upToCount:), whose
+    Data is autoreleased and never drained on a case's thread: footprint 2.7 GB at the start of a
+    run, 31.6 GB at the end (search under writes alone +19.8 GB). One reused buffer: 2.7 -> 5.4.
+  - THE SWAP RULE COUNTED THE WRONG THING: swap USED growing 512 MB stopped the run, and that is
+    the kernel parking the owner's idle apps whenever anything allocates on 16 GB. It now counts
+    pages READ BACK from swap (vm swapins), 512 MB to stop, and the report lists every case that
+    read back over 64 MB as Paged.
+  - THE GATE NOW USES MEASURED PEAKS and free memory less 1 GB, not 60% of it. Every case reports
+    env.footprint_peak_delta_mb (phys_footprint every 50 ms). One-bit store, release, M3 Ultra
+    forced: store_build 4,248 MB, search_under_writes 1,479, delete_cost 3,129 at 500k rows, scan
+    ladder 5,472 up to 2M; the old arithmetic said 3,552 / 3,552 / 1,536 / 7,104. The scan case is
+    gated on its smallest rung, each rung again on its own.
+  - Serving is held off for the run (ServingController.pausedForBenchmark, never persisted) instead
+    of refusing to start. Isolated instance on 51399: answered, closed for the 48 s the run took,
+    answered after the cancel.
 - `--only store_build,search_under_writes` runs a subset (2 min); the report marks it SUBSET RUN.
   With OMNI_SEARCH_TIMING=1 every slice, checkpoint and slow search logs its phases.
 - WHAT IT FOUND ON ITS FIRST FULL RUN: a 1.3-1.8 s stall in the bulk delete (tombstones over budget

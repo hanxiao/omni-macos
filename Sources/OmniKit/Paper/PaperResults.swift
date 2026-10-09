@@ -311,7 +311,7 @@ public enum PaperCaseStatus: String, Sendable, Codable {
     case skippedTowers = "skipped:towers"
     /// The case's arithmetic peak did not fit in the memory actually available (Risk 1).
     case skippedMemory = "skipped:memory"
-    /// The suite aborted (swap grew past the limit) before this case started.
+    /// The suite aborted (paging past the limit) before this case started.
     case skippedAborted = "skipped:aborted"
     /// No body is compiled in for this case on this build. Never a measured zero.
     case skippedUnimplemented = "skipped:unimplemented"
@@ -330,6 +330,11 @@ public struct PaperCaseEnvironment: Sendable, Codable {
     public var memFreeBeginMB: Double
     public var swapDeltaMB: Double
     public var footprintDeltaMB: Double
+    /// Highest phys_footprint while the case ran, over the footprint it started from, sampled every
+    /// 50 ms. What the memory gate's estimates are checked against.
+    public var footprintPeakDeltaMB: Double?
+    /// Pages read back from swap while the case ran, system-wide.
+    public var swapInMB: Double?
     public var mlxPeakMB: Double
     public var systemBusyPercent: Double
     public var ownCPUCores: Double
@@ -376,8 +381,8 @@ public enum PaperSuiteStatus: String, Sendable, Codable {
     case complete
     case partial
     case cancelled
-    /// Swap grew past the limit mid-run: every number after that point would be a paging
-    /// measurement, so the suite stops rather than filling a table with them.
+    /// More than the limit read back from swap mid-run: every number after that point would be a
+    /// paging measurement, so the suite stops rather than filling a table with them.
     case abortedSwap = "aborted:swap"
     case failed
 }
@@ -412,4 +417,7 @@ public struct PaperSuiteResult: Sendable, Codable {
     public var casesTotal: Int { cases.count }
     public var thermalDriftExceeded: Bool { abs(thermalDriftPercent ?? 0) > 8 }
     public var contendedCases: [String] { cases.filter { $0.environment?.contended == true }.map(\.id) }
+    /// Cases that waited on swap: more than `pagedThresholdMB` read back from it while they ran.
+    public var pagedCases: [String] { cases.filter { ($0.environment?.swapInMB ?? 0) > Self.pagedThresholdMB }.map(\.id) }
+    public static let pagedThresholdMB = 64.0
 }
