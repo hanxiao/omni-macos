@@ -1201,3 +1201,27 @@ drawing in `mole_family.py`, not the PNGs.
   posted to a background instance are dropped, and bringing it forward would take the user's focus.
 - PerfScript `menu:<title>` performs a menu bar item by title, so a background instance can open
   the shortcuts window for `screencapture -l`.
+
+## iCloud-only files in the lists (2026-10-09)
+
+Checked through the app on a real iCloud folder after indexing with "Index, then remove download":
+17 of 17 files stayed dataless through the folder gallery, folder list, results gallery and
+results list - every thumbnail comes from the one iCloud keeps (QuickLook, no download).
+
+- FINDER'S CLOUD BADGE (`CloudBadge`) after the name in all four views; white on a selected row.
+  Lexical first: only a path under `Library/Mobile Documents` or `Library/CloudStorage` is stat'ed,
+  off the main thread. Refreshed by Open and Quick Look (they download, as in Finder), by Download
+  Now / Remove Download, and when the app comes forward (Finder may have changed one).
+- DOWNLOAD NOW / REMOVE DOWNLOAD in the file menu under Open, iCloud Drive only. Measured: double
+  click downloaded and opened in Preview in under 1 s, the badge cleared; Remove Download put it
+  back in 0.5 s and the badge returned. Refused (beep) while Preview still had the file mapped,
+  as iCloud refuses any eviction of a file in use.
+- A SELECTION NEVER DOWNLOADS. `OpenAtHit.prefetch` read a selected PDF to find the hit's page,
+  which for an iCloud-only PDF was a download on a click. It skips dataless files; the open does
+  the work instead.
+- THUMBNAILS COVER THE TILE (`Thumbnail.coverPixels`). Every path decoded to FIT the long side to
+  the tile, and the tile FILLS a square, so a 1280x749 photo came back 256x150 and was stretched
+  1.7x, a tall screenshot 2.8x: soft next to Finder, downloaded or not. ImageIO now sizes the long
+  side from the header so the short side covers (capped at 4x); QuickLook is asked for a box twice
+  the tile and the answer scaled down to the short side on QuickLook's queue. A 1:7.5 strip still
+  shows a soft middle crop: iCloud's own thumbnail of it is 34x256.

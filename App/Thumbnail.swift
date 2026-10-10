@@ -150,7 +150,10 @@ struct Thumbnail: View {
         // Finder has shown is ~free.
         let request = QLThumbnailGenerator.Request(
             fileAt: url,
-            size: CGSize(width: side, height: side),
+            // Twice the tile: QuickLook FITS the box, and the tile fills it (see coverPixels). An
+            // iCloud-only file is served from the thumbnail iCloud keeps, at no download - measured
+            // 92x256 for a tall screenshot at a 256 box, 512x363 for a photo at 512.
+            size: CGSize(width: side * 2, height: side * 2),
             scale: scale,
             representationTypes: .all
         )
@@ -167,7 +170,8 @@ struct Thumbnail: View {
         let cg: CGImage? = await withTaskCancellationHandler {
             await withCheckedContinuation { (cont: CheckedContinuation<CGImage?, Never>) in
                 QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { rep, _ in
-                    cont.resume(returning: rep?.cgImage)
+                    // Scaled here, on QuickLook's queue, not on the main actor after the await.
+                    cont.resume(returning: rep.map { Self.coverDownscale($0.cgImage, tile: maxPixel) })
                 }
             }
         } onCancel: {
@@ -224,12 +228,46 @@ struct Thumbnail: View {
     /// and never returns the type-icon placeholder for a valid image (the QuickLook in-app failure mode
     /// for multi-megapixel files). `WithTransform` honors EXIF orientation. Synchronous CPU decode -
     /// call off the main thread.
+    /// The long side a thumbnail needs so its SHORT side covers a `tile`-pixel square.
+    ///
+    /// THE TILE FILLS, IT DOES NOT FIT. Thumbnails draw `.aspectRatio(contentMode: .fill)` into a
+    /// square, and every path decoded to fit the long side to the tile, so a 1280x749 photo came back
+    /// 256x150 and was stretched 1.7x to cover, a tall screenshot 2.8x: visibly soft in the gallery
+    /// next to Finder's. Capped at 4x so a panorama does not decode a strip the width of a wall.
+    nonisolated static func coverPixels(_ tile: Int, width: Int, height: Int) -> Int {
+        guard width > 0, height > 0 else { return tile }
+        let ratio = Double(Swift.max(width, height)) / Double(Swift.min(width, height))
+        return Int((Double(tile) * Swift.min(ratio, 4)).rounded(.up))
+    }
+
+    /// Scales `cg` down so its short side is `tile`, the most a filled square ever shows. QuickLook
+    /// is asked for a bigger box than the tile (it fits, and does not say the aspect first), and a
+    /// square answer would otherwise be cached at four times the pixels it needs.
+    nonisolated static func coverDownscale(_ cg: CGImage, tile: Int) -> CGImage {
+        let short = Swift.min(cg.width, cg.height)
+        guard short > tile else { return cg }
+        let s = Double(tile) / Double(short)
+        let w = Swift.max(1, Int((Double(cg.width) * s).rounded())), h = Swift.max(1, Int((Double(cg.height) * s).rounded()))
+        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return cg }
+        ctx.interpolationQuality = .high
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return ctx.makeImage() ?? cg
+    }
+
     nonisolated static func imageThumbnail(_ url: URL, maxPixel: Int) -> CGImage? {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
+        // Sized from the header (no decode) so the SHORT side covers the tile; see coverPixels.
+        var longSide = maxPixel
+        if let p = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+           let w = p[kCGImagePropertyPixelWidth] as? Int, let h = p[kCGImagePropertyPixelHeight] as? Int {
+            longSide = coverPixels(maxPixel, width: w, height: h)
+        }
         let opts: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: maxPixel,
+            kCGImageSourceThumbnailMaxPixelSize: longSide,
         ]
         return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
     }
@@ -242,7 +280,8 @@ struct Thumbnail: View {
         guard let doc = CGPDFDocument(url as CFURL), let page = doc.page(at: 1) else { return nil }
         let box = page.getBoxRect(.cropBox)
         guard box.width > 0, box.height > 0 else { return nil }
-        let s = CGFloat(maxPixel) / Swift.max(box.width, box.height)
+        let s = CGFloat(coverPixels(maxPixel, width: Int(box.width), height: Int(box.height)))
+            / Swift.max(box.width, box.height)
         let w = Swift.max(1, Int((box.width * s).rounded())), h = Swift.max(1, Int((box.height * s).rounded()))
         guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: CGColorSpaceCreateDeviceRGB(),

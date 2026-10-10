@@ -612,6 +612,7 @@ struct ResultRow: View {
                 HStack(spacing: 6) {
                     Text(fileName).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
                         .fileDragSource { [model, path = hit.path] in model.dragPaths(for: path) }
+                    CloudBadge(path: hit.path)
                     if let stack { stackBadge(stack) }
                 }
                 // The line is always there, blank when there is nothing to say: an image's tags are
@@ -832,8 +833,13 @@ struct ResultGridItem: View {
             // empty reserved line. Top-aligned, like Finder: the name starts right under the icon.
             ZStack(alignment: .top) {
                 Text(verbatim: "X\nX").font(.caption).padding(.vertical, 1).hidden()
-                Text(fileName).font(.caption).lineLimit(2)
-                    .multilineTextAlignment(.center)
+                // Finder's icon view: the cloud mark follows the name, inside its capsule.
+                HStack(alignment: .firstTextBaseline, spacing: 3) {
+                    Text(fileName).font(.caption).lineLimit(2)
+                        .multilineTextAlignment(.center)
+                    CloudBadge(path: hit.path, tint: selected && controlActive == .key
+                               ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
+                }
                     .foregroundStyle(selected && controlActive == .key ? .white : .primary)
                     .padding(.horizontal, 6).padding(.vertical, 1)
                     .background(selected ? (controlActive == .key

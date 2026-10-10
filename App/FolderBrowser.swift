@@ -212,6 +212,12 @@ struct FolderBrowser: View {
                     Text(entry.name).lineLimit(1).truncationMode(.middle)
                         .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
                     Spacer(minLength: 8)
+                    // Finder's iCloud status, at the trailing edge of the name column.
+                    if !entry.isDirectory {
+                        CloudBadge(path: entry.url.path,
+                                   tint: isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
+                            .padding(.trailing, 4)
+                    }
                     // THE TRAILING EDGE OF THE NAME COLUMN, where the sidebar puts the same pie at
                     // the trailing edge of its row. Between the name and the first fixed column, so
                     // it never overlaps a value and never moves when columns are turned on or off.
@@ -440,8 +446,11 @@ struct FolderBrowser: View {
                                         ? Color(nsColor: .unemphasizedSelectedContentBackgroundColor)
                                         : .clear,
                                         in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        Text(entry.name).font(.caption).lineLimit(2)
-                            .multilineTextAlignment(.center)
+                        HStack(alignment: .firstTextBaseline, spacing: 3) {
+                            Text(entry.name).font(.caption).lineLimit(2)
+                                .multilineTextAlignment(.center)
+                            if !entry.isDirectory { CloudBadge(path: entry.url.path) }
+                        }
                             .foregroundStyle(isSelected
                                              ? AnyShapeStyle(Color(nsColor: .alternateSelectedControlTextColor))
                                              : AnyShapeStyle(.primary))

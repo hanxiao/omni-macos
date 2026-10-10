@@ -44,6 +44,9 @@ enum OpenAtHit {
               let page = ChunkPreview.pageIndex(fromLocator: locator) else { return }
         let url = URL(fileURLWithPath: path)
         Task.detached(priority: .utility) {
+            // A SELECTION NEVER DOWNLOADS. Reading an iCloud-only PDF here would pull it down on a
+            // click, which Finder never does; the open, which downloads anyway, works it out then.
+            guard !FileExtractor.isDataless(path) else { return }
             _ = phraseCache.phrase(url, page: page, snippet: snippet, budget: prefetchBudget)
         }
     }

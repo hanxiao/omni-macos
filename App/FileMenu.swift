@@ -2,6 +2,83 @@ import SwiftUI
 import AppKit
 import OmniKit
 
+/// Finder's iCloud state for a file: whether it is on this Mac, and the two commands that change it.
+///
+/// LEXICAL FIRST. Rows are drawn without touching the file system (a stat on a network share is a
+/// blocking round trip; see ResultRow.fileName), so only a path inside iCloud Drive or a cloud
+/// storage folder is ever stat'ed, and then off the main thread. stat never downloads (TN3150).
+@MainActor @Observable
+final class CloudStatus {
+    static let shared = CloudStatus()
+    /// Bumped when Omni downloads a file or removes a download, so every badge looks again.
+    private(set) var epoch = 0
+
+    nonisolated static func isICloud(_ path: String) -> Bool { path.contains("/Library/Mobile Documents/") }
+    nonisolated static func mayBeInCloud(_ path: String) -> Bool {
+        isICloud(path) || path.contains("/Library/CloudStorage/")
+    }
+
+    /// Download Now: asks iCloud for the file and redraws the badges once it has landed.
+    static func download(_ path: String) {
+        let url = URL(fileURLWithPath: path)
+        do { try FileManager.default.startDownloadingUbiquitousItem(at: url) } catch { NSSound.beep(); return }
+        settle(path, until: false)
+    }
+
+    /// Remove Download: hands the file back to iCloud. iCloud refuses while the file has changes it
+    /// has not uploaded, and Finder beeps the same way.
+    static func removeDownload(_ path: String) {
+        do { try FileManager.default.evictUbiquitousItem(at: URL(fileURLWithPath: path)) } catch { NSSound.beep(); return }
+        settle(path, until: true)
+    }
+
+    /// Open and Quick Look download an iCloud-only file, as they do in Finder; the badge follows.
+    static func watchDownload(_ path: String) {
+        guard mayBeInCloud(path) else { return }
+        Task.detached(priority: .utility) {
+            guard FileExtractor.isDataless(path) else { return }
+            await MainActor.run { settle(path, until: false) }
+        }
+    }
+
+    /// Looks again at every badge: Finder, or the system under disk pressure, may have downloaded
+    /// or evicted something while Omni was in the background.
+    func refresh() { epoch += 1 }
+
+    /// Waits off the main thread for the file to reach the state asked for (a download can take a
+    /// while; an eviction ~0.6 s, measured), then redraws.
+    private static func settle(_ path: String, until dataless: Bool) {
+        Task.detached(priority: .utility) {
+            for _ in 0 ..< 600 where FileExtractor.isDataless(path) != dataless {
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+            await MainActor.run { shared.epoch += 1 }
+        }
+    }
+}
+
+/// Finder's cloud mark on a file that is in iCloud only: opening it downloads it first.
+struct CloudBadge: View {
+    let path: String
+    var tint: AnyShapeStyle = AnyShapeStyle(.secondary)
+    @State private var cloudOnly = false
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if cloudOnly {
+                Image(systemName: "icloud.and.arrow.down").font(.caption).foregroundStyle(tint)
+                    .help("In iCloud only. Opening it downloads it.")
+            }
+        }
+        .task(id: "\(path)|\(CloudStatus.shared.epoch)") {
+            guard CloudStatus.mayBeInCloud(path) else { return }
+            let p = path
+            let dataless = await Task.detached(priority: .utility) { FileExtractor.isDataless(p) }.value
+            if dataless != cloudOnly { cloudOnly = dataless }
+        }
+    }
+}
+
 /// Kinds whose snippets are generated content tags (media). Generate Tags applies to these only -
 /// a text file's snippet is a real excerpt, and tags would be a downgrade.
 let taggableKinds: Set<String> = [
@@ -55,6 +132,19 @@ struct FileMenuItems<Passages: View>: View {
         if !Transcribe.candidates([path]).isEmpty {
             Button { Transcribe.send([path], model: model, ocr: ocr) } label: {
                 Label(Transcribe.title(1), systemImage: "text.viewfinder")
+            }
+        }
+        // Finder's pair, in Finder's place under Open: an iCloud file offers whichever of the two
+        // applies. Absent outside iCloud Drive - a third-party File Provider evicts by its own rules.
+        if CloudStatus.isICloud(path) {
+            if FileExtractor.isDataless(path) {
+                Button { CloudStatus.download(path) } label: {
+                    Label("Download Now", systemImage: "icloud.and.arrow.down")
+                }
+            } else {
+                Button { CloudStatus.removeDownload(path) } label: {
+                    Label("Remove Download", systemImage: "xmark.icloud")
+                }
             }
         }
         passages()

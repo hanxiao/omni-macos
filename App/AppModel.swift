@@ -427,6 +427,7 @@ final class AppModel {
     /// Open a result where it matched - a PDF at its page, a text file at its line - when the
     /// opening app can be told (OpenAtHit, issue #26); anything else opens as it always did.
     func openResult(_ path: String) {
+        CloudStatus.watchDownload(path)
         if let h = searchHit(for: path) {
             OpenAtHit.open(path, locator: h.locator, snippet: h.snippet)
         } else {
@@ -1381,6 +1382,7 @@ final class AppModel {
     /// guessed: a row context menu and the View menu both crash on the first click, the space bar
     /// never does, and the space bar is the one path that already runs off the menu's turn.
     func showPreview(_ url: URL?) {
+        if let url { CloudStatus.watchDownload(url.path) }   // Quick Look downloads, as in Finder
         Task { @MainActor [weak self] in self?.previewURL = url }
     }
     /// Finder-style toggle: dismiss the preview if open, else preview the current selection.
@@ -4861,6 +4863,8 @@ final class AppModel {
                 self.refreshDeniedRoots()
                 // Coming back from the Finder is when a folder has just been renamed there.
                 if self.store != nil { self.followMovedFolders() }
+                // ... and when a file was downloaded or had its download removed there.
+                CloudStatus.shared.refresh()
             }
         }
     }
