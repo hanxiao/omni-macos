@@ -402,7 +402,7 @@ private struct PageThumb: View, Equatable {
             if page.state == .done {
                 Button {
                     OmniPasteboard.copy(session.pageText(at: page.id))
-                } label: { Label("Copy Page as Markdown", systemImage: "doc.on.clipboard") }
+                } label: { Label("Copy Page as Markdown", systemImage: "doc.on.doc") }
             }
             if let url = OCRSession.fileURL(of: page.source) {
                 Divider()

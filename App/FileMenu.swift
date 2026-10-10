@@ -67,7 +67,7 @@ struct CloudBadge: View {
         HStack(spacing: 0) {
             if cloudOnly {
                 Image(systemName: "icloud.and.arrow.down").font(.caption).foregroundStyle(tint)
-                    .help("In iCloud only. Opening it downloads it.")
+                    .help("Stored in iCloud only")
             }
         }
         .task(id: "\(path)|\(CloudStatus.shared.epoch)") {
@@ -387,7 +387,7 @@ struct FolderMenuItems: View {
             Button(role: .destructive) {
                 willRemove()
                 if isRoot { model.removeRoot(url) } else { model.ignoreFolder(url) }
-            } label: { Label("Remove from Omni", systemImage: "minus.circle") }
+            } label: { Label("Remove from Omni", systemImage: "trash") }
         }
     }
 

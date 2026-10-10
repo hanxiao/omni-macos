@@ -442,12 +442,11 @@ private struct HistorySections: View {
                         }
                         Spacer(minLength: 0)
                         if hovered {
-                            // Safari's and Finder's Recents remove: under the pointer the row's
-                            // trailing glyph gives way to an x that drops the search, the same
-                            // command as Remove from History in its context menu. A clear mark,
-                            // not a trash can: nothing on disk is touched.
+                            // Under the pointer the trailing glyph gives way to Remove from
+                            // History, drawn with the trash its context menu and the day's use:
+                            // one action, one icon, wherever it appears.
                             Button { model.removeHistory(item) } label: {
-                                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                                Image(systemName: "trash").foregroundStyle(.secondary)
                             }
                             .buttonStyle(.plain)
                             .help("Remove from History")
@@ -719,7 +718,7 @@ private struct PhotoSourceRow: View {
             }
             Divider()
             Button(role: .destructive) { deselect(); model.removePhotoSource(source) } label: {
-                Label("Remove from Omni", systemImage: "minus.circle")
+                Label("Remove from Omni", systemImage: "trash")
             }
         }
     }
@@ -813,7 +812,7 @@ private struct CoveredFolderRow: View {
             // NOT "Remove from Omni". This is not a root, so there is nothing to un-index - the
             // parent still covers these files. It only forgets the shortcut.
             Button { model.removeCoveredFolder(url) } label: {
-                Label("Remove from Sidebar", systemImage: "sidebar.leading")
+                Label("Remove from Sidebar", systemImage: "trash")
             }
         }
     }

@@ -313,7 +313,7 @@ struct ContentView: View {
                 // The one status screen with a subtitle: it asks for a turn-on, and the title alone
                 // does not say what turning it on gets you.
                 CenteredStatus(symbol: CenteredStatus.moleSleep, title: "Clipboard history is off",
-                               subtitle: "Keeps what you copy, text and images, on this Mac, searchable by meaning like the rest of your files.",
+                               subtitle: "Saves the text and images you copy so you can search them.",
                                action: ("Turn On", { model.setClipboardEnabled(true) }),
                                prominent: true)
             } else if showsRecents {
@@ -752,8 +752,8 @@ struct SearchWaysPrompt: View {
         ("character.cursor.ibeam", "Type a phrase"),
         ("arrow.down.doc", "Drag in an image, file, or text"),
         ("doc.on.clipboard", "Paste an image or text  \u{2318}V"),
-        ("doc.viewfinder", "Search by File  \u{21E7}\u{2318}O"),
-        ("square.on.square", "Right-click a result for Find Similar"),
+        ("folder", "Search by File  \u{21E7}\u{2318}O"),
+        ("sparkle.magnifyingglass", "Right-click a result for Find Similar"),
     ]
 
     /// WAYS IN, not a feature list. This carried three more rows - find in the transcript, copy as

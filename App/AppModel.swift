@@ -137,9 +137,9 @@ enum HistoryMode: String, CaseIterable, Identifiable {
     }
     var detail: String {
         switch self {
-        case .auto: return "Every search you settle on is kept."
-        case .onSubmit: return "Only searches submitted with Return, plus Find Similar."
-        case .manual: return "Nothing is kept until you bookmark it."
+        case .auto: return "Saves every search after you stop typing."
+        case .onSubmit: return "Saves searches you submit with Return, and Find Similar."
+        case .manual: return "Saves only bookmarked searches."
         }
     }
 }

@@ -1225,3 +1225,16 @@ results list - every thumbnail comes from the one iCloud keeps (QuickLook, no do
   side from the header so the short side covers (capped at 4x); QuickLook is asked for a box twice
   the tile and the answer scaled down to the short side on QuickLook's queue. A 1:7.5 strip still
   shows a soft middle crop: iCloud's own thumbnail of it is 34x256.
+
+## One action, one icon; plain text (2026-10-09)
+
+- Every action that removes an entry from a list draws `trash`: Remove from History (row, day,
+  hover button), Remove from Omni, Remove from Sidebar, Clear Clipboard History, Move to Trash.
+  The hover button was `xmark.circle.fill` and Remove from Omni `minus.circle`: three icons for one
+  verb. Remove Download keeps Finder's `xmark.icloud`; the toolbar's filled star is a state.
+- Every copy draws `doc.on.doc` (Copy Page as Markdown was `doc.on.clipboard`, which is Paste's).
+  The empty-state hints use the toolbar's and menus' icons: `folder` for Search by File,
+  `sparkle.magnifyingglass` for Find Similar.
+- UI text says what a control does, in plain words: no "the headroom comes back on its own", no
+  "one batch of indexing always works in", no "every search you settle on". A new string is read
+  next to its neighbours before it ships.

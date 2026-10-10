@@ -124,8 +124,8 @@ extension AppModel {
         guard !isIndexWorkInFlight else {
             activeSheet = nil   // take the progress sheet down before the modal that explains why
             paperAlert("Indexing did not stop",
-                       "A file being indexed did not finish within 30 seconds. Its work would share "
-                       + "the GPU with every measurement. Wait for indexing to go quiet, then run it again.")
+                       "A file being indexed did not finish within 30 seconds and would slow down the "
+                       + "measurements. Wait for indexing to finish, then try again.")
             return
         }
 
@@ -237,22 +237,22 @@ extension AppModel {
         let loadLimit = max(2.0, 0.35 * Double(ProcessInfo.processInfo.activeProcessorCount))
         guard snap.loadAvg1m <= loadLimit else {
             paperAlert("The Mac is too busy",
-                       String(format: "One-minute load average is %.1f (the limit on this Mac is %.1f). "
-                              + "Let it settle, quit whatever is working, then run it again.",
+                       String(format: "One-minute load average is %.1f (limit %.1f). "
+                              + "Quit busy apps, then try again.",
                               snap.loadAvg1m, loadLimit))
             return false
         }
         guard snap.thermal != "serious", snap.thermal != "critical" else {
             paperAlert("The Mac is too hot",
-                       "Thermal state is '\(snap.thermal)', so it is already throttling and the numbers "
-                       + "would be mixed-clock. Let it cool down, then run it again.")
+                       "Thermal state is '\(snap.thermal)'. The Mac is throttling, so results would be "
+                       + "unreliable. Let it cool down, then try again.")
             return false
         }
         // Hard refuse: on battery AND in Low Power Mode is a different machine, not a slower one.
         guard !(snap.powerSource == "battery" && snap.lowPowerMode) else {
             paperAlert("Plug in, or turn off Low Power Mode",
-                       "On battery with Low Power Mode on, Apple silicon clocks differently and every "
-                       + "number would be a low-power number.")
+                       "Low Power Mode on battery slows the chip, so results would not be comparable "
+                       + "with other Macs.")
             return false
         }
         // The run writes several stores plus a VACUUM transient into $TMPDIR.
@@ -274,9 +274,9 @@ extension AppModel {
         if freeMB > 0, let worst = blocked.compactMap(\.arithmeticPeakMB).max() {
             let a = NSAlert()
             a.messageText = "Quit other apps first"
-            a.informativeText = String(format: "%d of the %d measurements need %.1f GB of memory available, and %.1f GB "
-                + "is available now. Quit other apps and run it again, or run anyway: those measurements, "
-                + "and the ones that use what they build, are left out.",
+            a.informativeText = String(format: "%d of %d measurements need %.1f GB of free memory, and %.1f GB "
+                + "is free now. Quit other apps and try again, or run anyway and skip those measurements "
+                + "and the ones that depend on them.",
                 blocked.count, specs.count, (worst + reserve) / 1024, freeMB / 1024)
             a.addButton(withTitle: "Cancel")
             a.addButton(withTitle: "Run anyway")
@@ -287,8 +287,8 @@ extension AppModel {
         if snap.powerSource == "battery" {
             let a = NSAlert()
             a.messageText = "Running on battery"
-            a.informativeText = "Apple silicon clocks differently on battery, and this takes \(BenchmarkDuration.minutesLabel). "
-                + "Plugging in gives numbers that merge with other machines'."
+            a.informativeText = "Apple silicon runs slower on battery. Plug in for results comparable with "
+                + "other Macs. The run takes \(BenchmarkDuration.minutesLabel)."
             a.addButton(withTitle: "Run anyway")
             a.addButton(withTitle: "Cancel")
             if a.runModal() != .alertFirstButtonReturn { return false }

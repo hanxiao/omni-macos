@@ -230,7 +230,7 @@ private struct ActivityTab: View {
                     Text("Index, then remove download").tag(1)
                     Text("Download and index").tag(2)
                 }
-                .help("Files kept in iCloud only. Index, then remove download reads each one, indexes it, and returns it to iCloud, leaving files you keep downloaded alone.")
+                .help("For files stored in iCloud only. Index, then remove download: downloads each file, indexes it, then removes the download. Files you keep downloaded are not affected.")
             }
 
             // WITH THE OTHER SOURCES, ahead of the folders. The clipboard is indexed like a folder -
@@ -395,7 +395,7 @@ private struct ContentTypesTab: View {
             } header: {
                 Text("Long files")
             } footer: {
-                Text("Text, Markdown, web pages and code are always read to the end. Logs and JSON past 2 MB keep their first 2 MB unless this is on.")
+                Text("Text, Markdown, web pages and code are always read in full. Logs and JSON files over 2 MB are cut at 2 MB unless this is on.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
@@ -426,7 +426,7 @@ private struct ContentTypesTab: View {
                 } header: {
                     Text("Rules in folders")
                 } footer: {
-                    Text("These folders have their own .omniignore file, which adds rules for that folder.")
+                    Text("These folders have their own .omniignore file with extra rules.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -685,10 +685,10 @@ private struct PerformanceTab: View {
             } footer: {
                 // What the setting is: room on top of what the model and index always take.
                 Text(model.isPaperRunning ? "Locked while the benchmark runs."
-                     : model.memoryPressureActive ? "Paused while your Mac is short of memory; Omni runs on what the model and index need, and the headroom comes back on its own."
+                     : model.memoryPressureActive ? "Paused while memory is low. Resumes automatically."
                      : (model.modelIndexBytes > 0
-                        ? "On top of the model and index, which take \(ByteSize.memory(model.modelIndexBytes)), and the \(ByteSize.memory(omniWorkingFloorBytes)) one batch of indexing always works in. More headroom indexes faster; with none, Omni still works, a small batch at a time."
-                        : "On top of the model and index, and the \(ByteSize.memory(omniWorkingFloorBytes)) one batch of indexing always works in. More headroom indexes faster; with none, Omni still works, a small batch at a time."))
+                        ? "Extra memory for indexing, on top of the model and index (\(ByteSize.memory(model.modelIndexBytes))) and a \(ByteSize.memory(omniWorkingFloorBytes)) working buffer. More indexes faster. With none, indexing still runs, more slowly."
+                        : "Extra memory for indexing, on top of the model, the index and a \(ByteSize.memory(omniWorkingFloorBytes)) working buffer. More indexes faster. With none, indexing still runs, more slowly."))
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -716,7 +716,7 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Benchmark")
             } footer: {
-                Text("Measures indexing, queries and search under heavy writes on data it generates, in \(BenchmarkDuration.minutesLabel). Sharing sends hardware and timings to hanxiao.io/omni, never files.")
+                Text("Measures indexing and search speed on generated test data. Takes \(BenchmarkDuration.minutesLabel). Sharing sends hardware details and timings to hanxiao.io/omni, never your files.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
