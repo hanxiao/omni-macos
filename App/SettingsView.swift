@@ -217,12 +217,20 @@ private struct ActivityTab: View {
                 Text("File types")
             }
 
+            // THREE POLICIES, NOT TWO (issue #29). Download and index fills the disk with every
+            // file the user chose to keep in the cloud; the middle one reads each through, indexes
+            // it, and hands the download straight back, so what the user kept local or in the
+            // cloud is exactly as they left it. Evict is set before skip, so the pass that turning
+            // skip off starts already knows to hand files back.
             Section("iCloud") {
-                Picker("Files not downloaded", selection: Binding(get: { model.skipDatalessFiles },
-                                                                 set: { model.skipDatalessFiles = $0 })) {
-                    Text("Skip").tag(true)
-                    Text("Download and index").tag(false)
+                Picker("Files not downloaded", selection: Binding(
+                    get: { model.skipDatalessFiles ? 0 : (model.evictDownloadedFiles ? 1 : 2) },
+                    set: { model.evictDownloadedFiles = $0 == 1; model.skipDatalessFiles = $0 == 0 })) {
+                    Text("Skip").tag(0)
+                    Text("Index, then remove download").tag(1)
+                    Text("Download and index").tag(2)
                 }
+                .help("Files kept in iCloud only. Index, then remove download reads each one, indexes it, and returns it to iCloud, leaving files you keep downloaded alone.")
             }
 
             // WITH THE OTHER SOURCES, ahead of the folders. The clipboard is indexed like a folder -
@@ -258,7 +266,7 @@ private struct ActivityTab: View {
                     let rp = model.progress.perRoot[url.path]
                     HStack {
                         Image(systemName: "folder").foregroundStyle(.secondary)
-                        Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
+                        Text(SpecialFolder.name(for: url)).lineLimit(1).truncationMode(.middle)
                         Spacer()
                         if let rp, rp.total > 0, rp.done < rp.total,
                            model.isIndexing || model.activeRoots.contains(url.path) {

@@ -134,7 +134,7 @@ struct SearchToolbar: ViewModifier {
             // instant a row was clicked, while the previous folder's files were still listed
             // underneath it - which reads as "I am in the new folder" when you are not.
             let shown = model.browsingFolderShown ?? folder
-            return (shown.lastPathComponent, shown.path)
+            return (SpecialFolder.name(for: shown), shown.path)
         }
         return nil
     }
@@ -498,7 +498,7 @@ struct SearchToolbar: ViewModifier {
                 set: { model.filterFolder = $0.isEmpty ? nil : URL(fileURLWithPath: $0) }
             )) {
                 Text("All Folders").tag("")
-                ForEach(model.roots, id: \.self) { Text($0.lastPathComponent).tag($0.path) }
+                ForEach(model.roots, id: \.self) { Text(SpecialFolder.name(for: $0)).tag($0.path) }
             }
             Picker("Extension", selection: Binding(get: { model.filterExt }, set: { model.filterExt = $0 })) {
                 Text("Any Extension").tag("")

@@ -73,7 +73,7 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
         // back to the raw string: "Documents, image" beats "in:/Users/.../Documents type:image",
         // and a path shows its last component for the same reason the field's chip does.
         let values = parsed.qualifiers.map { q in
-            (q.negated ? "-" : "") + (q.key == "in" ? (q.value as NSString).lastPathComponent : q.value)
+            (q.negated ? "-" : "") + (q.key == "in" ? SpecialFolder.name(forPath: q.value) : q.value)
         }
         return values.isEmpty ? displayText : values.joined(separator: ", ")
     }
@@ -110,7 +110,7 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
         guard !isFile else { return nil }
         let parsed = SearchQueryParser.parse(displayText)
         guard let folder = parsed.qualifiers.first(where: { $0.key == "in" && !$0.negated }) else { return nil }
-        let leaf = (folder.value as NSString).lastPathComponent
+        let leaf = SpecialFolder.name(forPath: folder.value)
         guard !leaf.isEmpty, leaf != displayLabel else { return nil }
         // Middle-elided, for the same reason the search field's chip is: the generated folders in
         // this tree differ only in their SUFFIX, so a tail truncation renders siblings identically.
@@ -1256,7 +1256,7 @@ final class AppModel {
         /// path shows its last component only, because the field's width is fixed (see CLAUDE.md:
         /// the toolbar will not grow on Tahoe) and every character costs one of the query's.
         var label: String {
-            let shown = key == "in" ? (value as NSString).lastPathComponent : value
+            let shown = key == "in" ? SpecialFolder.name(forPath: value) : value
             return "\(negated ? "-" : "")\(key):\(SearchToken.elided(shown))"
         }
 
@@ -1927,6 +1927,10 @@ final class AppModel {
             persistPerf()
             if !skipDatalessFiles { requestIndexPass() }
         }
+    }
+    /// Read-through with the download handed back once indexed (IndexSettings.evictDownloaded).
+    var evictDownloadedFiles: Bool = false {
+        didSet { if oldValue != evictDownloadedFiles { persistPerf() } }
     }
 
     /// Long logs and data files read to the end (IndexSettings.readLongDataFiles). Off by default.
@@ -3101,7 +3105,7 @@ final class AppModel {
     private nonisolated static func ignoreDanger(removed: Int, total: Int, roots: [String], candidate: OmniIgnore) -> String? {
         if total > 0 && removed >= total { return "This removes every indexed file." }
         for r in roots where candidate.isIgnored(r, isDir: true) {
-            return "This excludes an entire indexed folder: \((r as NSString).lastPathComponent)."
+            return "This excludes an entire indexed folder: \(SpecialFolder.name(forPath: r))."
         }
         if total > 0 {
             let pct = Int((Double(removed) / Double(total)) * 100)
@@ -3446,6 +3450,7 @@ final class AppModel {
         if d.object(forKey: "omni.minVideoSec") != nil { minVideoSeconds = max(0, d.double(forKey: "omni.minVideoSec")) }
         if d.object(forKey: "omni.minTextChars") != nil { minTextChars = max(0, d.integer(forKey: "omni.minTextChars")) }
         if d.object(forKey: "omni.skipDataless") != nil { skipDatalessFiles = d.bool(forKey: "omni.skipDataless") }
+        evictDownloadedFiles = d.bool(forKey: "omni.evictDownloaded")
         if d.object(forKey: "omni.readLongDataFiles") != nil { readLongDataFiles = d.bool(forKey: "omni.readLongDataFiles") }
         if d.object(forKey: "omni.imageTags") != nil { imageTagsEnabled = d.bool(forKey: "omni.imageTags") }
         if d.object(forKey: "omni.instantSearch") != nil { instantSearchEnabled = d.bool(forKey: "omni.instantSearch") }
@@ -3463,6 +3468,7 @@ final class AppModel {
         OmniPrefs.set(minVideoSeconds, forKey: "omni.minVideoSec")
         OmniPrefs.set(minTextChars, forKey: "omni.minTextChars")
         OmniPrefs.set(skipDatalessFiles, forKey: "omni.skipDataless")
+        OmniPrefs.set(evictDownloadedFiles, forKey: "omni.evictDownloaded")
         OmniPrefs.set(readLongDataFiles, forKey: "omni.readLongDataFiles")
         OmniPrefs.set(imageTagsEnabled, forKey: "omni.imageTags")
         OmniPrefs.set(instantSearchEnabled, forKey: "omni.instantSearch")
@@ -6253,6 +6259,7 @@ final class AppModel {
         s.minVideoSeconds = minVideoSeconds
         s.minTextChars = minTextChars
         s.skipDataless = skipDatalessFiles
+        s.evictDownloaded = evictDownloadedFiles
         s.readLongDataFiles = readLongDataFiles
         s.imageTags = imageTagsEnabled
         return s

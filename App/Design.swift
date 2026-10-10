@@ -274,4 +274,30 @@ enum SpecialFolder {
 
     /// The system's symbol for this folder, or the generic one.
     static func symbol(for url: URL) -> String { symbols[key(url)] ?? "folder" }
+
+    /// The name Finder shows for this folder. iCloud Drive is `com~apple~CloudDocs` on disk, and a
+    /// sidebar row, a scope chip or a history row reading that is the file system talking, not
+    /// the app; the special folders also take their localized names this way ("Dokumente").
+    /// Every other folder is its last path component.
+    static func name(for url: URL) -> String { name(forPath: url.path) }
+
+    /// Read per row per render, so the common case is one dictionary miss and a set test: only a
+    /// path whose LEAF is one of the special folders' leaves pays for resolving symlinks.
+    static func name(forPath path: String) -> String {
+        if let n = names[path] { return n }
+        let leaf = (path as NSString).lastPathComponent
+        guard leaves.contains(leaf) else { return leaf }
+        return names[key(URL(fileURLWithPath: path))] ?? leaf
+    }
+
+    /// The special folders' display names, keyed by resolved path. Built once from `symbols`.
+    private static let names: [String: String] = {
+        var out: [String: String] = [:]
+        for path in symbols.keys {
+            let shown = FileManager.default.displayName(atPath: path)
+            if !shown.isEmpty, shown != (path as NSString).lastPathComponent { out[path] = shown }
+        }
+        return out
+    }()
+    private static let leaves = Set(names.keys.map { ($0 as NSString).lastPathComponent })
 }

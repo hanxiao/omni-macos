@@ -179,6 +179,12 @@ final class DecodedItem: @unchecked Sendable {
     /// CWR crop patches for HQ tag refinement (retag pass, single-frame images only): the 5
     /// study crops, preprocessed on the decode stage. Empty = tag at base quality.
     var hqCrops: [OmniVisionPreprocess.RawPatches] = []
+    /// A file this item's decode downloaded, to be handed back to the cloud (IndexSettings
+    /// .evictDownloaded). ON RELEASE, because that is the one point every payload agrees on: a long
+    /// text file or a scanned PDF is read again by the embed stage, long after decode returned, and
+    /// an early eviction would download it a second time.
+    var evictWhenDone: URL?
+    deinit { if let url = evictWhenDone { CloudEviction.evict(url) } }
     init(file: CrawledFile, kind: String = "", payload: Payload = .empty, unchanged: Bool = false, abandoned: Bool = false,
          meta: (width: Int, height: Int, duration: Double) = (0, 0, 0), contentKey: String? = nil) {
         self.file = file; self.kind = kind; self.payload = payload; self.unchanged = unchanged; self.abandoned = abandoned
@@ -190,6 +196,26 @@ private final class ReadyBox: @unchecked Sendable {
     var items = [Int: DecodedItem]()
     var estimates = [Int: Int]()   // admitted-but-not-consumed decoded-byte estimate, per index
     var outstandingBytes = 0       // sum of the above; gates the producer (guarded by `cond`)
+}
+
+/// Hands a file the indexer downloaded back to iCloud. Off the calling thread: the last release of
+/// an item is often on the embed thread, and eviction is a round trip to the iCloud daemon. A
+/// failure leaves the file downloaded, which is what the plain read-through policy does anyway:
+/// iCloud refuses while the file has changes it has not uploaded, and a third-party File Provider
+/// (Dropbox, OneDrive) is not an iCloud item and keeps its own eviction policy.
+enum CloudEviction {
+    private static let queue = DispatchQueue(label: "io.hanxiao.omni.evict", qos: .utility)
+    static func evict(_ url: URL) {
+        queue.async {
+            do {
+                try FileManager.default.evictUbiquitousItem(at: url)
+                if omniPerfEnabled { omniPerfLog("evict ok \(url.lastPathComponent)") }
+            } catch {
+                Indexer.log.info("evict \(url.path, privacy: .private): \(error.localizedDescription, privacy: .public)")
+                if omniPerfEnabled { omniPerfLog("evict failed \(url.lastPathComponent): \(error.localizedDescription)") }
+            }
+        }
+    }
 }
 
 /// Crawl -> extract -> chunk -> embed -> store, incrementally.
@@ -2144,6 +2170,15 @@ public final class Indexer: @unchecked Sendable {
     /// payload shape, HQ crops - is policy, and lives here exactly once so a new channel cannot
     /// quietly acquire its own version of it. That is precisely how issue #13 happened.
     private func decode(_ file: CrawledFile, settings: IndexSettings) -> DecodedItem {
+        // Asked BEFORE anything reads the file: the probe's header read is already a download.
+        let evict = settings.evictDownloaded && !settings.skipDataless
+            && FileContentSource.claims(file) && FileExtractor.isDataless(file.path)
+        let item = decodeContent(file, settings: settings)
+        if evict { item.evictWhenDone = file.url }
+        return item
+    }
+
+    private func decodeContent(_ file: CrawledFile, settings: IndexSettings) -> DecodedItem {
         let source = ContentSources.source(for: file)
 
         // Nil probe = produce nothing for this item right now: it is gone, or its content could

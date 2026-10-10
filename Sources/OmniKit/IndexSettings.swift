@@ -50,6 +50,11 @@ public struct IndexSettings: Sendable, Equatable {
     /// file that later gets evicted KEEPS its index entry (eviction does not change content), so it
     /// stays searchable. `false` restores read-through behavior: indexing downloads as it goes.
     public var skipDataless: Bool = true
+    /// With `skipDataless` off: hand each file the indexer downloaded back to the cloud once it is
+    /// indexed (issue #29). Only files that were dataless BEFORE the indexer read them - a file the
+    /// user downloaded or pinned with Keep Downloaded is never one of those, so it is never touched.
+    /// Eviction keeps mtime and size, so the file stays indexed and the reconcile sees no change.
+    public var evictDownloaded: Bool = false
     /// Read long logs and data files (Indexer.dataTextExtensions) to the end, as long prose is.
     /// Off: they keep the 2 MB cut. A 946 MB agent log or a model's weights as JSON is not text
     /// anyone searches by meaning, and read to the end it doubled a real index (index.md).

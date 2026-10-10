@@ -500,7 +500,7 @@ struct OmniApp: App {
                 // Finder lists Documents / Desktop / Downloads here; ours are whatever the user
                 // added, which is the same idea with the right contents for this app.
                 ForEach(Array(model.roots.enumerated()), id: \.element) { i, url in
-                    Button(url.lastPathComponent) { model.enterFolder(url) }
+                    Button(SpecialFolder.name(for: url)) { model.enterFolder(url) }
                         // Cmd-1..9 belong to the view modes, so the roots take Ctrl-Cmd-1..9.
                         .keyboardShortcut(i < 9 ? KeyboardShortcut(KeyEquivalent(Character("\(i + 1)")),
                                                                    modifiers: [.command, .control]) : nil)
@@ -672,48 +672,100 @@ struct OmniApp: App {
     }
 }
 
-/// The keyboard-shortcuts reference (Help > Omni keyboard shortcuts, Cmd-/). Two aligned columns:
-/// the action, and its keys rendered as monospaced key-caps - the native macOS reference style,
-/// replacing the old tab-aligned NSAlert text.
+/// The keyboard-shortcuts reference (Help > Omni Keyboard Shortcuts, Cmd-/): the action, and its
+/// keys as key-caps, the native macOS reference style.
+///
+/// READ OFF THE HANDLERS, NOT REMEMBERED. The first version listed fifteen menu chords and none of
+/// the keys the results and the search field handle themselves (ContentKeys, the Escape handler,
+/// OCRView's exit command), so Esc, Home/End, type-select and every Go and transcript chord were
+/// working and undocumented. Grouped the way the menus are, in two columns so the window stays
+/// shorter than a laptop screen.
 private struct ShortcutsView: View {
-    private let rows: [(action: String, keys: [String])] = [
-        ("Find", ["\u{2318}F"]),
-        ("Search by File", ["\u{21E7}\u{2318}O"]),
-        ("Find Similar", ["\u{2325}\u{2318}F"]),
-        ("Bookmark Search", ["\u{2318}D"]),
-        ("Open", ["\u{2318}O", "\u{21A9}"]),
-        ("Quick Look", ["\u{2318}Y", "Space"]),
-        ("Show in Finder", ["\u{21E7}\u{2318}R"]),
-        ("Copy Path", ["\u{2325}\u{2318}C"]),
-        ("Move to Trash", ["\u{2318}\u{232B}"]),
-        ("Transcribe", ["\u{2325}\u{2318}T"]),
-        ("Transcribe a Document", ["\u{2325}\u{2318}O"]),
-        ("View as Gallery / List", ["\u{2318}1", "\u{2318}2"]),
-        ("Index", ["\u{21E7}\u{2318}I"]),
-        ("Move Selection", ["\u{2191}\u{2193}\u{2190}\u{2192}"]),
-        ("Back / Forward", ["\u{2318}[", "\u{2318}]"]),
+    private typealias Row = (action: String, keys: [String])
+    private typealias Group = (title: String, rows: [Row])
+
+    private let columns: [[Group]] = [
+        [
+            ("Search", [
+                ("Find", ["\u{2318}F"]),
+                ("Clear Search", ["esc"]),
+                ("Search by File", ["\u{21E7}\u{2318}O"]),
+                ("Search by Clipboard", ["\u{2318}V"]),
+                ("Find Similar", ["\u{2325}\u{2318}F"]),
+                ("Bookmark Search", ["\u{2318}D"]),
+            ]),
+            ("Results", [
+                ("Open", ["\u{21A9}", "\u{2318}O"]),
+                ("Quick Look", ["Space", "\u{2318}Y"]),
+                ("Show in Finder", ["\u{21E7}\u{2318}R"]),
+                ("Copy", ["\u{2318}C"]),
+                ("Copy Path", ["\u{2325}\u{2318}C"]),
+                ("Select All", ["\u{2318}A"]),
+                ("Move to Trash", ["\u{2318}\u{232B}"]),
+                ("Move Selection", ["\u{2191}\u{2193}\u{2190}\u{2192}"]),
+                ("Extend Selection", ["\u{21E7}\u{2191}", "\u{21E7}\u{2193}"]),
+                ("First / Last", ["\u{2325}\u{2191}", "\u{2325}\u{2193}"]),
+                ("Select by Name", ["Type"]),
+            ]),
+        ],
+        [
+            ("Go and View", [
+                ("Back / Forward", ["\u{2318}[", "\u{2318}]"]),
+                ("Enclosing Folder", ["\u{2318}\u{2191}"]),
+                ("Go to Folder", ["\u{21E7}\u{2318}G"]),
+                ("Indexed Folders", ["\u{2303}\u{2318}1\u{2013}9"]),
+                ("Gallery / List", ["\u{2318}1", "\u{2318}2"]),
+                ("Show Sidebar", ["\u{2303}\u{2318}S"]),
+                ("Update Index", ["\u{21E7}\u{2318}I"]),
+            ]),
+            ("Transcribe", [
+                ("Transcribe Selection", ["\u{2325}\u{2318}T"]),
+                ("Transcribe a Document", ["\u{2325}\u{2318}O"]),
+                ("Open Document", ["\u{2318}O"]),
+                ("Find Next / Previous", ["\u{2318}G", "\u{21E7}\u{2318}G"]),
+                ("Search for Selection", ["\u{2325}\u{2318}E"]),
+                ("Copy Markdown", ["\u{21E7}\u{2318}C"]),
+                ("Save Markdown", ["\u{2318}S"]),
+                ("Pause", ["\u{2325}\u{2318}."]),
+                ("Stop", ["esc", "\u{2318}."]),
+                ("Close Document", ["\u{21E7}\u{2318}W"]),
+            ]),
+        ],
     ]
+
     var body: some View {
-        Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 10) {
-            ForEach(rows, id: \.action) { row in
-                GridRow {
-                    Text(row.action).foregroundStyle(.primary)
-                    HStack(spacing: 6) {
-                        ForEach(Array(row.keys.enumerated()), id: \.offset) { _, key in
-                            Text(key)
-                                .font(.system(.callout, design: .rounded).weight(.medium))
-                                .monospacedDigit()
-                                .foregroundStyle(.secondary)
-                                .padding(.horizontal, 7).padding(.vertical, 3)
-                                .background(.quaternary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+        HStack(alignment: .top, spacing: 36) {
+            ForEach(columns.indices, id: \.self) { c in
+                Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 8) {
+                    ForEach(columns[c], id: \.title) { group in
+                        GridRow {
+                            Text(group.title).font(.headline).foregroundStyle(.secondary)
+                                .gridCellColumns(2)
+                                .padding(.top, group.title == columns[c].first?.title ? 0 : 12)
+                        }
+                        ForEach(group.rows, id: \.action) { row in
+                            GridRow {
+                                Text(row.action).foregroundStyle(.primary)
+                                HStack(spacing: 6) {
+                                    ForEach(Array(row.keys.enumerated()), id: \.offset) { _, key in
+                                        Text(key)
+                                            .font(.system(.callout, design: .rounded).weight(.medium))
+                                            .monospacedDigit()
+                                            .foregroundStyle(.secondary)
+                                            .padding(.horizontal, 7).padding(.vertical, 3)
+                                            .background(.quaternary, in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                                    }
+                                }
+                                .gridColumnAlignment(.trailing)
+                            }
                         }
                     }
-                    .gridColumnAlignment(.trailing)
                 }
+                .frame(width: 320)
             }
         }
         .padding(24)
-        .frame(width: 340)
+        .fixedSize()
     }
 }
 

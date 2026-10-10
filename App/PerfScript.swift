@@ -13,7 +13,7 @@ import OmniKit
 /// `wait:<seconds>`. For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
 /// (window size, centered), `front`, `appearance:light|dark`, `history:<n>`, `sort:<order>`,
-/// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `recents`, `clipboard:on|off`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
+/// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `menu:<title>`, `recents`, `clipboard:on|off`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
 enum PerfScript {
@@ -73,6 +73,17 @@ enum PerfScript {
             model.setSemanticText(arg); model.search()
         case "clear": model.clearSearch()
         case "wait": break   // the wait is the sleep after the step
+        case "menu":   // a menu bar item by its title, as a click would: menu:Omni Keyboard Shortcuts
+            func find(_ menu: NSMenu) -> NSMenuItem? {
+                for item in menu.items {
+                    if item.title == arg { return item }
+                    if let sub = item.submenu, let hit = find(sub) { return hit }
+                }
+                return nil
+            }
+            if let menu = NSApp.mainMenu, let item = find(menu), let owner = item.menu {
+                owner.performActionForItem(at: owner.index(of: item))
+            }
         case "share": SelectionShare.present(model.selectedURLsOrdered)   // what File > Share does
         case "cliptest":   // the clipboard history must never record Omni's own file copies
             let pb = NSPasteboard(name: .init("io.hanxiao.omni.cliptest"))
@@ -220,7 +231,9 @@ enum PerfScript {
         case "minAudio": model.minAudioSeconds = Double(v) ?? 0
         case "minVideo": model.minVideoSeconds = Double(v) ?? 0
         case "minText": model.minTextChars = Int(v) ?? 0
-        case "dataless": model.skipDatalessFiles = v == "skip"
+        case "dataless":   // skip | download | evict
+            model.evictDownloadedFiles = v == "evict"
+            model.skipDatalessFiles = v == "skip"
         case "tags": model.imageTagsEnabled = on
         case "recents": model.recentsLimit = Int(v) ?? model.recentsLimit
         case "historyMode": if let m = HistoryMode(rawValue: v) { model.historyMode = m }

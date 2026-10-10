@@ -1351,3 +1351,30 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
 - Two tests assumed the old shape: PathInterningTests' stale-claim fixture now holds coverage off
   explicitly (a small store is covered at close, blobs cleared), and PathAllowCacheKeyTests opened
   a second store on an open index, which a store with rows in its locked vector file refuses.
+
+## iCloud: index, then remove the download (issue #29, 2026-10-09)
+
+Files not downloaded had two policies: Skip, or Download and index. The second fills the disk with
+everything the user chose to keep in the cloud, and the user then has to evict by hand or let the
+File Provider evict whatever it picks. The third policy reads each file through, indexes it, and
+hands the download back (`IndexSettings.evictDownloaded`, Settings > iCloud, "Index, then remove
+download"; PerfScript `set:dataless=evict`).
+
+- WHICH FILES. Only one that was dataless BEFORE the indexer read it, asked at the top of
+  `decode()`, before the probe: an image's header read is already a download. A file the user
+  downloaded, or pinned with Keep Downloaded, is never dataless there, so it is never touched.
+- WHEN. In `DecodedItem`'s deinit, on a utility queue. Release is the one point every payload agrees
+  on: a long text file (`.textStream`) and a scanned PDF (`.pdfScan`) are read again by the embed
+  stage after decode returns, and an eviction at decode would download them twice.
+- `FileManager.evictUbiquitousItem` works from this unsandboxed app with no iCloud entitlement
+  (measured from a bare CLI too: 5.4 KB read in 1.36 s, dataless again 0.6 s after evict). mtime is
+  unchanged, so the reconcile's unchanged check holds and nothing re-indexes. iCloud refuses while
+  the file has changes not yet uploaded; a third-party File Provider (Dropbox, OneDrive) is not an
+  iCloud item, so the evict fails, is logged, and the file stays downloaded, as under read-through.
+- PROVEN on a real iCloud folder (17 files, 16 dataless, one downloaded first as the control),
+  through an isolated app: 16 indexed (the `.brush` is not an indexable type), every dataless one
+  evicted (`evict ok` x15), the control indexed and still downloaded, and every file's flags
+  identical before and after. A first attempt without `-omni.addedFolders` inherited the
+  installed app's folder list from the shared preferences domain and indexed more than the test
+  folder; every file it materialized was found by ctime-after-launch with an old mtime and was
+  dataless again. Pass `-omni.addedFolders` on every isolated run.

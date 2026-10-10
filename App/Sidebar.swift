@@ -392,7 +392,7 @@ private struct HistorySections: View {
     }
 
     private func historyRow(_ item: HistoryItem, indent: Bool = false) -> some View {
-        row(item)
+        HoverRow { hovered in row(item, hovered: hovered) }
             .padding(.leading, indent ? 8 : 0)   // half an icon in from the day: enough to read as inside it
             .help(item.isFile ? (item.filePath ?? item.displayLabel) : item.displayText)
             .contextMenu {
@@ -410,7 +410,7 @@ private struct HistorySections: View {
 
     @Environment(\.sidebarSelection) private var selection
 
-    @ViewBuilder private func row(_ item: HistoryItem) -> some View {
+    @ViewBuilder private func row(_ item: HistoryItem, hovered: Bool) -> some View {
                     let on = selection == .history(item.id)
                                         HStack(spacing: 7) {
                         // A bookmark draws exactly like the search it was: the Bookmarks header
@@ -441,7 +441,17 @@ private struct HistorySections: View {
                                 .lineLimit(1).truncationMode(.tail)
                         }
                         Spacer(minLength: 0)
-                        if item.isFile, let k = item.fileKind, let fk = FileKind(rawValue: k), fk != .text {
+                        if hovered {
+                            // Safari's and Finder's Recents remove: under the pointer the row's
+                            // trailing glyph gives way to an x that drops the search, the same
+                            // command as Remove from History in its context menu. A clear mark,
+                            // not a trash can: nothing on disk is touched.
+                            Button { model.removeHistory(item) } label: {
+                                Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help("Remove from History")
+                        } else if item.isFile, let k = item.fileKind, let fk = FileKind(rawValue: k), fk != .text {
                             Image(systemName: fk.symbol).font(.caption2).foregroundStyle(.tertiary)
                         } else if !item.isFile, item.isFiltered {
                             // Same trailing-glyph treatment as the file rows' kind symbol. It
@@ -457,6 +467,14 @@ private struct HistorySections: View {
                     }
     }
 
+}
+
+/// A row that knows whether the pointer is over it. Its own view, so a hover redraws one row and
+/// not the whole History section.
+private struct HoverRow<Content: View>: View {
+    @ViewBuilder let content: (Bool) -> Content
+    @State private var hovered = false
+    var body: some View { content(hovered).onHover { hovered = $0 } }
 }
 
 /// A section title in Finder's colour. A sidebar List draws its headers a step lighter than Finder
@@ -783,11 +801,11 @@ private struct CoveredFolderRow: View {
     var body: some View {
         HStack(spacing: 7) {
             Image(systemName: "folder").sidebarTint(selected, else: .tertiary).frame(width: 16)
-            Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
+            Text(SpecialFolder.name(for: url)).lineLimit(1).truncationMode(.middle)
                 .sidebarTint(selected, else: .secondary)
             Spacer()
         }
-        .help(model.rootCovering(url).map { "Indexed as part of \($0.lastPathComponent)" }
+        .help(model.rootCovering(url).map { "Indexed as part of \(SpecialFolder.name(for: $0))" }
               ?? "Indexed by a folder above it")
         .contextMenu {
             FolderMenuItems(url: url)
@@ -812,7 +830,7 @@ private struct FolderRow: View {
         HStack(spacing: 7) {
             Image(systemName: SpecialFolder.symbol(for: url))
                 .sidebarTint(selected, else: .secondary).frame(width: 16)
-            Text(url.lastPathComponent).lineLimit(1).truncationMode(.middle)
+            Text(SpecialFolder.name(for: url)).lineLimit(1).truncationMode(.middle)
                 .sidebarTint(selected, else: .primary)
             Spacer()
             if model.isFolderPaused(url) {

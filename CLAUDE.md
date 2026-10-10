@@ -163,10 +163,11 @@ codebase were already measured there, and many were rejected.
 - `index.md` - store and search engine: v5 content sharing, migrations under load, locks, chunking,
   resident memory, launch, write path, Photos reconcile, multi-folder scope, ignore policy grammar
   and defaults, renames, Recents, clipboard history, the 2026-10-02 speed review and media NaN,
-  search while long files stream, the heavy CRUD review.
+  search while long files stream, the heavy CRUD review, file-backed exact stores, iCloud
+  index-then-evict (issue #29).
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
-  and rejected, macOS 14/15 toolbar, site.
+  and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names.
 - `testing.md` - UI tests and their traps, chaos suites, perf tour, hangwatch and the main-thread
   stall investigations.
 - Also: `docs/OCR.md` (the OCR port's design and numbers), `docs/schema-v5.md`, `docs/clipboard.md`,

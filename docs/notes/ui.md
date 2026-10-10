@@ -1182,3 +1182,22 @@ drawing in `mole_family.py`, not the PNGs.
   releases' notes, measured offscreen), and the text moved. TextKit 1 (`usingTextLayoutManager:
   false`) laid out in full before the alert shows holds one height (462) throughout. Any other
   scrolling NSTextView with more than a screen of text wants the same.
+
+## Shortcuts window, folder names, history remove (2026-10-09)
+
+- THE SHORTCUTS WINDOW IS READ OFF THE HANDLERS. It listed fifteen menu chords and none of the keys
+  the content pane and search field handle themselves: Esc (clear search, stop transcribing),
+  Return, Home/End and Option-arrows, Shift-arrows, type-select, Cmd-Up, Shift-Cmd-G,
+  Ctrl-Cmd-1..9, Ctrl-Cmd-S and every transcript chord. Now four groups (Search, Results, Go and
+  View, Transcribe) in two columns, 724x625 pt. A new chord goes into the list in the same change.
+- FINDER'S NAME FOR A FOLDER. iCloud Drive is `com~apple~CloudDocs` on disk and the sidebar showed
+  that. `SpecialFolder.name(for:)` returns `FileManager.displayName` for the special folders
+  (iCloud Drive, and the localized Documents/Downloads/...), the last path component otherwise;
+  used by the sidebar, Go menu, toolbar title, scope chips, history rows and Settings. Read per row,
+  so a path whose leaf is not a special leaf never resolves symlinks.
+- HISTORY ROWS REMOVE ON HOVER. The trailing glyph (kind or filter mark) gives way to an
+  `xmark.circle.fill` under the pointer, the same command as Remove from History. A clear mark, not
+  a trash can: nothing on disk is touched. Not exercised in a running app: synthetic mouse events
+  posted to a background instance are dropped, and bringing it forward would take the user's focus.
+- PerfScript `menu:<title>` performs a menu bar item by title, so a background instance can open
+  the shortcuts window for `screencapture -l`.
