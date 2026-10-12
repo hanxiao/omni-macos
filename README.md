@@ -22,9 +22,6 @@ Text, code, PDFs, images, audio and video in one vector space, so any query find
 file. The embedding model is `jina-embeddings-v5-omni`, ported to MLX-Swift and running
 in-process on the GPU. No Python, no server, no cloud.
 
-It browses like Finder, runs on Metal, keeps up as files change, and works with the network
-cable pulled.
-
 ## Install
 
 Download the DMG from [hanxiao.io/omni](https://hanxiao.io/omni) or
@@ -33,6 +30,15 @@ Download the DMG from [hanxiao.io/omni](https://hanxiao.io/omni) or
 On first launch Omni downloads its search model (1.8 GB), and optionally the OCR model (4.2 GB)
 for transcribing scans and photos, both from this repository's GitHub releases. After that
 nothing leaves the Mac.
+
+## Usage
+
+It browses like Finder, runs on Metal, keeps up as files change, and works with the network
+cable pulled.
+
+<p align="center">
+  <img src="docs/assets/appshot.png" alt="Omni searching ~/Downloads for porsche sports car, annotated">
+</p>
 
 ## Serving
 
