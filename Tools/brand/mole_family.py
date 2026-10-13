@@ -116,3 +116,49 @@ def hug():
 </svg>'''
 if __name__ == "__main__" and "hug" in sys.argv:
     open("fam-hug.svg", "w").write(hug())
+
+# The search prompt with linked Macs: the family's search mole, unchanged in size and place, with a
+# smaller one leaning in beside it for each linked Mac (one on the left, or one on each side for two
+# or more). The small ones lean from the hips - head and body rotate, the mound stays level - the
+# way the hug's moles do. 176x100, so at 68 pt tall the centre mole is the plain prompt's mole.
+STAR_EYES = None
+def mole(pid, eyes, lean=0.0, sparkles=""):
+    """One family mole in its own 100x100 frame, with ids prefixed so several share an SVG."""
+    paws = [(33, 71), (67, 71)]
+    pawcut = "".join(f'<ellipse cx="{x}" cy="{y}" rx="10" ry="7.2" fill="black"/>' for x, y in paws)
+    pawfill = "".join(f'<ellipse cx="{x}" cy="{y}" rx="7.6" ry="5"/>' for x, y in paws)
+    rot = f'rotate({lean} 50 90)'
+    defs = f'''
+  <mask id="{pid}face"><rect x="-30" y="-30" width="160" height="160" fill="white"/>
+   {eyes}
+   <ellipse cx="50" cy="49.5" rx="6.8" ry="4.9" fill="black"/>
+   <rect x="45.8" y="56" width="8.4" height="6.4" rx="1.6" fill="black"/><rect x="49.35" y="55" width="1.3" height="9" fill="white"/>
+  </mask>
+  <mask id="{pid}level"><rect x="-30" y="-30" width="160" height="160" fill="white"/>
+   <path d="M6,88 C6,76 26,70 50,70 C74,70 94,76 94,88" fill="none" stroke="black" stroke-width="12"/>{pawcut}
+  </mask>
+  <mask id="{pid}mound"><rect x="-30" y="-30" width="160" height="160" fill="white"/>{pawcut}</mask>'''
+    body = f'''
+  <g mask="url(#{pid}level)"><g transform="{rot}"><g mask="url(#{pid}face)">
+   <circle cx="31" cy="25.5" r="4"/><circle cx="69" cy="25.5" r="4"/>
+   <path d="M25,90 L25,45 C25,27 36,18 50,18 C64,18 75,27 75,45 L75,90 Z"/>
+  </g></g></g>
+  <path mask="url(#{pid}mound)" d="M9,89 C9,79 27,75 50,75 C73,75 91,79 91,89 C91,92 89,94 86,94 L14,94 C11,94 9,92 9,89 Z"/>
+  {pawfill}{sparkles}'''
+    return defs, body
+
+def search_linked(n):
+    eyes = f'<path d="{star(40,39,6.2)}" fill="black"/><path d="{star(60,39,6.2)}" fill="black"/>'
+    main_d, main_b = mole("m", eyes, 0, f'<path d="{star(84,20,6)}"/><path d="{star(92,32,3.4)}"/>')
+    parts = [("m", main_d, f'<g transform="translate(38,0)">{main_b}</g>')]
+    # Half size, standing on the same ground line (the mound's bottom, y=94), centred 21 from the edge.
+    side = [("l", 8, 21 - 25)] + ([("r", -8, 176 - 21 - 25)] if n >= 2 else [])
+    for pid, lean, tx in side:
+        d, b = mole(pid, eyes, lean)
+        parts.append((pid, d, f'<g transform="translate({tx},47) scale(0.5)">{b}</g>'))
+    defs = "".join(d for _, d, _ in parts); body = "".join(b for _, _, b in parts)
+    return f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 176 100">\n <defs>{defs}\n </defs>{body}\n</svg>'
+
+if __name__ == "__main__" and "linked" in sys.argv:
+    open("fam-search-linked1.svg", "w").write(search_linked(1))
+    open("fam-search-linked2.svg", "w").write(search_linked(2))

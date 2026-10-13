@@ -1149,6 +1149,15 @@ other; at 68 pt the two extra paws read as too many hands (Han), so they are gon
 112/224/336`), 68 pt tall, `.secondary` (a success, not an empty state); whatever is in front is
 cut out of what is behind with the family's outline gap. Its buttons are a Tahoe alert's equal-width
 pair, `.glass` / `.glassProminent` on 26, bordered before.
+`MoleSearchLinked` / `MoleSearchLinkedMany` (`mole_family.py linked`): the search prompt while a
+search reaches linked Macs - the search mole unchanged, with a half-size one leaning in on the left
+for one linked Mac and one each side for two or more. Lean from the hips: body and head rotate, the
+mound stays level. 176x100, rendered by HEIGHT (`rsvg-convert -h 80/160/240`) so the centre mole is
+pixel for pixel the plain prompt's; `StatusGlyph` is now 68 pt tall with the width from the drawing.
+The prompt counts their files too ("Search 2,482 files on 3 Macs"): online, sharing Macs only, from
+the sources each reported on connect, and none while a folder on this Mac scopes the search.
+The pairing code is six boxes in two groups of three (Liquid Glass on 26), as macOS shows and asks
+for a verification code; on the typing Mac a clear field under the boxes takes the keys and a paste.
 
 ## History replay and the sidebar (2026-10-04)
 - A HISTORY ROW REPLAYS EXACTLY WHAT WAS SAVED, whatever is set at the moment of the click. A text

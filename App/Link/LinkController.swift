@@ -148,6 +148,11 @@ final class LinkController {
     func peer(_ id: String) -> LinkPeer? { peers.first { $0.id == id } }
     func name(of id: String) -> String { peer(id)?.name ?? "Linked Mac" }
 
+    /// Files on the Macs this one may search right now, as their sources last reported them.
+    var searchableFiles: Int {
+        searchable().reduce(0) { n, p in n + (sources[p.id] ?? []).reduce(0) { $0 + $1.files } }
+    }
+
     /// Macs this one may search right now.
     func searchable(only: String? = nil) -> [LinkPeer] {
         peers.filter { $0.theyAllowSearch && isOnline($0.id) && (only == nil || $0.id == only) }

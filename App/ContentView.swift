@@ -397,15 +397,23 @@ struct ContentView: View {
             // Idle prompt, and the in-flight search state. They share one calm placeholder so a
             // pending search only fades a small spinner in under the same prompt - it never flashes
             // "No matches" while the debounce/search for what you just typed is still running.
+            // LINKED MACS COUNT, when the next search reaches them: every linked Mac online and
+            // sharing, unless a folder on this Mac scopes it. Their files are in the number and their
+            // moles beside this one, so the prompt says what the search box will cover.
+            let reach = model.linkedScope == nil && model.filterFolders.isEmpty ? model.link.searchable().count : 0
+            let total = model.indexedFiles + (reach > 0 ? model.link.searchableFiles : 0)
             SearchWaysPrompt(
                 // With several folders scoped there is no browser to show (that needs exactly one),
                 // so the prompt is the only place that says what the next query will cover.
                 title: model.linkedScope.map { "Search \(model.link.name(of: $0.peer))" }
                     ?? (model.filterFolders.count > 1
                     ? "Search \(model.filterFolders.count) folders"
-                    : (model.indexedFiles > 0 ? "Search \(model.indexedFiles.formatted()) file\(model.indexedFiles == 1 ? "" : "s")" : "Search your files")),
-                count: model.indexedFiles,
-                showSpinner: model.isResolving)
+                    : (total > 0 ? "Search \(total.formatted()) file\(total == 1 ? "" : "s")\(reach > 0 ? " on \(reach + 1) Macs" : "")"
+                       : "Search your files")),
+                count: total,
+                showSpinner: model.isResolving,
+                symbol: reach == 0 ? CenteredStatus.moleSearch
+                    : reach == 1 ? CenteredStatus.moleSearchLinked : CenteredStatus.moleSearchLinkedMany)
         } else if model.hiddenByThreshold > 0 {
             // The count sits in the BUTTON, the only thing that acts on it. As a subtitle it
             // restated the title and then named the mechanism doing it.
@@ -695,8 +703,11 @@ struct StatusGlyph: View {
     let symbol: String
     var body: some View {
         if symbol.hasPrefix("Mole") {
+            // 68 pt TALL, width from the drawing: every mole is drawn at the same scale, so the
+            // square ones come out 68 wide and the search prompt with linked Macs (176x100, the
+            // same mole in the middle) wider, with its centre mole exactly where the plain one is.
             Image(symbol).renderingMode(.template).resizable().scaledToFit()
-                .frame(width: 68, height: 68).foregroundStyle(.tertiary)
+                .frame(height: 68).foregroundStyle(.tertiary)
                 .accessibilityHidden(true)
         } else {
             Image(systemName: symbol).font(.system(size: 44, weight: .light)).foregroundStyle(.tertiary)
@@ -708,7 +719,9 @@ struct CenteredStatus: View {
     /// The Omni mole glyphs (asset names), for `symbol`.
     static let mole = "MoleGlyph", moleSearch = "MoleSearch", moleOCR = "MoleOCR", moleSleep = "MoleSleep",
                moleSerious = "MoleSerious", moleEmpty = "MoleEmpty", moleCurious = "MoleCurious",
-               moleSad = "MoleSad"
+               moleSad = "MoleSad",
+               // The search mole with one linked Mac's small mole beside it, and with one each side.
+               moleSearchLinked = "MoleSearchLinked", moleSearchLinkedMany = "MoleSearchLinkedMany"
     let symbol: String
     let title: String
     let subtitle: String

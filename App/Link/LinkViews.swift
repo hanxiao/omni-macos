@@ -103,11 +103,11 @@ struct LinkSheet: View {
             }
         } else if let code = out.code {
             Text("Enter this code on \(out.name)").font(.headline)
-            Text(LinkPairing.display(code))
-                .font(.system(size: 40, weight: .semibold, design: .rounded).monospacedDigit())
-                .textSelection(.enabled)
+            CodeBoxes(digits: code)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 6)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(LinkPairing.display(code))
                 .accessibilityIdentifier("link.shownCode")
             buttons { Button("Cancel") { link.cancelPairing() }.keyboardShortcut(.cancelAction) }
         } else {
@@ -153,13 +153,25 @@ struct LinkSheet: View {
     @ViewBuilder private func incoming(_ req: IncomingPairing) -> some View {
         Text("Link with \u{201C}\(req.name)\u{201D}?").font(.headline)
         Text("Enter the code shown on \(req.name).").foregroundStyle(.secondary)
-        TextField("000 000", text: $typed)
-            .font(.system(size: 28, weight: .semibold, design: .rounded).monospacedDigit())
-            .multilineTextAlignment(.center)
-            .textFieldStyle(.roundedBorder)
-            .focused($codeFocused)
-            .onSubmit(submit)
-            .accessibilityIdentifier("link.code")
+        // The boxes show what is typed; the field underneath takes the keys (and a paste), clear
+        // so its own caret and text never show. Digits only, six at most.
+        CodeBoxes(digits: LinkPairing.normalize(typed), active: codeFocused ? LinkPairing.normalize(typed).count : nil)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
+            .overlay {
+                TextField("", text: $typed)
+                    .textFieldStyle(.plain)
+                    .foregroundStyle(.clear).tint(.clear)
+                    .focused($codeFocused)
+                    .onSubmit(submit)
+                    .onChange(of: typed) { _, t in
+                        let d = String(LinkPairing.normalize(t).prefix(6))
+                        if d != t { typed = d }
+                    }
+                    .accessibilityLabel("Code")
+                    .accessibilityIdentifier("link.code")
+            }
+            .onTapGesture { codeFocused = true }
             .onAppear { typed = ""; typedError = nil; codeFocused = true }
         if let typedError { Text(typedError).font(.callout).foregroundStyle(.red) }
         buttons {
@@ -464,3 +476,46 @@ private struct AlertButton: ViewModifier {
         }
     }
 }
+
+/// A pairing code as six boxes in two groups of three, the way macOS shows and asks for a
+/// verification code. Liquid Glass on macOS 26; a quiet fill before it. `active` is the box the next
+/// digit goes in, outlined in the accent colour while the field has focus.
+private struct CodeBoxes: View {
+    let digits: String
+    var active: Int? = nil
+
+    var body: some View {
+        HStack(spacing: 16) {
+            group(0); group(3)
+        }
+    }
+
+    private func group(_ from: Int) -> some View {
+        HStack(spacing: 8) {
+            ForEach(from ..< from + 3, id: \.self) { i in box(i) }
+        }
+    }
+
+    private func box(_ i: Int) -> some View {
+        let chars = Array(digits)
+        let shape = RoundedRectangle(cornerRadius: 10, style: .continuous)
+        return Text(i < chars.count ? String(chars[i]) : " ")
+            .font(.system(size: 28, weight: .semibold, design: .rounded).monospacedDigit())
+            .frame(width: 42, height: 54)
+            .modifier(CodeBoxSurface(shape: shape))
+            .overlay { if active == i { shape.strokeBorder(Color.accentColor, lineWidth: 2) } }
+            .animation(.snappy(duration: 0.15), value: active)
+    }
+}
+
+private struct CodeBoxSurface: ViewModifier {
+    let shape: RoundedRectangle
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.glassEffect(.regular, in: shape)
+        } else {
+            content.background(.quaternary, in: shape)
+        }
+    }
+}
+
