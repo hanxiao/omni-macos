@@ -117,19 +117,41 @@ struct Sidebar: View {
     /// A crawl root reports on its own pass; a folder a broader root covers has no pass to report
     /// on, so it gets the quieter row. Both are selectable, both browse, and both carry the folder
     /// context menu - which is what keeps "Add to Search Scope" reachable for a nested folder.
-    @ViewBuilder private func folderRow(_ url: URL) -> some View {
-        if model.isCrawlRoot(url) {
-            FolderRow(url: url,
-                      deselect: { if selection == .folder(url) { selection = nil } })
-        } else {
-            CoveredFolderRow(url: url)
-        }
-    }
-
     /// Extracted from `body`: with the folder row, its four badge states and the shared
     /// context menu all inline, the whole `List` stopped type-checking in reasonable time.
-    /// Is anything actually nested? Nothing is indented when nothing is inside anything.
-    private var isNested: Bool { model.folderTree.contains { $0.children != nil } }
+    /// `open` is set for a folder with folders added inside it.
+    @ViewBuilder private func folderRow(_ url: URL, depth: Int, open: Binding<Bool>?) -> some View {
+        Group {
+            if model.isCrawlRoot(url) {
+                FolderRow(url: url, open: open,
+                          deselect: { if selection == .folder(url) { selection = nil } })
+            } else {
+                CoveredFolderRow(url: url, open: open)
+            }
+        }
+        .padding(.leading, CGFloat(depth) * 8)   // a linked Mac's folders sit 8 in, and so does each level here
+    }
+
+    /// The folder tree as the rows on screen: depth first, a folded folder's descendants left out.
+    private struct VisibleFolder: Identifiable {
+        let url: URL
+        let depth: Int
+        let hasChildren: Bool
+        var id: String { url.path }
+    }
+
+    private var visibleFolders: [VisibleFolder] {
+        var out: [VisibleFolder] = []
+        func walk(_ nodes: [RootScope.Node], _ depth: Int) {
+            for n in nodes {
+                let kids = n.children ?? []
+                out.append(VisibleFolder(url: n.url, depth: depth, hasChildren: !kids.isEmpty))
+                if !kids.isEmpty, !folds.collapsed.contains("folder:" + n.url.path) { walk(kids, depth + 1) }
+            }
+        }
+        walk(model.folderTree, 0)
+        return out
+    }
 
     /// ONE section holding both. They are the same thing to the user - places Omni indexes - and
     /// splitting them cost two headers and two "Add" rows to carry, on this machine, six folders
@@ -145,32 +167,17 @@ struct Sidebar: View {
     /// change that.
     @ViewBuilder private var sourcesSection: some View {
             Section(isExpanded: $folds.section("Index")) {
-                // NESTED, the way Finder's sidebar nests. The user's folders are a tree - a parent
-                // and the folders they added inside it - and a flat list could not say so: after a
-                // parent absorbed six children the sidebar held seven rows with no sign that six
-                // of them live inside the seventh.
+                // NESTED, the way Finder's sidebar nests: the user's folders are a tree - a parent
+                // and the folders they added inside it - and a flat list could not say so.
                 //
-                // `OutlineGroup` is the platform's own control for this, so the disclosure
-                // triangles, their state and the keyboard behaviour are all native.
-                //
-                // ONLY WHEN SOMETHING IS NESTED. A List that has drawn a disclosure triangle keeps
-                // the column it drew it in: after the last subfolder was removed every row stayed
-                // indented by a triangle that was no longer there, which is not where Finder puts
-                // a top-level folder. A flat tree is built as plain rows instead, and the section
-                // is re-identified when that flips so the List lays out again rather than keeping
-                // the insets it had.
-                if isNested {
-                    ForEach(model.folderTree) { node in
-                        OutlineGroup(node, children: \.children) { item in
-                            folderRow(item.url)
-                                .sidebarRow(.folder(item.url))
-                        }
-                    }
-                } else {
-                    ForEach(model.folderTree) { node in
-                        folderRow(node.url)
-                            .sidebarRow(.folder(node.url))
-                    }
+                // FLAT ROWS AND A TRAILING CHEVRON, like a History day and a linked Mac, not an
+                // OutlineGroup. Its disclosure triangle sat LEFT of the folder icon, out of line with
+                // every other fold in this sidebar, and a List that has drawn one keeps a triangle
+                // column for every row - the reason History and Linked Macs were built flat. The
+                // children are indented under their parent; the fold state is in SidebarFolds.
+                ForEach(visibleFolders) { f in
+                    folderRow(f.url, depth: f.depth, open: f.hasChildren ? $folds.section("folder:" + f.url.path) : nil)
+                        .sidebarRow(.folder(f.url))
                 }
                 photoRows
                 // One "Add", and one PICKER behind it - see pickFolder. Whether the place is a
@@ -190,7 +197,6 @@ struct Sidebar: View {
             } header: {
                 SidebarHeader("Index")
             }
-            .id(isNested)
     }
 
     /// Extracted for the same reason the folder rows are: two badge-heavy row sets in one `List`
@@ -815,6 +821,8 @@ private struct CoveredFolderRow: View {
     @Environment(\.sidebarRowSelected) private var selected
     @Environment(AppModel.self) private var model: AppModel
     let url: URL
+    var open: Binding<Bool>? = nil
+    @State private var hovered = false
 
     var body: some View {
         HStack(spacing: 7) {
@@ -822,7 +830,9 @@ private struct CoveredFolderRow: View {
             Text(SpecialFolder.name(for: url)).lineLimit(1).truncationMode(.middle)
                 .sidebarTint(selected, else: .secondary)
             Spacer()
+            if let open, hovered || !open.wrappedValue { FoldChevron(open: open) }
         }
+        .onHover { hovered = $0 }
         .help(model.rootCovering(url).map { "Indexed as part of \(SpecialFolder.name(for: $0))" }
               ?? "Indexed by a folder above it")
         .contextMenu {
@@ -841,8 +851,11 @@ private struct FolderRow: View {
     @Environment(\.sidebarRowSelected) private var selected
     @Environment(AppModel.self) private var model: AppModel
     let url: URL
+    /// Set when folders were added inside this one: the row folds them.
+    var open: Binding<Bool>? = nil
     /// Let the sidebar drop a selection pointing at this row, just before it is removed.
     let deselect: () -> Void
+    @State private var hovered = false
 
     var body: some View {
         HStack(spacing: 7) {
@@ -851,7 +864,11 @@ private struct FolderRow: View {
             Text(SpecialFolder.name(for: url)).lineLimit(1).truncationMode(.middle)
                 .sidebarTint(selected, else: .primary)
             Spacer()
-            if model.isFolderPaused(url) {
+            if let open, hovered || !open.wrappedValue {
+                // The fold chevron takes the badge column under the pointer and while folded, as on
+                // a linked Mac; the count is back when the pointer leaves an open folder.
+                FoldChevron(open: open)
+            } else if model.isFolderPaused(url) {
                 // Paused: indexing skips this folder. Show the count it already has,
                 // plus a pause glyph so the stopped state is unambiguous.
                 if model.hasIndexedFiles, let c = model.folderFileCounts[url.path], c > 0 {
@@ -893,6 +910,7 @@ private struct FolderRow: View {
                     .help(c == 0 ? "No files indexed in this folder yet" : "\(c) file\(c == 1 ? "" : "s") indexed")
             }
         }
+        .onHover { hovered = $0 }
         // While this folder indexes, the row tooltip shows live progress;
         // otherwise the full path (useful when the name is truncated).
         .help(model.isFolderPaused(url) ? "This folder is paused"
@@ -904,6 +922,21 @@ private struct FolderRow: View {
         .contextMenu {
             FolderMenuItems(url: url, willRemove: deselect)
         }
+    }
+}
+
+/// The sidebar's fold control: a History day's and a linked Mac's chevron, in the trailing column,
+/// so every fold in the sidebar lines up in one vertical line.
+private struct FoldChevron: View {
+    @Binding var open: Bool
+    var body: some View {
+        Button { withAnimation(.snappy(duration: 0.2)) { open.toggle() } } label: {
+            Image(systemName: open ? "chevron.down" : "chevron.right")
+                .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+                .frame(width: 16, height: 16).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(open ? "Hide Folders" : "Show Folders")
     }
 }
 
