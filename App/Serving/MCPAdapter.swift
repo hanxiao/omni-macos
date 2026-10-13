@@ -354,7 +354,13 @@ enum MCPAdapter {
                 } else if hits.isEmpty {
                     content.append(diagnostic("On \(a.mac): no results for \"\(query)\"."))
                 } else {
-                    content.append(["type": "text", "text": "On \(a.mac):"])
+                    // THE WAY TO THE FILE GOES WITH THE PATHS. An agent given paths on another Mac and
+                    // nothing else concluded it could only read the snippets: the tool's name was in
+                    // the server instructions, which many clients never show the model.
+                    let how = !a.canOpen ? "\(a.mac) does not allow opening its files, so only these snippets"
+                        : cli ? "paths on \(a.mac); copy one here with: omni get_linked_file <path> --mac \"\(a.mac)\""
+                        : "paths on \(a.mac); copy one here to read with get_linked_file, mac \"\(a.mac)\""
+                    content.append(["type": "text", "text": "On \(a.mac) (\(how)):"])
                     for (i, h) in hits.enumerated() {
                         let score = Int((max(0, min(1, h.score)) * 100).rounded())
                         let loc = h.locator.isEmpty ? "" : ", \(h.locator)"
@@ -366,7 +372,7 @@ enum MCPAdapter {
                         content.append(["type": "text", "text": text])
                     }
                 }
-                linked.append(["mac": a.mac, "note": a.note ?? NSNull(), "results": hits.map { h -> [String: Any] in
+                linked.append(["mac": a.mac, "note": a.note ?? NSNull(), "canOpen": a.canOpen, "results": hits.map { h -> [String: Any] in
                     ["path": h.path, "kind": h.kind, "score": Double(max(0, min(1, h.score))), "snippet": h.snippet,
                      "locator": h.locator, "modified": h.modified, "size": h.size]
                 }])

@@ -76,6 +76,8 @@ struct LinkedSearchAnswer: Sendable {
     let mac: String
     let hits: [SearchHit]
     let note: String?
+    /// That Mac lets this one open its files, so `get_linked_file` will work on these paths.
+    var canOpen = false
 }
 
 // MARK: - HTTP

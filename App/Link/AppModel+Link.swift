@@ -185,7 +185,7 @@ extension AppModel {
                                            kind: h.kind, chunkIndex: h.chunkIndex, modified: h.modified, width: h.width,
                                            height: h.height, duration: h.duration, size: h.size, locator: h.locator,
                                            chunkCount: h.chunkCount)
-                        }, note: nil)
+                        }, note: nil, canOpen: p.theyAllowFetch)
                     } catch {
                         return LinkedSearchAnswer(mac: p.name, hits: [], note: LinkController.describe(error))
                     }

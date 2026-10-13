@@ -113,5 +113,12 @@ B killed, frozen and unplugged against the feature off; B's own search latency w
 - `get_linked_file <path> --mac <name>` copies the file here (the same fetch and grant as Open) and
   prints the local, read-only path; path first because the command line takes the first required
   parameter bare. REST /v1/search is unchanged: local only.
+- THE WAY TO THE FILE GOES WITH THE PATHS (2026-10-13). An agent searching over MCP got a linked
+  Mac's results and reported it "can only see the search snippets": the only mention of
+  `get_linked_file` was in the server instructions (many clients never show those to the model) and
+  in the `macs` parameter's description. Each "On <Mac>:" header now says how to read its paths -
+  `get_linked_file, mac "<Mac>"` over MCP, the full `omni get_linked_file <path> --mac "<Mac>"` on
+  the command line - or that the Mac does not allow opening its files; the JSON carries `canOpen`.
+  Checked on two linked instances, both grants, MCP over HTTP and the CLI.
 - The sidebar folds each Mac like a History day (chevron on hover, kept while folded, state in
   SidebarFolds under "mac:<id>"); no disclosure triangle, which would indent every row.
