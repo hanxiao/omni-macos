@@ -22,23 +22,32 @@ struct PhotoSourceBrowser: View {
     @State private var hits: [SearchHit] = []
     @State private var loading = true
     @State private var selected: String?
-    /// Click-to-sort, so this header behaves like the folder browser's rather than being a row of
-    /// labels that look the same and do nothing. Only the two columns that exist here.
-    @State private var sortByName = false
+    /// Click-to-sort, through the shared header (`BrowserHeader`). Date descending by default, which
+    /// is the order `listMatching` already returns and the order a photo library reads in.
+    @State private var sort: BrowserSort = .column(.dateModified)
     @State private var ascending = false
+    /// Where the rows' last column ends, for `BrowserHeader`'s padding.
+    @State private var rowCellsMaxX: CGFloat = 0
 
-    /// The listing in the order the header asks for. Date descending by default, which is the order
-    /// `listMatching` already returns and the order a photo library reads in.
+    /// What a photo has to show: the folder browser's columns that mean something here.
+    private static let columns: [BrowserColumn] = [.kind, .dateModified, .size]
+
+    /// The listing in the order the header asks for.
     private var sorted: [SearchHit] {
-        let rows = sortByName
-            ? hits.sorted { ($0.path as NSString).lastPathComponent.localizedStandardCompare(
-                            ($1.path as NSString).lastPathComponent) == .orderedAscending }
-            : hits.sorted { $0.modified < $1.modified }
-        return ascending ? rows : rows.reversed()
+        let name = { (h: SearchHit) in (h.path as NSString).lastPathComponent }
+        return hits.sorted { a, b in
+            let result: Bool
+            switch sort {
+            case .column(.kind) where a.kind != b.kind: result = a.kind < b.kind
+            case .column(.size) where a.size != b.size: result = a.size < b.size
+            case .column(.dateModified) where a.modified != b.modified: result = a.modified < b.modified
+            default: result = name(a).localizedStandardCompare(name(b)) == .orderedAscending
+            }
+            return ascending ? result : !result
+        }
     }
 
-    /// Matches `photoSourceHits`' default. Named here so the header can say when it truncated
-    /// rather than quietly showing a prefix of the library.
+    /// Matches `photoSourceHits`' default.
     private static let cap = 1000
 
     var body: some View {
@@ -109,18 +118,14 @@ struct PhotoSourceBrowser: View {
         }
     }
 
-    /// The same geometry as `FolderBrowser.listBody`, from the same `BrowserMetrics`: a Photos
-    /// source is a folder as far as browsing goes, and the two must not drift apart.
-    /// Header as a SAFE-AREA BAR, for the reason spelled out on `FolderBrowser.listBody`: a scroll
-    /// view only gets Tahoe's edge effect when it fills its pane, and a sibling header above it is
-    /// the documented failure case.
-    @ViewBuilder private var listBody: some View {
-        if #available(macOS 26.0, *) {
-            listCore.safeAreaBar(edge: .top, spacing: 0) {
-                VStack(spacing: 0) { header; Divider() }
+    /// The same geometry as `FolderBrowser.listBody`, from the same `BrowserMetrics` and under the
+    /// same header: a Photos source is a folder as far as browsing goes.
+    private var listBody: some View {
+        listCore.columnHeader {
+            BrowserHeader(columns: Self.columns, sort: sort, ascending: ascending, rowCellsMaxX: rowCellsMaxX) { t in
+                // Names read A to Z, everything else newest or largest first.
+                if sort == t { ascending.toggle() } else { sort = t; ascending = t == .name }
             }
-        } else {
-            VStack(spacing: 0) { header; Divider(); listCore }
         }
     }
 
@@ -138,15 +143,17 @@ struct PhotoSourceBrowser: View {
                         .lineLimit(1).truncationMode(.middle)
                         .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
                     Spacer(minLength: 8)
-                    Text(Date(timeIntervalSince1970: hit.modified)
-                            .formatted(date: .abbreviated, time: .shortened))
-                        .font(.callout.monospacedDigit())
-                        .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
-                        .lineLimit(1)
-                        .modifier(ColumnSlot(col: .dateModified, alignment: .leading))
+                    ForEach(Self.columns) { col in
+                        cell(col, hit)
+                            .font(.callout.monospacedDigit())
+                            .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
+                            .lineLimit(1)
+                            .modifier(ColumnSlot(col: col, alignment: col.alignment))
+                    }
                 }
                 .padding(.leading, BrowserMetrics.rowLead)
                 .padding(.trailing, BrowserMetrics.rowTrail)
+                .reportsCellsMaxX($rowCellsMaxX)
                 .contentShape(RoundedRectangle(cornerRadius: BrowserMetrics.selectionRadius))
                 .fileDragSource { select(hit.path); return [hit.path] }   // see FileDrag
                 .onTapGesture(count: 2) { PhotoActions.open(hit.path) }
@@ -198,49 +205,12 @@ struct PhotoSourceBrowser: View {
             quickLook: { model.toggleQuickLook() })
     }
 
-    /// EXACTLY the folder browser's header cell - same weight and colour rules, same sort chevron.
-    /// These two headers sit one sidebar click apart, and this one used to leave "Name" at primary
-    /// weight while everything else was secondary, so the two read as different controls.
-    @ViewBuilder private func headerCell(_ title: String, active: Bool) -> some View {
-        Text(title)
-            .fontWeight(active ? .semibold : .regular)
-            .foregroundStyle(active ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
-            .lineLimit(1)
-            .overlay(alignment: .trailing) {
-                Image(systemName: ascending ? "chevron.up" : "chevron.down")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .opacity(active ? 1 : 0)
-            }
-    }
-
-    /// Finder's column header, the same two-strip layout the folder browser uses. The source's
-    /// NAME is not repeated here - the toolbar carries it, next to the back chevron, exactly where
-    /// Finder puts a folder's name. What is left is the column titles and the item count.
-    private var header: some View {
-        HStack(spacing: 0) {
-            Color.clear.frame(width: BrowserMetrics.icon + BrowserMetrics.iconGap, height: 1)
-            HStack(spacing: 6) {
-                headerCell("Name", active: sortByName)
-                if !hits.isEmpty {
-                    Text(hits.count >= Self.cap
-                         ? "first \(Self.cap.formatted())"
-                         : "\(hits.count.formatted()) item\(hits.count == 1 ? "" : "s")")
-                        .foregroundStyle(.tertiary)
-                }
-                Spacer(minLength: 0)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(.rect)
-            .onTapGesture { if sortByName { ascending.toggle() } else { sortByName = true; ascending = true } }
-            headerCell("Date Modified", active: !sortByName)
-                .modifier(ColumnSlot(col: .dateModified, alignment: .leading))
-                .overlay(alignment: .leading) { Divider().frame(height: 12) }
-                .onTapGesture { if !sortByName { ascending.toggle() } else { sortByName = false; ascending = false } }
+    @ViewBuilder private func cell(_ col: BrowserColumn, _ hit: SearchHit) -> some View {
+        switch col {
+        case .kind: Text(FileKind(rawValue: hit.kind)?.title ?? "--")
+        case .dateModified: Text(Date(timeIntervalSince1970: hit.modified).formatted(date: .abbreviated, time: .shortened))
+        case .size: Text(hit.size > 0 ? ByteSize.file(hit.size) : "--")
+        default: Text("--")
         }
-        .font(.caption)
-        .padding(.leading, BrowserMetrics.rowLead + BrowserMetrics.listInset)
-        .padding(.trailing, BrowserMetrics.rowTrail + BrowserMetrics.listInset)
-        .padding(.vertical, 5)
     }
 }

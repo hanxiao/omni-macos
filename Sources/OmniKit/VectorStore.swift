@@ -4427,10 +4427,12 @@ public final class VectorStore: @unchecked Sendable {
             let winners = heap.sorted(by: before)
             let hits = winners.map { i -> SearchHit in
                 let r = rows[i]
-                return SearchHit(path: pathOf(r), score: 0, snippet: "", kind: kindOf(r),
-                                 chunkIndex: r.chunkIndex, modified: metaOf(r).modified,
-                                 width: Int(metaOf(r).width), height: Int(metaOf(r).height), duration: metaOf(r).duration,
-                                 locator: "", chunkCount: Int(fileChunkCount[Int(fileID[i])]))
+                var h = SearchHit(path: pathOf(r), score: 0, snippet: "", kind: kindOf(r),
+                                  chunkIndex: r.chunkIndex, modified: metaOf(r).modified,
+                                  width: Int(metaOf(r).width), height: Int(metaOf(r).height), duration: metaOf(r).duration,
+                                  locator: "", chunkCount: Int(fileChunkCount[Int(fileID[i])]))
+                h.size = Int(metaOf(r).size)   // the browsers' Size column
+                return h
             }
             return fillSnippetsLocked(hits)
         }

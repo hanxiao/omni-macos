@@ -180,3 +180,119 @@ struct ColumnSlot: ViewModifier {
             .frame(width: col.width, alignment: alignment)
     }
 }
+
+/// THE column header, for every browser: a folder, Recents, a Photos source, a linked Mac.
+///
+/// ONE COMPONENT BECAUSE FOUR COPIES DRIFTED. Each browser used to draw its own, and they read as
+/// four different controls one sidebar click apart: an item count beside "Name" in two of them, a
+/// linked Mac's header that did not sort, Photos' chevron drawn over the end of its own title, and
+/// a sibling bar above the list where the others are a safe-area bar. The folder browser's was the
+/// right one; this is it, moved here, and every browser now passes its columns and its sort.
+struct BrowserHeader<Menu: View>: View {
+    let columns: [BrowserColumn]
+    let sort: BrowserSort
+    let ascending: Bool
+    /// Where the rows' last column ends, as the rows report it (`reportsCellsMaxX`); 0 until then.
+    let rowCellsMaxX: CGFloat
+    let click: (BrowserSort) -> Void
+    @ViewBuilder let menu: () -> Menu
+    @State private var headerMaxX: CGFloat = 0
+
+    var body: some View {
+        HStack(spacing: 0) {
+            // Aligned with the row's name: the icon slot plus its gap, so "Name" sits exactly over
+            // the first character of every file name under it.
+            Color.clear.frame(width: BrowserMetrics.icon + BrowserMetrics.iconGap, height: 1)
+            cell("Name", target: .name)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            ForEach(columns) { col in
+                cell(col.title, target: .column(col))
+                    .modifier(ColumnSlot(col: col, alignment: .leading))
+                    // The divider is an OVERLAY, not a sibling: as a laid-out view each one stole a
+                    // point from the strip and walked the header off the rows by one more point per
+                    // column. Finder's dividers sit exactly on the column boundary.
+                    .overlay(alignment: .leading) { Divider().frame(height: 12) }
+            }
+        }
+        .font(.caption)
+        .padding(.leading, BrowserMetrics.rowLead + BrowserMetrics.listInset)
+        .padding(.trailing, trailingPad)
+        .onGeometryChange(for: CGFloat.self, of: { $0.frame(in: .global).maxX }) { x in
+            if abs(x - headerMaxX) > 0.5 { headerMaxX = x }
+        }
+        .padding(.vertical, 5)
+        // NO fill. In Finder the header sits on the same surface as the toolbar - there is no seam
+        // between them - so painting a grey band here is what made it read as a separate component
+        // bolted under the chrome. The hairline below the header is the only separation, and it
+        // divides the header from the ROWS, not from the toolbar.
+        .contentShape(.rect)
+        .contextMenu { menu() }
+    }
+
+    /// The trailing padding, MEASURED from the rows rather than assumed. A visible scroller (the
+    /// Automatic setting with a mouse attached, or Always) takes its 17pt from the rows and not from
+    /// the header, so a fixed padding put every column title 17pt right of the values under it
+    /// while the names still lined up. Without a scroller this equals the fixed value.
+    private var trailingPad: CGFloat {
+        let fixed = BrowserMetrics.rowTrail + BrowserMetrics.listInset
+        guard rowCellsMaxX > 0, headerMaxX > 0 else { return fixed }
+        return max(0, headerMaxX - rowCellsMaxX + BrowserMetrics.rowTrail)
+    }
+
+    /// One header cell. LEFT-ALIGNED IN EVERY COLUMN, including the numeric ones - Finder sorted by
+    /// Size puts "Size" hard against the column's leading edge while the values under it stay right
+    /// aligned. The chevron is an overlay at the trailing edge of the SLOT, not of the title, so it
+    /// costs no width and never sits on top of the title's last letters.
+    @ViewBuilder private func cell(_ title: String, target: BrowserSort) -> some View {
+        let active = sort == target
+        Text(title)
+            // Finder emphasises the sorted column in BOTH weight and colour - side by side its
+            // "Name" is visibly bolder and darker than the rest, and colour alone did not read.
+            .fontWeight(active ? .semibold : .regular)
+            .foregroundStyle(active ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+            .lineLimit(1)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay(alignment: .trailing) {
+                Image(systemName: ascending ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .opacity(active ? 1 : 0)
+            }
+            .contentShape(.rect)
+            .onTapGesture { click(target) }
+    }
+}
+
+extension BrowserHeader where Menu == EmptyView {
+    init(columns: [BrowserColumn], sort: BrowserSort, ascending: Bool, rowCellsMaxX: CGFloat,
+         click: @escaping (BrowserSort) -> Void) {
+        self.init(columns: columns, sort: sort, ascending: ascending, rowCellsMaxX: rowCellsMaxX,
+                  click: click, menu: { EmptyView() })
+    }
+}
+
+extension View {
+    /// A browser list with its column header as a SAFE-AREA BAR, not a sibling above it.
+    ///
+    /// This is what makes the scroll edge effect work. On Tahoe a scroll view only gets the effect
+    /// when it fills its pane top to bottom - a scroll view that starts below a sibling header is
+    /// the documented failure case (Sarah Reichelt hit the AppKit twin of it with `NSTableView`:
+    /// rows scrolling INTO the header with no blur, fixed by letting the scroll view span the whole
+    /// content view). `safeAreaBar(edge:)` is the macOS 26 API for a bar that sits in the safe area
+    /// with the scroll content passing under it, which is exactly a column header. Pre-Tahoe keeps
+    /// the plain stack: it has no edge effect to earn.
+    @ViewBuilder func columnHeader<H: View>(@ViewBuilder _ header: () -> H) -> some View {
+        if #available(macOS 26.0, *) {
+            safeAreaBar(edge: .top, spacing: 0) { VStack(spacing: 0) { header(); Divider() } }
+        } else {
+            VStack(spacing: 0) { header(); Divider(); self }
+        }
+    }
+
+    /// A row reports where its last column ends, for `BrowserHeader`'s measured trailing padding.
+    func reportsCellsMaxX(_ x: Binding<CGFloat>) -> some View {
+        onGeometryChange(for: CGFloat.self, of: { $0.frame(in: .global).maxX }) { v in
+            if abs(v - x.wrappedValue) > 0.5 { x.wrappedValue = v }
+        }
+    }
+}

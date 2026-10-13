@@ -17,9 +17,8 @@ struct RecentsBrowser: View {
     @State private var selected: String?
     @State private var sort: BrowserSort = .column(.dateIndexed)
     @State private var ascending = false
-    /// Where the rows' last column ends and where the header ends; see `headerTrailingPad`.
+    /// Where the rows' last column ends, for `BrowserHeader`'s padding.
     @State private var rowCellsMaxX: CGFloat = 0
-    @State private var headerMaxX: CGFloat = 0
 
     private static let columns: [BrowserColumn] = [.folder, .kind, .dateIndexed, .size]
 
@@ -132,14 +131,11 @@ struct RecentsBrowser: View {
         }
     }
 
-    /// Header as a safe-area bar, for the scroll edge effect; see `FolderBrowser.listBody`.
-    @ViewBuilder private var listBody: some View {
-        if #available(macOS 26.0, *) {
-            listCore.safeAreaBar(edge: .top, spacing: 0) {
-                VStack(spacing: 0) { header; Divider() }
-            }
-        } else {
-            VStack(spacing: 0) { header; Divider(); listCore }
+    /// The list under the shared column header (`BrowserHeader`, as a safe-area bar).
+    private var listBody: some View {
+        listCore.columnHeader {
+            BrowserHeader(columns: Self.columns, sort: sort, ascending: ascending, rowCellsMaxX: rowCellsMaxX,
+                          click: clickHeader)
         }
     }
 
@@ -164,9 +160,7 @@ struct RecentsBrowser: View {
             }
             .padding(.leading, BrowserMetrics.rowLead)
             .padding(.trailing, BrowserMetrics.rowTrail)
-            .onGeometryChange(for: CGFloat.self, of: { $0.frame(in: .global).maxX }) { x in
-                if abs(x - rowCellsMaxX) > 0.5 { rowCellsMaxX = x }
-            }
+            .reportsCellsMaxX($rowCellsMaxX)
             .contentShape(RoundedRectangle(cornerRadius: BrowserMetrics.selectionRadius))
             .help(item.path)
             .fileDragSource { select(item.path); return [item.path] }   // see FileDrag
@@ -207,53 +201,11 @@ struct RecentsBrowser: View {
         }
     }
 
-    /// The folder browser's header cell: the sorted column in primary and semibold, its chevron at
-    /// the trailing edge as an overlay so it costs no width.
-    @ViewBuilder private func headerCell(_ title: String, target: BrowserSort) -> some View {
-        let active = sort == target
-        Text(title)
-            .fontWeight(active ? .semibold : .regular)
-            .foregroundStyle(active ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
-            .lineLimit(1)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .overlay(alignment: .trailing) {
-                Image(systemName: ascending ? "chevron.up" : "chevron.down")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .opacity(active ? 1 : 0)
-            }
-            .contentShape(.rect)
-            .onTapGesture {
-                if sort == target { ascending.toggle() } else { sort = target; ascending = target == .name }
-                sorted = Self.order(items, by: sort, ascending: ascending)
-            }
-    }
-
-    private var header: some View {
-        HStack(spacing: 0) {
-            Color.clear.frame(width: BrowserMetrics.icon + BrowserMetrics.iconGap, height: 1)
-            headerCell("Name", target: .name)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            ForEach(Self.columns) { col in
-                headerCell(col.title, target: .column(col))
-                    .modifier(ColumnSlot(col: col, alignment: .leading))
-                    .overlay(alignment: .leading) { Divider().frame(height: 12) }
-            }
-        }
-        .font(.caption)
-        .padding(.leading, BrowserMetrics.rowLead + BrowserMetrics.listInset)
-        .padding(.trailing, headerTrailingPad)
-        .onGeometryChange(for: CGFloat.self, of: { $0.frame(in: .global).maxX }) { x in
-            if abs(x - headerMaxX) > 0.5 { headerMaxX = x }
-        }
-        .padding(.vertical, 5)
-    }
-
-    /// Measured, as in `FolderBrowser`: a visible scroller takes its width from the rows only.
-    private var headerTrailingPad: CGFloat {
-        let fixed = BrowserMetrics.rowTrail + BrowserMetrics.listInset
-        guard rowCellsMaxX > 0, headerMaxX > 0 else { return fixed }
-        return max(0, headerMaxX - rowCellsMaxX + BrowserMetrics.rowTrail)
+    /// A header click: sort by that column, or reverse it. Names read A to Z, everything else
+    /// newest or largest first.
+    private func clickHeader(_ target: BrowserSort) {
+        if sort == target { ascending.toggle() } else { sort = target; ascending = target == .name }
+        sorted = Self.order(items, by: sort, ascending: ascending)
     }
 
     private static func folderName(_ path: String) -> String {

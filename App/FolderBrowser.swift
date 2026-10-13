@@ -68,10 +68,8 @@ struct FolderBrowser: View {
     /// 1,158-entry folder - a selection, a progress tick, a view-mode switch - sorted it again with
     /// `localizedStandardCompare`.
     @State private var sorted: [Entry] = []
-    /// Where the rows' last column actually ends and where the header strip ends, in window
-    /// coordinates. See `headerTrailingPad`.
+    /// Where the rows' last column ends, in window coordinates, for `BrowserHeader`'s padding.
     @State private var rowCellsMaxX: CGFloat = 0
-    @State private var headerMaxX: CGFloat = 0
     /// The width the gallery's grid is laid out in; see `GridColumns`.
     @State private var gridWidth: CGFloat = 0
     private static let gridMin: CGFloat = 108, gridSpacing: CGFloat = 14
@@ -164,22 +162,11 @@ struct FolderBrowser: View {
 
     // MARK: - Bodies
 
-    /// The header is a SAFE-AREA BAR, not a sibling above the list.
-    ///
-    /// This is what makes the scroll edge effect work. On Tahoe a scroll view only gets the effect
-    /// when it fills its pane top to bottom - a scroll view that starts below a sibling header is
-    /// the documented failure case (Sarah Reichelt hit the AppKit twin of it with `NSTableView`:
-    /// rows scrolling INTO the header with no blur, fixed by letting the scroll view span the whole
-    /// content view). `safeAreaBar(edge:)` is the macOS 26 API for a bar that sits in the safe area
-    /// with the scroll content passing under it, which is exactly a column header. Pre-Tahoe keeps
-    /// the plain stack: it has no edge effect to earn.
-    @ViewBuilder private var listBody: some View {
-        if #available(macOS 26.0, *) {
-            listCore.safeAreaBar(edge: .top, spacing: 0) {
-                VStack(spacing: 0) { header; Divider() }
-            }
-        } else {
-            VStack(spacing: 0) { header; Divider(); listCore }
+    /// The list under the shared column header (`BrowserHeader`, as a safe-area bar).
+    private var listBody: some View {
+        listCore.columnHeader {
+            BrowserHeader(columns: columns.visible, sort: sort, ascending: ascending, rowCellsMaxX: rowCellsMaxX,
+                          click: clickHeader) { columnMenu }
         }
     }
 
@@ -239,9 +226,7 @@ struct FolderBrowser: View {
                 }
                 .padding(.leading, BrowserMetrics.rowLead)
                 .padding(.trailing, BrowserMetrics.rowTrail)
-                .onGeometryChange(for: CGFloat.self, of: { $0.frame(in: .global).maxX }) { x in
-                    if abs(x - rowCellsMaxX) > 0.5 { rowCellsMaxX = x }
-                }
+                .reportsCellsMaxX($rowCellsMaxX)
                 // Hit shape only. It does NOT govern the right-click highlight on macOS: that is
                 // drawn by AppKit as a square, full-bleed rect, measured as a 22pt band with an
                 // all-zero corner profile against the selection's rounded 20pt. SwiftUI's
@@ -299,79 +284,8 @@ struct FolderBrowser: View {
         }
     }
 
-    /// Finder's column header: click a title to sort by it, click again to reverse, right-click
-    /// anywhere on the header to choose which columns are shown.
-    ///
-    /// Drawn to Finder's rules, which are specific: the sorted column's title is the only one in
-    /// the primary colour, its chevron sits at the column's TRAILING edge rather than beside the
-    /// text, a hairline divides each column from the next, and the whole strip sits on a faint
-    /// fill so it reads as chrome rather than as the first row.
-    private var header: some View {
-        HStack(spacing: 0) {
-            // Aligned with the row's name: the icon slot plus its gap, so "Name" sits exactly over
-            // the first character of every file name under it.
-            Color.clear.frame(width: BrowserMetrics.icon + BrowserMetrics.iconGap, height: 1)
-            headerCell("Name", target: .name)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            ForEach(columns.visible) { col in
-                headerCell(col.title, target: .column(col))
-                    .modifier(ColumnSlot(col: col, alignment: .leading))
-                    // The divider is an OVERLAY, not a sibling: as a laid-out view each one stole a
-                    // point from the strip and walked the header off the rows by one more point per
-                    // column. Finder's dividers sit exactly on the column boundary.
-                    .overlay(alignment: .leading) { Divider().frame(height: 12) }
-            }
-        }
-        .font(.caption)
-        .padding(.leading, BrowserMetrics.rowLead + BrowserMetrics.listInset)
-        .padding(.trailing, headerTrailingPad)
-        .onGeometryChange(for: CGFloat.self, of: { $0.frame(in: .global).maxX }) { x in
-            if abs(x - headerMaxX) > 0.5 { headerMaxX = x }
-        }
-        .padding(.vertical, 5)
-        // NO fill. In Finder the header sits on the same surface as the toolbar - there is no seam
-        // between them - so painting a grey band here is what made it read as a separate component
-        // bolted under the chrome. The hairline below the header is the only separation, and it
-        // divides the header from the ROWS, not from the toolbar.
-        .contentShape(.rect)
-        .contextMenu { columnMenu }
-    }
-
-    /// The header's trailing padding, MEASURED from the rows rather than assumed. A visible
-    /// scroller (the Automatic setting with a mouse attached, or Always) takes its 17pt from the
-    /// rows and not from the header, so a fixed padding put every column title 17pt right of the
-    /// values under it while the names still lined up. Without a scroller this equals the fixed
-    /// value it replaces.
-    private var headerTrailingPad: CGFloat {
-        let fixed = BrowserMetrics.rowTrail + BrowserMetrics.listInset
-        guard rowCellsMaxX > 0, headerMaxX > 0 else { return fixed }
-        return max(0, headerMaxX - rowCellsMaxX + BrowserMetrics.rowTrail)
-    }
-
-    /// One header cell. LEFT-ALIGNED IN EVERY COLUMN, including the numeric ones - Finder sorted by
-    /// Size puts "Size" hard against the column's leading edge while the values under it stay right
-    /// aligned, so the header does not follow the column's own alignment. The chevron is an overlay
-    /// at the trailing edge for the same reason the dividers are: it must not cost layout width, or
-    /// the title stops lining up with the values.
-    @ViewBuilder private func headerCell(_ title: String, target: BrowserSort) -> some View {
-        let active = sort == target
-        Text(title)
-            // Finder emphasises the sorted column in BOTH weight and colour - side by side its
-            // "Name" is visibly bolder and darker than the rest, and colour alone did not read.
-            .fontWeight(active ? .semibold : .regular)
-            .foregroundStyle(active ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
-            .lineLimit(1)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .overlay(alignment: .trailing) {
-                Image(systemName: ascending ? "chevron.up" : "chevron.down")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                    .opacity(active ? 1 : 0)
-            }
-            .contentShape(.rect)
-            .onTapGesture { clickHeader(target) }
-    }
-
+    /// A header click, as Finder does it: sort by that column, or reverse it if it already is.
+    /// Right-click on the header chooses the columns (`columnMenu`).
     private func clickHeader(_ target: BrowserSort) {
         if sort == target { ascending.toggle() } else { sort = target; ascending = true }
         sorted = Self.order(entries, by: sort, ascending: ascending)

@@ -187,14 +187,39 @@ struct RemoteBrowser: View {
     @State private var loading = true
     @State private var failure: String?
     @State private var selected: String?
+    @State private var sort: BrowserSort = .name
+    @State private var ascending = true
+    /// Where the rows' last column ends, for `BrowserHeader`'s padding.
+    @State private var rowCellsMaxX: CGFloat = 0
 
     private var link: LinkController { model.link }
     private var macName: String { link.name(of: scope.peer) }
 
+    /// What a linked Mac's listing carries: the folder browser's columns that it can fill.
+    private static let columns: [BrowserColumn] = [.kind, .dateModified, .size, .filesIndexed]
+
+    /// Folders first, as in the folder browser, then the column's order.
+    private var sorted: [LinkWire.Child] {
+        children.sorted { a, b in
+            if a.folder != b.folder { return a.folder }
+            let result: Bool
+            switch sort {
+            case .column(.kind) where a.kind != b.kind: result = a.kind < b.kind
+            case .column(.dateModified) where a.modified != b.modified: result = a.modified < b.modified
+            case .column(.size) where a.size != b.size: result = a.size < b.size
+            case .column(.filesIndexed) where a.files != b.files: result = a.files < b.files
+            default: result = name(a).localizedStandardCompare(name(b)) == .orderedAscending
+            }
+            return ascending ? result : !result
+        }
+    }
+
+    private func name(_ c: LinkWire.Child) -> String {
+        c.folder ? displayName(c.path) : (c.path as NSString).lastPathComponent
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            header
-            Divider()
             if !link.isOnline(scope.peer) {
                 CenteredStatus(symbol: CenteredStatus.moleSleep, title: "\(macName) is offline", subtitle: "",
                                showSpinner: false, action: ("Try Again", { link.retry(scope.peer) }))
@@ -208,7 +233,13 @@ struct RemoteBrowser: View {
             } else if children.isEmpty {
                 CenteredStatus(symbol: CenteredStatus.moleEmpty, title: "Nothing indexed here", subtitle: "", showSpinner: false)
             } else {
-                list
+                // The shared header, as a safe-area bar, exactly as over a folder on this Mac.
+                list.columnHeader {
+                    BrowserHeader(columns: Self.columns, sort: sort, ascending: ascending, rowCellsMaxX: rowCellsMaxX) { t in
+                        // Names read A to Z, everything else newest or largest first.
+                        if sort == t { ascending.toggle() } else { sort = t; ascending = t == .name }
+                    }
+                }
             }
         }
         .task(id: "\(scope.peer)|\(scope.folder ?? "")|\(link.isOnline(scope.peer))") { await load() }
@@ -223,11 +254,7 @@ struct RemoteBrowser: View {
         guard link.isOnline(scope.peer) else { children = []; return }
         if let folder = scope.folder {
             do {
-                let kids = try await link.list(scope.peer, folder: folder)
-                children = kids.sorted { a, b in
-                    a.folder != b.folder ? a.folder
-                        : (a.path as NSString).lastPathComponent.localizedStandardCompare((b.path as NSString).lastPathComponent) == .orderedAscending
-                }
+                children = try await link.list(scope.peer, folder: folder)
             } catch {
                 failure = LinkController.describe(error)
             }
@@ -239,28 +266,6 @@ struct RemoteBrowser: View {
         }
     }
 
-    /// The browsers' column header: the location is in the scope chip above, as a folder's name is
-    /// in the toolbar for FolderBrowser.
-    private var header: some View {
-        HStack(spacing: 0) {
-            Color.clear.frame(width: BrowserMetrics.icon + BrowserMetrics.iconGap, height: 1)
-            HStack(spacing: 6) {
-                Text("Name").foregroundStyle(.secondary)
-                if !children.isEmpty {
-                    Text("\(children.count.formatted()) item\(children.count == 1 ? "" : "s")").foregroundStyle(.tertiary)
-                }
-                Spacer(minLength: 0)
-            }
-            Text("Date Modified").foregroundStyle(.secondary).lineLimit(1)
-                .modifier(ColumnSlot(col: .dateModified, alignment: .leading))
-                .overlay(alignment: .leading) { Divider().frame(height: 12) }
-        }
-        .font(.caption)
-        .padding(.leading, BrowserMetrics.rowLead + BrowserMetrics.listInset)
-        .padding(.trailing, BrowserMetrics.rowTrail + BrowserMetrics.listInset)
-        .padding(.vertical, 5)
-    }
-
     private func displayName(_ path: String) -> String {
         if let s = link.sources[scope.peer]?.first(where: { $0.key == path }) { return s.name }
         return (path as NSString).lastPathComponent
@@ -268,8 +273,21 @@ struct RemoteBrowser: View {
 
     private func remote(_ c: LinkWire.Child) -> String { RemotePath.make(peer: scope.peer, path: c.path) }
 
+    /// One cell, with the folder browser's "--" where a row has no value: a folder has no kind or
+    /// size, a file no file count.
+    @ViewBuilder private func cell(_ col: BrowserColumn, _ c: LinkWire.Child) -> some View {
+        switch col {
+        case .kind: Text(c.folder ? "Folder" : (FileKind(rawValue: c.kind)?.title ?? "--"))
+        case .dateModified:
+            Text(c.modified > 0 ? Date(timeIntervalSince1970: c.modified).formatted(date: .abbreviated, time: .shortened) : "--")
+        case .size: Text(!c.folder && c.size > 0 ? ByteSize.file(c.size) : "--")
+        case .filesIndexed: Text(c.folder ? c.files.formatted() : "--")
+        default: Text("--")
+        }
+    }
+
     private var list: some View {
-        List(children, id: \.path, selection: $selected) { c in
+        List(sorted, id: \.path, selection: $selected) { c in
             let isSelected = selected == c.path
             HStack(spacing: 0) {
                 Group {
@@ -282,18 +300,21 @@ struct RemoteBrowser: View {
                     }
                 }
                 .padding(.trailing, BrowserMetrics.iconGap)
-                Text(c.folder ? displayName(c.path) : (c.path as NSString).lastPathComponent)
+                Text(name(c))
                     .lineLimit(1).truncationMode(.middle)
                     .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
                 Spacer(minLength: 8)
-                Text(c.modified > 0 ? Date(timeIntervalSince1970: c.modified).formatted(date: .abbreviated, time: .shortened) : "")
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
-                    .lineLimit(1)
-                    .modifier(ColumnSlot(col: .dateModified, alignment: .leading))
+                ForEach(Self.columns) { col in
+                    cell(col, c)
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.secondary))
+                        .lineLimit(1)
+                        .modifier(ColumnSlot(col: col, alignment: col.alignment))
+                }
             }
             .padding(.leading, BrowserMetrics.rowLead)
             .padding(.trailing, BrowserMetrics.rowTrail)
+            .reportsCellsMaxX($rowCellsMaxX)
             .contentShape(RoundedRectangle(cornerRadius: BrowserMetrics.selectionRadius))
             .onTapGesture(count: 2) { activate(c) }
             .simultaneousGesture(TapGesture().onEnded { select(c) })

@@ -1252,3 +1252,15 @@ results list - every thumbnail comes from the one iCloud keeps (QuickLook, no do
 - UI text says what a control does, in plain words: no "the headroom comes back on its own", no
   "one batch of indexing always works in", no "every search you settle on". A new string is read
   next to its neighbours before it ships.
+
+## One column header for every browser (2026-10-13)
+- Four browsers drew four copies of the column header (folder, Recents, a Photos source, a linked
+  Mac), and two had drifted far enough that Han saw them as different controls: the linked Mac's
+  had an item count beside "Name", no sorting and sat as a sibling above the list (no Tahoe scroll
+  edge); Photos' put its chevron on top of "Date Modified" and an item count beside "Name". The
+  folder browser's was right. It is now `BrowserHeader` (BrowserColumns.swift) with
+  `columnHeader { }` (the safe-area bar) and `reportsCellsMaxX` (the measured trailing pad), and all
+  four use it, each passing its columns and its sort. Photos shows Kind, Date Modified, Size (the
+  store's `listMatching` now fills `size`, which it had dropped); a linked Mac shows Kind, Date
+  Modified, Size, Files Indexed from what its listing already carried. No item counts: Finder
+  shows none in the header, and the folder browser never did.
