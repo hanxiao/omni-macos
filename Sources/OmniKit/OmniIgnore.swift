@@ -74,6 +74,11 @@ public struct OmniIgnore: Sendable, Equatable {
     private let general: [Int]
     /// Indexed folders, as lowercased segments: what a relative central pattern is relative to.
     private let bases: [[[UInt32]]]
+    /// Folders the user ADDED, whether or not they are crawl roots. Each is a floor exactly like a
+    /// root: never excluded itself, nothing above it tested. A folder covered by a broader root
+    /// used to fall under that root's rules - `.openclaw` under a home folder lost all 180,911 of
+    /// its files to the default hidden-name rule, though the user had added it by name.
+    private let kept: Set<String>
     /// Stable hash of the source text.
     public let textHash: String
 
@@ -84,7 +89,8 @@ public struct OmniIgnore: Sendable, Equatable {
 
     /// `text` is the central policy; its relative patterns apply under each of `bases`. `folderRules`
     /// are rules already rewritten to absolute paths by `scoped`, appended after it.
-    public init(text: String, bases: [String] = [], folderRules: String = "") {
+    public init(text: String, bases: [String] = [], folderRules: String = "", kept: [String] = []) {
+        self.kept = Set(kept.map { $0.count > 1 && $0.hasSuffix("/") ? String($0.dropLast()) : $0 })
         var rs: [Rule] = []
         func add(_ source: String, relative: Bool) {
             for raw in source.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline) {   // "\r\n" is ONE Character
@@ -318,7 +324,7 @@ public struct OmniIgnore: Sendable, Equatable {
     /// whether the crawl ever enters it. Roots are never excluded. Cached across calls.
     public func excludesFolder(roots: [String] = []) -> (Substring) -> Bool {
         var dirCache: [Substring: Bool] = [:]
-        let rootSet = Set(roots.map { $0.hasSuffix("/") && $0.count > 1 ? String($0.dropLast()) : $0 })
+        let rootSet = Set(roots.map { $0.hasSuffix("/") && $0.count > 1 ? String($0.dropLast()) : $0 }).union(kept)
         func dirExcluded(_ dir: Substring) -> Bool {
             if dir.isEmpty || dir == "/" || rules.isEmpty { return false }
             if rootSet.contains(String(dir)) { return false }
@@ -334,6 +340,7 @@ public struct OmniIgnore: Sendable, Equatable {
     /// Whether `path` (absolute) is excluded. `isDir` gates directory-only rules. Last match wins.
     public func isIgnored(_ path: String, isDir: Bool) -> Bool {
         guard !rules.isEmpty else { return false }
+        if isDir, !kept.isEmpty, kept.contains(path) { return false }   // a folder the user added
         let p = PathView(path)
         return p.ranges.isEmpty ? false : decide(p, p.ranges.count, isDir: isDir)
     }
@@ -357,7 +364,11 @@ public struct OmniIgnore: Sendable, Equatable {
         let p = PathView(path)
         let n = p.ranges.count
         guard n > 0 else { return false }
-        let floor = root.map { $0.split(separator: "/", omittingEmptySubsequences: true).count } ?? 0
+        // The deepest of the root and any added folder above the path: nothing at or above it is tested.
+        var floor = root.map { $0.split(separator: "/", omittingEmptySubsequences: true).count } ?? 0
+        for k in kept where k.count < path.count && path.hasPrefix(k + "/") {
+            floor = max(floor, k.split(separator: "/", omittingEmptySubsequences: true).count)
+        }
         var i = floor
         while i < n - 1 { if decide(p, i + 1, isDir: true) { return true }; i += 1 }   // the root and above are skipped
         return decide(p, n, isDir: isDir)

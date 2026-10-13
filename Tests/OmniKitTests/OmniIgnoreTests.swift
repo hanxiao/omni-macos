@@ -152,4 +152,25 @@ final class OmniIgnoreTests: XCTestCase {
         XCTAssertFalse(g2.isIgnoredIncludingAncestors("/a/b/keep.log", isDir: false))
         XCTAssertTrue(g2.isIgnoredIncludingAncestors("/a/b/other.log", isDir: false))
     }
+
+    /// A folder the user added stays indexed under a broader root whose rules would exclude it:
+    /// `.openclaw` added by name, then the home folder above it, lost every file to the hidden-name
+    /// rule. A hidden folder nobody added is still excluded - the control that the rule fires.
+    func testAddedFolderIsAFloorUnderABroaderRoot() {
+        let g = OmniIgnore(text: OmniIgnore.hiddenRule, kept: ["/u/.openclaw/"])
+        XCTAssertFalse(g.isIgnored("/u/.openclaw", isDir: true))
+        XCTAssertTrue(g.isIgnored("/u/.cache", isDir: true))
+        XCTAssertFalse(g.isIgnoredIncludingAncestors("/u/.openclaw/a/notes.md", isDir: false, root: "/u"))
+        XCTAssertTrue(g.isIgnoredIncludingAncestors("/u/.cache/notes.md", isDir: false, root: "/u"))
+        // Rules still apply BELOW the added folder.
+        XCTAssertTrue(g.isIgnoredIncludingAncestors("/u/.openclaw/.git/HEAD", isDir: false, root: "/u"))
+        let folder = g.excludesFolder(roots: ["/u"])
+        XCTAssertFalse(folder("/u/.openclaw"))
+        XCTAssertFalse(folder("/u/.openclaw/sessions"))
+        XCTAssertTrue(folder("/u/.cache"))
+        XCTAssertTrue(folder("/u/.openclaw/.git"))
+        let file = g.excludesIndexedFile(roots: ["/u"])
+        XCTAssertFalse(file("/u/.openclaw/sessions/log.md"))
+        XCTAssertTrue(file("/u/.cache/log.md"))
+    }
 }

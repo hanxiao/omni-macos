@@ -211,7 +211,11 @@ final class ServingController {
             return false
         }
 
-        let router = Router(backend: backend, auth: auth, appVersion: AppModel.appVersion, sources: sources)
+        var built = Router(backend: backend, auth: auth, appVersion: AppModel.appVersion, sources: sources)
+        // Local scope: answer only requests addressed to this Mac (DNS rebinding; Router.handle).
+        // LAN scope already requires the token, which a rebinding page does not have.
+        built.loopbackOnly = !isPublic
+        let router = built
         let sink: @Sendable (LogEntry) -> Void = { [weak self] entry in
             Task { @MainActor in self?.ingest(entry) }
         }

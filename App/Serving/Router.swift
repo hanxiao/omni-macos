@@ -15,9 +15,22 @@ struct Router: Sendable {
     /// What an MCP tool call through this router counts as: `.cli` on the command line's socket,
     /// where the only caller is `omni`.
     var mcpSurface: ServedSurface = .mcp
+    /// Refuse requests that name another host or come from another site's page. On for the TCP
+    /// server in local scope; off for the command line's socket, which no browser can reach.
+    var loopbackOnly = false
 
     func handle(_ req: HTTPRequest) async -> HTTPResponse {
         let route = req.routePath
+
+        // DNS REBINDING, before anything else - health included. A local-only server is still
+        // reachable from a web page: the page's own domain is re-pointed at 127.0.0.1, the browser
+        // then sends it requests it considers same-origin, and reads the answers. Accepting the
+        // connection from loopback proves nothing about who wrote the request. What does is the
+        // Host header (the browser sends the page's domain, not 127.0.0.1) and the Origin header
+        // (the page's origin). Measured before this: Host: evil.test with Origin: http://evil.test
+        // got a 200 and the full source list. Requests from agents and curl send no Origin and a
+        // loopback Host, so they are untouched. The MCP transport spec requires the Origin check.
+        if loopbackOnly, let refusal = Self.refuseForeign(req) { return refusal }
 
         // Liveness probes are always open, before any auth check.
         if req.method == "GET", route == "/health" || route == "/v1/models" {
@@ -80,6 +93,39 @@ struct Router: Sendable {
         }
 
         return notFound(for: route)
+    }
+
+    // MARK: - Foreign requests
+
+    static func refuseForeign(_ req: HTTPRequest) -> HTTPResponse? {
+        if let host = req.headers["host"], !isLoopbackHost(host) {
+            return HTTPResponse.json(["error": ["message": "Host \(host) is not this Mac; Omni answers only requests addressed to localhost",
+                                                "type": "forbidden"]], status: 403)
+        }
+        if let origin = req.headers["origin"], !isLoopbackOrigin(origin) {
+            return HTTPResponse.json(["error": ["message": "Requests from web pages at \(origin) are refused",
+                                                "type": "forbidden"]], status: 403)
+        }
+        return nil
+    }
+
+    /// "localhost", "127.0.0.1", "[::1]", each with or without a port.
+    static func isLoopbackHost(_ raw: String) -> Bool {
+        var h = raw.trimmingCharacters(in: .whitespaces).lowercased()
+        if h.hasPrefix("[") {                       // [::1] or [::1]:51299
+            guard let close = h.firstIndex(of: "]") else { return false }
+            h = String(h[h.index(after: h.startIndex)..<close])
+        } else if let colon = h.lastIndex(of: ":"), h.firstIndex(of: ":") == colon {
+            h = String(h[..<colon])                 // localhost:51299; a bare IPv6 has several colons
+        }
+        return h == "localhost" || h == "127.0.0.1" || h == "::1"
+    }
+
+    /// An http(s) origin on this Mac. "null" (a sandboxed frame, a file:// page) is not.
+    static func isLoopbackOrigin(_ raw: String) -> Bool {
+        guard let u = URL(string: raw.trimmingCharacters(in: .whitespaces)), let scheme = u.scheme?.lowercased(),
+              scheme == "http" || scheme == "https", let host = u.host?.lowercased() else { return false }
+        return host == "localhost" || host == "127.0.0.1" || host == "::1" || host == "[::1]"
     }
 
     // MARK: - Error envelopes

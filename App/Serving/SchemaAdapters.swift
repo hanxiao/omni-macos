@@ -489,7 +489,11 @@ enum FileStatusAdapter {
                 // mtime + byte size of the file VERSION the index holds.
                 "modified": st.modified,
                 "bytes": st.size,
-                "up_to_date": exists && diskMtime == st.modified && diskSize == st.size
+                // WITHIN A MILLISECOND, the indexer's own test (Indexer: `abs(m - modified) < 0.001`).
+                // Exact equality called unchanged files STALE: the crawl stores stat()'s
+                // seconds+nanoseconds, Foundation's date goes through a 2001-based Double, and the
+                // two can differ in the sixth decimal (measured: .931619817 on disk, .93162 stored).
+                "up_to_date": exists && abs(diskMtime - st.modified) < 0.001 && diskSize == st.size
             ]
             // When the indexer last wrote these rows; absent if the rows predate the
             // indexed_at column (they get a real stamp on their next reindex).

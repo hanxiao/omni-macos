@@ -52,6 +52,9 @@ struct SourcesSnapshot: Sendable {
 struct SourceMutation: Sendable {
     let key: String?
     let error: String?
+    /// Done, but not what the verb says: a folder added inside one already indexed starts no
+    /// indexing of its own, and the caller must not read "now indexing <parent>" as its answer.
+    var note: String? = nil
     static func ok(_ key: String) -> SourceMutation { .init(key: key, error: nil) }
     static func fail(_ message: String) -> SourceMutation { .init(key: nil, error: message) }
 }

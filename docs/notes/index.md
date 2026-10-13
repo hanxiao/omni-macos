@@ -1478,3 +1478,45 @@ were `filesUnder` plus a pass over every file id, per watched folder, every 1.5 
   once the random test wiped in-session: reopens alone never reset a store holding counts), the
   fold not parking its slots, the overflow recount skipped. A drop at the settle was proven
   redundant (its one caller resets first) and removed.
+
+## An agent's MCP audit, and what it did to a real index (2026-10-13)
+
+An agent auditing the MCP server (against 0.15.15, the installed build) left the owner's sources as
+one `/Users/hanxiao` root and 180,911 `.openclaw` files out of the index. Its report
+(`jina-dataroom-harness/runs/300f513b8f18/work/REPORT.md`), checked claim by claim:
+
+- REAL, the chain that cost the rows. `add_source "/"` was accepted and became the only crawl root;
+  the next `add_source "~"` was recorded but reported as a failure ("already covered"); removing `/`
+  promoted `~` to root; with home as the root the default hidden-name rule applied to the
+  `.openclaw` the owner had added by name, and a pause/resume pruned it. Fixed three ways: the API
+  refuses the disk root, system folders and the home folder (`tooBroadToIndex`; the sidebar does
+  not, a person is choosing); an added folder is an ignore FLOOR like a root (`OmniIgnore.kept`),
+  so a broader root's rules never exclude it; and an add inside an indexed folder answers "already
+  indexed as part of X; nothing new to index" instead of "now indexing X".
+- REAL, and what made the repair expensive. Removing a parent deleted every row under it, its
+  promoted children's included, then crawled and embedded them again from nothing.
+  `dropRemovedFolder` keeps the rows of folders still indexed beneath it (sliced `deletePaths`)
+  and only the parent's own files go. Measured on an isolated instance: `indexed_at` of the
+  children identical before and after, the parent-only folder gone, an un-added hidden folder
+  still excluded (the control). `deleteUnderFolder` refuses "/", so removing `/` had deleted
+  nothing - which is why the agent saw coverage intact right after.
+- REAL: DNS rebinding. Local scope accepted any Host and Origin; `Host: evil.test` with
+  `Origin: http://evil.test` got the full source list. Router refuses a non-loopback Host or
+  Origin in local scope (403); agents and curl send neither. The CLI socket is exempt.
+- HALF: "listening on every interface". Non-loopback connections were dropped in accept(), so no
+  data left the Mac (curl from the LAN address: reset), but the port answered a TCP handshake.
+  The listener now requires the loopback interface: refused from the LAN.
+- REAL: initialize echoed any version ("bogus", "2099-01-01"). It answers one of 2025-11-25,
+  2025-06-18, 2025-03-26, 2024-11-05, and a bad MCP-Protocol-Version header is a 400.
+- REAL: unknown arguments (`topK`) were ignored. Refused with the tool's argument list, and every
+  schema says `additionalProperties: false`.
+- REAL, small: file_status said "NOT indexed" for a folder, a URL and a missing file alike; it now
+  says which. And `up_to_date` compared mtimes for exact equality while the crawl and Foundation
+  compute them differently, so unchanged files read STALE; it uses the indexer's 1 ms tolerance.
+- FALSE: "new files under a source are never indexed". A new file in ~/Documents on the live app
+  was indexed within 5 s. During the audit the agent's own changes had a full home re-scan
+  running, which file events wait behind.
+- NOT OURS: the harness's cached tool list (no `ocr`, no titles) and its exposure of
+  `remove_source` as a direct tool.
+- LEFT AS IS: no SSE progress (the spec allows JSON), no rate limit on a loopback-only server,
+  `top_k` clamped to its maximum rather than refused.

@@ -43,9 +43,8 @@ final class HTTPServer: @unchecked Sendable {
     private var conns: [ObjectIdentifier: NWConnection] = [:]
     private var idleTimers: [ObjectIdentifier: DispatchSourceTimer] = [:]
     private var cancelled = false
-    /// When bound for local scope we accept the listener on all interfaces (the reliable
-    /// NWListener path) but drop any connection whose peer is not loopback - functionally
-    /// local-only without the fragile requiredLocalEndpoint bind.
+    /// Local scope: the listener is on the loopback interface only, and any connection whose peer
+    /// is not loopback is dropped as well.
     private var loopbackOnly = false
 
     init(handler: @escaping Handler, onLog: @escaping @Sendable (LogEntry) -> Void) {
@@ -61,10 +60,13 @@ final class HTTPServer: @unchecked Sendable {
         }
         loopbackOnly = (host == "127.0.0.1")
 
-        // Canonical bind: NWListener(using:on:) on all interfaces. requiredLocalEndpoint with
-        // a port throws EINVAL here, so loopback scope is enforced per-connection in accept().
+        // NWListener(using:on:) with a port. requiredLocalEndpoint with a port throws EINVAL here;
+        // what does work is requiring the LOOPBACK INTERFACE, so in local scope the port is not
+        // open on the network at all (it was: every interface, with non-loopback peers dropped in
+        // accept() - a LAN scan saw the port answer a TCP handshake). The accept() check stays.
         let params = NWParameters.tcp
         params.allowLocalEndpointReuse = true
+        if loopbackOnly { params.requiredInterfaceType = .loopback }
 
         let l = try NWListener(using: params, on: nwPort)
         self.listener = l

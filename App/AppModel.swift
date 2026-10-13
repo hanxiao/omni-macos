@@ -3025,7 +3025,7 @@ final class AppModel {
             let rules = OmniIgnore.scoped(folderPolicies[dir] ?? "", to: dir)
             if !rules.isEmpty { folderRules += rules + "\n" }
         }
-        return OmniIgnore(text: central, bases: ignoreBases, folderRules: folderRules)
+        return OmniIgnore(text: central, bases: ignoreBases, folderRules: folderRules, kept: addedFolders.map(\.path))
     }
 
     /// Every spelling of every crawled folder: FSEvents and the crawl report real paths
@@ -5058,6 +5058,7 @@ final class AppModel {
     func removeCoveredFolder(_ url: URL) {
         addedFolders.removeAll { $0 == url }
         recomputeRoots()
+        recompileIgnoreForRoots()   // it was an ignore floor (OmniIgnore.kept)
     }
 
     // MARK: - Serving: what Omni indexes, over the API
@@ -5133,13 +5134,38 @@ final class AppModel {
             return .fail("Omni cannot read \(path). Grant access under Privacy & Security > Files and Folders.")
         }
         let url = URL(fileURLWithPath: path)
+        let canonical = (try? url.resourceValues(forKeys: [.canonicalPathKey]))?.canonicalPath ?? path
+        // TOO BROAD FOR ONE SOURCE. "/" was accepted, became the only crawl root, swallowed every
+        // folder the user had added, and its removal then handed the home folder the job - whose
+        // default hidden-name rule dropped a 180,911-file `.openclaw` the user had added by name.
+        // An agent wants a folder; these are the disk, its system areas and the whole home.
+        if Self.tooBroadToIndex(canonical) {
+            return .fail("\(path) is too broad to index as one source: it would take in system and app data and swallow the folders already added. Add the folders inside it instead, such as ~/Documents.")
+        }
+        let coveredBy = RootScope.rootCovering(URL(fileURLWithPath: canonical), in: roots)
         addRoots([url])
+        // Kept as the user's folder (it stays when the parent is removed), but it starts nothing:
+        // say so, rather than "now indexing <parent>".
+        if let parent = coveredBy, parent.path != canonical {
+            var m = SourceMutation.ok(parent.path)
+            m.note = "\(canonical) is already indexed as part of \(parent.path); nothing new to index"
+            return m
+        }
         // The key the caller must use afterwards is the CANONICAL one (symlinks resolved, and the
         // folder may have been absorbed by a parent root that was already there).
         let key = roots.first { $0.path == url.path }?.path
             ?? rootKey(for: (try? url.resourceValues(forKeys: [.canonicalPathKey]))?.canonicalPath ?? path)
         guard let key else { return .fail("\(path) is already covered by an indexed parent folder") }
         return .ok(key)
+    }
+
+    /// The volume root, the folders that hold every user's or every app's files, and the home
+    /// folder itself. Refused over the API only: the sidebar's Add is a person choosing.
+    nonisolated static func tooBroadToIndex(_ path: String) -> Bool {
+        let p = path.count > 1 && path.hasSuffix("/") ? String(path.dropLast()) : path
+        let system: Set<String> = ["/", "/Users", "/Volumes", "/System", "/Library", "/Applications", "/private",
+                                   "/usr", "/opt", "/bin", "/sbin", "/etc", "/var", "/tmp", "/cores"]
+        return system.contains(p) || p == NSHomeDirectory() || p == "/System/Volumes/Data"
     }
 
     private func apiAddAlbum(_ id: String) -> SourceMutation {
@@ -5585,7 +5611,7 @@ final class AppModel {
         addedFolders.removeAll { $0 == url }
         recomputeRoots()
         // Promoted by this removal: under the folder being removed, and a root only now. Their
-        // vectors go with the delete below, so they have to be crawled again.
+        // rows are kept (dropRemovedFolder); they get a catch-up pass for what the parent excluded.
         let promoted = roots.filter { !rootsBefore.contains($0.path) && RootScope.covers(url.path, $0.path) }
         if filterFolder == url { filterFolder = nil }
         if pausedRoots.remove(url.path) != nil {
@@ -5603,8 +5629,9 @@ final class AppModel {
         } else {
             // Drop that folder's vectors so removed folders stop appearing in results, then
             // reclaim the disk space those rows held (SQLite keeps freed pages until VACUUM).
+            let keep = roots.map(\.path)
             Task.detached {
-                store.deleteUnderFolder(url.path)
+                Self.dropRemovedFolder(url.path, keeping: keep, store: store)
                 await self.afterBulkDelete(store)
                 store.compact()
                 await MainActor.run { self.requeuePromoted(promoted) }
@@ -5751,6 +5778,27 @@ final class AppModel {
 
     /// Folders that became roots because the root covering them was removed. The delete took their
     /// vectors with it, so they need a pass; queued rather than started, like any other new source.
+    /// A removed folder's files out of the index - EXCEPT those under a folder that is still a
+    /// root. Removing a parent promotes the folders the user added beneath it, and those keep
+    /// their rows: they used to be deleted with everything else and then crawled and embedded again
+    /// from nothing, which for a home folder with Documents and Downloads under it is hours of GPU
+    /// for files that never changed. The promoted roots still get a catch-up pass
+    /// (`requeuePromoted`), which skips every file it already has and picks up only what the
+    /// parent's rules had excluded.
+    ///
+    /// With nothing to keep it is the folder delete it always was. Otherwise the files go through
+    /// `deletePaths`, the sliced delete, as the ignore-rule prune does. This also covers "/", which
+    /// `deleteUnderFolder` refuses as a whole-index wipe.
+    nonisolated static func dropRemovedFolder(_ folder: String, keeping roots: [String], store: VectorStore) {
+        let keep = roots.filter { $0 != folder && RootScope.covers(folder, $0) }
+        guard !keep.isEmpty else { store.deleteUnderFolder(folder); return }
+        var drop = Set<String>()
+        store.knownFiles().forEach { path, _ in
+            if RootScope.covers(folder, path), !keep.contains(where: { RootScope.covers($0, path) }) { drop.insert(path) }
+        }
+        store.deletePaths(drop)
+    }
+
     private func requeuePromoted(_ promoted: [URL]) {
         guard !promoted.isEmpty else { return }
         indexNewSourcesFirst { self.pendingCatchUpRoots.append(contentsOf: promoted) }
@@ -6847,8 +6895,9 @@ final class AppModel {
                             // Drop the removed folders' vectors now the pass stopped re-inserting them,
                             // reclaim disk, then resume indexing the remaining roots.
                             self.indexState = .idle
+                            let keep = self.roots.map(\.path)
                             Task.detached {
-                                for path in removed { store.deleteUnderFolder(path) }
+                                for path in removed { Self.dropRemovedFolder(path, keeping: keep, store: store) }
                                 await self.afterBulkDelete(store)
                                 store.compact()
                                 await MainActor.run {
@@ -6970,8 +7019,9 @@ final class AppModel {
         let removed = pendingRootRemovals
         pendingRootRemovals.removeAll()
         if !removed.isEmpty {
+            let keep = roots.map(\.path)
             Task.detached {
-                for path in removed { store.deleteUnderFolder(path) }
+                for path in removed { Self.dropRemovedFolder(path, keeping: keep, store: store) }
                 await self.afterBulkDelete(store)
                 store.compact()
                 await MainActor.run {

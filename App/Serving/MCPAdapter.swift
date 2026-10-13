@@ -17,9 +17,12 @@ import AppKit
 /// vectors use the OpenAI-style /v1/embeddings endpoint instead; MCP is for the things agents
 /// actually do with Omni - reach the user's files by meaning and trust what the index covers.
 enum MCPAdapter {
-    /// The newest protocol revision this server knows. If the client asks for a different
-    /// one we echo the client's (every revision we care about shares this method surface).
-    private static let protocolVersion = "2025-06-18"
+    /// The revisions this server answers, newest first. Its replies are valid under each: tools
+    /// with annotations and titles, no sessions, no batching, nothing a later revision removed.
+    /// A client asking for one of these gets it back; any other request gets the newest, which the
+    /// spec says the client then accepts or disconnects on. It used to echo whatever was asked -
+    /// "2099-01-01" and "bogus" included - so a client believed it had negotiated anything.
+    static let supportedVersions = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
 
     /// Longest edge of an inlined thumbnail (matches jina-ai/MCP's image handling).
     private static let inlineImageMaxEdge = 800
@@ -51,8 +54,14 @@ enum MCPAdapter {
                       pauseSourceDescriptor(), removeSourceDescriptor(), linkedFileDescriptor()]
         }
         return tools.map { tool in
-            guard let name = tool["name"] as? String, let ex = examples[name] else { return tool }
             var t = tool
+            // Closed schemas: an argument a tool does not take is refused (tools/call), and saying
+            // so here lets a client catch the typo before it calls.
+            if var schema = t["inputSchema"] as? [String: Any] {
+                schema["additionalProperties"] = false
+                t["inputSchema"] = schema
+            }
+            guard let name = tool["name"] as? String, let ex = examples[name] else { return t }
             t["_meta"] = [examplesMetaKey: ex]
             return t
         }
@@ -89,6 +98,13 @@ enum MCPAdapter {
                                                   message: "use POST; this server does not offer an SSE stream"),
                                      status: 405)
         }
+        // After initialize the client names its revision on every request; one this server does
+        // not speak is a 400, as the spec says.
+        if let v = req.headers["mcp-protocol-version"], !supportedVersions.contains(v) {
+            return HTTPResponse.json(jsonRPCError(id: NSNull(), code: -32600,
+                message: "unsupported MCP-Protocol-Version \(v); supported: \(supportedVersions.joined(separator: ", "))"),
+                status: 400)
+        }
         guard let obj = try? JSONSerialization.jsonObject(with: req.body) else {
             return HTTPResponse.json(jsonRPCError(id: NSNull(), code: -32700, message: "parse error"), status: 400)
         }
@@ -111,7 +127,7 @@ enum MCPAdapter {
         case "initialize":
             let requested = params["protocolVersion"] as? String
             return result(id: id, [
-                "protocolVersion": requested ?? protocolVersion,
+                "protocolVersion": requested.flatMap { supportedVersions.contains($0) ? $0 : nil } ?? supportedVersions[0],
                 "capabilities": ["tools": [:] as [String: Any]],
                 "serverInfo": ["name": "omni", "title": "Omni - local semantic file search",
                                "version": appVersion],
@@ -129,6 +145,17 @@ enum MCPAdapter {
                 return HTTPResponse.json(jsonRPCError(id: id, code: -32602, message: "missing tool name"))
             }
             let args = params["arguments"] as? [String: Any] ?? [:]
+            // AN ARGUMENT THE TOOL DOES NOT TAKE IS AN ERROR, naming the ones it does. `topK` for
+            // `top_k` - the slip every agent makes - used to be ignored without a word, and the call
+            // ran with the default instead of what was asked.
+            if let schema = tools(withSources: sources != nil).first(where: { $0["name"] as? String == name })?["inputSchema"] as? [String: Any],
+               let props = schema["properties"] as? [String: Any] {
+                let unknown = args.keys.filter { props[$0] == nil }.sorted()
+                if !unknown.isEmpty {
+                    let known = props.keys.sorted().joined(separator: ", ")
+                    return toolError(id: id, "\(name) failed: unknown argument\(unknown.count == 1 ? "" : "s") \(unknown.map { "'\($0)'" }.joined(separator: ", ")); \(name) takes: \(known)")
+                }
+            }
             // The `omni` command line marks its calls (CLI.md): it gets structuredContent and the
             // diagnostic blocks marked for stderr. Every other client's answer is unchanged.
             let cli = (params["_meta"] as? [String: Any])?[cliMetaKey] as? Bool == true
@@ -521,7 +548,16 @@ enum MCPAdapter {
                 else { fresh = "file MISSING on disk" }
                 line = "\(i + 1). \(p)  indexed (\(kind), \(chunks) chunk\(chunks == 1 ? "" : "s"), \(fresh))"
             } else {
-                line = "\(i + 1). \(p)  NOT indexed"
+                // WHY NOT, since the next step differs: a bare "NOT indexed" for a folder or a URL
+                // read as "go and index it", and sent agents to add_source.
+                let asked = i < paths.count ? paths[i] : p
+                var isDir: ObjCBool = false
+                let why: String
+                if !asked.hasPrefix("/") && !asked.hasPrefix("~") { why = "not an absolute file path" }
+                else if !FileManager.default.fileExists(atPath: p, isDirectory: &isDir) { why = "no such file" }
+                else if isDir.boolValue { why = "a folder, not a file: search inside it with search's 'folder', or list_sources for what is indexed" }
+                else { why = "NOT indexed (outside the indexed folders, a kind Omni skips, or not reached yet)" }
+                line = "\(i + 1). \(p)  \(why)"
             }
             return ["type": "text", "text": line]
         }
@@ -877,7 +913,7 @@ enum MCPAdapter {
         [
             "name": "add_source",
             "title": "Index a folder or photo album",
-            "description": "Add a folder, or the user's Apple Photos library, to what Omni indexes. Indexing starts right away and the source appears in the app's sidebar. Give EITHER 'path' (an absolute folder path) OR 'album' ('all' for the whole Photos library, or an album id from list_sources) - not both. A folder already covered by an indexed parent is reported as such rather than added twice.",
+            "description": "Add a folder, or the user's Apple Photos library, to what Omni indexes. Indexing starts right away and the source appears in the app's sidebar. Give EITHER 'path' (an absolute folder path) OR 'album' ('all' for the whole Photos library, or an album id from list_sources) - not both. A folder already covered by an indexed parent is reported as such rather than added twice. The disk root, system folders and the home folder itself are refused: add the folders inside them.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
@@ -930,7 +966,7 @@ enum MCPAdapter {
         func done(_ m: SourceMutation, _ verb: String) async -> HTTPResponse {
             if let err = m.error { return toolError(id: id, "\(tool) failed: \(err)") }
             let snap = await sources.snapshot()
-            return sourcesResult(id: id, snap, headline: "\(verb) \(m.key ?? "")", cli: cli)
+            return sourcesResult(id: id, snap, headline: m.note ?? "\(verb) \(m.key ?? "")", cli: cli)
         }
 
         switch tool {
