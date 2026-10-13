@@ -42,6 +42,12 @@ cable pulled.
 
 ## Linked Macs
 
+<p align="center">
+  <a href="https://hanxiao.io/omni/assets/omni-linked-macs.mp4?v=e5e02864">
+    <img src="site/omni/assets/omni-linked-poster-play.jpg?v=765a5b1c" alt="Linked Macs film" width="720">
+  </a>
+</p>
+
 File > Link a Mac links another Mac running Omni: open it on both, pick the Mac, and type the
 six-digit code one shows into the other. From then on a search here also searches there, on that
 Mac's index and GPU, and its files open here as if they were in a folder. No server is involved:
