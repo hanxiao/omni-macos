@@ -1014,7 +1014,12 @@ final class ContentSharingTests: XCTestCase {
         var markAfterFirst = -1
         do {
             let s = try VectorStore(dbURL: url)
+            // Rows with no position yet: the Storage pane's pending count must still match a walk.
+            let pv = s.pendingVectorUnitsForTest()
+            XCTAssertEqual(pv.kept, pv.scanned, "pending vectors before the backfill")
             for _ in 0 ..< 2 { s.advanceCoverageForTest(budget: 1000) }
+            let pvMid = s.pendingVectorUnitsForTest()
+            XCTAssertEqual(pvMid.kept, pvMid.scanned, "pending vectors mid-backfill")
             markAfterFirst = num(url, "SELECT CAST(value AS INTEGER) FROM meta WHERE key='chunk_slots_upto'")
             XCTAssertGreaterThan(markAfterFirst, 0, "no slice was taken")
             XCTAssertGreaterThan(num(url, "SELECT COUNT(*) FROM chunks WHERE slot < 0"), 0,

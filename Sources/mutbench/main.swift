@@ -157,6 +157,13 @@ if args[2] == "--crud" {
     //   delext ext       deleteExtensions([ext])
     //   delkind kind     deleteKinds([kind])
     //   known n          knownFiles(), n times (the indexer's pass start)
+    //   diskuse n batch  the Storage pane's breakdown (the stats tick calls it every 1.5 s while
+    //                    indexing), 40 calls 50 ms apart; n new files of 4 chunks added first so
+    //                    their contents sit uncovered, as they do mid-pass (0 = the index at rest)
+    //   idle             nothing for 4 s: the probes' own latency, the control for diskuse
+    //   stats n batch    the stats tick's store calls (refreshIndexStats, every 1.5 s while
+    //                    indexing), over the index's own top-level folders: each call alone, then
+    //                    40 ticks 50 ms apart, n new files added before each tick as a pass does
     //   settle           run every pending one-time migration to the end, then idle `tail` s
     let op = args.count > 3 ? args[3] : "update"
     let n = args.count > 4 ? Int(args[4]) ?? 2000 : 2000
@@ -171,6 +178,11 @@ if args[2] == "--crud" {
         print(String(format: "  slots %.1f s", s.seconds))
         let c = store.advanceCoverageToCompletion()
         print(String(format: "  coverage %d/%d %.1f s", c.covered, c.positions, c.seconds))
+        // The split build and the v4 drop are turns of the coverage stamp, which nothing above
+        // drives: without this a settled clone stayed on schema 4.
+        let ts = Date()
+        let stamps = store.runMigrationStampsForTest()
+        print(String(format: "  stamps %d %.1f s schema=%d", stamps, -ts.timeIntervalSinceNow, store.schemaVersion))
         let t = Date()
         print(String(format: "  vacuum owed freed %lld in %.1f s", store.reclaimAfterCoverageMigration(), -t.timeIntervalSinceNow))
         usleep(UInt32(tail * 1_000_000))
@@ -203,6 +215,115 @@ if args[2] == "--crud" {
     // The browse target: the parent folder of the median file, a folder the UI would show.
     let browseFolder = (all[all.count / 2] as NSString).deletingLastPathComponent
     let queries = (0 ..< 64).map { _ in vec() }
+    // diskuse: the writes that leave an uncovered tail happen BEFORE the probes start, so the
+    // probes see only what the breakdown itself costs. NEW files, not re-written ones: a re-write
+    // frees its old positions and the new contents take them, below the claim, so nothing would
+    // be pending. Run with OMNI_VEC_COVERAGE=0 to keep the stamp from covering them meanwhile.
+    if op == "diskuse", n > 0 {
+        let tw = Date()
+        var i = 0
+        while i < n {
+            try store.replaceMany((i ..< Swift.min(n, i + batch)).map { f in
+                let path = "/diskuse-new/f\(f).txt"
+                return (path, (0 ..< 4).map { j in
+                    IndexedChunk(path: path, modified: 3, size: 1, kind: "text", chunkIndex: j, snippet: "new \(j)",
+                                 embedding: vec(), chunkKey: "diskuse-\(f)-\(j)") })
+            })
+            i += batch
+        }
+        print(String(format: "  added %d files in %.1f s", n, -tw.timeIntervalSinceNow))
+    }
+    // The stats tick's folders: every distinct first three components, as the app's roots are
+    // (/Users/x/Documents, /Volumes/v/backup, ...).
+    let statRoots = op == "stats" ? Array(Set(all.compactMap { p -> String? in
+        let parts = p.split(separator: "/", maxSplits: 3)
+        return parts.count >= 4 ? "/" + parts[0 ..< 3].joined(separator: "/") : nil
+    })).sorted() : []
+    func statsTick() {
+        _ = store.indexSummary(folders: statRoots)
+        _ = store.sizeBytes()
+        _ = store.residentSearchMemory()
+        _ = store.metaGet("last_indexed")
+        _ = store.storageMigration
+        _ = store.diskUse()
+        _ = store.schemaVersion
+        _ = store.metaGet("embedding_version")
+        _ = store.vectorDim
+        _ = store.metaGet("index_model_variant")
+    }
+    var statFiles = 0
+    func addStatFiles(_ k: Int) throws {
+        guard k > 0 else { return }
+        func unit(_ f: Int, _ j: Int) -> [Float] {   // its own generator: vec()'s is shared with the probes' setup
+            var s = UInt64(f &* 2_654_435_761 &+ j &+ 1)
+            var v = [Float](repeating: 0, count: dim)
+            for i in 0 ..< dim { s ^= s << 13; s ^= s >> 7; s ^= s << 17; v[i] = Float(s % 2048) / 1024 - 1 }
+            let nn = (v.reduce(0) { $0 + $1 * $1 }).squareRoot()
+            return nn > 0 ? v.map { $0 / nn } : v
+        }
+        try store.replaceMany((statFiles ..< statFiles + k).map { f in
+            let path = statRoots[f % statRoots.count] + "/stats-new/f\(f).txt"
+            return (path, (0 ..< 2).map { j in
+                IndexedChunk(path: path, modified: 3, size: 1, kind: "text", chunkIndex: j, snippet: "new \(j)",
+                             embedding: unit(f, j), chunkKey: "stats-\(f)-\(j)") })
+        })
+        statFiles += k
+    }
+    if op == "stats" {
+        _ = store.search(queries[0], filter: SearchFilter(), topK: 10)
+        print("  roots \(statRoots.count): " + statRoots.joined(separator: " "))
+        // A fresh open keeps the queue busy for a while (stamps, folds): timed "alone" before it
+        // settles, every call read as the wait. MUT_QUIET seconds first.
+        usleep(UInt32((Double(ProcessInfo.processInfo.environment["MUT_QUIET"] ?? "20") ?? 20) * 1_000_000))
+        func alone(_ label: String, _ body: () -> Void) {
+            var ms: [Double] = []
+            for _ in 0 ..< 20 { let t = Date(); body(); ms.append(-t.timeIntervalSinceNow * 1000) }
+            ms.sort()
+            print(String(format: "  alone %@ min %.2f p50 %.2f max %.2f ms", label, ms[0], ms[ms.count / 2], ms.last ?? 0))
+        }
+        alone("indexSummary") { _ = store.indexSummary(folders: statRoots) }
+        // filesUnder, which the search's folder filter and the folder deletes also use: one
+        // folder through the unchanged full count. The largest root, the most files decided.
+        let big = store.fileCounts(underFolders: statRoots).max { $0.value < $1.value }?.key ?? "/"
+        alone("filesUnder via fileCount(\(big))") { _ = store.fileCount(underFolder: big) }
+        alone("residentSearchMemory") { _ = store.residentSearchMemory() }
+        alone("diskUse") { _ = store.diskUse() }
+        alone("tick") { statsTick() }
+        // A tick after n files arrived, alone: what the incremental counts pay per tick mid-pass.
+        var after: [Double] = []
+        var parts: [String: [Double]] = [:]
+        func part(_ label: String, _ body: () -> Void) {
+            let t = Date(); body(); parts[label, default: []].append(-t.timeIntervalSinceNow * 1000)
+        }
+        for _ in 0 ..< 10 {
+            try addStatFiles(Swift.max(1, n))
+            let t = Date(); statsTick(); after.append(-t.timeIntervalSinceNow * 1000)
+            // The same calls one at a time after the next write: which one a write makes slow.
+            try addStatFiles(Swift.max(1, n))
+            part("indexSummary") { _ = store.indexSummary(folders: statRoots) }
+            part("sizeBytes") { _ = store.sizeBytes() }
+            part("residentSearchMemory") { _ = store.residentSearchMemory() }
+            part("metaGet") { _ = store.metaGet("last_indexed") }
+            part("storageMigration") { _ = store.storageMigration }
+            part("diskUse") { _ = store.diskUse() }
+            part("schemaVersion") { _ = store.schemaVersion }
+        }
+        for (k, v) in parts.sorted(by: { $0.key < $1.key }) {
+            let v = v.sorted()
+            print(String(format: "    after a write: %@ min %.2f p50 %.2f ms", k, v[0], v[v.count / 2]))
+        }
+        after.sort()
+        print(String(format: "  alone tick after %d new files min %.2f p50 %.2f max %.2f ms", Swift.max(1, n), after[0], after[after.count / 2], after.last ?? 0))
+    }
+    if op == "diskuse" {
+        // What one call costs with nothing else on the queue; the probed calls below include the
+        // wait behind a search.
+        _ = store.search(queries[0], filter: SearchFilter(), topK: 10)
+        var alone: [Double] = []
+        for _ in 0 ..< 20 { let t = Date(); _ = store.diskUse(); alone.append(-t.timeIntervalSinceNow * 1000) }
+        alone.sort()
+        print(String(format: "  diskUse alone n=%d p50 %.2f max %.2f ms", alone.count, alone[alone.count / 2], alone.last ?? 0))
+    }
     _ = store.search(queries[0], filter: SearchFilter(), topK: 10)   // warm, as a running app is
     _ = store.indexedChildrenDetailed(ofFolder: browseFolder)
 
@@ -274,6 +395,35 @@ if args[2] == "--crud" {
     case "delext": store.deleteExtensions([args.count > 4 ? args[4] : "json"])
     case "delkind": store.deleteKinds([args.count > 4 ? args[4] : "image"])
     case "known": for _ in 0 ..< Swift.max(1, n) { _ = store.knownFiles() }
+    case "idle": usleep(4_000_000)   // the probes alone: the control for diskuse
+    case "stats":
+        var ms: [Double] = []
+        for _ in 0 ..< 40 {
+            try addStatFiles(n)
+            let t = Date(); statsTick(); ms.append(-t.timeIntervalSinceNow * 1000)
+            usleep(50_000)
+        }
+        ms.sort()
+        // Same folders, both ways: the kept counts against a full pass over every file.
+        let kept = store.indexSummary(folders: statRoots).folderCounts
+        let full = store.fileCounts(underFolders: statRoots)
+        detail = String(format: "tick n=%d p50 %.1f max %.1f ms  folder counts %@", ms.count, ms[ms.count / 2],
+                        ms.last ?? 0, kept == full ? "match" : "DIFFER")
+    case "diskuse":
+        var ms: [Double] = []
+        var entries: [VectorStore.DiskUse.Entry] = []
+        for _ in 0 ..< 40 {
+            let t = Date()
+            entries = store.diskUse().entries
+            ms.append(-t.timeIntervalSinceNow * 1000)
+            usleep(50_000)
+        }
+        ms.sort()
+        // The count the breakdown reads, against every row walked at the same instant.
+        let pv = store.pendingVectorUnitsForTest()
+        detail = String(format: "diskUse n=%d p50 %.1f max %.1f ms  pending kept %d scanned %d", ms.count,
+                        ms[ms.count / 2], ms.last ?? 0, pv.kept, pv.scanned)
+            + entries.map { "\n    \($0.name) \($0.bytes)" }.joined()
     case "readers":
         // The app's periodic readers, each timed on its own: what one call holds the queue for.
         let roots = Array(Set(all.prefix(50_000).compactMap { p -> String? in

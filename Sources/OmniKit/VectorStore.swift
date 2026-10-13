@@ -1494,21 +1494,35 @@ public final class VectorStore: @unchecked Sendable {
     private var orphanCacheOcc = 0                     // rows already counted
     private var orphanCacheLogged = 0                  // deadLog entries already applied
     private var orphanCacheRows = -1                   // slots covered
-    /// Slots whose live count a relocation moved (tail reclaim), merged by the next update.
-    private var orphanMovedSlots: [Int32] = []
+    /// Slots whose live count moved outside a merge - a relocation (tail reclaim) or a fold
+    /// without one (foldOrphanLiveLocked) - merged into the list by the next orphanSlotsLocked.
+    private var orphanPendingSlots: [Int32] = []
+    /// The pending slots overflowed: the next merge recounts the list from `orphanLive`.
+    private var orphanListStale = false
+    /// TEST ONLY: the pending cap, so a test reaches the recount without 65k writes.
+    nonisolated(unsafe) static var orphanPendingCapForTest: Int?
     private var orphanCacheValidLocked: Bool {
         orphanCacheRows >= 0 && orphanCacheStruct == occStructGen && orphanCacheShrink == deadShrinkGen
     }
-    private func orphanSlotsLocked(upTo n: Int) -> MLXArray? {
-        guard n > 0 else { return nil }
+    /// Fold what changed since the last update into `orphanLive`, the live count per slot, and
+    /// leave the LIST alone: the slots whose count moved wait in `orphanPendingSlots` for the next
+    /// orphanSlotsLocked to merge. The Storage pane's count needs only the counts, and the merge
+    /// is O(orphans): on the bench index 3.77M freed positions are orphans, new contents take
+    /// them, and merging after every write cost a stats tick ~40 ms that search would otherwise
+    /// pay once, at its next query. False when the counts cannot be folded: rebuild instead.
+    private func foldOrphanLiveLocked() -> Bool {
         let occ = _occSlot.count
         guard orphanCacheRows >= 0, orphanCacheStruct == occStructGen, orphanCacheShrink == deadShrinkGen,
-              orphanCacheOcc <= occ, orphanCacheLogged <= deadLog.count, n >= orphanCacheRows else {
-            return rebuildOrphansLocked(upTo: n)
-        }
+              orphanCacheOcc <= occ, orphanCacheLogged <= deadLog.count else { return false }
         let oldOcc = orphanCacheOcc
-        var touched: [Int32] = []
-        func grow(_ sl: Int) { if sl >= orphanLive.count { orphanLive.append(contentsOf: repeatElement(0, count: sl + 1 - orphanLive.count)) } }
+        // A list nobody merges is memory nobody needs: past an eighth of the slots, the next merge
+        // recounts the list from `orphanLive` instead (O(slots), no row walk).
+        let cap = Self.orphanPendingCapForTest ?? Swift.max(65_536, orphanLive.count / 8)
+        func pend(_ sl: Int32) {
+            if orphanListStale { return }
+            if orphanPendingSlots.count >= cap { orphanListStale = true; orphanPendingSlots.removeAll(); return }
+            orphanPendingSlots.append(sl)
+        }
         // Deaths first, against the rows counted before this pass: a row appended since and
         // already dead was never counted, so its death is not taken off either.
         for k in orphanCacheLogged ..< deadLog.count {
@@ -1517,37 +1531,57 @@ public final class VectorStore: @unchecked Sendable {
             let sl = _occSlot[r]
             guard sl >= 0, Int(sl) < orphanLive.count else { continue }
             orphanLive[Int(sl)] -= 1
-            touched.append(sl)
+            pend(sl)
         }
         for r in oldOcc ..< occ {
             let sl = _occSlot[r]
             guard sl >= 0, !deadRows.contains(Int32(r)) else { continue }
-            grow(Int(sl))
+            growOrphanLiveLocked(Int(sl))
             orphanLive[Int(sl)] += 1
-            touched.append(sl)
+            pend(sl)
         }
-        if n > orphanCacheRows { grow(n - 1); touched.append(contentsOf: (orphanCacheRows ..< n).map(Int32.init)) }
-        touched += orphanMovedSlots
-        orphanMovedSlots.removeAll()
         orphanCacheOcc = occ
         orphanCacheLogged = deadLog.count
+        return true
+    }
+    @inline(__always) private func growOrphanLiveLocked(_ sl: Int) {
+        if sl >= orphanLive.count { orphanLive.append(contentsOf: repeatElement(0, count: sl + 1 - orphanLive.count)) }
+    }
+
+    private func orphanSlotsLocked(upTo n: Int) -> MLXArray? {
+        guard n > 0 else { return nil }
+        guard n >= orphanCacheRows, foldOrphanLiveLocked() else { return rebuildOrphansLocked(upTo: n) }
+        var touched = orphanPendingSlots
+        orphanPendingSlots.removeAll(keepingCapacity: true)
+        if n > orphanCacheRows {
+            growOrphanLiveLocked(n - 1)
+            if !orphanListStale { touched.append(contentsOf: (orphanCacheRows ..< n).map(Int32.init)) }
+        }
         orphanCacheRows = n
-        guard !touched.isEmpty else { return orphanCache }
-        // Merge the touched slots' new standing into the sorted list.
-        var add = Set<Int32>(), drop = Set<Int32>()
-        for sl in touched where Int(sl) < n {
-            if orphanLive[Int(sl)] == 0 { add.insert(sl); drop.remove(sl) } else { drop.insert(sl); add.remove(sl) }
-        }
         var changed = false
-        if !drop.isEmpty {
-            let before = orphanCacheHost.count
-            orphanCacheHost.removeAll { drop.contains($0) }
-            changed = orphanCacheHost.count != before
-        }
-        if !add.isEmpty {
-            let have = Set(orphanCacheHost)
-            let fresh = add.filter { !have.contains($0) }
-            if !fresh.isEmpty { orphanCacheHost = (orphanCacheHost + fresh).sorted(); changed = true }
+        if orphanListStale {
+            orphanListStale = false
+            var idx: [Int32] = []
+            for sl in 0 ..< n where orphanLive[sl] == 0 { idx.append(Int32(sl)) }
+            changed = idx != orphanCacheHost
+            orphanCacheHost = idx
+        } else {
+            guard !touched.isEmpty else { return orphanCache }
+            // Merge the touched slots' new standing into the sorted list.
+            var add = Set<Int32>(), drop = Set<Int32>()
+            for sl in touched where Int(sl) < n {
+                if orphanLive[Int(sl)] == 0 { add.insert(sl); drop.remove(sl) } else { drop.insert(sl); add.remove(sl) }
+            }
+            if !drop.isEmpty {
+                let before = orphanCacheHost.count
+                orphanCacheHost.removeAll { drop.contains($0) }
+                changed = orphanCacheHost.count != before
+            }
+            if !add.isEmpty {
+                let have = Set(orphanCacheHost)
+                let fresh = add.filter { !have.contains($0) }
+                if !fresh.isEmpty { orphanCacheHost = (orphanCacheHost + fresh).sorted(); changed = true }
+            }
         }
         if changed {
             orphanCache = orphanCacheHost.isEmpty ? nil : MLXArray(orphanCacheHost)
@@ -1557,7 +1591,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func rebuildOrphansLocked(upTo n: Int) -> MLXArray? {
-        orphanMovedSlots.removeAll()
+        orphanPendingSlots.removeAll(); orphanListStale = false
         let occ = _occSlot.count
         var dead = [Bool](repeating: false, count: occ)
         for d in deadRows where Int(d) >= 0 && Int(d) < occ { dead[Int(d)] = true }
@@ -1604,6 +1638,56 @@ public final class VectorStore: @unchecked Sendable {
             invalidateSlotRowsLocked()
             ensureSlotRowsLocked()
             return (kept, (0 ..< n).map { rowsOfSlotLocked($0).sorted() })
+        }
+    }
+
+    /// HOW MANY VECTORS `pending_vecs` HOLDS: past the coverage claim, one per content live rows
+    /// point at once blobs are keyed on the content, and under v4 one per live row, every row
+    /// having its own blob. No row in memory is without a slot: every loader seats a stored -1 on
+    /// the position it rebuilds, and the row sidecar refuses to stamp one.
+    ///
+    /// ONE BLOB PER CONTENT ONCE THEY ARE KEYED THAT WAY. Counting rows there overstates by the
+    /// duplicate count - 3.5M on the measured index - and the overstatement comes straight off the
+    /// "Snippets" slice beside it, so the chart reports two wrong numbers rather than one.
+    ///
+    /// READ OFF THE ORPHAN CACHE'S LIVE-ROW COUNT PER SLOT, brought up to date by what changed
+    /// since the last search, and walked only past `coveredRows`: the uncovered tail, empty at
+    /// rest. It was a walk of every row against the dead set with a hash insert per row, under the
+    /// store queue, on every stats tick (1.5 s while indexing) - 8 of 10 samples of a macOS CPU
+    /// report on a 652k-file index (index.md, "The Storage pane's count").
+    private func pendingVectorUnitsLocked() -> Int {
+        guard dim > 0 else { return 0 }
+        // The counts only (see foldOrphanLiveLocked). A cache that cannot be folded is rebuilt at
+        // its own range, as the hole audit asks: past `baseRows` the next search would rebuild it
+        // again. `orphanLive` counts every slot a row points at whatever the range.
+        if !foldOrphanLiveLocked() {
+            _ = orphanSlotsLocked(upTo: orphanCacheRows > 0 ? orphanCacheRows : Swift.max(1, baseRows))
+        }
+        var units = 0
+        let perContent = splitPendingKeyedLocked
+        orphanLive.withUnsafeBufferPointer { lv in
+            for sl in Swift.min(coveredRows, lv.count) ..< lv.count {
+                units += perContent ? (lv[sl] > 0 ? 1 : 0) : Int(lv[sl])
+            }
+        }
+        return units
+    }
+
+    /// For tests: the pending-vector count as the Storage pane reads it, and the same counted by
+    /// walking every row against the dead set, as it was before. They must always be equal.
+    public func pendingVectorUnitsForTest() -> (kept: Int, scanned: Int) {
+        queue.sync {
+            let kept = pendingVectorUnitsLocked()
+            guard dim > 0 else { return (kept, 0) }
+            let perContent = splitPendingKeyedLocked
+            var scanned = 0
+            var seen = Set<Int32>()
+            for (i, sl) in _occSlot.enumerated() where !deadRows.contains(Int32(i)) {
+                guard sl < 0 || Int(sl) >= coveredRows else { continue }
+                if perContent, sl >= 0, !seen.insert(sl).inserted { continue }
+                scanned += 1
+            }
+            return (kept, scanned)
         }
     }
 
@@ -1767,7 +1851,71 @@ public final class VectorStore: @unchecked Sendable {
     private var liveFiles = 0                          // distinct files with >=1 live chunk
     private var kindFileCounts: [String: Int] = [:]    // kind -> file count (keys = the kinds present)
     private var extFileCounts: [String: Int] = [:]     // ext  -> file count (keys = the extensions present)
-    private func resetAggregatesLocked() { liveFiles = 0; kindFileCounts.removeAll(keepingCapacity: true); extFileCounts.removeAll(keepingCapacity: true) }
+    private func resetAggregatesLocked() {
+        liveFiles = 0; kindFileCounts.removeAll(keepingCapacity: true); extFileCounts.removeAll(keepingCapacity: true)
+        dropFolderCountsLocked()
+    }
+
+    // PER-FOLDER LIVE FILE COUNTS, kept the same way. They were a pass over every file id per
+    // watched folder on every stats tick - O(folders x files) under the store queue, 2 of 10
+    // samples of a macOS CPU report on a 652k-file index (index.md, "The stats tick's folder
+    // counts"). A file whose liveness flips (the 0->1 / 1->0 transitions above) is logged, and the
+    // next ask applies only those files. Rebuilt whole when the folder list changes and after a
+    // reset: every path that renumbers file ids resets the aggregates, and so does the one bulk
+    // load that defers them (the sidecar adopt), before rows the log never sees. Kept only once
+    // asked for, so a store nobody asks logs nothing.
+    private var folderCountFolders: [String]?          // nil = no counts kept
+    private var folderCountMatch: [PathTable.FolderMatch] = []
+    private var folderCountValues: [Int] = []
+    private var folderCountLive: [Bool] = []           // each file's liveness the counts reflect
+    private var folderFlips: [Int32] = []              // files flipped since the counts caught up
+    private func dropFolderCountsLocked() {
+        folderCountFolders = nil; folderCountMatch = []; folderCountValues = []; folderCountLive = []
+        folderFlips.removeAll()
+    }
+    @inline(__always) private func noteLiveFlipLocked(_ fid: Int32) {
+        guard folderCountFolders != nil else { return }
+        // A log nobody drains is memory nobody needs: past an eighth of the files, rebuilding is
+        // the cheaper way back.
+        if folderFlips.count >= Swift.max(65_536, fileChunkCount.count / 8) { dropFolderCountsLocked(); return }
+        folderFlips.append(fid)
+    }
+    private func folderCountsLocked(_ folders: [String]) -> [String: Int] {
+        guard !folders.isEmpty else { return [:] }
+        let files = Swift.min(filePaths.count, fileChunkCount.count)
+        if folderCountFolders != folders {
+            folderCountFolders = folders
+            folderCountMatch = folders.map { f in
+                var m = PathTable.FolderMatch(f, semantics: .string); filePaths.extend(&m); return m
+            }
+            folderCountLive = (0 ..< files).map { fileChunkCount[$0] > 0 }
+            folderCountValues = folderCountMatch.map { m in
+                var n = 0
+                for id in 0 ..< files where folderCountLive[id] && filePaths.contains(id, m) { n += 1 }
+                return n
+            }
+            folderFlips.removeAll(keepingCapacity: true)
+        } else {
+            for k in folderCountMatch.indices { filePaths.extend(&folderCountMatch[k]) }
+            if folderCountLive.count < files {
+                folderCountLive.append(contentsOf: repeatElement(false, count: files - folderCountLive.count))
+            }
+            for f in folderFlips {
+                let i = Int(f)
+                guard i < files else { continue }
+                let now = fileChunkCount[i] > 0
+                guard now != folderCountLive[i] else { continue }   // flipped back, or seen already
+                folderCountLive[i] = now
+                for k in folderCountMatch.indices where filePaths.contains(i, folderCountMatch[k]) {
+                    folderCountValues[k] += now ? 1 : -1
+                }
+            }
+            folderFlips.removeAll(keepingCapacity: true)
+        }
+        var out: [String: Int] = [:]
+        for (k, f) in folders.enumerated() { out[f] = folderCountValues[k] }
+        return out
+    }
     /// Add one chunk for file `fid`; on the file's first live chunk (0->1) bump the aggregates.
     ///
     /// The path is read from the table INSIDE the transition, not passed in: it is needed once per
@@ -1802,6 +1950,7 @@ public final class VectorStore: @unchecked Sendable {
         invalidateTagFilterCacheLocked()   // any row change can add/remove a tag match
         if fileChunkCount[Int(fid)] == 0 {
             liveFiles += 1
+            noteLiveFlipLocked(fid)
             kindFileCounts[kind, default: 0] += 1
             let e = filePaths.lowercasedExtension(Int(fid)); if !e.isEmpty { extFileCounts[e, default: 0] += 1 }
         }
@@ -1814,6 +1963,7 @@ public final class VectorStore: @unchecked Sendable {
         fileChunkCount[Int(fid)] = n
         if n == 0 {
             liveFiles -= 1
+            noteLiveFlipLocked(fid)
             if let c = kindFileCounts[kind] { if c <= 1 { kindFileCounts[kind] = nil } else { kindFileCounts[kind] = c - 1 } }
             let e = filePaths.lowercasedExtension(Int(fid)); if !e.isEmpty, let c = extFileCounts[e] { if c <= 1 { extFileCounts[e] = nil } else { extFileCounts[e] = c - 1 } }
             // The file has no live rows left, so its window can be forgotten - and MUST be, or a
@@ -5485,24 +5635,15 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    /// Summary stats (O(1) from the incremental aggregates) plus per-folder distinct-file counts (one
-    /// pass over LIVE FILES, not rows). refreshIndexStats calls this every 1.5s during indexing, so
-    /// killing the O(rows) path-Set + per-row ext scan that held the search queue is the win (measured
-    /// 371ms -> the folder pass only, ~7x fewer iterations and zero per-row String alloc, on 667k rows).
+    /// Summary stats and per-folder distinct-file counts, all kept incrementally (the aggregates
+    /// and folderCountsLocked). refreshIndexStats calls this every 1.5s during indexing, and it
+    /// holds the search queue: the O(rows) path-Set + per-row ext scan it began as measured 371ms
+    /// on 667k rows, and the per-folder pass over every file that followed was the rest.
     /// OMNI_STAT_VERIFY=1 cross-checks the aggregates against the old full scan on every call.
     public func indexSummary(folders: [String])
         -> (fileCount: Int, chunkCount: Int, kinds: Set<String>, exts: Set<String>, folderCounts: [String: Int]) {
         queue.sync {
-            var fc: [String: Int] = [:]
-            if !folders.isEmpty {
-                // One pass per folder over DIRECTORIES, then a flag read per live file.
-                for folder in folders {
-                    let under = filePaths.filesUnder(folder, semantics: .string)
-                    var n = 0
-                    for id in 0 ..< Swift.min(under.count, fileChunkCount.count) where fileChunkCount[id] > 0 && under[id] { n += 1 }
-                    fc[folder] = n
-                }
-            }
+            let fc = folderCountsLocked(folders)
             let result = (liveFiles, rows.count - deadRows.count, Set(kindFileCounts.keys), Set(extFileCounts.keys), fc)
             if Self.statVerify { verifyAggregatesLocked(folders: folders, against: result) }
             return result
@@ -10891,7 +11032,7 @@ public final class VectorStore: @unchecked Sendable {
                 if orphanLive.count < need { orphanLive.append(contentsOf: repeatElement(0, count: need - orphanLive.count)) }
                 orphanLive[Int(pr.dst)] += orphanLive[Int(pr.src)]
                 orphanLive[Int(pr.src)] = 0
-                orphanMovedSlots.append(pr.src); orphanMovedSlots.append(pr.dst)
+                orphanPendingSlots.append(pr.src); orphanPendingSlots.append(pr.dst)
             }
             vecHoles.remove(pr.dst); vecHoles.insert(pr.src)
             if Int(pr.dst) < baseRows { patchedSlots.append(pr.dst) }
@@ -12707,31 +12848,9 @@ public final class VectorStore: @unchecked Sendable {
         // noticed. The same bytes were mislabelled before v4 too, as `chunks.vec` blobs; what is
         // new is that they are a table of their own and can be told apart.
         //
-        // Counted from the resident rows rather than a COUNT(*): this feeds a Settings pane, the
-        // number is the same, and it costs nothing.
-        let pendingVectors = queue.sync { () -> Int64 in
-            guard dim > 0 else { return 0 }
-            // A ROW HAS A BLOB UNTIL ITS POSITION IS COVERED, and several rows can point at one
-            // position - so this is a count of ROWS asked about POSITIONS, and the v4 identity
-            // (live rows minus covered live rows) subtracts one unit from the other. It overstates
-            // by exactly the number of duplicates, which then comes off "Snippets", because that
-            // slice is the rest of the database file.
-            // ONE BLOB PER CONTENT ONCE THEY ARE KEYED THAT WAY, so the count is of
-            // uncovered POSITIONS rather than of the rows reading them. Counting rows here
-            // overstates by the duplicate count - 3.5M on the measured index - and the
-            // overstatement is taken straight off the "Snippets" slice beside it, so the
-            // chart reports two wrong numbers rather than one.
-            let dead = deadRows
-            let perContent = splitPendingKeyedLocked
-            var pending = 0
-            var seen = Set<Int32>()
-            for (i, sl) in occSlot.enumerated() where !dead.contains(Int32(i)) {
-                guard sl < 0 || Int(sl) >= coveredRows else { continue }
-                if perContent, sl >= 0, !seen.insert(sl).inserted { continue }
-                pending += 1
-            }
-            return Int64(pending) * Int64(dim * MemoryLayout<UInt16>.size)
-        }
+        // Counted from resident state rather than a COUNT(*), which walks every leaf of a table of
+        // 1.5 KB blobs (index.md, "Coverage stamp"); see pendingVectorUnitsLocked.
+        let pendingVectors = Int64(queue.sync { pendingVectorUnitsLocked() }) * Int64(dim * MemoryLayout<UInt16>.size)
         var entries: [DiskUse.Entry] = [
             .init(name: "Vectors", bytes: size(base + ".vecs") + pendingVectors, irreplaceable: true,
                   // "per chunk" stopped being true when contents started sharing a vector: a
@@ -14065,9 +14184,13 @@ public final class VectorStore: @unchecked Sendable {
     public func internPathsForTest() -> Int64? { queue.sync { internPathsLocked() } }
     /// Coverage state, for tests that have to build a specific on-disk claim.
     var coveredRowsForTest: Int { queue.sync { coveredRows } }
+    /// Whether staged blobs are keyed on the content (the split) rather than the row.
+    var splitPendingKeyedForTest: Bool { queue.sync { splitPendingKeyedLocked } }
     /// Drive coverage to completion. The budget is a SLICE SIZE, and it is added to the current
     /// claim - so the old `Int.max` default trapped on overflow the moment anyone used it.
     func advanceCoverageForTest(budget: Int = 1_000_000) { queue.sync { while advanceCoverageLocked(budget: budget) {} } }
+    /// One coverage slice of `budget` positions, so a test can leave the claim part-way.
+    func advanceCoverageSliceForTest(budget: Int) { queue.sync { _ = advanceCoverageLocked(budget: budget) } }
 
     /// DRIVE THE MIGRATION THE WAY A LIVE SESSION DOES, one coverage stamp at a time.
     ///

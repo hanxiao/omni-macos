@@ -305,41 +305,86 @@ struct PathTable: Sendable {
     func filesUnder(_ folder: String, semantics: PrefixSemantics) -> [Bool] {
         var out = [Bool](repeating: false, count: count)
         guard count > 0 else { return out }
-        let pfx = folder + "/"
-        let pfxBytes = Array(pfx.utf8)
-        let pfxASCII = pfxBytes.allSatisfy { $0 < 0x80 }
-        var dirMatch = [Bool](repeating: false, count: dirCount)
-        var dirExact = [Bool](repeating: false, count: dirCount)   // the dir IS the folder
-        for d in 0 ..< dirCount {
-            withDirBytes(d) { db in
-                let bytePrefix = db.count >= pfxBytes.count
-                    && memcmp(db.baseAddress, pfxBytes, pfxBytes.count) == 0
-                switch semantics {
-                case .bytes:
-                    dirMatch[d] = bytePrefix
-                case .string:
-                    if pfxASCII && allASCII(db) {
-                        dirMatch[d] = bytePrefix
-                        dirExact[d] = bytePrefix && db.count == pfxBytes.count
-                    } else {
-                        let ds = String(decoding: db, as: UTF8.self)
-                        dirMatch[d] = ds.hasPrefix(pfx)
-                        dirExact[d] = dirMatch[d] && ds == pfx
+        var m = FolderMatch(folder, semantics: semantics)
+        extend(&m)
+        let dirMatch = m.dirMatch, dirExact = m.dirExact, pfx = m.pfx
+        for i in 0 ..< count {
+            let d = Int(fileDir[i])
+            var v = dirMatch[d]
+            if semantics == .string, dirExact[d],
+               withNameBytes(i, { !$0.isEmpty && $0[0] >= 0x80 }) {
+                v = self[i].hasPrefix(pfx)
+            }
+            out[i] = v
+        }
+        if let e = m.folderID { out[Int(e)] = true }
+        return out
+    }
+
+    /// `filesUnder`'s decision for one folder, KEPT: the per-directory half is made once per
+    /// directory and extended as directories are added (the table only appends them), so a caller
+    /// that asks about a few files at a time - the per-folder counts, fed the files whose liveness
+    /// flipped - pays for those files and the new directories, not for the whole table.
+    struct FolderMatch: Sendable {
+        let folder: String
+        let semantics: PrefixSemantics
+        fileprivate let pfx: String
+        fileprivate let pfxBytes: [UInt8]
+        fileprivate let pfxASCII: Bool
+        fileprivate var dirMatch: [Bool] = []
+        fileprivate var dirExact: [Bool] = []   // the dir IS the folder
+        fileprivate var folderID: Int32?        // the file whose path IS the folder
+        init(_ folder: String, semantics: PrefixSemantics) {
+            self.folder = folder; self.semantics = semantics
+            pfx = folder + "/"
+            pfxBytes = Array(pfx.utf8)
+            pfxASCII = pfxBytes.allSatisfy { $0 < 0x80 }
+        }
+    }
+
+    /// Bring `m` up to this table: decide the directories added since, and look the folder up as
+    /// a file (it can be interned later than the match was made).
+    func extend(_ m: inout FolderMatch) {
+        let first = m.dirMatch.count
+        if first < dirCount {
+            // The loop filesUnder always ran, over the new directories only: local arrays written
+            // by index, appended once.
+            let pfx = m.pfx, pfxBytes = m.pfxBytes, pfxASCII = m.pfxASCII, semantics = m.semantics
+            var dirMatch = [Bool](repeating: false, count: dirCount - first)
+            var dirExact = [Bool](repeating: false, count: dirCount - first)
+            for d in first ..< dirCount {
+                let k = d - first
+                withDirBytes(d) { db in
+                    let bytePrefix = db.count >= pfxBytes.count
+                        && memcmp(db.baseAddress, pfxBytes, pfxBytes.count) == 0
+                    switch semantics {
+                    case .bytes:
+                        dirMatch[k] = bytePrefix
+                    case .string:
+                        if pfxASCII && allASCII(db) {
+                            dirMatch[k] = bytePrefix
+                            dirExact[k] = bytePrefix && db.count == pfxBytes.count
+                        } else {
+                            let ds = String(decoding: db, as: UTF8.self)
+                            dirMatch[k] = ds.hasPrefix(pfx)
+                            dirExact[k] = dirMatch[k] && ds == pfx
+                        }
                     }
                 }
             }
+            m.dirMatch += dirMatch; m.dirExact += dirExact
         }
-        for i in 0 ..< count {
-            let d = Int(fileDir[i])
-            var m = dirMatch[d]
-            if semantics == .string, dirExact[d],
-               withNameBytes(i, { !$0.isEmpty && $0[0] >= 0x80 }) {
-                m = self[i].hasPrefix(pfx)
-            }
-            out[i] = m
+        m.folderID = id(m.folder)
+    }
+
+    /// `filesUnder(m.folder, m.semantics)[i]`, for a match extended to this table.
+    @inline(__always) func contains(_ i: Int, _ m: FolderMatch) -> Bool {
+        if let e = m.folderID, Int(e) == i { return true }
+        let d = Int(fileDir[i])
+        if m.semantics == .string, m.dirExact[d], withNameBytes(i, { !$0.isEmpty && $0[0] >= 0x80 }) {
+            return self[i].hasPrefix(m.pfx)
         }
-        if let e = id(folder) { out[Int(e)] = true }
-        return out
+        return m.dirMatch[d]
     }
 
     /// Does the path end in "." + `ext`, ASCII-case-insensitively? `SearchFilter.hasExtensionCI` on

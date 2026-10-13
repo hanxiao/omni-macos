@@ -75,11 +75,11 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (720 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (729 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|
-  delkind|delext|readers|settle> [n] [batch]` - one op on a fresh clone of the settled 9.7M-row
+  delkind|delext|readers|diskuse|stats|idle|settle> [n] [batch]` - one op on a fresh clone of the settled 9.7M-row
   bench index, a search every 50 ms and a browse every 250 ms throughout (index.md, "Heavy CRUD
   review"). Fresh clones are a COLD page cache; that is the case that matters.
 - The benchmark (Settings > Benchmark this Mac; testing.md, "The benchmark"): `omni-verify bench

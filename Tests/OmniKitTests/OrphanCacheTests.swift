@@ -61,10 +61,16 @@ final class OrphanCacheEquivalenceTests: XCTestCase {
         return v.map { $0 / n }
     }
 
-    func testIncrementalEqualsRebuildUnderRandomWrites() throws {
-        let saved = VectorStore.quantBaseOverride
+    func testIncrementalEqualsRebuildUnderRandomWrites() throws { try run(pendingCap: nil) }
+    /// The Storage pane folds the counts without merging the list; past the cap the next merge
+    /// recounts the list from the counts. A cap of 4 sends nearly every merge down that path.
+    func testIncrementalEqualsRebuildWhenThePendingListOverflows() throws { try run(pendingCap: 4) }
+
+    private func run(pendingCap: Int?) throws {
+        let saved = VectorStore.quantBaseOverride, savedCap = VectorStore.orphanPendingCapForTest
         VectorStore.quantBaseOverride = VectorStore.scanBits
-        defer { VectorStore.quantBaseOverride = saved }
+        VectorStore.orphanPendingCapForTest = pendingCap
+        defer { VectorStore.quantBaseOverride = saved; VectorStore.orphanPendingCapForTest = savedCap }
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("orphan-eq-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -76,7 +82,7 @@ final class OrphanCacheEquivalenceTests: XCTestCase {
         func chunks(_ path: String, _ seeds: [Int], from: Int = 0) -> [IndexedChunk] {
             seeds.enumerated().map { i, sd in
                 IndexedChunk(path: path, modified: 1, size: 10, kind: "text", chunkIndex: from + i, snippet: "s\(sd)",
-                             embedding: vec(sd), chunkKey: "k\(sd)")
+                             embedding: vec(sd), chunkKey: String(format: "%016x", sd))   // hex, or nothing shares
             }
         }
         for step in 0 ..< 400 {
@@ -94,6 +100,17 @@ final class OrphanCacheEquivalenceTests: XCTestCase {
                 store.deletePaths([path]); seedOf[path] = nil
             case 8:         // a search, which is what reads (and folds) the cache
                 _ = store.search(vec(Int.random(in: 0 ..< 200, using: &rng)), filter: SearchFilter(), topK: 5)
+            case 9 where Bool.random(using: &rng):
+                // The Storage pane between searches: writes, each followed by a fold of the counts
+                // with no merge, so the touched slots pile up for the check's merge below.
+                for _ in 0 ..< 3 {
+                    let p = "/f/\(Int.random(in: 0 ..< 30, using: &rng)).txt"
+                    let seeds = (0 ..< Int.random(in: 1 ... 6, using: &rng)).map { _ in Int.random(in: 0 ..< 80, using: &rng) }
+                    if Bool.random(using: &rng) { try store.replaceMany([(p, chunks(p, seeds))]); seedOf[p] = seeds }
+                    else { store.deletePaths([p]); seedOf[p] = nil }
+                    let pv = store.pendingVectorUnitsForTest()
+                    XCTAssertEqual(pv.kept, pv.scanned, "pending count, step \(step)")
+                }
             default:        // collect: shrinks the dead set
                 _ = store.reclaimVectorHolesForTest()
             }

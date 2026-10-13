@@ -1378,3 +1378,103 @@ download"; PerfScript `set:dataless=evict`).
   installed app's folder list from the shared preferences domain and indexed more than the test
   folder; every file it materialized was found by ctime-after-launch with an old mtime and was
   dataless again. Pass `-omni.addedFolders` on every isolated run.
+
+## The Storage pane's count (2026-10-12, found by a macOS CPU report)
+
+`/Library/Logs/DiagnosticReports/Omni_2026-10-12-031054_han-ms.cpu_resource.diag`: v0.15.15 used
+90 s of CPU in 171 s at 03:08 while indexing what OpenClaw and a harness run were writing into
+watched folders. 8 of 10 samples were `refreshIndexStats` -> `VectorStore.diskUse()`, 2 were
+`indexSummary`. The stats tick runs every 1.5 s while indexing; its one consumer of `diskUse` is
+Settings > Storage.
+
+- WHAT IT DID. "Vectors still inside the database" (`pending_vecs`, the contents past the coverage
+  claim) was counted by walking every row under the store queue: a dead-set lookup per row and,
+  under the split, a hash insert per uncovered row. Its comment said it cost nothing. A
+  `COUNT(*)` on `pending_vecs` is no way out either: it walks every leaf of a table of 1.5 KB
+  blobs (see "Coverage stamp" above).
+- NOW. Read off the orphan cache's live-row count per slot (`orphanLive`, already kept
+  incrementally for search and the hole audit), then one pass over the slots past the claim: a
+  slot with live rows is one blob under the split, its live-row count under v4. The counts are
+  folded forward WITHOUT the orphan list (`foldOrphanLiveLocked`): the list merge is O(orphans),
+  the bench index has 3.77M freed positions as orphans and new contents take them, so merging on
+  every tick cost 40-49 ms after any write - work search does anyway at its next query. The
+  touched slots wait in `orphanPendingSlots` (which the tail reclaim already used); past an eighth
+  of the slots the next merge recounts the list from the counts, O(slots), no row walk. `pendingVectorUnitsForTest` keeps the old walk as
+  the oracle. A row in memory never has a negative slot (every loader seats a stored -1 on the
+  position it rebuilds; the row sidecar refuses to stamp one), so the old `sl < 0` branch had
+  nothing to count.
+- MEASURED with `mutbench --crud diskuse` (new: `diskUse()` alone, then 40 calls 50 ms apart under
+  the search/browse probes) and `--crud idle` (the probes alone), fresh clones of the settled bench
+  index (9.7M rows, schema 5), arms interleaved:
+
+  | case                         | old: call alone / searches p50 | new: call alone / searches p50 |
+  |------------------------------|--------------------------------|--------------------------------|
+  | probes only (`idle`)         | - / 83-85 ms                   | - / 82-83 ms                   |
+  | at rest                      | 269-462 ms / 277-463 ms        | 0.30-0.33 ms / 77-85 ms        |
+  | 5,000 files re-written       | 264-466 ms / 274-475 ms        | 0.30-0.33 ms / 74-79 ms        |
+  | 5,000 / 50,000 files added   | 311-314 ms / 288-298 ms        | 0.33 ms / 71-77 ms             |
+
+  Old: every one of 40 calls put a search over 250 ms, worst 1.4 s. New: the breakdown is
+  identical to the byte, and the count equals the walk on every run. The one search over 250 ms
+  per new run is the oracle's walk at the end of the op, not the breakdown.
+- THE TAIL could not be made non-empty on this clone: 6.2M contents over 9.98M positions leaves
+  3.77M freed positions below the claim, and new contents take those first (with
+  OMNI_VEC_COVERAGE=0 too). The pass over it, same code shape, `-O`: 0.38 ms per million slots,
+  4.0 ms for a 10M-slot index with nothing covered.
+- `PendingVectorCountTests`: exact counts by hand for a content two files share past the claim
+  (3 under the split, 4 under v4, 2 after one file is deleted), and 400 random writes per layout
+  with coverage one small slice at a time. Positive controls: counting rows instead of contents,
+  ignoring the claim, and skipping the fold each fail it. CONTENT KEYS ARE HEX:
+  `hexToBytes("k12")` is empty, so a non-hex `chunkKey` never shares - which is why
+  `OrphanCacheEquivalenceTests` (keys `k\(sd)`) never had a shared content until now.
+- `indexSummary`, the other 2 samples: "The stats tick's folder counts" below.
+
+## The stats tick's folder counts (2026-10-12, the same CPU report)
+
+The other 2 of the 10 samples: `indexSummary`, whose per-folder file counts (the sidebar's numbers)
+were `filesUnder` plus a pass over every file id, per watched folder, every 1.5 s while indexing.
+
+- NOW kept like the other aggregates. `fileChunkInc`/`fileChunkDec` log a file whose liveness
+  flips (0 -> 1, 1 -> 0) once counts exist; the next ask applies only those files, through
+  `PathTable.FolderMatch` - `filesUnder`'s decision with the per-directory half kept and extended
+  as directories are added (the table only appends them). Rebuilt whole when the folder list
+  changes and after `resetAggregatesLocked`, which every path that renumbers file ids calls,
+  including the one bulk load that defers the aggregates (the sidecar adopt). The flip log is
+  capped at an eighth of the files; past it the counts are dropped and rebuilt on the next ask.
+  `fileCounts(underFolders:)` keeps the full pass and is the oracle.
+- MEASURED with `mutbench --crud stats` (new: each tick call alone, a tick after n new files, then
+  40 ticks under the probes, n new files before each), fresh clones of the settled bench index,
+  the index's own 19 top-level folders, old = HEAD, arms interleaved, two rounds:
+
+  | (OMNI_IDLE_FOLD=0 OMNI_VEC_COVERAGE=0) | old            | new              |
+  |----------------------------------------|----------------|------------------|
+  | indexSummary                           | 243-256 ms     | 0.01 ms (first ask 282-305) |
+  | diskUse                                | 428-488 ms     | 0.31-0.35 ms     |
+  | diskUse after a write                  | -              | 0.47-0.50 ms     |
+  | whole tick                             | 693-743 ms     | 0.44-0.49 ms     |
+  | whole tick after 64 new files          | 725-739 ms     | 0.70-0.91 ms     |
+  | filesUnder (search folder filter)      | 13.3-14.0 ms   | 13.6-14.1 ms     |
+
+  With the background loops on, ticks under the probes: 821-822 ms old, 0.9-1.0 ms new (max
+  2.2), and 80-82 of ~170 searches over 250 ms old, 0-2 new. The folder counts matched the full
+  pass in every run.
+- THE ALONE TIMINGS NEED THE LOOPS OFF. With idle fold and coverage on, every call in the alone
+  phase read ~100 ms p50 in both arms - `residentSearchMemory`, which reads capacities and is
+  O(1), included - and the floor moved from run to run: the store's own maintenance holding the
+  queue after open. `sample` could not attach to mutbench from the agent's shell (it reports the
+  process gone), so which loop it is was found by turning them off, not by a profile.
+- SEARCH UNCHANGED. `filesUnder` compiled alone, old and new, -O, 2.7M files over 280k
+  directories: 8.1-8.5 vs 8.4-8.7 ms (string), 3.1-3.2 ms both (bytes). `mutbench --stream`
+  (the long-text catch-up's write pattern, 384,000 rows, the orphan merge under every search):
+  p50 103 / 103 ms old, 107 / 103 new, p99 267-343 vs 270-299, 6-8 searches over 250 ms either way.
+  searchreal on the clone: 134b9ff183fd2f29 both, p50 5.6-6.2 ms old, 5.7 new.
+- TESTS. `FolderCountTests`: counts by hand (a folder that is also a file, a name starting with a
+  combining mark directly in a folder, a re-index, a folder delete), 500 random writes per layout
+  against the full pass with a changing folder list, deletes, folder deletes, collects, reopens and
+  in-session wipes, and `FolderMatch.contains` against `filesUnder` for both semantics.
+  `OrphanCacheEquivalenceTests` folds without merging between writes, and once with a pending cap
+  of 4 to drive the recount. Positive controls, each failing the suite: no log on a death, the
+  folder-is-a-file case dropped, the combining-mark case dropped, no drop on reset (caught only
+  once the random test wiped in-session: reopens alone never reset a store holding counts), the
+  fold not parking its slots, the overflow recount skipped. A drop at the settle was proven
+  redundant (its one caller resets first) and removed.
