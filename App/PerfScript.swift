@@ -13,7 +13,7 @@ import OmniLink
 /// Steps: `browse:<folder>`, `view:list|grid`, `sidebar` (toggle), `search:<text>`, `clear`,
 /// `wait:<seconds>`. For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
-/// (window size, centered), `front`, `appearance:light|dark`, `history:<n>`, `sort:<order>`,
+/// (window size, centered), `front`, `appearance:light|dark`, `ocrview:raw|rendered|split|triple`, `ocrpage:<n>`, `history:<n>`, `sort:<order>`,
 /// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `menu:<title>`, `recents`, `clipboard:on|off`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
@@ -121,6 +121,8 @@ enum PerfScript {
         case "history":   // the sidebar row click: same call the selection handler makes
             if let i = Int(arg), model.searchHistory.indices.contains(i) { _ = model.runHistoryQuery(model.searchHistory[i]) }
         case "ocr": model.ocrMode = true
+        case "ocrview": NotificationCenter.default.post(name: .omniPerfOCRView, object: arg)   // raw | rendered | split | triple
+        case "ocrpage": NotificationCenter.default.post(name: .omniPerfOCRPage, object: Int(arg) ?? 1)   // a thumbnail click
         case "remember": model.recordCurrentSearchToHistory(viaSubmit: true)   // what Return does
         case "sort": model.sortOrder = SortOrder(rawValue: arg) ?? .relevance
         case "set":       // a Settings value through the setter its control uses: set:<name>=<value>
@@ -350,4 +352,6 @@ extension Notification.Name {
     static let omniPerfSettingsTab = Notification.Name("omni.perf.settingsTab")
     static let omniPerfSidebarSelect = Notification.Name("omni.perf.sidebarSelect")
     static let omniPerfLinkFold = Notification.Name("omni.perf.linkFold")
+    static let omniPerfOCRView = Notification.Name("omni.perf.ocrView")
+    static let omniPerfOCRPage = Notification.Name("omni.perf.ocrPage")
 }

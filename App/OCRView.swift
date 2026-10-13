@@ -222,6 +222,14 @@ private struct OCRToolbar: ViewModifier {
 
     func body(content: Content) -> some View {
         content.toolbar { toolbar }
+            // PerfScript's `ocrview:` step: the picker's choice, as a click on it would make.
+            .onReceive(NotificationCenter.default.publisher(for: .omniPerfOCRView)) { note in
+                if let m = (note.object as? String).flatMap(OCRSession.ViewMode.init(rawValue:)) { session.mode = m }
+            }
+            // `ocrpage:` - a click on that page's thumbnail (1-based, as the thumbnails are numbered).
+            .onReceive(NotificationCenter.default.publisher(for: .omniPerfOCRPage)) { note in
+                if let n = note.object as? Int { session.select(n - 1) }
+            }
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
