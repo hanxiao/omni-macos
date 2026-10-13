@@ -656,6 +656,12 @@ struct ResultRow: View {
                         Text(hit.locator)
                         Text("\u{00B7}")
                     }
+                    if let peer = RemotePath.peer(of: hit.path) {
+                        // A linked Mac's file: that Mac's computer, as its sidebar row draws it, at
+                        // the head of the path on it - where Finder's path bar puts a volume's icon.
+                        Image(systemName: LinkedMacIcon.symbol(model.link.peer(peer)?.model ?? ""))
+                            .help("On \(model.link.name(of: peer))")
+                    }
                     Text(PhotoActions.location(hit.path, sources: model.photoSources))
                         .lineLimit(1).truncationMode(.middle)
                     if hit.modified > 0 {
