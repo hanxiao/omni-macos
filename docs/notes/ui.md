@@ -1045,10 +1045,18 @@ toolbar to /tmp/omni-debug-toolbar.txt inside the VM. The nano model runs in the
   every asset. Keep those three hooks in any redesign; the release step rewrites them.
 - Copy is lean: a headline and a few words per item, no explanatory paragraphs. FAQ answers live in
   faq.json and were fact-checked against the code; keep them true when features change.
-- Screenshots: the installed release relaunched with `-omni.ephemeralUIState YES -omni.dbDir <real
-  index> -omni.addedFolders/-omni.roots` limited to Desktop, Documents, Downloads (no private folder
-  names, no history), window captured at 1600x860 with `screencapture -o -l`. WebP with alpha plus
-  a JPEG fallback.
+- Screenshots (the gallery, 2026-10-13): NOT from a real index. Limiting `-omni.addedFolders` to
+  three folders does not limit search - a clone of the real index still answered with agent session
+  logs and a backup volume's files. The gallery is shot on a demo index of public content only: this
+  repo, its SwiftPM checkouts, arXiv papers, the synthetic OCR bench scan, the films and their
+  narration, in ~/Projects, ~/Papers and ~/Media (home paths so rows read `~/Papers`; none of them is
+  a root of the real install), plus a second isolated instance ("Mac mini") for Linked Macs. Text
+  first: one image-free query per card. Window 1440x900 (this display is 1x), captured with
+  `screencapture -o -l <window>` so the window keeps its own corners, then a two-layer shadow baked
+  into the alpha on a 1500x960 WebP. PerfScript `ocrview:` and `ocrpage:` set the OCR workspace's
+  layout and page; synthetic clicks posted to the instance did not reach its toolbar. Check every OCR
+  card against the scan: the handwritten pages misread digits (4.3 -> 7.8), the printed table pages
+  are exact.
 
 ## Dragging files out (owner's decisions, 2026-10-02)
 

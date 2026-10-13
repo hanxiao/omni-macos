@@ -6,7 +6,7 @@
 
 - Command line: `omni search "what you are looking for"` against the running app (it starts the app if needed and never loads a second model). `omni tools` lists the tools and `omni <tool> --help` shows their options. The command ships at `/Applications/Omni.app/Contents/Helpers/omni`; Settings > Serving > Install puts it on PATH.
 - Skill file: `omni skill` prints a SKILL.md generated from the app's own tool definitions (also Settings > Serving > SKILL.md).
-- MCP: turn on Serving in Settings, then `claude mcp add --transport http omni http://127.0.0.1:51234/mcp`. Tools: search, search_inline, file_status, tag_image, ocr, list_sources, add_source, pause_source, remove_source.
+- MCP: turn on Serving in Settings, then `claude mcp add --transport http omni http://127.0.0.1:51234/mcp`. Tools: search, search_inline, file_status, tag_image, ocr, get_linked_file, list_sources, add_source, pause_source, remove_source. With Linked Macs (File > Link a Mac), search also covers the user's other Macs running Omni; `get_linked_file` copies one of their files here to read.
 - HTTP: `POST /v1/search` with `{"query": "...", "top_k": 10, "filters": {...}}`, plus OpenAI, Jina, Cohere and Gemini embedding endpoints and OCR endpoints.
 
 Describe the content you want in natural language, in any language; results are absolute file paths with scores, snippets and positions (page or line). Read the files yourself for their full contents.

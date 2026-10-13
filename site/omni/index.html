@@ -25,9 +25,9 @@
   <meta name="twitter:description" content="Omni searches every file on your Mac by meaning, in any language, fully airgapped." />
   <meta name="twitter:image" content="https://hanxiao.io/omni/assets/og-image.png" />
   <meta name="twitter:label1" content="Version" />
-  <meta name="twitter:data1" content="v0.14.0" />
+  <meta name="twitter:data1" content="v0.16.0" />
   <meta name="twitter:label2" content="Updated" />
-  <meta name="twitter:data2" content="September 23, 2026" />
+  <meta name="twitter:data2" content="October 13, 2026" />
 
   <script type="application/ld+json">
   {
@@ -247,12 +247,40 @@
     .feature p { margin: 0; font-size: 15px; line-height: 1.47; color: var(--text-2); letter-spacing: -0.01em; }
     .feature code { font-size: 13px; }
 
-    /* Showcase rows */
-    .show { margin-top: 64px; }
-    .show + .show { margin-top: 96px; }
-    .show-text { max-width: var(--narrow); margin: 0 auto 32px; text-align: center; }
-    .show-text h3 { margin: 0; font-size: clamp(26px, 3.4vw, 36px); line-height: 1.12; letter-spacing: -0.028em; font-weight: 700; text-wrap: balance; }
-    .show-text p { margin: 12px auto 0; font-size: 17px; color: var(--text-2); max-width: 50ch; text-wrap: pretty; }
+    /* Gallery: the App Store's screenshot row, full width, swiped or paged. The first card lines up
+       with the page's left edge; the row runs off the right edge to say there is more. */
+    .gallery-wrap { margin-top: 72px; }
+    .gallery {
+      --inset: max(var(--gutter), calc((100vw - var(--wide)) / 2));
+      overflow-x: auto; overscroll-behavior-x: contain; scroll-snap-type: x mandatory;
+      scroll-padding-inline: var(--inset); scrollbar-width: none; -webkit-overflow-scrolling: touch;
+    }
+    .gallery::-webkit-scrollbar { display: none; }
+    .gallery:focus-visible { outline: none; }
+    .gallery:focus-visible .g-tile { box-shadow: 0 0 0 2px var(--accent); }
+    .g-track { display: flex; gap: 20px; margin: 0; padding: 4px var(--inset) 8px; list-style: none; width: max-content; }
+    .g-card { width: min(860px, 84vw); scroll-snap-align: start; }
+    .g-card figure { margin: 0; }
+    .g-tile {
+      position: relative; border-radius: 28px; overflow: hidden; aspect-ratio: 16 / 10.5;
+      display: grid; place-items: center; padding: 2.4% 3.4% 3.4%;
+      background: radial-gradient(120% 90% at 15% 0%, var(--t1), transparent 60%),
+                  radial-gradient(110% 90% at 100% 100%, var(--t2), transparent 62%), var(--bg-alt);
+    }
+    .g-tile img { width: 100%; height: auto; }
+    .g-card figcaption { padding: 18px 6px 0; max-width: 56ch; }
+    .g-card figcaption b { display: block; font-size: 19px; font-weight: 600; letter-spacing: -0.02em; }
+    .g-card figcaption span { display: block; margin-top: 4px; font-size: 15px; color: var(--text-2); letter-spacing: -0.01em; text-wrap: pretty; }
+    .g-new { display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; letter-spacing: 0; color: #fff; background: var(--accent); vertical-align: 3px; }
+    .g-paddles { display: flex; justify-content: flex-end; gap: 12px; margin-top: 22px; }
+    .g-paddle {
+      width: 40px; height: 40px; border: 0; border-radius: 999px; cursor: pointer; color: var(--text);
+      display: grid; place-items: center; transition: opacity 0.2s ease, transform 0.2s ease;
+    }
+    .g-paddle:active { transform: scale(0.94); }
+    .g-paddle:disabled { opacity: 0.35; cursor: default; }
+    .g-paddle svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+    @media (hover: none) { .g-paddles { display: none; } }
 
     /* Agents */
     .code {
@@ -378,6 +406,10 @@
       .app-icon { width: 120px; height: 112px; }
       .hero-shot { margin-top: 40px; }
       .shot { border-radius: 10px; }
+      .g-track { gap: 12px; }
+      .g-tile { border-radius: 20px; }
+      .g-card figcaption b { font-size: 17px; }
+      .g-card figcaption span { font-size: 14px; }
       section { padding-top: 88px; }
       .features { grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 40px; }
       .stats { grid-template-columns: 1fr 1fr; gap: 32px 12px; margin-top: 36px; }
@@ -469,29 +501,63 @@
           <div class="feature"><h3>Folders and Photos</h3><p>Kept in sync as they change.</p></div>
           <div class="feature"><h3>Airgapped</h3><p>Works with the network off.</p></div>
         </div>
-
-        <div class="show">
-          <div class="show-text">
-            <h3>Scans become Markdown.</h3>
-          </div>
-          <div class="shot">
-            <picture>
-              <source srcset="assets/shot-ocr.webp" type="image/webp" />
-              <img src="assets/shot-ocr.jpg" width="1600" height="860" alt="The OCR workspace transcribing a 40-page scan, with page thumbnails, the Markdown source and the rendered page side by side" loading="lazy" />
-            </picture>
-          </div>
+      </div>
+      <div class="gallery-wrap">
+        <div class="gallery" id="gallery" tabindex="0" role="region" aria-label="Screenshots">
+        <ul class="g-track">
+          <li class="g-card">
+            <figure>
+              <div class="g-tile" style="--t1: rgba(90,160,255,.30); --t2: rgba(120,220,200,.26)">
+                <img src="assets/g-language.webp" width="1500" height="960" alt="Results for a search typed in Chinese: Markdown notes, Swift source, a video and audio clips, each with the passage that matched" />
+              </div>
+              <figcaption><b>Any language</b><span>Ask in Chinese, find English notes, code and recordings. Matched by meaning, not keywords.</span></figcaption>
+            </figure>
+          </li>
+          <li class="g-card">
+            <figure>
+              <div class="g-tile" style="--t1: rgba(255,190,120,.28); --t2: rgba(255,150,190,.22)">
+                <img src="assets/g-passage.webp" width="1500" height="960" alt="PDF results for a search, each with the page and the passage that matched, under an ext:pdf filter chip" loading="lazy" />
+              </div>
+              <figcaption><b>Straight to the passage</b><span>Every hit names its page or line and shows the text that matched. ext:pdf keeps it to PDFs.</span></figcaption>
+            </figure>
+          </li>
+          <li class="g-card">
+            <figure>
+              <div class="g-tile" style="--t1: rgba(120,220,200,.28); --t2: rgba(90,160,255,.24)">
+                <img src="assets/g-similar.webp" width="1500" height="960" alt="Papers ranked by similarity to a PDF dropped into the search field" loading="lazy" />
+              </div>
+              <figcaption><b>Search with a file</b><span>Drop in a document, an image or a clip, or right-click any result for Find Similar.</span></figcaption>
+            </figure>
+          </li>
+          <li class="g-card">
+            <figure>
+              <div class="g-tile" style="--t1: rgba(90,160,255,.30); --t2: rgba(255,150,190,.24)">
+                <img src="assets/g-linked.webp" width="1500" height="960" alt="Results from this Mac and a linked Mac mini in one list, with the Mac mini's folders in the sidebar" loading="lazy" />
+              </div>
+              <figcaption><b>Linked Macs <span class="g-new">New</span></b><span>One search covers your other Macs too, each on its own index. Their files open here.</span></figcaption>
+            </figure>
+          </li>
+          <li class="g-card">
+            <figure>
+              <div class="g-tile" style="--t1: rgba(200,170,255,.28); --t2: rgba(120,220,200,.22)">
+                <img src="assets/g-ocr.webp" width="1500" height="960" alt="The OCR workspace with a scanned ledger page, its Markdown source and the rendered table side by side" loading="lazy" />
+              </div>
+              <figcaption><b>Scans become Markdown</b><span>The scanned page, its Markdown and the rendered result side by side, transcribed on this Mac.</span></figcaption>
+            </figure>
+          </li>
+          <li class="g-card">
+            <figure>
+              <div class="g-tile" style="--t1: rgba(120,220,160,.28); --t2: rgba(90,160,255,.24)">
+                <img src="assets/g-map.webp" width="1500" height="960" alt="A folder of about two thousand files laid out as a map by meaning, colored by file kind" loading="lazy" />
+              </div>
+              <figcaption><b>Folders become maps</b><span>Every file in a folder placed by meaning, colored by kind.</span></figcaption>
+            </figure>
+          </li>
+        </ul>
         </div>
-
-        <div class="show">
-          <div class="show-text">
-            <h3>Folders become maps.</h3>
-          </div>
-          <div class="shot">
-            <picture>
-              <source srcset="assets/shot-map.webp" type="image/webp" />
-              <img src="assets/shot-map.jpg" width="1600" height="860" alt="A folder of tens of thousands of files laid out as a map by embedding similarity, colored by file kind" loading="lazy" />
-            </picture>
-          </div>
+        <div class="wrap g-paddles">
+          <button class="g-paddle glass" type="button" data-dir="-1" aria-label="Previous screenshot"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M10 3 5 8l5 5"/></svg></button>
+          <button class="g-paddle glass" type="button" data-dir="1" aria-label="Next screenshot"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m6 3 5 5-5 5"/></svg></button>
         </div>
       </div>
     </section>
@@ -517,7 +583,7 @@ curl http://127.0.0.1:51234/v1/search -d '{"query": "invoice from february", "to
           <div class="api-row"><dt>Tags</dt><dd><code>/v1/tag</code> &middot; <code>/v1/files/tags</code></dd></div>
           <div class="api-row"><dt>Index</dt><dd><code>/v1/sources</code> &middot; <code>/v1/files/status</code></dd></div>
           <div class="api-row"><dt>Command line</dt><dd><code>omni</code> &middot; SKILL.md</dd></div>
-          <div class="api-row"><dt>MCP</dt><dd>9 tools</dd></div>
+          <div class="api-row"><dt>MCP</dt><dd>10 tools</dd></div>
         </dl>
       </div>
     </section>
@@ -575,6 +641,32 @@ curl http://127.0.0.1:51234/v1/search -d '{"query": "invoice from february", "to
               </nav>
     </div>
   </footer>
+
+  <script>
+  (function () {
+    // Gallery paddles: a card at a time; disabled at either end. Swipe and trackpad scroll natively.
+    var g = document.getElementById("gallery");
+    if (!g) return;
+    var paddles = document.querySelectorAll(".g-paddle");
+    function step() {
+      var cards = g.querySelectorAll(".g-card");
+      return cards.length > 1 ? cards[1].offsetLeft - cards[0].offsetLeft : g.clientWidth;
+    }
+    function update() {
+      var max = g.scrollWidth - g.clientWidth - 2;
+      paddles[0].disabled = g.scrollLeft <= 2;
+      paddles[1].disabled = g.scrollLeft >= max;
+    }
+    paddles.forEach(function (p) {
+      p.addEventListener("click", function () {
+        g.scrollBy({ left: step() * Number(p.getAttribute("data-dir")), behavior: "smooth" });
+      });
+    });
+    g.addEventListener("scroll", update, { passive: true });
+    window.addEventListener("resize", update);
+    update();
+  })();
+  </script>
 
   <script>
   (function () {
