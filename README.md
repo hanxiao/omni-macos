@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://hanxiao.io/omni/assets/omni-intro.mp4?v=06b4ad11">
-    <img src="site/omni/assets/omni-poster-play.jpg?v=285be582" alt="Omni launch film" width="720">
+    <img src="https://github.com/hanxiao/omni-macos/blob/main/site/omni/assets/omni-poster-play.jpg?raw=true&v=285be582" alt="Omni launch film" width="720">
   </a>
 </p>
 
@@ -44,7 +44,7 @@ cable pulled.
 
 <p align="center">
   <a href="https://hanxiao.io/omni/assets/omni-linked-macs.mp4?v=a687c4ea">
-    <img src="site/omni/assets/omni-linked-poster-play.jpg?v=d028fd33" alt="Linked Macs: federated search across your Macs" width="720">
+    <img src="https://github.com/hanxiao/omni-macos/blob/main/site/omni/assets/omni-linked-poster-play.jpg?raw=true&v=d028fd33" alt="Linked Macs: federated search across your Macs" width="720">
   </a>
 </p>
 
