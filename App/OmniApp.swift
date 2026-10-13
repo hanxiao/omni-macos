@@ -404,6 +404,10 @@ struct OmniApp: App {
                 }
                 .keyboardShortcut("d", modifiers: .command)
                 .disabled(!model.hasActiveSearch)
+                // Linked Macs (docs/notes/link.md): the first link starts here, before the sidebar
+                // has a Linked Macs section to offer it.
+                Button("Link a Mac\u{2026}") { model.link.openWindow() }
+                    .disabled(model.phase != .ready)
                 Divider()
                 // EVERYTHING BELOW WAS CONTEXT-MENU OR TOOLBAR ONLY. A feature reachable by
                 // right-click alone is a feature most people never find, and it cannot be given a

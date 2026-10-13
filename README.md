@@ -40,6 +40,14 @@ cable pulled.
   <img src="docs/assets/appshot.png" alt="Omni searching ~/Downloads for porsche sports car, annotated">
 </p>
 
+## Linked Macs
+
+File > Link a Mac links another Mac running Omni: open it on both, pick the Mac, and type the
+six-digit code one shows into the other. From then on a search here also searches there, on that
+Mac's index and GPU, and its files open here as if they were in a folder. No server is involved:
+Macs find each other on the local network, or by address over a VPN, and the link is TLS 1.3 with
+keys pinned at pairing. A Mac that is off or asleep is simply left out of the results.
+
 ## Serving
 
 Settings > Serving exposes an HTTP API on `127.0.0.1:51234` with an MCP endpoint at `/mcp`.

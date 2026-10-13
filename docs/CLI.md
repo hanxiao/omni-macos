@@ -82,6 +82,8 @@ x --json | jq -r '.results[].path'`) rather than cutting lines.
 ## Commands
 
     omni search "invoice from february" --top-k 5 --modified-after 2026-02-01 --ext pdf
+    omni search "tax return 2025" --macs none  # this Mac only (linked Macs are searched by default)
+    omni get_linked_file /Users/me/tax-2025.pdf --mac Studio   # a linked Mac's file, copied here
     omni file_status /path/a.pdf /path/b.png
     omni tools            # the tool list
     omni <tool> --help    # a tool's flags, from its schema

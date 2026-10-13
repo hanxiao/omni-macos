@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import OmniKit
+import OmniLink
 
 /// EVERY PLACE THE UI ASSUMES A RESULT IS A FILE, in one file.
 ///
@@ -15,15 +16,20 @@ import OmniKit
 ///
 /// A plain file path falls through every one of these unchanged, so callers need one branch, not
 /// three.
+///
+/// A LINKED MAC'S FILE (`omni-link://`, docs/notes/link.md) is the third kind: Open, Quick Look,
+/// Share and drag fetch a read-only copy over the link (RemoteFiles); Reveal has nowhere to go.
 enum PhotoActions {
     /// Open a result: Photos.app for an asset, the default app for a file.
-    static func open(_ path: String) {
+    @MainActor static func open(_ path: String) {
+        if RemotePath.isRemote(path) { AppModel.shared?.openRemote(path); return }
         if let ref = PhotoLibrary.Ref(path) { PhotoLibrary.openInPhotos(ref); return }
         NSWorkspace.shared.openAsync(URL(fileURLWithPath: path))
     }
 
     /// Reveal a result: "in Photos" for an asset, "in Finder" for a file.
     static func reveal(_ path: String) {
+        if RemotePath.isRemote(path) { NSSound.beep(); return }   // it is on another Mac
         if let ref = PhotoLibrary.Ref(path) { PhotoLibrary.openInPhotos(ref); return }
         NSWorkspace.shared.revealAsync(URL(fileURLWithPath: path))
     }
@@ -32,7 +38,7 @@ enum PhotoActions {
     /// single asset in its URL), so a mixed selection reveals the files together and then the
     /// first asset - the closest thing to Finder's behavior that the two apps allow.
     static func reveal(paths: [String]) {
-        let files = paths.filter { !PhotoLibrary.isPhotoPath($0) }.map { URL(fileURLWithPath: $0) }
+        let files = paths.filter { !ResultPath.isVirtual($0) }.map { URL(fileURLWithPath: $0) }
         if !files.isEmpty { NSWorkspace.shared.activateFileViewerSelecting(files) }
         if files.isEmpty, let first = paths.first { reveal(first) }
     }
@@ -45,6 +51,7 @@ enum PhotoActions {
     /// A real file for a result, exporting a Photos asset if it has to. NEVER call this on the main
     /// thread for an asset: the export writes the full-size original, and may pull it from iCloud.
     nonisolated static func materialize(_ path: String) -> URL? {
+        if RemotePath.isRemote(path) { return RemoteFiles.shared.fetchBlocking(path) }
         if let ref = PhotoLibrary.Ref(path) { return PhotoLibrary.exportedFile(ref) }
         let url = URL(fileURLWithPath: path)
         return FileManager.default.fileExists(atPath: path) ? url : nil
@@ -52,6 +59,7 @@ enum PhotoActions {
 
     /// Same, off the main actor, for the UI paths that need a file (Quick Look, Share, find-similar).
     static func materialized(_ path: String) async -> URL? {
+        if RemotePath.isRemote(path) { return try? await RemoteFiles.shared.fetch(path) }
         if !PhotoLibrary.isPhotoPath(path) {
             return FileManager.default.fileExists(atPath: path) ? URL(fileURLWithPath: path) : nil
         }
@@ -60,7 +68,8 @@ enum PhotoActions {
 
     /// Where a result lives, for the row subtitle: the album for an asset, the parent folder
     /// (home-relative) for a file.
-    static func location(_ path: String, sources: [PhotoLibrary.Source]) -> String {
+    @MainActor static func location(_ path: String, sources: [PhotoLibrary.Source]) -> String {
+        if RemotePath.isRemote(path) { return LinkController.shared.location(path) }
         guard let ref = PhotoLibrary.Ref(path) else {
             let dir = (path as NSString).deletingLastPathComponent
             let home = FileManager.default.homeDirectoryForCurrentUser.path

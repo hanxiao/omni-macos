@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import QuickLook
 import OmniKit
+import OmniLink
 
 struct ResultsList<Footer: View>: View {
     @Environment(AppModel.self) private var model: AppModel
@@ -124,6 +125,9 @@ struct ResultsList<Footer: View>: View {
                     ForEach(Array(model.groups.enumerated()), id: \.element.id) { index, group in
                         let hit = group.representative
                         VStack(spacing: 0) {
+                            // A linked Mac whose scores do not rank against this Mac's: its group
+                            // opens with its name (AppModel.recomputeResults).
+                            if let title = model.resultSections[index] { ResultSectionHeader(title: title) }
                             ResultRow(hit: hit,
                                       selected: model.selectedPaths.contains(hit.path),
                                       // Only multi-chunk files (long docs, multi-page PDFs) have a
@@ -293,78 +297,100 @@ struct ResultsList<Footer: View>: View {
             quickLook: { model.toggleQuickLook() })
     }
 
+    /// The grid in runs that share a header: one run with none, unless a linked Mac in another
+    /// vector space has a group of its own (AppModel.resultSections).
+    private struct GridSection { let start: Int; let title: String?; let groups: ArraySlice<ResultGroup> }
+    private var gridSections: [GridSection] {
+        let groups = model.groups
+        let starts = ([0] + model.resultSections.keys.filter { $0 > 0 && $0 < groups.count }).sorted()
+        return starts.enumerated().map { i, start in
+            let end = i + 1 < starts.count ? starts[i + 1] : groups.count
+            return GridSection(start: start, title: model.resultSections[start], groups: groups[start ..< end])
+        }
+    }
+
+    @ViewBuilder private func gridCell(_ group: ResultGroup) -> some View {
+        let hit = group.representative
+        ResultGridItem(hit: hit, selected: model.selectedPaths.contains(hit.path),
+                       stack: group.isStack ? (group.count, group.reason) : nil,
+                       stackOpen: model.expandedStacks.contains(group.id),
+                       onToggleStack: { toggleStack(group.id) })
+            .equatable()
+            // The whole cell is the drag handle, as in Finder's icon view; a drag
+            // that starts in the gaps between cells draws a marquee.
+            .fileDragSource { [model, path = hit.path] in model.dragPaths(for: path) }
+            // Make the whole cell tappable, not just the opaque thumbnail/label - without
+            // this, clicking the transparent padding around a small item did nothing.
+            // (The list row already has this; the grid relied on .draggable's hit area,
+            // which was removed.)
+            .contentShape(Rectangle())
+            .resultClick { handleTap(hit.path) }
+            .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
+            .lazyContextMenu(armed: model.selectedPaths.contains(hit.path)) { menu(hit) }
+            .reportResultFrame(hit.path, in: marqueeSpace, view: "grid")
+            // The grid's counterpart of the list's inline expansion: a popover
+            // anchored to the cell (the Photos/Finder info pattern - cells stay
+            // uniform, the breakdown floats with system vibrancy). Passages are
+            // fetched BEFORE presenting (see the menu action): swapping a loading
+            // placeholder for the loaded view would animate an NSPopover window
+            // resize mid-presentation, which crashes AppKit (NSMoveHelper SEGV).
+            .popover(isPresented: Binding(
+                get: { passagesPopover == hit.path },
+                set: { if !$0 { passagesPopover = nil } }
+            ), arrowEdge: .bottom) {
+                ScrollView {
+                    PassagesView(passages: passagesCache[hit.path],
+                                 fileName: (hit.path as NSString).lastPathComponent,
+                                 path: hit.path, kind: hit.kind)
+                        .padding(12)
+                }
+                .frame(width: 380)
+                .frame(maxHeight: 320)
+            }
+            .id(hit.path)
+        // An opened stack spills its copies into the grid as ordinary cells right
+        // after the one that represents them - the gallery stays a uniform grid
+        // (no cell grows, nothing reflows around a panel), and every copy is a
+        // full-sized, selectable, openable result.
+        if group.isStack, model.expandedStacks.contains(group.id) {
+            ForEach(group.members.dropFirst(), id: \.path) { member in
+                ResultGridItem(hit: member, selected: model.selectedPaths.contains(member.path))
+                    .contentShape(Rectangle())
+                    .resultClick { handleTap(member.path) }
+                    .simultaneousGesture(TapGesture(count: 2).onEnded { open(member.path) })
+                    .lazyContextMenu(armed: model.selectedPaths.contains(member.path)) { menu(member) }
+                    .reportResultFrame(member.path, in: marqueeSpace, view: "grid")
+                    // Level 2 in the gallery: a copy opens its own passages popover,
+                    // anchored to its own cell, exactly like the representative.
+                    .popover(isPresented: Binding(
+                        get: { passagesPopover == member.path },
+                        set: { if !$0 { passagesPopover = nil } }
+                    ), arrowEdge: .bottom) {
+                        ScrollView {
+                            PassagesView(passages: passagesCache[member.path],
+                                         fileName: (member.path as NSString).lastPathComponent,
+                                         path: member.path, kind: member.kind)
+                                .padding(12)
+                        }
+                        .frame(width: 380)
+                        .frame(maxHeight: 320)
+                    }
+                    .id(member.path)
+                    .transition(.opacity)
+            }
+        }
+    }
+
     private var gridView: some View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: gridMin, maximum: 220), spacing: Design.gapLarge)], spacing: Design.gapLarge) {
-                    ForEach(model.groups) { group in
-                        let hit = group.representative
-                        ResultGridItem(hit: hit, selected: model.selectedPaths.contains(hit.path),
-                                       stack: group.isStack ? (group.count, group.reason) : nil,
-                                       stackOpen: model.expandedStacks.contains(group.id),
-                                       onToggleStack: { toggleStack(group.id) })
-                            .equatable()
-                            // The whole cell is the drag handle, as in Finder's icon view; a drag
-                            // that starts in the gaps between cells draws a marquee.
-                            .fileDragSource { [model, path = hit.path] in model.dragPaths(for: path) }
-                            // Make the whole cell tappable, not just the opaque thumbnail/label - without
-                            // this, clicking the transparent padding around a small item did nothing.
-                            // (The list row already has this; the grid relied on .draggable's hit area,
-                            // which was removed.)
-                            .contentShape(Rectangle())
-                            .resultClick { handleTap(hit.path) }
-                            .simultaneousGesture(TapGesture(count: 2).onEnded { open(hit.path) })
-                            .lazyContextMenu(armed: model.selectedPaths.contains(hit.path)) { menu(hit) }
-                            .reportResultFrame(hit.path, in: marqueeSpace, view: "grid")
-                            // The grid's counterpart of the list's inline expansion: a popover
-                            // anchored to the cell (the Photos/Finder info pattern - cells stay
-                            // uniform, the breakdown floats with system vibrancy). Passages are
-                            // fetched BEFORE presenting (see the menu action): swapping a loading
-                            // placeholder for the loaded view would animate an NSPopover window
-                            // resize mid-presentation, which crashes AppKit (NSMoveHelper SEGV).
-                            .popover(isPresented: Binding(
-                                get: { passagesPopover == hit.path },
-                                set: { if !$0 { passagesPopover = nil } }
-                            ), arrowEdge: .bottom) {
-                                ScrollView {
-                                    PassagesView(passages: passagesCache[hit.path],
-                                                 fileName: (hit.path as NSString).lastPathComponent,
-                                                 path: hit.path, kind: hit.kind)
-                                        .padding(12)
-                                }
-                                .frame(width: 380)
-                                .frame(maxHeight: 320)
-                            }
-                            .id(hit.path)
-                        // An opened stack spills its copies into the grid as ordinary cells right
-                        // after the one that represents them - the gallery stays a uniform grid
-                        // (no cell grows, nothing reflows around a panel), and every copy is a
-                        // full-sized, selectable, openable result.
-                        if group.isStack, model.expandedStacks.contains(group.id) {
-                            ForEach(group.members.dropFirst(), id: \.path) { member in
-                                ResultGridItem(hit: member, selected: model.selectedPaths.contains(member.path))
-                                    .contentShape(Rectangle())
-                                    .resultClick { handleTap(member.path) }
-                                    .simultaneousGesture(TapGesture(count: 2).onEnded { open(member.path) })
-                                    .lazyContextMenu(armed: model.selectedPaths.contains(member.path)) { menu(member) }
-                                    .reportResultFrame(member.path, in: marqueeSpace, view: "grid")
-                                    // Level 2 in the gallery: a copy opens its own passages popover,
-                                    // anchored to its own cell, exactly like the representative.
-                                    .popover(isPresented: Binding(
-                                        get: { passagesPopover == member.path },
-                                        set: { if !$0 { passagesPopover = nil } }
-                                    ), arrowEdge: .bottom) {
-                                        ScrollView {
-                                            PassagesView(passages: passagesCache[member.path],
-                                                         fileName: (member.path as NSString).lastPathComponent,
-                                                         path: member.path, kind: member.kind)
-                                                .padding(12)
-                                        }
-                                        .frame(width: 380)
-                                        .frame(maxHeight: 320)
-                                    }
-                                    .id(member.path)
-                                    .transition(.opacity)
+                    ForEach(gridSections, id: \.start) { section in
+                        Section {
+                            ForEach(section.groups) { group in gridCell(group) }
+                        } header: {
+                            if let title = section.title {
+                                ResultSectionHeader(title: title).padding(.top, section.start == 0 ? 0 : 8)
                             }
                         }
                     }
@@ -792,6 +818,15 @@ struct ResultGridItem: View {
                                 .padding(.horizontal, 5).padding(.vertical, 2)
                                 .mediaBadge().padding(5)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                            // A linked Mac's file: a computer badge (the list row names the Mac).
+                            if let peer = RemotePath.peer(of: hit.path) {
+                                Image(systemName: "desktopcomputer")
+                                    .font(.caption2).foregroundStyle(.primary)
+                                    .help(LinkController.shared.name(of: peer))
+                                    .padding(.horizontal, 5).padding(.vertical, 2)
+                                    .mediaBadge().padding(5)
+                                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                            }
                             // Match position inside the file (page/line), mirroring the score chip.
                             if !hit.locator.isEmpty {
                                 Text(hit.locator).font(.caption2.monospacedDigit()).foregroundStyle(.primary)
@@ -974,7 +1009,7 @@ struct MediaInfoLabel: View {
     // A Photos row is excluded too: its dimensions/duration are always stored, and the fallback
     // would try to read a header from a path that is not a file.
     private var isMedia: Bool {
-        !PhotoLibrary.isPhotoPath(path) && (FileKind(rawValue: kind).map { $0 != .text && $0 != .scan } ?? false)
+        !ResultPath.isVirtual(path) && (FileKind(rawValue: kind).map { $0 != .text && $0 != .scan } ?? false)
     }
 
     var body: some View {
@@ -1192,5 +1227,22 @@ struct SoftTopScrollEdge: ViewModifier {
         } else {
             content
         }
+    }
+}
+
+/// The start of a linked Mac's own group in the results: its name (docs/notes/link.md).
+struct ResultSectionHeader: View {
+    let title: String
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(title).fontWeight(.semibold).foregroundStyle(.secondary)
+            Spacer()
+        }
+        .font(.callout)
+        .padding(.horizontal, 10)
+        .padding(.top, 10)
+        .padding(.bottom, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityAddTraits(.isHeader)
     }
 }

@@ -20,6 +20,8 @@ targets:
     dependencies:
       - package: OmniKit
         product: OmniKit
+      - package: OmniKit
+        product: OmniLink
       # The `omni` command line (docs/CLI.md), in Contents/Helpers: not Contents/MacOS, where
       # `omni` and `Omni` are one file on a case-insensitive volume.
       - target: omni-cli
@@ -68,6 +70,12 @@ targets:
         # Nothing is exported, copied, or uploaded, and Omni never writes to the library.
         INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "Omni indexes your Photos library on this Mac so you can search your photos and videos by meaning. Nothing leaves your Mac."
         INFOPLIST_KEY_LSMinimumSystemVersion: "14.0"
+        # Linked Macs (docs/notes/link.md): the Local Network prompt's text, and the one Bonjour
+        # type Omni browses and advertises. An array cannot be an INFOPLIST_KEY_ setting, so it is in
+        # App/Info.plist, which Xcode merges with the generated keys. Neither is consulted until the
+        # user links a Mac: nothing touches the network before that.
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Omni finds and connects to your other Macs running Omni, so you can search them from here."
+        INFOPLIST_FILE: App/Info.plist
         # NO `INFOPLIST_KEY_LSMultipleInstancesProhibited` HERE, AND IT IS NOT AN OVERSIGHT.
         # Xcode's INFOPLIST_KEY_ mechanism only honours Apple's whitelisted keys; this is not one,
         # and the setting is silently dropped - verified by reading the key back out of the built

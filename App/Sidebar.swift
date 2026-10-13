@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import OmniKit
+import OmniLink
 
 /// One selectable row in the sidebar - a folder, or a history query - so both participate in the
 /// List's native selection (focus highlight, arrow keys, Delete).
@@ -10,6 +11,9 @@ enum SidebarSelection: Hashable {
     case photos(String)   // a Photos source, by its root key
     case clipboard
     case history(String)
+    /// A linked Mac (by peer id), or a folder it shares (docs/notes/link.md).
+    case linkedMac(String)
+    case linkedFolder(String, String)
 }
 
 /// Drops the List's own background on Tahoe so the window's sidebar material is what shows.
@@ -211,6 +215,8 @@ struct Sidebar: View {
 
             sourcesSection
 
+            LinkedMacsSection(folds: $folds)
+
             // Past searches, grouped by time. Extracted into its own view so it re-renders only when
             // searchHistory changes - NOT on every indexing-progress publish (~12x/sec), which would
             // otherwise re-run the historyGroups date-bucketing on the main thread and jank the sidebar.
@@ -246,6 +252,8 @@ struct Sidebar: View {
             // filters first and clearing here would wipe them straight back out.
             if case .folder(let url) = sel { model.enterFolder(url) }
             else if sel == .recents { model.enterRecents() }
+            else if case .linkedMac(let id) = sel { model.enterLinkedMac(id) }
+            else if case .linkedFolder(let id, let key) = sel { model.enterLinkedMac(id, folder: key) }
             else if sel == .clipboard { model.enterClipboard() }
             else if case .photos(let key) = sel,
                     let source = model.photoSources.first(where: { $0.key == key }) {
@@ -275,6 +283,14 @@ struct Sidebar: View {
             reconcileSelection()
         })
         .onChange(of: model.fileQuery) { _, _ in reconcileSelection() }
+        // Leaving a linked Mac's scope (its chip, another row, a folder here) drops its highlight.
+        .onChange(of: model.linkedScope) { _, scope in
+            switch selection {
+            case .linkedMac(let id) where scope?.peer != id || scope?.folder != nil: selection = nil
+            case .linkedFolder(let id, let key) where scope?.peer != id || scope?.folder != key: selection = nil
+            default: break
+            }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .omniPerfSidebarSelect)) { note in
             if let i = note.object as? Int, i == -1 { selection = .recents }
             else if let i = note.object as? Int, i == -2 { selection = .clipboard }
@@ -282,6 +298,9 @@ struct Sidebar: View {
                 selection = .history(model.searchHistory[-100 - i].id)
             }
             else if let i = note.object as? Int, model.roots.indices.contains(i) { selection = .folder(model.roots[i]) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .omniPerfLinkFold)) { note in
+            if let id = note.object as? String { $folds.section("mac:" + id).wrappedValue.toggle() }
         }
         .sheet(isPresented: Binding(get: { model.showPhotoPicker }, set: { model.showPhotoPicker = $0 })) { PhotoSourcePicker() }
         .sheet(isPresented: Binding(get: { model.showPhotoDenied }, set: { model.showPhotoDenied = $0 })) { PhotoAccessDenied() }
@@ -298,7 +317,7 @@ struct Sidebar: View {
             case .history(let id):
                 if let item = model.searchHistory.first(where: { $0.id == id }) { model.removeHistory(item) }
                 selection = nil
-            case .recents, .clipboard, .none: break
+            case .recents, .clipboard, .linkedMac, .linkedFolder, .none: break   // unlinking asks first: Settings or the row's menu
             }
         }
         // Drag a folder in from Finder to add it as a search root - the most natural gesture on
@@ -957,5 +976,148 @@ private struct RawQueryWatcher: View {
     var body: some View {
         Color.clear.frame(width: 0, height: 0)
             .onChange(of: model.rawQuery) { _, raw in action(raw) }
+    }
+}
+
+/// Linked Macs (docs/notes/link.md): each Mac, its status, and the folders it shares, nested under
+/// it the way Finder nests a server's volumes. Absent until a Mac is linked; File > Link a Mac
+/// starts the first one.
+private struct LinkedMacsSection: View {
+    @Environment(AppModel.self) private var model: AppModel
+    @Binding var folds: SidebarFolds
+    @State private var confirmUnlink: LinkPeer?
+
+    var body: some View {
+        let link = model.link
+        if !link.peers.isEmpty {
+            Section(isExpanded: $folds.section("Linked Macs")) {
+                ForEach(link.peers) { p in
+                    // Each Mac folds like a History day: flat rows, no disclosure triangle (one
+                    // would indent every row in the List), state kept in SidebarFolds.
+                    let open = $folds.section("mac:" + p.id)
+                    let folders = link.isOnline(p.id) && p.theyAllowSearch ? (link.sources[p.id] ?? []) : []
+                    LinkedMacRow(peer: p, open: open, folds: !folders.isEmpty, unlink: { confirmUnlink = p })
+                        .sidebarRow(.linkedMac(p.id))
+                    if open.wrappedValue {
+                        ForEach(folders) { src in
+                            LinkedFolderRow(peer: p.id, source: src)
+                                .padding(.leading, 8)
+                                .sidebarRow(.linkedFolder(p.id, src.key))
+                        }
+                    }
+                }
+                Button { link.openWindow() } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "plus").frame(width: 16)
+                        Text("Link a Mac\u{2026}")
+                        Spacer()
+                    }
+                    .foregroundStyle(.secondary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            } header: {
+                SidebarHeader("Linked Macs")
+            }
+            .confirmationDialog(confirmUnlink.map { "Unlink \u{201C}\($0.name)\u{201D}?" } ?? "", isPresented: Binding(
+                get: { confirmUnlink != nil }, set: { if !$0 { confirmUnlink = nil } })) {
+                Button("Unlink", role: .destructive) {
+                    if let p = confirmUnlink {
+                        if model.linkedScope?.peer == p.id { model.leaveLinkedScope() }
+                        link.unlink(p.id)
+                    }
+                }
+            } message: {
+                Text("Neither Mac can search the other until you link them again.")
+            }
+        }
+    }
+}
+
+private struct LinkedMacRow: View {
+    @Environment(\.sidebarRowSelected) private var selected
+    @Environment(AppModel.self) private var model: AppModel
+    let peer: LinkPeer
+    @Binding var open: Bool
+    /// It has folders to fold.
+    let folds: Bool
+    let unlink: () -> Void
+    @State private var hovered = false
+
+    var body: some View {
+        let link = model.link
+        let online = link.isOnline(peer.id)
+        HStack(spacing: 7) {
+            Image(systemName: LinkedMacIcon.symbol(peer.model))
+                .sidebarTint(selected, else: .secondary).frame(width: 16)
+            // Unreachable (offline, or not sharing): dimmed, the way Finder dims what it cannot reach.
+            Text(peer.name).lineLimit(1).truncationMode(.middle)
+                .sidebarTint(selected, else: online && peer.theyAllowSearch ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiary))
+            Spacer()
+            if link.state(peer.id) == .connecting {
+                ProgressView().controlSize(.mini)
+            } else if folds && (hovered || !open) {
+                // The day row's chevron: under the pointer, and kept while folded so a folded
+                // Mac reads as having more.
+                Button { withAnimation(.snappy(duration: 0.2)) { open.toggle() } } label: {
+                    Image(systemName: open ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 10, weight: .semibold)).foregroundStyle(.secondary)
+                        .frame(width: 16, height: 16).contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(open ? "Hide Folders" : "Show Folders")
+            }
+        }
+        .onHover { hovered = $0 }
+        .help(LinkedMacIcon.status(link, peer))
+        .contextMenu {
+            Button { model.enterLinkedMac(peer.id); SearchFieldFocus.focus() } label: {
+                Label("Search \(peer.name)", systemImage: "magnifyingglass")
+            }
+            if !online {
+                Button { link.retry(peer.id) } label: { Label("Reconnect", systemImage: "arrow.clockwise") }
+            }
+            Divider()
+            Toggle(isOn: Binding(get: { peer.allowSearch }, set: { link.setAllowSearch(peer.id, $0) })) {
+                Label("Allow Searching This Mac", systemImage: "magnifyingglass")
+            }
+            Toggle(isOn: Binding(get: { peer.allowFetch }, set: { link.setAllowFetch(peer.id, $0) })) {
+                Label("Allow Opening Files", systemImage: "doc")
+            }
+            .disabled(!peer.allowSearch)
+            Divider()
+            Button(role: .destructive, action: unlink) {
+                Label("Unlink\u{2026}", systemImage: "trash")
+            }
+        }
+    }
+}
+
+private struct LinkedFolderRow: View {
+    @Environment(\.sidebarRowSelected) private var selected
+    @Environment(AppModel.self) private var model: AppModel
+    let peer: String
+    let source: LinkWire.Source
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: source.kind == "photos" ? "photo.on.rectangle.angled" : "folder")
+                .sidebarTint(selected, else: .secondary).frame(width: 16)
+            Text(source.name).lineLimit(1).truncationMode(.middle)
+                .sidebarTint(selected, else: .primary)
+            Spacer()
+            if source.files > 0 {
+                Text(source.files.formatted()).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+            }
+        }
+        .help(source.key)
+        .contextMenu {
+            Button { model.enterLinkedMac(peer, folder: source.key) } label: {
+                Label("Open", systemImage: "arrow.up.forward.app")
+            }
+            Button { model.enterLinkedMac(peer, folder: source.key); SearchFieldFocus.focus() } label: {
+                Label("Search in This Folder", systemImage: "magnifyingglass")
+            }
+        }
     }
 }

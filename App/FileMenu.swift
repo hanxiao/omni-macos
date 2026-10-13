@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import OmniKit
+import OmniLink
 
 /// Finder's iCloud state for a file: whether it is on this Mac, and the two commands that change it.
 ///
@@ -15,7 +16,8 @@ final class CloudStatus {
 
     nonisolated static func isICloud(_ path: String) -> Bool { path.contains("/Library/Mobile Documents/") }
     nonisolated static func mayBeInCloud(_ path: String) -> Bool {
-        isICloud(path) || path.contains("/Library/CloudStorage/")
+        guard !RemotePath.isRemote(path) else { return false }   // that Mac's iCloud, not this one's
+        return isICloud(path) || path.contains("/Library/CloudStorage/")
     }
 
     /// Download Now: asks iCloud for the file and redraws the badges once it has landed.
@@ -136,7 +138,7 @@ struct FileMenuItems<Passages: View>: View {
         }
         // Finder's pair, in Finder's place under Open: an iCloud file offers whichever of the two
         // applies. Absent outside iCloud Drive - a third-party File Provider evicts by its own rules.
-        if CloudStatus.isICloud(path) {
+        if CloudStatus.isICloud(path), !remote {
             if FileExtractor.isDataless(path) {
                 Button { CloudStatus.download(path) } label: {
                     Label("Download Now", systemImage: "icloud.and.arrow.down")
@@ -155,26 +157,29 @@ struct FileMenuItems<Passages: View>: View {
         }
         .keyboardShortcut("f", modifiers: [.command, .option])
         // (Re)generate this file's content tags - explicit request, HQ quality.
-        if model.canGenerateTags, taggableKinds.contains(kind) {
+        if model.canGenerateTags, taggableKinds.contains(kind), !remote {
             Button { model.selectSingle(path); model.requestTags([path]) } label: {
                 Label("Generate Tags", systemImage: "tag")
             }
         }
         Divider()
-        Button { model.selectSingle(path); PhotoActions.reveal(path) } label: {
-            Label(PhotoActions.revealTitle(path), systemImage: "folder")
+        // A linked Mac's file has no folder on this Mac to show, and no path here to copy.
+        if !remote {
+            Button { model.selectSingle(path); PhotoActions.reveal(path) } label: {
+                Label(PhotoActions.revealTitle(path), systemImage: "folder")
+            }
+            .keyboardShortcut("r", modifiers: [.command, .shift])
+            Button {
+                OmniPasteboard.copy(path)
+            } label: { Label("Copy Path", systemImage: "doc.on.doc") }
+            // Opt-Cmd-C, matching the File menu, because that is the chord that actually fires. A
+            // chord declared inside a context menu never fires on macOS, so this label is decoration -
+            // and it read "Cmd-C", which IS bound, to Edit > Copy, and does something else entirely.
+            .keyboardShortcut("c", modifiers: [.command, .option])
         }
-        .keyboardShortcut("r", modifiers: [.command, .shift])
-        Button {
-            OmniPasteboard.copy(path)
-        } label: { Label("Copy Path", systemImage: "doc.on.doc") }
-        // Opt-Cmd-C, matching the File menu, because that is the chord that actually fires. A
-        // chord declared inside a context menu never fires on macOS, so this label is decoration -
-        // and it read "Cmd-C", which IS bound, to Edit > Copy, and does something else entirely.
-        .keyboardShortcut("c", modifiers: [.command, .option])
         // Native macOS share picker - the same system sheet Finder's Share opens. A Photos asset
-        // has no file to share until it is exported, so that one exports first.
-        if PhotoLibrary.isPhotoPath(path) {
+        // has no file to share until it is exported, and a linked Mac's file until it is fetched.
+        if ResultPath.isVirtual(path) {
             Button { sharePhoto(path) } label: { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
         } else {
             ShareLink(item: URL(fileURLWithPath: path, isDirectory: false)) {
@@ -194,7 +199,7 @@ struct FileMenuItems<Passages: View>: View {
         // confirmation. Deleting a Photos asset means deleting it from the library and every
         // synced device - Photos.app's decision to offer, not Omni's.
         let ignorable = model.canIgnoreEnclosingFolder(ofPath: path)
-        let trashable = !PhotoLibrary.isPhotoPath(path)
+        let trashable = !ResultPath.isVirtual(path)
         if ignorable || trashable || trashAll != nil {
             Divider()
         }
@@ -215,6 +220,8 @@ struct FileMenuItems<Passages: View>: View {
             }
         }
     }
+
+    private var remote: Bool { RemotePath.isRemote(path) }
 
     private var enclosingName: String {
         (path as NSString).deletingLastPathComponent.components(separatedBy: "/").last ?? ""
@@ -260,7 +267,11 @@ enum Transcribe {
     static func candidates(_ paths: [String]) -> [String] {
         // `isDirectory: false`: the answer is the extension, and the plain initialiser stats every
         // path to learn what the menu bar - which asks on each selection change - does not need.
-        paths.filter { PhotoLibrary.isPhotoPath($0) || OCRSession.isSupported(URL(fileURLWithPath: $0, isDirectory: false)) }
+        paths.filter {
+            PhotoLibrary.isPhotoPath($0)
+                || (RemotePath.isRemote($0) ? OCRSession.isSupported(URL(fileURLWithPath: ($0 as NSString).lastPathComponent, isDirectory: false))
+                                            : OCRSession.isSupported(URL(fileURLWithPath: $0, isDirectory: false)))
+        }
     }
 
     static func send(_ paths: [String], model: AppModel, ocr: OCRSession) {
@@ -268,8 +279,8 @@ enum Transcribe {
         guard !wanted.isEmpty else { return }
         let t0 = omniPerfEnabled ? Date() : nil
         model.ocrMode = true
-        let onDisk = wanted.filter { !PhotoLibrary.isPhotoPath($0) }.map { URL(fileURLWithPath: $0) }
-        let assets = wanted.filter { PhotoLibrary.isPhotoPath($0) }
+        let onDisk = wanted.filter { !ResultPath.isVirtual($0) }.map { URL(fileURLWithPath: $0) }
+        let assets = wanted.filter { ResultPath.isVirtual($0) }   // exported, or fetched from a linked Mac
         Task { @MainActor in
             var urls = onDisk
             for a in assets {

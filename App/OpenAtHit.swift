@@ -17,7 +17,7 @@ import OmniKit
 /// replaces. A scanned PDF has no text for Preview to find and opens at its first page, as before.
 enum OpenAtHit {
     /// Open `path` at the hit's place when one is known, else exactly as PhotoActions.open does.
-    static func open(_ path: String, locator: String, snippet: String) {
+    @MainActor static func open(_ path: String, locator: String, snippet: String) {
         guard !PhotoLibrary.isPhotoPath(path), !locator.isEmpty else { PhotoActions.open(path); return }
         let url = URL(fileURLWithPath: path)
         if url.pathExtension.lowercased() == "pdf", let page = ChunkPreview.pageIndex(fromLocator: locator) {
@@ -40,7 +40,7 @@ enum OpenAtHit {
     /// Work out the phrase for a selected PDF hit ahead of the open, so a double-click or Return
     /// does not wait for it.
     static func prefetch(_ path: String, locator: String, snippet: String) {
-        guard !PhotoLibrary.isPhotoPath(path), (path as NSString).pathExtension.lowercased() == "pdf",
+        guard !ResultPath.isVirtual(path), (path as NSString).pathExtension.lowercased() == "pdf",
               let page = ChunkPreview.pageIndex(fromLocator: locator) else { return }
         let url = URL(fileURLWithPath: path)
         Task.detached(priority: .utility) {

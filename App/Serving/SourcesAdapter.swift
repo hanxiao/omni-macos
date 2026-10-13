@@ -63,6 +63,19 @@ struct SourcesControl: Sendable {
     var addAlbum: @Sendable (String) async -> SourceMutation
     var setPaused: @Sendable (String, Bool) async -> SourceMutation
     var remove: @Sendable (String) async -> SourceMutation
+    /// The search tool's `macs`: the same search on linked Macs (docs/notes/link.md), by name or
+    /// "all". Each answers from its own index. `explicit`: the caller named them (an unnamed
+    /// default stays quiet about Macs a folder scope rules out). nil when the app has not wired it.
+    var linkedSearch: (@Sendable (_ query: String, _ filter: SearchFilter, _ topK: Int, _ macs: [String], _ explicit: Bool) async -> [LinkedSearchAnswer])? = nil
+    /// `get_linked_file`: a linked Mac's file copied here; the local path, or why not.
+    var linkedFetch: (@Sendable (_ mac: String, _ path: String) async -> (path: String?, error: String?))? = nil
+}
+
+/// One linked Mac's answer to a served search: its hits (paths on THAT Mac), or why there are none.
+struct LinkedSearchAnswer: Sendable {
+    let mac: String
+    let hits: [SearchHit]
+    let note: String?
 }
 
 // MARK: - HTTP

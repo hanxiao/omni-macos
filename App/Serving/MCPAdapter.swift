@@ -38,7 +38,7 @@ enum MCPAdapter {
 
     /// What `initialize` tells a client about the whole server. Also the body of SKILL.md
     /// (AgentSkill), so it is written for an agent reading it cold.
-    static let instructions = "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, snippets, and media metadata (resolution, duration, size); read the files yourself if you need their full contents.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
+    static let instructions = "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, snippets, and media metadata (resolution, duration, size); read the files yourself if you need their full contents.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. Linked Macs (other Macs running Omni that this one is linked with) are searched too, and their results are listed under each Mac's name: get_linked_file copies one here to read. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
 
     /// Every tool, as `tools/list` returns them - and as the `omni` command line and SKILL.md
     /// present them. The source tools are only advertised once the app has wired the control:
@@ -48,7 +48,7 @@ enum MCPAdapter {
                      fileStatusToolDescriptor(), tagImageToolDescriptor(), ocrToolDescriptor()]
         if withSources {
             tools += [listSourcesDescriptor(), addSourceDescriptor(),
-                      pauseSourceDescriptor(), removeSourceDescriptor()]
+                      pauseSourceDescriptor(), removeSourceDescriptor(), linkedFileDescriptor()]
         }
         return tools.map { tool in
             guard let name = tool["name"] as? String, let ex = examples[name] else { return tool }
@@ -67,12 +67,14 @@ enum MCPAdapter {
             ["query": "invoice from anthropic in february"],
             ["query": "photos of a red sports car", "kinds": ["image"], "top_k": 5],
             ["query": "meeting notes about the launch", "modified_after": "2026-09-01", "ext": "md"],
+            ["query": "tax return 2025", "macs": []],
         ],
         "search_inline": [["query": "termination clause", "paths": ["/Users/me/Documents/contract.pdf"]]],
         "file_status": [["paths": ["/Users/me/Documents/report.pdf", "/Users/me/Desktop/notes.md"]]],
         "tag_image": [["paths": ["/Users/me/Pictures/IMG_0001.jpg"]]],
         "ocr": [["path": "/Users/me/Downloads/scan.pdf"], ["path": "/Users/me/Downloads/scan.pdf", "pages": "11-20"]],
         "list_sources": [[:]],
+        "get_linked_file": [["mac": "Studio", "path": "/Users/me/Documents/tax-2025.pdf"]],
         "add_source": [["path": "/Users/me/Projects"], ["album": "all"]],
         "pause_source": [["key": "/Users/me/Downloads"], ["key": "/Users/me/Downloads", "paused": false]],
         "remove_source": [["key": "/Users/me/Old Projects"]],
@@ -137,6 +139,9 @@ enum MCPAdapter {
             case "file_status":   return callFileStatus(id: id, args: args, backend: backend, cli: cli)
             case "tag_image":     return callTagImage(id: id, args: args, backend: backend, cli: cli)
             case "ocr":           return await callOCR(id: id, args: args, cli: cli)
+            case "get_linked_file":
+                guard let fetch = sources?.linkedFetch else { return toolError(id: id, "get_linked_file failed: Omni is still loading") }
+                return await callLinkedFile(id: id, args: args, fetch: fetch, cli: cli)
             case "list_sources", "add_source", "pause_source", "remove_source":
                 guard let sources else {
                     return toolError(id: id, "\(name) failed: indexing control is unavailable (the index is still loading)")
@@ -209,6 +214,11 @@ enum MCPAdapter {
                         "type": "number",
                         "description": "Relevance floor, 0 to 1. Defaults to the floor the app's window applies (0.5 unless the user changed it), so weak matches are dropped rather than padding the page - semantic search always returns its nearest neighbours, and most of them are not answers. The floor is scaled per kind (a text query scores a photo on a lower scale than a document), so images are not deleted by a text-shaped cut. Pass 0 for everything.",
                         "minimum": 0, "maximum": 1
+                    ],
+                    "macs": [
+                        "type": "array",
+                        "items": ["type": "string"],
+                        "description": "Linked Macs to search too, by name. Default: every linked Mac (File > Link a Mac); [] or [\"none\"] searches this Mac only. Each answers from its own index. Their results are listed under the Mac's name with paths on THAT Mac: read one with get_linked_file."
                     ],
                     "group_duplicates": [
                         "type": "boolean", "default": true,
@@ -330,8 +340,43 @@ enum MCPAdapter {
             }
         }
 
+        // Linked Macs, after this Mac's results: each under its name, its paths on that Mac.
+        var linked: [[String: Any]] = []
+        // Every linked Mac unless the caller names some, or none with [].
+        var named = args["macs"] as? [String]
+        if named?.count == 1, named?.first?.caseInsensitiveCompare("none") == .orderedSame { named = [] }
+        if named?.isEmpty != true, let search = sources?.linkedSearch {
+            let floor = filter.minScore ?? EngineServingBackend.minScore
+            for a in await search(query, filter, topK, named ?? ["all"], named != nil) {
+                let hits = Array(a.hits.filter { floor <= 0 || Double($0.score) >= VectorStore.relevanceFloor(kind: $0.kind, base: floor) }.prefix(topK))
+                if let note = a.note {
+                    content.append(diagnostic("On \(a.mac): \(note.hasSuffix(".") ? note : note + ".")"))
+                } else if hits.isEmpty {
+                    content.append(diagnostic("On \(a.mac): no results for \"\(query)\"."))
+                } else {
+                    content.append(["type": "text", "text": "On \(a.mac):"])
+                    for (i, h) in hits.enumerated() {
+                        let score = Int((max(0, min(1, h.score)) * 100).rounded())
+                        let loc = h.locator.isEmpty ? "" : ", \(h.locator)"
+                        var text = "\(i + 1). \(h.path)  (\(h.kind), \(score)%\(loc), \(Self.shortDate(h.modified)))"
+                        if maxSnippet > 0 {
+                            let snippet = h.snippet.replacingOccurrences(of: "\n", with: " ")
+                            if !snippet.isEmpty { text += "\n   \(String(snippet.prefix(maxSnippet)))" }
+                        }
+                        content.append(["type": "text", "text": text])
+                    }
+                }
+                linked.append(["mac": a.mac, "note": a.note ?? NSNull(), "results": hits.map { h -> [String: Any] in
+                    ["path": h.path, "kind": h.kind, "score": Double(max(0, min(1, h.score))), "snippet": h.snippet,
+                     "locator": h.locator, "modified": h.modified, "size": h.size]
+                }])
+            }
+        }
+
         return answer(id: id, content, cli: cli) {
-            ["query": query, "results": SearchAdapter.rows(groups, backend: backend), "grouped": group]
+            var body: [String: Any] = ["query": query, "results": SearchAdapter.rows(groups, backend: backend), "grouped": group]
+            if !linked.isEmpty { body["linked"] = linked }
+            return body
         }
     }
 
@@ -781,6 +826,35 @@ enum MCPAdapter {
     // These four mirror the sidebar one-for-one (add / pause / resume / remove) and go through the
     // same AppModel methods it does - see SourcesAdapter. They are the only MCP tools that CHANGE
     // anything, which is why each description says plainly what the user will see happen.
+
+    private static func linkedFileDescriptor() -> [String: Any] {
+        [
+            "name": "get_linked_file",
+            "title": "Get a file from a linked Mac",
+            "description": "Copy a file from a linked Mac - a path search listed under that Mac's name - to this Mac, and return the local path to read. The copy is read-only; editing it changes nothing on the other Mac.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "mac": ["type": "string", "description": "The linked Mac's name, as search listed it."],
+                    "path": ["type": "string", "description": "The file's path on that Mac, as search listed it."],
+                ] as [String: Any],
+                "required": ["path", "mac"],   // path first: the command line takes it bare
+            ] as [String: Any],
+            "annotations": ["readOnlyHint": true, "destructiveHint": false,
+                            "idempotentHint": true, "openWorldHint": false],
+        ]
+    }
+
+    private static func callLinkedFile(id: Any, args: [String: Any],
+                                       fetch: @Sendable (String, String) async -> (path: String?, error: String?),
+                                       cli: Bool) async -> HTTPResponse {
+        guard let mac = args["mac"] as? String, !mac.isEmpty, let path = args["path"] as? String, !path.isEmpty else {
+            return toolError(id: id, "get_linked_file failed: 'mac' and 'path' are required")
+        }
+        let r = await fetch(mac, path)
+        guard let local = r.path else { return toolError(id: id, "get_linked_file failed: \(r.error ?? "unknown error")") }
+        return answer(id: id, [["type": "text", "text": local]], cli: cli) { ["mac": mac, "path": path, "local": local] }
+    }
 
     private static func listSourcesDescriptor() -> [String: Any] {
         [

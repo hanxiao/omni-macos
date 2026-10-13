@@ -5,6 +5,7 @@ import CryptoKit
 import MLX
 import os
 import OmniKit
+import OmniLink
 import Photos
 
 enum ResultViewMode: String, CaseIterable { case list, grid }
@@ -266,6 +267,7 @@ final class AppModel {
         indexGen += 1
         indexState = .idle
         serving.detach()
+        link.responder.detach()
         store?.close()
         store = nil
     }
@@ -427,6 +429,7 @@ final class AppModel {
     /// Open a result where it matched - a PDF at its page, a text file at its line - when the
     /// opening app can be told (OpenAtHit, issue #26); anything else opens as it always did.
     func openResult(_ path: String) {
+        if RemotePath.isRemote(path) { openRemote(path); return }
         CloudStatus.watchDownload(path)
         if let h = searchHit(for: path) {
             OpenAtHit.open(path, locator: h.locator, snippet: h.snippet)
@@ -623,7 +626,7 @@ final class AppModel {
             pathsCount: selectedPaths.count,
             transcribable: Transcribe.candidates(next).count,
             taggable: selectionIsTaggable,
-            enclosingFolder: selection.flatMap { PhotoLibrary.isPhotoPath($0) ? nil : ($0 as NSString).deletingLastPathComponent })
+            enclosingFolder: selection.flatMap { ResultPath.isVirtual($0) ? nil : ($0 as NSString).deletingLastPathComponent })
         if menu != menuSelection { menuSelection = menu }
     }
 
@@ -651,7 +654,7 @@ final class AppModel {
     func canIgnoreFolder(_ folder: String) -> Bool { !roots.contains { $0.path == folder } }
     /// Every selected result as a file URL, in result order (falls back to the active item). The
     /// share picker shares the whole selection, the same set Open/Reveal/Copy/Trash act on.
-    var selectedURLsOrdered: [URL] { selectedPathsOrdered.map { URL(fileURLWithPath: $0) } }
+    var selectedURLsOrdered: [URL] { selectedPathsOrdered.filter { !RemotePath.isRemote($0) }.map { URL(fileURLWithPath: $0) } }
     /// Open every selected result - Finder opens a whole selection on Return / double-click.
     /// A Photos asset opens in Photos.app; there is nothing else to open it with.
     func openSelected() { for p in selectedPathsOrdered { openResult(p) } }
@@ -662,6 +665,7 @@ final class AppModel {
     /// Search by a result, whichever kind it is. A Photos asset has to be written out first - the
     /// query path embeds a FILE - so this is async; a plain file runs straight through.
     func searchBySimilar(to path: String) {
+        if RemotePath.isRemote(path) { searchBySimilarRemote(path); return }
         if !PhotoLibrary.isPhotoPath(path) {
             setFileQuery(URL(fileURLWithPath: path), similar: true, sourcePath: path); return
         }
@@ -679,6 +683,7 @@ final class AppModel {
     /// Quick Look a result. Photos assets are exported to a temp file first (Quick Look needs a
     /// real file), which is why this is not just a `previewURL` write.
     func showPreview(path: String) {
+        if RemotePath.isRemote(path) { previewRemote(path); return }
         if !PhotoLibrary.isPhotoPath(path) { showPreview(URL(fileURLWithPath: path)); return }
         Task { @MainActor in
             guard let url = await PhotoActions.materialized(path) else { return }
@@ -713,7 +718,7 @@ final class AppModel {
     func moveToTrash(_ paths: [String]) {
         // A Photos asset is not a file Omni may move: deleting it means deleting it from the
         // library (and from every synced device). That belongs in Photos.app, not here.
-        let paths = paths.filter { !PhotoLibrary.isPhotoPath($0) }
+        let paths = paths.filter { !ResultPath.isVirtual($0) }   // nor a linked Mac's file
         guard !paths.isEmpty else { return }
         let set = Set(paths)
         NSWorkspace.shared.recycle(paths.map { URL(fileURLWithPath: $0) }, completionHandler: nil)
@@ -760,7 +765,7 @@ final class AppModel {
     func copySelectedFiles() {
         let paths = selectionOrdered
         guard !paths.isEmpty else { return }
-        let files = paths.filter { !PhotoLibrary.isPhotoPath($0) }.map { URL(fileURLWithPath: $0) }
+        let files = paths.filter { !ResultPath.isVirtual($0) }.map { URL(fileURLWithPath: $0) }
         OmniPasteboard.copyFiles(files, text: paths.joined(separator: "\n"))
     }
 
@@ -876,6 +881,7 @@ final class AppModel {
     /// without a second history. Selecting a folder used to only draw its embedding map, which
     /// left the search unscoped and told a reader nothing about the folder's contents.
     func enterFolder(_ url: URL?) {
+        linkedScope = nil
         showsClipboardOff = false
         selectFolderForVisualization(nil)        // browsing takes the empty-result region
         browsedPhotoSource = nil                 // one browser at a time
@@ -903,6 +909,7 @@ final class AppModel {
     /// Browse a Photos source. Selecting one used to do NOTHING - the sidebar's `onChange` handled
     /// `.folder` and let `.photos` fall through - so the row highlighted and the pane did not move.
     func enterPhotoSource(_ source: PhotoLibrary.Source) {
+        linkedScope = nil
         showsClipboardOff = false
         selectFolderForVisualization(nil)
         setFilterRecentsQuietly(false)
@@ -938,6 +945,7 @@ final class AppModel {
     /// Browse Recents, which also scopes the search to it (`in:Recents` in the box), exactly as
     /// entering a folder does. Removing the chip searches everything.
     func enterRecents() {
+        linkedScope = nil
         showsClipboardOff = false
         selectFolderForVisualization(nil)
         browsedPhotoSource = nil
@@ -1399,6 +1407,7 @@ final class AppModel {
     /// rankChunks does a queue.sync linear scan over all rows, which would stall the UI on a large
     /// index when a row is expanded.
     func passages(for path: String) async -> [ChunkHit] {
+        if RemotePath.isRemote(path) { return await passagesRemote(path) }
         guard let store, let v = lastQueryVector else { return [] }
         return await Task.detached(priority: .userInitiated) { store.rankChunks(v, path: path) }.value
     }
@@ -1518,10 +1527,13 @@ final class AppModel {
         case progress
         /// Run id only: identity for the presentation, the report itself stays on the model.
         case paperResult(String)
+        /// Link a Mac (docs/notes/link.md).
+        case link
         var id: String {
             switch self {
             case .progress: "progress"
             case .paperResult(let runId): "paper:" + runId
+            case .link: "link"
             }
         }
     }
@@ -1744,7 +1756,13 @@ final class AppModel {
     /// Browsing still uses exactly one (see `filterFolder` and `showsFolderBrowser`): a browser
     /// showing two folders at once is a different feature, and the empty-result region has room for
     /// one listing.
-    var filterFolders: [URL] = [] { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    var filterFolders: [URL] = [] {
+        didSet {
+            // A folder on this Mac and a linked Mac are two different places: scoping to one leaves the other.
+            if !filterFolders.isEmpty, linkedScope != nil { linkedScope = nil }
+            if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) }
+        }
+    }
 
     /// The single-folder spelling. Browsing, the breadcrumb and every "am I in a folder" check read
     /// this; assigning it REPLACES the whole scope, which is what entering a folder means.
@@ -2179,6 +2197,31 @@ final class AppModel {
     /// attach(), which also auto-starts the server when the user had it enabled last session. The
     /// engine/store stay private - attach() is the only seam the serving layer sees.
     let serving = ServingController()
+    /// Linked Macs (docs/notes/link.md): other Macs running Omni that this one searches, and that
+    /// search this one. Quiet until the user links one.
+    let link = LinkController()
+
+    // Linked Macs' half of the current search (App/Link/AppModel+Link.swift).
+    @ObservationIgnored var localHits: [SearchHit] = []
+    @ObservationIgnored var remoteHits: [String: [SearchHit]] = [:]
+    @ObservationIgnored var remoteTasks: [Task<Void, Never>] = []
+    @ObservationIgnored var remoteInFlight: Set<String> = []
+    /// The local half of the current search has landed (remote replies wait for it, so a fast
+    /// linked Mac never shows its hits over the previous query's local ones).
+    @ObservationIgnored var localLanded = false
+    /// What a search scoped to a linked Mac will settle on (its resolved token).
+    @ObservationIgnored var pendingResolved = ""
+    /// The search is scoped to a linked Mac or one of its folders (its sidebar row).
+    var linkedScope: LinkedScope? = nil
+    /// A linked Mac's file being fetched to open, preview or share, and the last fetch that failed.
+    var remoteOpening: String? = nil
+    var remoteError: String? = nil
+    /// Headers in the result list: before group N, "On <Mac>" (a linked Mac in another vector space).
+    private(set) var resultSections: [Int: String] = [:]
+    var currentSearchToken: Int { searchToken }
+    /// When the current search started, for the perf log's search-to-results times.
+    @ObservationIgnored var searchStartedAt = Date.distantPast
+    var lastQueryVectorForLink: [Float]? { lastQueryVector }
 
     /// The live model, for the app-level quit handler (a global AppKit callback with no other seam to
     /// reach it). Weak so it never keeps the model alive.
@@ -2721,7 +2764,7 @@ final class AppModel {
         // so a copy below the cut can never resurrect its stack.
         let collapsed = collapse(above)
         if collapsedCount != above.count - collapsed.count { collapsedCount = above.count - collapsed.count }
-        let ordered: [ResultGroup]
+        var ordered: [ResultGroup]
         switch sortOrder {
         case .relevance:
             ordered = collapsed
@@ -2730,6 +2773,31 @@ final class AppModel {
         case .dateModified:
             ordered = collapsed.sorted { $0.representative.modified > $1.representative.modified }
         }
+        // A linked Mac in another vector space: its hits stay a group of their own, after this
+        // Mac's, in every sort order - scores from two different models do not rank against each
+        // other. Each group opens with a header naming the Mac.
+        var sections: [Int: String] = [:]
+        if !remoteHits.isEmpty {
+            var main: [ResultGroup] = [], blocks: [String: [ResultGroup]] = [:], order: [String] = []
+            for g in ordered {
+                if let p = isGroupedRemote(g.representative.path) {
+                    if blocks[p] == nil { order.append(p) }
+                    blocks[p, default: []].append(g)
+                } else {
+                    main.append(g)
+                }
+            }
+            if !blocks.isEmpty {
+                var out = main
+                for p in order {
+                    // No header when that Mac's group is the whole list because the search is scoped to it.
+                    if !(out.isEmpty && order.count == 1 && linkedScope?.peer == p) { sections[out.count] = link.name(of: p) }
+                    out += blocks[p] ?? []
+                }
+                ordered = out
+            }
+        }
+        if resultSections != sections { resultSections = sections }
         if groups != ordered { groups = ordered }
         let reps = ordered.map(\.representative)
         if results != reps { results = reps; refreshSelectionOrdered() }
@@ -3145,7 +3213,7 @@ final class AppModel {
         // A Photos asset has no enclosing folder to exclude - the level above it is one asset's
         // identifier, and .omniignore is a filesystem policy. Removing a Photos source is the
         // sidebar's job, exactly as removing a root is.
-        guard !PhotoLibrary.isPhotoPath(path) else { return false }
+        guard !ResultPath.isVirtual(path) else { return false }
         let folder = (path as NSString).deletingLastPathComponent
         return !roots.contains { $0.path == folder }
     }
@@ -3385,6 +3453,7 @@ final class AppModel {
             indexer.onPolicyFile = Self.policyFileReporter(self)
             self.indexer = indexer
             self.serving.attach(engine: loaded, store: store, modelName: "omni-\(self.modelVariant.rawValue)")
+            self.attachLink(engine: loaded, store: store)
             self.supportsImages = loaded.supportsImages
             self.audioSupported = loaded.supportsAudio
             await self.ensureTagger()
@@ -4340,6 +4409,7 @@ final class AppModel {
             // Set before attach(), so a server that auto-starts inside it is already wired.
             self.serving.onServedSearch = { [weak self] q, surface in self?.recordServedSearch(q, surface: surface) }
             self.serving.sources = self.makeSourcesControl()
+            self.attachLink(engine: engine, store: store)
             // A served OCR request holds the same two things a workspace run does: the lifted
             // memory cap while the weights are up, and indexing stood down while it decodes.
             // POSTED, NOT AWAITED: a served request must not wait on the main thread, which a
@@ -5005,7 +5075,11 @@ final class AppModel {
             addFolder: { p in await MainActor.run { AppModel.shared?.apiAddFolder(p) ?? .fail("Omni is not ready") } },
             addAlbum: { a in await MainActor.run { AppModel.shared?.apiAddAlbum(a) ?? .fail("Omni is not ready") } },
             setPaused: { k, on in await MainActor.run { AppModel.shared?.apiSetPaused(k, on) ?? .fail("Omni is not ready") } },
-            remove: { k in await MainActor.run { AppModel.shared?.apiRemove(k) ?? .fail("Omni is not ready") } }
+            remove: { k in await MainActor.run { AppModel.shared?.apiRemove(k) ?? .fail("Omni is not ready") } },
+            linkedSearch: { q, f, k, macs, explicit in
+                await AppModel.shared?.linkedSearchForServing(q, filter: f, topK: k, macs: macs, explicit: explicit) ?? []
+            },
+            linkedFetch: { mac, path in await AppModel.shared?.linkedFetchForServing(mac, path: path) ?? (nil, "Omni is not ready") }
         )
     }
 
@@ -5715,6 +5789,8 @@ final class AppModel {
             return
         }
         query = ""; rawQuery = ""        // the text field empties; the chip represents the query
+        // A file query searches everywhere this Mac can reach, linked Macs included.
+        if linkedScope != nil { linkedScope = nil }
         // Tag qualifiers live ONLY in the query language - with the box emptied they must not
         // silently keep constraining this file's results (a leftover tag:beard filtered a
         // photo's similar-search down to beard-tagged files). The other filter dimensions keep
@@ -5993,6 +6069,8 @@ final class AppModel {
     private static let vectorCacheLimit = 600
 
     private func loadGroupingInputs(for hits: [SearchHit], token: String) {
+        // A linked Mac's file has no row in this store; copies are only stacked within this Mac.
+        let hits = hits.filter { !RemotePath.isRemote($0.path) }
         guard let store, hits.count > 1 else { groupingKeys = [:]; groupingVectors = [:]; return }
         let paths = hits.map(\.path)
         let wantNear = groupNearDuplicates
@@ -6045,9 +6123,15 @@ final class AppModel {
     private func applyResults(_ hits: [SearchHit], resolved: String) {
         var hits = hits
         if let own = clipboardSelfPath(resolved: resolved) { hits.removeAll { $0.path == own } }
+        // This Mac's half, kept apart so linked Macs' replies can be merged in as they land.
+        localHits = hits
+        localLanded = true
+        hits = combinedHits()
         let isNewQuery = resolvedQuery != resolved
         if omniPerfEnabled {
-            omniPerfLog("results n=\(hits.count) was=\(rawResults.count) new=\(isNewQuery) view=\(viewMode.rawValue) sidebar=\(sidebarShown)")
+            omniPerfLog(String(format: "results n=%d was=%d new=%@ view=%@ sidebar=%@ local=%d since-search=%.1fms",
+                               hits.count, rawResults.count, isNewQuery ? "true" : "false", viewMode.rawValue,
+                               sidebarShown ? "true" : "false", localHits.count, -searchStartedAt.timeIntervalSinceNow * 1000))
         }
         // A live refresh that found exactly what is on screen changes nothing; see recomputeResults.
         if rawResults != hits { rawResults = hits }
@@ -6094,6 +6178,42 @@ final class AppModel {
         }
     }
 
+    /// The engine and store go to Linked Macs too: this Mac answers linked Macs' searches with them,
+    /// and its index's space probe decides which linked Macs' scores mix with its own.
+    func attachLink(engine: OmniEngine, store: VectorStore) {
+        link.responder.attach(engine: engine, store: store, modelName: "omni-\(modelVariant.rawValue)")
+        link.onPeerReady = { [weak self] _ in
+            guard let self, self.hasQuery || self.fileQuery != nil else { return }
+            self.search()
+        }
+        Task { [link] in
+            let probe = await Task.detached(priority: .utility) { LinkResponder.probe(engine) }.value
+            link.localSpace = (engine.dim, probe)
+            link.localSpaceChanged()
+        }
+    }
+
+    /// Drop this Mac's folder and Recents scopes without re-running anything; the box follows.
+    func clearLocalScopeQuietly() {
+        guard !filterFolders.isEmpty || filterRecents else { return }
+        suppressFilterEffects = true
+        filterFolders = []
+        filterRecents = false
+        suppressFilterEffects = false
+        syncBoxFromFilters(reSearch: false)
+    }
+
+    /// No results and no resolved query: the browser takes the pane.
+    func clearResultsQuietly() {
+        if !rawResults.isEmpty { rawResults = [] }
+        if !resolvedQuery.isEmpty { resolvedQuery = "" }
+    }
+
+    /// Settle a search scoped to a linked Mac on whatever it answered.
+    func applyScopedResults() {
+        applyResults([], resolved: pendingResolved)
+    }
+
     func search() {
         searchDebounce?.cancel()   // a direct search supersedes any pending debounced one
         searchWorkTask?.cancel()   // and supersedes the previous in-flight search's embed + store scan
@@ -6108,6 +6228,8 @@ final class AppModel {
         let filter = currentFilter()
         searchToken += 1
         let token = searchToken
+        searchStartedAt = Date()
+        resetRemote()
 
         // File-as-query: embed the file off-thread (high priority inside the engine), then search.
         if let fq = fileQuery {
@@ -6171,6 +6293,10 @@ final class AppModel {
                     }
                     if stored == nil { self.cacheFileQueryVector(cacheKey, vec) }
                     self.lastQueryVector = vec
+                    // Linked Macs in this Mac's vector space search with the same vector; the Mac a
+                    // Find Similar started on, if it is in another space, searches with its own.
+                    self.fanOutRemote(text: nil, vector: vec, filter: filter, token: token, exclude: fq.sourcePath)
+                    if let src = fq.sourcePath, RemotePath.isRemote(src) { self.fanOutSimilarByPath(src, token: token) }
                     self.applyResults(hits, resolved: self.fileToken(url))
                     // Re-running from history must not reorder it; a transient temp-file image must
                     // not enter History at all (its UUID path never dedups and soon dangles).
@@ -6202,6 +6328,16 @@ final class AppModel {
             return
         }
         searching = true
+        // Scoped to a linked Mac: nothing to search here; its reply is the whole result set.
+        if linkedScope != nil {
+            pendingResolved = q
+            localHits = []; localLanded = true
+            fanOutRemote(text: q, vector: nil, filter: filter, token: token)
+            if remoteInFlight.isEmpty { searching = false; applyScopedResults() }   // that Mac is offline
+            return
+        }
+        // Linked Macs search in parallel with this one, each on its own index and GPU.
+        fanOutRemote(text: q, vector: nil, filter: filter, token: token)
         // Cached query vector: skip the GPU embed entirely (instant, and no contention with indexing).
         if let cached = queryEmbedCache[q] {
             touchQueryVector(q)   // LRU: a re-run query shouldn't be first in line for eviction
@@ -6937,7 +7073,7 @@ final class AppModel {
         // read as deleted and its rows were dropped.
         let byPath = Dictionary(rawResults.map { ($0.path, $0.kind) }, uniquingKeysWith: { a, _ in a })
         let mediaPaths = paths.filter { p in
-            !PhotoLibrary.isPhotoPath(p)
+            !ResultPath.isVirtual(p)
                 && media.contains(byPath[p] ?? FileExtractor.kind(forExtension: (p as NSString).pathExtension)?.rawValue ?? "")
         }
         guard !mediaPaths.isEmpty else { return }
@@ -6959,7 +7095,7 @@ final class AppModel {
         let media: Set<String> = [FileKind.image.rawValue, FileKind.scan.rawValue, FileKind.video.rawValue]
         var added = false
         for h in hits where media.contains(h.kind)
-            && !PhotoLibrary.isPhotoPath(h.path)   // see requestTags
+            && !ResultPath.isVirtual(h.path)   // see requestTags
             && pendingRetag.count < Self.retagQueueCap
             && !retagSeen.contains(h.path)
             && OmniTagger.nameDerivedSnippet(h.snippet, path: h.path) {

@@ -1,5 +1,6 @@
 import AppKit
 import OmniKit
+import OmniLink
 
 /// A measured script of UI steps, run inside the app: `OMNI_PERF_SCRIPT="browse:/a/b;view:list;sidebar;sidebar"`.
 ///
@@ -31,6 +32,12 @@ enum PerfScript {
                     let cpu0 = HangWatch.threadCPU()
                     let t0 = Date()
                     if raw.hasPrefix("type:") { await type(String(raw.dropFirst(5)), model) }
+                    else if raw.hasPrefix("waitfile:") {   // hold here until <path> exists (another process's cue)
+                        let path = String(raw.dropFirst(9))
+                        for _ in 0 ..< 600 where !FileManager.default.fileExists(atPath: path) {
+                            try? await Task.sleep(for: .milliseconds(200))
+                        }
+                    }
                     else { perform(raw, model) }
                     let pause = raw.hasPrefix("wait:") ? Double(raw.dropFirst(5)) ?? 0 : settle
                     try? await Task.sleep(for: .seconds(pause))
@@ -144,9 +151,88 @@ enum PerfScript {
                let outline = firstView(of: NSOutlineView.self, in: w.contentView) {
                 w.makeFirstResponder(outline)
             }
+        case "linkwindow":  // Link a Mac: open | close
+            if arg == "open" { model.link.openWindow() } else if model.activeSheet == .link { model.activeSheet = nil }
+        case "linkpair":    // start linking with the Mac at this address, as the window's Link button does
+            model.link.pair(address: arg)
+        case "linkcode":    // write the code this Mac shows, once it shows one, to <path>
+            Task { @MainActor in
+                for _ in 0 ..< 300 {
+                    if let c = model.link.outgoing?.code { try? c.write(toFile: arg, atomically: true, encoding: .utf8); return }
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+            }
+        case "linkaccept":  // type the code found in <path> into this Mac's request, as its user would
+            Task { @MainActor in
+                for _ in 0 ..< 300 {
+                    if model.link.incoming != nil, let c = try? String(contentsOfFile: arg, encoding: .utf8), c.count == 6 {
+                        let err = model.link.submit(c)
+                        omniPerfLog("linkaccept submitted result=\(err ?? "linked")")
+                        return
+                    }
+                    try? await Task.sleep(for: .milliseconds(100))
+                }
+                omniPerfLog("linkaccept: no request or no code")
+            }
+        case "linkmac":     // the sidebar row of linked Mac n (by name order), or n:<folder on it>
+            let parts = arg.split(separator: ":", maxSplits: 1).map(String.init)
+            if let i = Int(parts[0]), model.link.peers.indices.contains(i) {
+                model.enterLinkedMac(model.link.peers[i].id, folder: parts.count > 1 ? parts[1] : nil)
+            }
+        case "linkfetch":   // fetch result n from its linked Mac and write what arrived to <path>: n:<path>
+            let parts = arg.split(separator: ":", maxSplits: 1).map(String.init)
+            let index = parts[0] == "first" ? model.results.firstIndex { RemotePath.isRemote($0.path) } : Int(parts[0])
+            if parts.count == 2, let i = index, model.results.indices.contains(i) {
+                let remote = model.results[i].path
+                Task {
+                    let t0 = Date()
+                    var out: [String: Any] = ["remote": remote]
+                    do {
+                        let url = try await RemoteFiles.shared.fetch(remote)
+                        out["local"] = url.path
+                        out["ms"] = -t0.timeIntervalSinceNow * 1000
+                        out["size"] = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? -1
+                    } catch {
+                        out["error"] = "\(error)"
+                    }
+                    if let d = try? JSONSerialization.data(withJSONObject: out) { try? d.write(to: URL(fileURLWithPath: parts[1])) }
+                }
+            }
+        case "linkthumb":   // the thumbnail a linked Mac renders for result n, written to <path>: n:<path>
+            let parts = arg.split(separator: ":", maxSplits: 1).map(String.init)
+            let index = parts[0] == "first" ? model.results.firstIndex { RemotePath.isRemote($0.path) && $0.kind == "image" } : Int(parts[0])
+            if parts.count == 2, let i = index, model.results.indices.contains(i) {
+                let remote = model.results[i].path
+                Task {
+                    let cg = await RemoteFiles.shared.thumbnail(remote, maxPixel: 256)
+                    let out: [String: Any] = ["remote": remote, "w": cg?.width ?? 0, "h": cg?.height ?? 0]
+                    if let d = try? JSONSerialization.data(withJSONObject: out) { try? d.write(to: URL(fileURLWithPath: parts[1])) }
+                }
+            }
+        case "linkfold":    // fold or unfold linked Mac n's folders in the sidebar, as its chevron does
+            if let i = Int(arg), model.link.peers.indices.contains(i) {
+                NotificationCenter.default.post(name: .omniPerfLinkFold, object: model.link.peers[i].id)
+            }
+        case "linkunlink":  // unlink linked Mac n, without the confirmation
+            if let i = Int(arg), model.link.peers.indices.contains(i) { model.link.unlink(model.link.peers[i].id) }
         case "dumpui":   // what the window shows, as JSON at <path>: results with their copies, browser rows
             let groups = model.groups.map { g in g.members.map(\.path) }
+            let link = model.link
+            let peers: [[String: Any]] = link.peers.map { p in
+                ["id": p.id, "name": p.name, "state": "\(link.state(p.id))", "mixable": link.mixable[p.id].map { $0 ? "yes" : "no" } ?? "unknown",
+                 "theyAllowSearch": p.theyAllowSearch, "allowSearch": p.allowSearch, "allowFetch": p.allowFetch,
+                 "sources": (link.sources[p.id] ?? []).map(\.key), "host": p.host ?? "", "port": Int(p.port ?? 0)]
+            }
             let payload: [String: Any] = [
+                "linkPeers": peers,
+                "linkPort": Int(link.port ?? 0),
+                "linkOutgoing": link.outgoing.map { ["name": $0.name, "code": $0.code ?? "", "error": $0.error ?? "", "linked": $0.linked] } ?? [:],
+                "linkIncoming": link.incoming?.name ?? "",
+                "linkMessage": link.incomingMessage ?? "",
+                "linkedScope": model.linkedScope.map { ["peer": $0.peer, "folder": $0.folder ?? ""] } ?? [:],
+                "sections": Dictionary(uniqueKeysWithValues: model.resultSections.map { ("\($0.key)", $0.value) }),
+                "scores": model.groups.map { Double($0.representative.score) },
+                "remoteError": model.remoteError ?? "",
                 "time": Date().timeIntervalSince1970, "query": model.query, "box": model.rawQuery,
                 "results": groups,
                 "selection": model.selection ?? "",
@@ -263,4 +349,5 @@ extension Notification.Name {
     static let omniPerfBrowseSort = Notification.Name("omni.perf.browseSort")
     static let omniPerfSettingsTab = Notification.Name("omni.perf.settingsTab")
     static let omniPerfSidebarSelect = Notification.Name("omni.perf.sidebarSelect")
+    static let omniPerfLinkFold = Notification.Name("omni.perf.linkFold")
 }

@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 import OmniKit
+import OmniLink
 
 /// Dragging files OUT of Omni, Finder-style: from a result row or cell, or a browser row, to Finder,
 /// Mail, an editor or any other app, which then does what it does with dropped files.
@@ -50,10 +51,13 @@ final class FileDrag: NSObject, @preconcurrency NSDraggingSource {
     }
 
     private static func writer(for path: String) -> NSPasteboardWriting {
-        guard PhotoLibrary.isPhotoPath(path) else { return URL(fileURLWithPath: path) as NSURL }
-        let name = (path as NSString).lastPathComponent.removingPercentEncoding
-            ?? (path as NSString).lastPathComponent
-        let type = UTType(filenameExtension: (name as NSString).pathExtension) ?? .image
+        // A Photos asset and a linked Mac's file go as promises, written out only when dropped.
+        guard ResultPath.isVirtual(path) else { return URL(fileURLWithPath: path) as NSURL }
+        let remote = RemotePath.isRemote(path)
+        // A Photos path percent-encodes its name; a linked Mac's path is the file's own name.
+        let name = remote ? (path as NSString).lastPathComponent
+            : (path as NSString).lastPathComponent.removingPercentEncoding ?? (path as NSString).lastPathComponent
+        let type = UTType(filenameExtension: (name as NSString).pathExtension) ?? (remote ? .data : .image)
         let provider = NSFilePromiseProvider(fileType: type.identifier, delegate: PhotoPromise.shared)
         provider.userInfo = PhotoPromise.Request(path: path, name: name)
         return provider

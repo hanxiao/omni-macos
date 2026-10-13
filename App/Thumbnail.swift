@@ -4,6 +4,7 @@ import QuickLookThumbnailing
 import UniformTypeIdentifiers
 import ImageIO
 import OmniKit
+import OmniLink
 
 extension NSWorkspace {
     /// Open a file without blocking the caller. The plain `open(URL)` is the deprecated SYNCHRONOUS
@@ -89,7 +90,24 @@ struct Thumbnail: View {
         if image != nil { image = nil }
         let scale = NSScreen.main?.backingScaleFactor ?? 2
         let maxPixel = Swift.max(32, Int((side * scale).rounded()))
+        // A linked Mac's file is not here: that Mac renders the thumbnail from its own copy, the
+        // same way it would for its own window, and sends the picture.
+        let cg: CGImage?
+        if RemotePath.isRemote(path) {
+            cg = await RemoteFiles.shared.thumbnail(path, maxPixel: maxPixel)
+        } else {
+            cg = await Self.render(path: path, maxPixel: maxPixel, side: side, scale: scale)
+        }
+        guard let cg, !Task.isCancelled else { return }
+        let img = NSImage(cgImage: cg, size: NSSize(width: CGFloat(cg.width) / scale,
+                                                    height: CGFloat(cg.height) / scale))
+        ThumbnailCache.shared.store(img, key, cost: cg.bytesPerRow * cg.height)
+        image = img
+    }
 
+    /// The thumbnail of a file on this Mac (or a Photos asset), at `maxPixel` for a tile of `side`
+    /// points: the row's own picture, and what this Mac sends a linked Mac that asks for one.
+    nonisolated static func render(path: String, maxPixel: Int, side: CGFloat, scale: CGFloat) async -> CGImage? {
         // A Photos asset has no file to read: PhotoKit serves the thumbnail, from the same local
         // cache Photos.app draws its own grid from. Network access stays OFF - scrolling results
         // must never start an iCloud download - so an asset that is not on this Mac falls through
@@ -98,18 +116,11 @@ struct Thumbnail: View {
             let cg = await Self.decodeBounded {
                 PhotoLibrary.image(ref, maxDimension: maxPixel, allowNetwork: false)
             }
-            if Task.isCancelled { return }
             if cg == nil {
                 omniPerfLog("photo-thumb nil auth=\(PhotoLibrary.authorization.rawValue) "
                             + "assetFound=\(PhotoLibrary.debugAssetExists(ref)) id=\(ref.localIdentifier)")
             }
-            if let cg {
-                let img = NSImage(cgImage: cg, size: NSSize(width: CGFloat(cg.width) / scale,
-                                                            height: CGFloat(cg.height) / scale))
-                ThumbnailCache.shared.store(img, key, cost: cg.bytesPerRow * cg.height)
-                image = img
-            }
-            return
+            return cg
         }
 
         let url = URL(fileURLWithPath: path)
@@ -132,14 +143,8 @@ struct Thumbnail: View {
             let cg = await Self.decodeBounded {
                 isPDF ? Self.pdfThumbnail(url, maxPixel: maxPixel) : Self.imageThumbnail(url, maxPixel: maxPixel)
             }
-            if Task.isCancelled { return }
-            if let cg {
-                let img = NSImage(cgImage: cg, size: NSSize(width: CGFloat(cg.width) / scale,
-                                                            height: CGFloat(cg.height) / scale))
-                ThumbnailCache.shared.store(img, key, cost: cg.bytesPerRow * cg.height)
-                image = img
-                return
-            }
+            if Task.isCancelled { return nil }
+            if let cg { return cg }
         }
 
         // `.all` (icon + low-quality + full thumbnail), not `.thumbnail` alone: the bulk of an index is
@@ -148,7 +153,8 @@ struct Thumbnail: View {
         // BEST available - the real content thumbnail for media, QuickLook's faithful Finder-matching
         // type icon otherwise. Same iconservicesd/QuickLook daemon and disk cache Finder uses, so a file
         // Finder has shown is ~free.
-        let request = QLThumbnailGenerator.Request(
+        // Immutable once built, and only handed to QuickLook and its own cancel.
+        nonisolated(unsafe) let request = QLThumbnailGenerator.Request(
             fileAt: url,
             // Twice the tile: QuickLook FITS the box, and the tile fills it (see coverPixels). An
             // iCloud-only file is served from the thumbnail iCloud keeps, at no download - measured
@@ -158,9 +164,9 @@ struct Thumbnail: View {
             representationTypes: .all
         )
         // IMPORTANT: keep the QuickLook completion handler inside withCheckedContinuation, whose body is
-        // @Sendable (non-isolated). load() is @MainActor (View), so a handler written directly here would
-        // inherit MainActor isolation; QuickLook calls it on its OWN dispatch queue, and the Swift runtime
-        // then traps (dispatch_assert_queue / swift_task_isCurrentExecutor) - an EXC_BREAKPOINT crash with
+        // @Sendable (non-isolated). A handler written in a @MainActor context would inherit MainActor
+        // isolation; QuickLook calls it on its OWN dispatch queue, and the Swift runtime then traps
+        // (dispatch_assert_queue / swift_task_isCurrentExecutor) - an EXC_BREAKPOINT crash with
         // `.all` specifically, because that enables QL's icon-generation callback. A progressive
         // (icon-then-thumbnail) variant via generateRepresentations re-introduced exactly that crash; the
         // single best-representation call is the safe pattern. The async overlay does NOT forward Swift
@@ -177,11 +183,7 @@ struct Thumbnail: View {
         } onCancel: {
             QLThumbnailGenerator.shared.cancel(request)
         }
-        guard let cg, !Task.isCancelled else { return }
-        let img = NSImage(cgImage: cg, size: NSSize(width: CGFloat(cg.width) / scale,
-                                                    height: CGFloat(cg.height) / scale))
-        ThumbnailCache.shared.store(img, key, cost: cg.bytesPerRow * cg.height)
-        image = img
+        return Task.isCancelled ? nil : cg
     }
 
     /// Async width gate for direct decodes. A `Task.detached` sync decode would (a) occupy one of
@@ -219,7 +221,7 @@ struct Thumbnail: View {
     }
 
     /// File extensions decoded directly by ImageIO (CGImageSource handles all of these natively).
-    static let imageExts: Set<String> = [
+    nonisolated static let imageExts: Set<String> = [
         "png", "jpg", "jpeg", "gif", "heic", "heif", "tiff", "tif", "bmp", "webp", "avif",
         "jp2", "ico", "icns", "dng", "cr2", "cr3", "nef", "arw", "raf", "orf", "rw2",
     ]

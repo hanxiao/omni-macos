@@ -112,7 +112,18 @@ struct ContentView: View {
             switch route {
             case .progress: ProfilingSheet()
             case .paperResult: PaperResultSheet()
+            case .link: LinkSheet()
             }
+        }
+        // Link a Mac goes through the same single sheet route (stacked sheets race each other).
+        .onChange(of: model.link.showWindow) { _, show in
+            guard show else { return }
+            model.link.showWindow = false
+            if model.activeSheet == nil { model.activeSheet = .link }
+        }
+        .alert(model.remoteError ?? "", isPresented: Binding(
+            get: { model.remoteError != nil }, set: { if !$0 { model.remoteError = nil } })) {
+            Button("OK") { model.remoteError = nil }
         }
     }
 
@@ -272,6 +283,12 @@ struct ContentView: View {
             && model.filterFolders.map(\.standardizedFileURL.path) == [AppModel.clipboardDirectory.standardizedFileURL.path]
     }
 
+    /// A linked Mac (or a folder on it) is selected and nothing search-related is active.
+    private var showsRemoteBrowser: Bool {
+        model.linkedScope != nil && !model.hasQuery && model.fileQuery == nil
+            && !model.hasResults && model.queryError == nil && !model.isResolving
+    }
+
     private var showsPhotoBrowser: Bool {
         model.browsedPhotoSource != nil && !model.hasQuery && model.fileQuery == nil
             && !model.hasResults && model.queryError == nil && !model.isResolving
@@ -300,8 +317,11 @@ struct ContentView: View {
         // so results clipped at a hard line instead of blurring under the chrome.
         contentBody.modifier(TopBar {
             if let fq = model.fileQuery { FileQueryChip(fileQuery: fq) }
+            else if let scope = model.linkedScope { LinkedScopeChip(scope: scope) }
             else if showsQualifierBar { QualifierBar() }
         })
+        // A linked Mac's file on its way to be opened or previewed.
+        .overlay(alignment: .bottom) { RemoteFetchStatus() }
     }
 
     @ViewBuilder private var contentBody: some View {
@@ -316,6 +336,8 @@ struct ContentView: View {
                                subtitle: "Saves the text and images you copy so you can search them.",
                                action: ("Turn On", { model.setClipboardEnabled(true) }),
                                prominent: true)
+            } else if showsRemoteBrowser, let scope = model.linkedScope {
+                RemoteBrowser(scope: scope)
             } else if showsRecents {
                 RecentsBrowser()
             } else if showsPhotoBrowser {
@@ -342,7 +364,10 @@ struct ContentView: View {
         // AppModel.loadRoots). Keyed on hasSources, not on `roots`: a user who added only their
         // photo library has a source and can search, and telling them to add a folder over the
         // top of it would be wrong.
-        if !model.hasSources {
+        if let scope = model.linkedScope, !model.link.isOnline(scope.peer) {
+            CenteredStatus(symbol: CenteredStatus.moleSleep, title: "\(model.link.name(of: scope.peer)) is offline",
+                           subtitle: "", showSpinner: false, action: ("Try Again", { model.link.retry(scope.peer) }))
+        } else if !model.hasSources {
             CenteredStatus(symbol: CenteredStatus.moleSleep, title: "Add folders to search",
                            subtitle: "", showSpinner: false,
                            action: ("Add\u{2026}", { SourcePicker.add(to: model) }),
@@ -375,9 +400,10 @@ struct ContentView: View {
             SearchWaysPrompt(
                 // With several folders scoped there is no browser to show (that needs exactly one),
                 // so the prompt is the only place that says what the next query will cover.
-                title: model.filterFolders.count > 1
+                title: model.linkedScope.map { "Search \(model.link.name(of: $0.peer))" }
+                    ?? (model.filterFolders.count > 1
                     ? "Search \(model.filterFolders.count) folders"
-                    : (model.indexedFiles > 0 ? "Search \(model.indexedFiles.formatted()) file\(model.indexedFiles == 1 ? "" : "s")" : "Search your files"),
+                    : (model.indexedFiles > 0 ? "Search \(model.indexedFiles.formatted()) file\(model.indexedFiles == 1 ? "" : "s")" : "Search your files")),
                 count: model.indexedFiles,
                 showSpinner: model.isResolving)
         } else if model.hiddenByThreshold > 0 {
