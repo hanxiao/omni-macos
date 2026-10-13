@@ -79,31 +79,37 @@ def courier(c, P, s, t, t0, dur, sprite_name, back=False, h=110, label=None):
         paper_rect(c, x - w / 2, y - 26, w, 48, "tex-teal.png", radius=24, shadow=0.6)
         draw_text(c, label, x, y + 8, 26, 600, INK, 1, "center", "mono")
 
-# ---------------------------------------------------------------- 1. files on more than one Mac
-S1_END = 4.45
-def s_many(c, t):
-    leave = expo_io(prog(t, 4.0, 4.9))
+# ---------------------------------------------------------------- 1. one Mac, then several
+S2_0 = T.VO["link"] - 0.6                       # the link shot slides in
+def s_intro(c, t):
+    leave = expo_io(prog(t, S2_0, S2_0 + 0.9))
     c.save(); c.translate(0, leave * H * 1.05)
-    zoom = 1.04 + 0.02 * prog(t, 0, 4.5)
-    s, P = cam(1376, 760, zoom)
-    L.plate(c, PLATE, 1376, 760, zoom, src_w=PW)
+    # close on this Mac (Mac Studio), then back out to reveal the other one on "but"
+    pull = expo_io(prog(t, at("intro", "but") - 0.1, at("intro", "but") + 1.5))
+    fx, fy, zoom = lerp(1890, 1376, pull), lerp(555, 760, pull), lerp(1.6, 1.04, pull)
+    s, P = cam(fx, fy, zoom)
+    L.plate(c, PLATE, fx, fy, zoom, src_w=PW)
     rnd = random.Random(2)
     kinds = ["doc-cut.png", "photo-cut.png", "folder-cut.png"]
     for i in range(12):
-        side = i % 2
-        t0 = word("many", 1) + i * 0.13 + side * 0.07
+        side = 1 if i < 7 else 0                   # this Mac's files first, the other's on "spread"
+        t0 = (at("intro", "every") + i * 0.16) if side else (at("intro", "spread") + (i - 7) * 0.13)
         d = t - t0
         if d < 0: continue
         dx, dy = (B_DESK if side == 0 else A_DESK)
         tx, ty = P(dx + rnd.uniform(-170, 170), dy - 30 + rnd.uniform(-25, 15))
         drop = spring(d * 1.1, 1.5, 5.0)
-        draw_image(c, sprite(kinds[i % 3], 500), tx, ty - (1 - drop) * 520, h=62 * s / 0.6,
+        draw_image(c, sprite(kinds[i % 3], 500), tx, ty - (1 - drop) * 300, h=62 * s / 0.6,
                    rot=rnd.uniform(-25, 25) * (1 - 0.4 * drop), shadow=0.5)
     moles(c, P, s, t)
-    headline(c, "Your files live on more than one Mac.", W / 2, 84, 56, t, word("many", 0) - 0.05, INK, align="center")
+    a1 = 1 - prog(t, at("intro", "but") - 0.3, at("intro", "but"))
+    headline(c, "Omni searches every kind of file on your Mac.", W / 2, 84, 56, t, word("intro", 0) - 0.05, INK,
+             alpha=a1, align="center")
+    headline(c, "What if your files are spread across several Macs?", W / 2, 84, 56, t, at("intro", "what") - 0.05,
+             INK, align="center")
     bx, by = P(B_DESK[0], B_DESK[1] + 180); ax, ay = P(A_DESK[0], A_DESK[1] + 180)
-    chip(c, "MacBook Pro", bx - 110, by, t, at("many", "one") - 0.1, 28, "tex-cream.png", INK)
-    chip(c, "Mac Studio", ax - 100, ay, t, at("many", "Mac") - 0.05, 28, "tex-cream.png", INK)
+    chip(c, "MacBook Pro", bx - 110, by, t, at("intro", "several") - 0.1, 28, "tex-cream.png", INK)
+    chip(c, "Mac Studio", ax - 100, ay, t, at("intro", "Mac") - 0.05, 28, "tex-cream.png", INK)
     c.restore()
 
 # ---------------------------------------------------------------- 2. link: the real sheets
@@ -144,10 +150,10 @@ def typed(s, size):
     return _rounded[key]
 
 CODE = "175554"
-S2_0 = 4.0
+LINK_OUT = T.VO["link"] + T.dur("link") + 0.6   # the link shot leaves; the proof shot is underneath
 def s_link(c, t):
     enter = expo_io(prog(t, S2_0, S2_0 + 0.9))
-    leave = expo_io(prog(t, 12.2, 13.1))
+    leave = expo_io(prog(t, LINK_OUT, LINK_OUT + 0.9))
     c.save(); c.translate(0, (1 - enter) * -H * 1.05 + leave * -H * 1.05)
     L.plate(c, "bg-paper.png", 2752, 1536, 1.05)
     # MacBook Pro (laptop, left) and Mac Studio (display, right)
@@ -262,7 +268,7 @@ def s_search_under(c, t):
             x, y = P(hx, hy - 40)
             glow(c, x, y, 260 * s / 0.6, TEAL, 0.28 * (0.6 + 0.4 * math.sin((t - work) * 6)))
     for i, (hx, hy) in enumerate((B_HOLE, A_HOLE)):
-        x, y = P(hx, hy + 300)
+        x, y = P(hx, hy - 255)
         chip(c, "own index · own GPU", x - 175, y, t, at("search", "index") - 0.1 + i * 0.2, 26, "tex-ink.png", CREAM)
     back = at("search", "results") - 0.1
     for k in range(5):
@@ -291,12 +297,88 @@ def s_search_app(c, t):
     tt = 4.2 + (t - APP0) * 0.95
     sc = app_window(c, t, k1(), tt, APP0, caption_s="MacBook Pro's photos, among this Mac's", cap_t=APP0 + 1.0)
     # point at the first result's badge: the computer marks a linked Mac's file
-    r = prog(t, APP0 + 1.6, APP0 + 2.2) * (1 - prog(t, T.BREAK - 0.6, T.BREAK - 0.2))
+    r = prog(t, APP0 + 1.6, APP0 + 2.2) * (1 - prog(t, SWARM0 - 0.6, SWARM0 - 0.2))
     if r > 0:
         fr = k1().frame(tt); wx = W / 2 - fr.width() * sc / 2; wy = H / 2 + 10 - fr.height() * sc / 2
         bx, by = wx + 321 * sc, wy + 89 * sc
         pp = skia.Paint(AntiAlias=True, Style=skia.Paint.kStroke_Style, StrokeWidth=4, Color4f=rgb(TEAL_INK, r))
         c.drawCircle(bx, by, 28 + 6 * math.sin(t * 5), pp)
+
+# ---------------------------------------------------------------- 4b. as many Macs as you like
+SWARM = A_("bg-swarm.png")
+HUB = (1396, 806, 158)                    # this Mac: the big burrow in the middle (plate px, radius)
+COLONY = [(481, 1154, 87), (1735, 983, 85), (974, 1326, 82), (752, 911, 72), (2254, 1097, 70), (2356, 780, 67),
+          (410, 559, 66), (1727, 560, 59), (2365, 544, 54), (1049, 642, 42), (1477, 1179, 42), (836, 446, 40),
+          (1155, 1014, 40), (2018, 1190, 39), (1991, 686, 38), (209, 775, 36), (2447, 1297, 60)]
+COLONY.sort(key=lambda b: math.hypot(b[0] - HUB[0], b[1] - HUB[1]))
+SWARM0 = T.VO["swarm"] - 0.8
+MOLES = ["mole-listen-cut.png", "mole-dig-cut.png", "mole-pop-cut.png", "mole-carry-cut.png", "mole-wave-cut.png"]
+
+def _arm(k, x, y, r):
+    """The tunnel from the hub to burrow k: end points on the two rims, a gentle bend."""
+    dx, dy = x - HUB[0], y - HUB[1]; d = math.hypot(dx, dy); ux, uy = dx / d, dy / d
+    p0 = (HUB[0] + ux * HUB[2] * 0.92, HUB[1] + uy * HUB[2] * 0.92)
+    p1 = (x - ux * r * 0.9, y - uy * r * 0.9)
+    bend = (0.05 if k % 2 else -0.05) * d
+    c = ((p0[0] + p1[0]) / 2 - uy * bend, (p0[1] + p1[1]) / 2 + ux * bend)
+    return p0, c, p1
+
+def _bez(p0, c, p1, u):
+    return ((1 - u) ** 2 * p0[0] + 2 * (1 - u) * u * c[0] + u * u * p1[0],
+            (1 - u) ** 2 * p0[1] + 2 * (1 - u) * u * c[1] + u * u * p1[1])
+
+def s_swarm(c, t):
+    w0 = T.VO["swarm"]
+    pull = expo_io(prog(t, SWARM0, w0 + 0.9))       # settled before the headline and the tunnels
+    fx, fy, zoom = lerp(HUB[0], 1376, pull), lerp(HUB[1] + 60, 768, pull), lerp(2.4, 1.0, pull)
+    s, P = cam(fx, fy, zoom)
+    L.plate(c, SWARM, fx, fy, zoom, src_w=PW)
+    fan, back = at("swarm", "fans") - 0.2, at("swarm", "answer") - 0.2
+    arms = []
+    for k, (x, y, r) in enumerate(COLONY):
+        td = w0 + 0.9 + k * 0.08
+        u = ease_io(prog(t, td, td + 0.75))
+        p0, cc, p1 = _arm(k, x, y, r)
+        arms.append((td, p0, cc, p1, x, y, r))
+        if u <= 0: continue
+        path = skia.Path(); a = P(*p0); path.moveTo(*a)
+        n = 18
+        for q in range(1, int(n * u) + 1):
+            path.lineTo(*P(*_bez(p0, cc, p1, q / n)))
+        ribbon(c, path, max(9, 30 * s))
+    # the hub's mole, and one in every linked burrow as its tunnel arrives
+    hx, hy = P(HUB[0], HUB[1] + HUB[2] * 0.82)
+    draw_image(c, sprite("mole-dig-cut.png", 1000), hx, hy, h=HUB[2] * 2.0 * s, anchor=(0.5, 0.95), shadow=0.6)
+    for k, (td, p0, cc, p1, x, y, r) in enumerate(arms):
+        d = t - (td + 0.55)
+        if d <= 0: continue
+        kk = spring(d * 1.1, 1.4, 5.0)
+        mx, my = P(x, y + r * 0.82)
+        working = fan + 0.9 < t < back + 0.6
+        kind = "mole-dig-cut.png" if working else MOLES[k % len(MOLES)]
+        draw_image(c, sprite(kind, 700), mx, my + (1 - kk) * r * s, h=r * 1.9 * s, anchor=(0.5, 0.95), shadow=0.5)
+        if working:
+            gx, gy = P(x, y)
+            glow(c, gx, gy, r * 2.2 * s, TEAL, 0.25 + 0.1 * math.sin((t - fan) * 7 + k))
+    # one search fans out; every answer comes back
+    for k, (td, p0, cc, p1, x, y, r) in enumerate(arms):
+        for t0, outbound in ((fan + k * 0.04, True), (back + k * 0.05, False)):
+            u = ease_io(prog(t, t0, t0 + 0.9))
+            if not (0 < u < 1): continue
+            bx, by = P(*_bez(p0, cc, p1, u if outbound else 1 - u))
+            if outbound:
+                glow(c, bx, by, 60 * max(s, 0.6), TEAL, 0.5)
+                circle(c, bx, by, 9 * max(s, 0.6), TEAL, 0.95)
+            else:
+                draw_image(c, sprite("photo-cut.png", 300), bx, by, h=52 * max(s, 0.7), rot=math.sin(t * 5 + k) * 8, shadow=0.4)
+    if t > back + 0.8:
+        glow(c, *P(HUB[0], HUB[1]), HUB[2] * 2.4 * s, TEAL, 0.32 * prog(t, back + 0.8, back + 1.2))
+    headline(c, "Link as many Macs as you like.", W / 2, 84, 56, t, w0 + 0.7, INK, align="center")
+    c1 = 1 - prog(t, at("swarm", "and") - 0.3, at("swarm", "and"))
+    caption(c, "One search fans out to all of them at once.", W / 2, 140, t, at("swarm", "One") - 0.1, 34, "#5E4B3A",
+            alpha=c1, align="center", weight=550)
+    caption(c, "Every answer comes back to you.", W / 2, 140, t, at("swarm", "every") - 0.1, 34, TEAL_INK,
+            align="center", weight=600)
 
 # ---------------------------------------------------------------- 5. asleep
 def s_away(c, t):
@@ -378,7 +460,7 @@ def s_agents(c, t):
     headline(c, "Local agents get the same reach.", W / 2, 200, 66, t, word("agents", 0) - 0.05, CREAM, align="center")
 
 # ---------------------------------------------------------------- 8. the app, held
-MONT0 = WORDS["agents"][-1][2] + 0.6
+MONT0 = WORDS["agents"][-1][2] + 1.8           # the output is read before the card leaves
 def s_montage(c, t):
     tt = 9.5 + (t - MONT0) * 0.9
     app_window(c, t, k1(), tt, MONT0, zoom=1.28, caption_s="One search. Every Mac.", cap_t=MONT0 + 1.0)
@@ -393,21 +475,21 @@ def s_end(c, t):
         k = spring(d * 0.8, 1.2, 4.0)
         bob = math.sin(max(0, t - t0 - 1.5) * 2.2) * 4
         draw_image(c, sprite("mole-wave-cut.png", 1000), 520, 840 + (1 - k) * 600 + bob, h=600, anchor=(0.5, 0.95), shadow=0.7)
-    draw_text(c, "Linked Macs", 780, 520, 150, 720, INK, expo_out(prog(t, t0, t0 + 0.8)), "left",
+    draw_text(c, "Linked Macs", 780, 500, 150, 720, INK, expo_out(prog(t, t0, t0 + 0.8)), "left",
               scale=1 + 0.06 * math.exp(-6 * max(0, t - t0)))
-    reveal_words(c, "New in Omni 0.16.", 786, 610, 46, t, at("end", "new") - 0.1, 0.12, 0.6, 550, MUTED)
-    caption(c, "hanxiao.io/omni", 786, 690, t, at("end", "Omni") + 0.2, 34, TEAL_INK, kind="mono", weight=600)
-    caption(c, "macOS 14+ · Apple silicon · free and open source", 786, 746, t, T.LAST_HIT - 0.6, 28, MUTED, kind="mono")
+    reveal_words(c, "Federated search across your Macs.", 786, 592, 46, t, at("end", "multimodal") - 0.1, 0.1, 0.6, 600, TEAL_INK)
+    caption(c, "New in Omni 0.16 · hanxiao.io/omni", 786, 668, t, at("end", "federated") + 0.1, 32, MUTED, kind="mono", weight=550)
 
 # ---------------------------------------------------------------- the edit
-UNDER0 = 12.4
+UNDER0 = LINK_OUT + 0.15
 SEARCH_U0 = word("search", 0) - 0.6
 SHOTS = [
-    (0.0, S1_END + 0.5, s_many),
-    (S2_0, 13.2, s_link),
+    (0.0, S2_0 + 1.0, s_intro),
+    (S2_0, LINK_OUT + 1.0, s_link),
     (UNDER0, SEARCH_U0 + 0.4, s_proof),
     (SEARCH_U0, APP0 + 1.0, s_search_under),
-    (APP0, T.BREAK + 0.5, s_search_app),
+    (APP0, SWARM0 + 0.6, s_search_app),
+    (SWARM0, T.BREAK + 0.5, s_swarm),
     (T.BREAK, word("open", 0) - 0.4, s_away),
     (word("open", 0) - 0.8, SIDEBAR0 + 1.0, s_open_under),
     (SIDEBAR0, AG0 + 0.6, s_open_app),
@@ -416,7 +498,8 @@ SHOTS = [
     (END0, T.LENGTH + 0.1, s_end),
 ]
 DISSOLVE = {(s_proof, s_search_under): (SEARCH_U0, SEARCH_U0 + 0.4),
-            (s_search_app, s_away): (T.BREAK, T.BREAK + 0.5),
+            (s_search_app, s_swarm): (SWARM0, SWARM0 + 0.6),
+            (s_swarm, s_away): (T.BREAK, T.BREAK + 0.5),
             (s_away, s_open_under): (word("open", 0) - 0.8, word("open", 0) - 0.4),
             (s_open_app, s_agents): (AG0 - 0.4, AG0 + 0.6),
             (s_agents, s_montage): (MONT0, MONT0 + 0.5),
@@ -425,13 +508,14 @@ DISSOLVE = {(s_proof, s_search_under): (SEARCH_U0, SEARCH_U0 + 0.4),
 # s_search_under -> s_search_app and s_open_under -> s_open_app overlap and the window scales in.
 DISSOLVE[(s_search_under, s_search_app)] = (APP0, APP0 + 0.35)
 DISSOLVE[(s_open_under, s_open_app)] = (SIDEBAR0, SIDEBAR0 + 0.35)
-DISSOLVE[(s_link, s_proof)] = (12.4, 13.0)
+DISSOLVE[(s_link, s_proof)] = (UNDER0, UNDER0 + 0.6)
 
 def fade_to_black(t):
     return 1 - prog(t, T.LENGTH - 1.3, T.LENGTH)
 
-WHIP = [(3.9, 5.0), (12.1, 13.2)]
-BLUR = [(APP0, APP0 + 1.1), (SIDEBAR0, SIDEBAR0 + 1.1), (MONT0, MONT0 + 1.1)]
+WHIP = [(S2_0 - 0.1, S2_0 + 1.0), (LINK_OUT - 0.1, LINK_OUT + 1.0)]
+BLUR = [(APP0, APP0 + 1.1), (SIDEBAR0, SIDEBAR0 + 1.1), (MONT0, MONT0 + 1.1),
+        (at("intro", "but") - 0.1, at("intro", "but") + 1.5), (SWARM0, T.VO["swarm"] + 0.9)]
 def subframes(t):
     if any(a <= t <= b for a, b in WHIP): return 12
     return 5 if any(a <= t <= b for a, b in BLUR) else 1

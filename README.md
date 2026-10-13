@@ -43,8 +43,8 @@ cable pulled.
 ## Linked Macs
 
 <p align="center">
-  <a href="https://hanxiao.io/omni/assets/omni-linked-macs.mp4?v=e5e02864">
-    <img src="site/omni/assets/omni-linked-poster-play.jpg?v=765a5b1c" alt="Linked Macs film" width="720">
+  <a href="https://hanxiao.io/omni/assets/omni-linked-macs.mp4?v=a687c4ea">
+    <img src="site/omni/assets/omni-linked-poster-play.jpg?v=d028fd33" alt="Linked Macs: federated search across your Macs" width="720">
   </a>
 </p>
 

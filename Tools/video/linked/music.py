@@ -1,21 +1,22 @@
-# Score for the Linked Macs film: Lyria, the launch film's instrumentation, a one-minute arc.
+# Score for the Linked Macs film: Lyria, the launch film's instrumentation, a 78-second arc.
 # usage: music.py <out-prefix> [n variants] [model]
 import sys, os, json, base64, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 KEY = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "work", ".gemini-key")).read().strip()
 
-BRIEF = """Instrumental score for a 62-second feature film for a calm, precise Mac app. 102 BPM, 4/4,
+BRIEF = """Instrumental score for a 78-second feature film for a calm, precise Mac app. 102 BPM, 4/4,
 steady tempo throughout. Warm, tactile, handcrafted sound: felt piano, plucked muted strings, marimba,
 soft round analog synth bass, brushed light percussion, a few subtle paper and wooden foley ticks.
 Elegant and confident, never epic, no risers, no dubstep, no vocals.
 Structure:
-0:00-0:06 a sparse felt-piano motif alone, curious, two notes answering each other like a call and reply.
-0:06-0:14 light pizzicato and soft marimba join, the call and reply passes between two instruments.
-0:14-0:40 a steady, precise groove: brushed kick and shaker, marimba ostinato, soft synth bass, playful and clever.
-0:40-0:46 a short breakdown, piano alone, quiet, sleepy.
-0:46-0:57 the full groove returns, brighter and confident, crisp percussion.
-0:57-1:02 resolve on a warm final piano chord with a short natural tail."""
+0:00-0:08 a sparse felt-piano motif alone, curious, two notes answering each other like a call and reply.
+0:08-0:17 light pizzicato and soft marimba join, the call and reply passes between two instruments.
+0:17-0:38 a steady, precise groove: brushed kick and shaker, marimba ostinato, soft synth bass, playful and clever.
+0:38-0:48 the same groove grows wider and fuller, more voices joining in, many marimbas answering each other.
+0:48-0:56 a short breakdown, piano alone, quiet, sleepy.
+0:56-1:13 the full groove returns, brighter and confident, crisp percussion.
+1:13-1:18 resolve on a warm final piano chord with a long natural tail."""
 
 def one(i, prefix, model):
     body = {"contents": [{"parts": [{"text": BRIEF}]}], "generationConfig": {"responseModalities": ["AUDIO"]}}

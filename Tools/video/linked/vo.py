@@ -8,14 +8,15 @@ KEY = open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "work"
 DIRECTION = "Say warmly and clearly, at a natural, slightly brisk pace, like the narrator of a short product film"
 
 LINES = [
-    ("many",   "Your files live on more than one Mac."),
+    ("intro",  "Omni already searches every kind of file on your Mac, by meaning. But what if your files are spread across several Macs?"),
     ("link",   "Omni can now link them. Open Link a Mac on both, and type the six digits one shows into the other."),
     ("proof",  "The code proves the two Macs are talking to each other, with nothing in between. No server is involved: they find each other on your network, or over your VPN."),
     ("search", "From then on, one search covers every linked Mac. Each one searches its own index on its own GPU, and its results join yours as they arrive."),
     ("open",   "Open, preview or drag a result, and the file comes across the link. Its folders are in your sidebar."),
+    ("swarm",  "Link as many Macs as you like. One search fans out to all of them at once, and every answer comes back to you."),
     ("away",   "If a Mac is asleep, the search simply goes on without it."),
     ("agents", "Local agents get the same reach, through the same tools."),
-    ("end",    "Linked Macs. New in Omni zero point sixteen."),
+    ("end",    "Omni Linked Macs: multimodal search, now federated."),
 ]
 
 def say(line_id, text, out, voice, model):
