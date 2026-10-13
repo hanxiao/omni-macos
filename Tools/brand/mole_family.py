@@ -77,3 +77,50 @@ def svg(v):
 </svg>'''
 for v in ["base", "search", "ocr", "sleep", "serious", "empty", "curious", "sad"]:
     open(f"fam-{v}.svg", "w").write(svg(v))
+
+# Two moles hugging: Linked Macs' "Linked with ..." sheet. The family's mole at the family's size on a
+# 140x100 canvas, so it reads as the same drawing: happy eyes, cheeks together, the front mole's arm
+# across the other, the other's paw on its far shoulder, one mound, a heart. Monochrome by gaps:
+# whatever is in front is cut out of what is behind, with the family's 2.5-unit outline.
+def hug():
+    head = "M25,90 L25,45 C25,27 36,18 50,18 C64,18 75,27 75,45 L75,90 Z"
+    ears = '<circle cx="31" cy="25.5" r="4"/><circle cx="69" cy="25.5" r="4"/>'
+    face = ('<path d="M36.2,41 Q40,36.5 43.8,41" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>'
+            '<path d="M56.2,41 Q60,36.5 63.8,41" fill="none" stroke="black" stroke-width="2.6" stroke-linecap="round"/>'
+            '<ellipse cx="50" cy="49.5" rx="6.8" ry="4.9" fill="black"/>'
+            '<rect x="45.8" y="56" width="8.4" height="6.4" rx="1.6" fill="black"/><rect x="49.35" y="55" width="1.3" height="9" fill="white"/>')
+    A, B = "translate(-8,0) rotate(7 50 90)", "translate(48,0) rotate(-7 50 90)"
+    arm = "M71,64 Q48,73 25,59"                       # B's arm, in front of A
+    pawA = (118, 53)                                  # A's paw, on B's far shoulder
+    rim = "M4,88 C4,76 36,70 70,70 C104,70 136,76 136,88"
+    paws = [(28, 72), (112, 72)]
+    pawcut = "".join(f'<ellipse cx="{x}" cy="{y}" rx="10" ry="7.2" fill="black"/>' for x, y in paws)
+    pawfill = "".join(f'<ellipse cx="{x}" cy="{y}" rx="7.6" ry="5"/>' for x, y in paws)
+    return f'''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 140 100">
+ <defs>
+  <g id="sil">{ears}<path d="{head}"/></g>
+  <mask id="faceA"><rect x="-20" y="-20" width="140" height="140" fill="white"/>{face}</mask>
+  <mask id="faceB"><rect x="-20" y="-20" width="140" height="140" fill="white"/>{face}</mask>
+  <mask id="behind"><rect width="140" height="100" fill="white"/>
+   <g transform="{B}"><use href="#sil" fill="black" stroke="black" stroke-width="5"/></g>
+   <path d="{arm}" fill="none" stroke="black" stroke-width="13" stroke-linecap="round"/>
+   <ellipse cx="23" cy="58" rx="8.5" ry="9.4" fill="black"/>
+   <path d="{rim}" fill="none" stroke="black" stroke-width="12"/>{pawcut}
+  </mask>
+  <mask id="front"><rect width="140" height="100" fill="white"/>
+   <ellipse cx="{pawA[0]}" cy="{pawA[1]}" rx="7.6" ry="8.4" fill="black"/>
+   <path d="{rim}" fill="none" stroke="black" stroke-width="12"/>{pawcut}
+  </mask>
+  <mask id="mound"><rect width="140" height="100" fill="white"/>{pawcut}</mask>
+ </defs>
+ <g mask="url(#behind)"><g transform="{A}"><g mask="url(#faceA)"><use href="#sil"/></g></g></g>
+ <g mask="url(#front)"><g transform="{B}"><g mask="url(#faceB)"><use href="#sil"/></g></g>
+  <path d="{arm}" fill="none" stroke="black" stroke-width="8" stroke-linecap="round"/></g>
+ <ellipse cx="23" cy="58" rx="6" ry="6.8" transform="rotate(20 23 58)"/>
+ <ellipse cx="{pawA[0]}" cy="{pawA[1]}" rx="5.1" ry="5.9" transform="rotate(-20 {pawA[0]} {pawA[1]})"/>
+ <path mask="url(#mound)" d="M8,89 C8,79 36,75 70,75 C104,75 132,79 132,89 C132,92 130,94 127,94 L13,94 C10,94 8,92 8,89 Z"/>
+ {pawfill}
+ <path d="M70,15.5 C70,11.5 64.5,10.5 64.5,14.6 C64.5,18 70,21.5 70,21.5 C70,21.5 75.5,18 75.5,14.6 C75.5,10.5 70,11.5 70,15.5 Z"/>
+</svg>'''
+if __name__ == "__main__" and "hug" in sys.argv:
+    open("fam-hug.svg", "w").write(hug())

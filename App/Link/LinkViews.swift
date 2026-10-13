@@ -17,6 +17,7 @@ struct LinkSheet: View {
     @State private var typed = ""
     @State private var typedError: String?
     @FocusState private var codeFocused: Bool
+    @State private var hugIn = false
 
     private var link: LinkController { model.link }
 
@@ -24,6 +25,10 @@ struct LinkSheet: View {
         VStack(alignment: .leading, spacing: 14) {
             if let req = link.incoming {
                 incoming(req)
+            } else if let name = link.incomingLinked {
+                linked(name, "\(name) can now search this Mac.", again: nil)
+            } else if let out = link.outgoing, out.linked {
+                linked(out.name, "Searches here now include \(out.name).", again: { link.cancelPairing() })
             } else if let out = link.outgoing {
                 outgoing(out)
             } else if let msg = link.incomingMessage {
@@ -89,14 +94,7 @@ struct LinkSheet: View {
 
     // This Mac asked: show the code, or how it went.
     @ViewBuilder private func outgoing(_ out: LinkController.Outgoing) -> some View {
-        if out.linked {
-            Label("Linked with \(out.name)", systemImage: "checkmark.circle.fill")
-                .font(.headline).symbolRenderingMode(.multicolor)
-            buttons {
-                Button("Link Another") { link.cancelPairing() }
-                Button("Done") { dismiss() }.keyboardShortcut(.defaultAction)
-            }
-        } else if let err = out.error {
+        if let err = out.error {
             Text("Couldn\u{2019}t link with \(out.name)").font(.headline)
             Text(err).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             buttons {
@@ -120,6 +118,35 @@ struct LinkSheet: View {
             }
             buttons { Button("Cancel") { link.cancelPairing() }.keyboardShortcut(.cancelAction) }
         }
+    }
+
+    // Linked, on either Mac: the family's mole, twice, hugging - the way the app marks every state
+    // that has a picture (template-rendered, monochrome), centered over a Tahoe alert's button row.
+    @ViewBuilder private func linked(_ name: String, _ detail: String, again: (() -> Void)?) -> some View {
+        VStack(spacing: 6) {
+            Image("MoleHug").renderingMode(.template).resizable().scaledToFit()
+                .frame(height: 68).foregroundStyle(.secondary)
+                .scaleEffect(hugIn ? 1 : 0.8).opacity(hugIn ? 1 : 0)
+                .padding(.bottom, 8)
+                .accessibilityHidden(true)
+            Text("Linked with \(name)").font(.title3.weight(.semibold))
+            Text(detail).foregroundStyle(.secondary).multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 8)
+        .onAppear { withAnimation(.spring(duration: 0.45, bounce: 0.35)) { hugIn = true } }
+        .onDisappear { hugIn = false }
+        HStack(spacing: 10) {
+            if let again {
+                Button(action: again) { Text("Link Another").frame(maxWidth: .infinity) }
+                    .modifier(AlertButton(prominent: false))
+            }
+            Button { dismiss() } label: { Text("Done").frame(maxWidth: .infinity) }
+                .keyboardShortcut(.defaultAction)
+                .modifier(AlertButton(prominent: true))
+        }
+        .controlSize(.large)
+        .padding(.top, 10)
     }
 
     // The other Mac asked; type what it shows.
@@ -401,6 +428,18 @@ enum LinkedMacIcon {
         case .connecting: return "Connecting\u{2026}"
         case .offline: return "Offline"
         case .unlinked: return "Unlinked on \(p.name)"
+        }
+    }
+}
+
+/// A Tahoe alert's button: Liquid Glass on macOS 26, the bordered pair before it.
+private struct AlertButton: ViewModifier {
+    let prominent: Bool
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            if prominent { content.buttonStyle(.glassProminent) } else { content.buttonStyle(.glass) }
+        } else {
+            if prominent { content.buttonStyle(.borderedProminent) } else { content.buttonStyle(.bordered) }
         }
     }
 }

@@ -35,6 +35,8 @@ final class LinkController {
     private(set) var sources: [String: [LinkWire.Source]] = [:]
     var incoming: IncomingPairing?
     var incomingMessage: String?
+    /// This Mac just accepted a link from the Mac named here (its sheet shows the success view).
+    var incomingLinked: String?
     var outgoing: Outgoing?
     var showWindow = false
     /// Grant the Macs this one links with search (and file access) on this Mac too.
@@ -200,7 +202,7 @@ final class LinkController {
             pairTask?.cancel(); pairTask = nil
             outgoing = nil
             incoming?.cancel(); incoming = nil
-            incomingMessage = nil
+            incomingMessage = nil; incomingLinked = nil
         }
     }
 
@@ -243,14 +245,14 @@ final class LinkController {
     private func present(_ req: IncomingPairing) {
         incoming?.cancel()
         incoming = req
-        incomingMessage = nil
+        incomingMessage = nil; incomingLinked = nil
         showWindow = true
         req.onEnd = { [weak self] outcome in
             Task { @MainActor in
                 guard let self, self.incoming?.id == req.id else { return }
                 self.incoming = nil
                 switch outcome {
-                case .linked: self.incomingMessage = "Linked with \(req.name)"
+                case .linked: self.incomingMessage = "Linked with \(req.name)"; self.incomingLinked = req.name
                 case .wrong: self.incomingMessage = "Wrong code"
                 case .cancelled: self.incomingMessage = nil
                 }

@@ -1143,6 +1143,12 @@ welcome mole read darker than the rest.
 All are rendered from the full 100x100 canvas, never cropped, so the mole keeps one size and place
 across screens. `StatusGlyph` draws any `symbol` starting with "Mole" as one of these. Change the
 drawing in `mole_family.py`, not the PNGs.
+`MoleHug` (2026-10-13, `mole_family.py hug`): two of the same mole cheek to cheek, happy eyes, the
+front one's arm across the other, the other's paw on its far shoulder, one mound and a heart - the
+"Linked with ..." sheet on both Macs. A 140x100 canvas at the family's scale (`rsvg-convert -w
+112/224/336`), 68 pt tall, `.secondary` (a success, not an empty state); whatever is in front is
+cut out of what is behind with the family's outline gap. Its buttons are a Tahoe alert's equal-width
+pair, `.glass` / `.glassProminent` on 26, bordered before.
 
 ## History replay and the sidebar (2026-10-04)
 - A HISTORY ROW REPLAYS EXACTLY WHAT WAS SAVED, whatever is set at the moment of the click. A text
