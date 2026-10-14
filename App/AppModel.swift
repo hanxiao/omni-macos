@@ -2803,7 +2803,9 @@ final class AppModel {
         // again when `loadGroupingInputs` brings the grouping keys - and on every live refresh of
         // the same query, and an @Observable property notifies on every write, equal or not. Each
         // unguarded pass re-rendered the results list and every visible row for nothing.
-        var above = rawResults.filter { Self.relevance($0.score) >= VectorStore.relevanceFloor(kind: $0.kind, base: minScore) }
+        var above = rawResults.filter {
+            Self.relevance($0.score) >= VectorStore.relevanceFloor(kind: $0.onTextScale ? FileKind.text.rawValue : $0.kind, base: minScore)
+        }
         if hiddenByFloor != rawResults.count - above.count { hiddenByFloor = rawResults.count - above.count }
         // WEAKER MATCHES FOLD, on the relevance order the store produced and before any sort, one
         // vector space at a time: a linked Mac in another space scores on its own scale, and its

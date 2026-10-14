@@ -331,7 +331,7 @@ enum MCPAdapter {
                 let loc = h.locator.isEmpty ? "" : ", \(h.locator)"
                 // Resolution/duration/size suffix on media hits only (text hits stay clean):
                 // lets the reading agent weigh quality without a follow-up call.
-                let isTextKind = h.kind == FileKind.text.rawValue
+                let isTextKind = h.fileKind == FileKind.text.rawValue
                 var meta = isTextKind ? "" : mediaLabel(width: h.width, height: h.height,
                                                         duration: h.duration, bytes: h.size)
                 // State what the row stands for, in the text block itself.
@@ -347,13 +347,13 @@ enum MCPAdapter {
                 if h.chunkCount > 1 { meta += ", \(h.chunkCount) passages" }
                 meta += ", \(Self.shortDate(h.modified))"
                 if weaker[i] { meta += ", weaker match" }
-                var text = "\(i + 1). \(h.path)  (\(h.kind), \(score)%\(loc)\(meta))"
+                var text = "\(i + 1). \(h.path)  (\(h.fileKind), \(score)%\(loc)\(meta))"
                 if maxSnippet > 0 {
                     let snippet = h.snippet.replacingOccurrences(of: "\n", with: " ")
                     if !snippet.isEmpty { text += "\n   \(String(snippet.prefix(maxSnippet)))" }
                 }
                 content.append(["type": "text", "text": text])
-                let isMedia = h.kind == FileKind.image.rawValue || h.kind == FileKind.scan.rawValue
+                let isMedia = h.fileKind == FileKind.image.rawValue || h.fileKind == FileKind.scan.rawValue
                 if includeImages && isMedia {
                     if inlined >= maxInlineImages {
                         cappedSkips += 1                         // genuinely skipped by the cap
@@ -394,7 +394,7 @@ enum MCPAdapter {
                     for (i, h) in hits.enumerated() {
                         let score = Int((max(0, min(1, h.score)) * 100).rounded())
                         let loc = h.locator.isEmpty ? "" : ", \(h.locator)"
-                        var text = "\(i + 1). \(h.path)  (\(h.kind), \(score)%\(loc), \(Self.shortDate(h.modified)))"
+                        var text = "\(i + 1). \(h.path)  (\(h.fileKind), \(score)%\(loc), \(Self.shortDate(h.modified)))"
                         if maxSnippet > 0 {
                             let snippet = h.snippet.replacingOccurrences(of: "\n", with: " ")
                             if !snippet.isEmpty { text += "\n   \(String(snippet.prefix(maxSnippet)))" }
@@ -403,7 +403,7 @@ enum MCPAdapter {
                     }
                 }
                 linked.append(["mac": a.mac, "note": a.note ?? NSNull(), "canOpen": a.canOpen, "results": hits.map { h -> [String: Any] in
-                    ["path": h.path, "kind": h.kind, "score": Double(max(0, min(1, h.score))), "snippet": h.snippet,
+                    ["path": h.path, "kind": h.fileKind, "score": Double(max(0, min(1, h.score))), "snippet": h.snippet,
                      "locator": h.locator, "modified": h.modified, "size": h.size]
                 }])
             }

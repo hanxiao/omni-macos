@@ -179,7 +179,7 @@ struct PhotoSourceBrowser: View {
     /// The same builder the search results and the folder browser use - a photo offers what a
     /// photo offers, whichever list it was reached from.
     @ViewBuilder private func menu(_ hit: SearchHit) -> some View {
-        FileMenuItems(path: hit.path, kind: hit.kind)
+        FileMenuItems(path: hit.path, kind: hit.fileKind)
     }
 
     private func select(_ path: String) {
@@ -207,7 +207,7 @@ struct PhotoSourceBrowser: View {
 
     @ViewBuilder private func cell(_ col: BrowserColumn, _ hit: SearchHit) -> some View {
         switch col {
-        case .kind: Text(FileKind(rawValue: hit.kind)?.title ?? "--")
+        case .kind: Text(FileKind(rawValue: hit.fileKind)?.title ?? "--")
         case .dateModified: Text(Date(timeIntervalSince1970: hit.modified).formatted(date: .abbreviated, time: .shortened))
         case .size: Text(hit.size > 0 ? ByteSize.file(hit.size) : "--")
         default: Text("--")

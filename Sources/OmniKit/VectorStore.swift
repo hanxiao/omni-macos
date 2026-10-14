@@ -66,6 +66,9 @@ public struct SearchHit: Sendable, Equatable {
     /// Total indexed chunks of this FILE (pages/passages), regardless of filters. 1 = single
     /// embedding; > 1 means the UI can offer a per-chunk breakdown (rankChunks).
     public var chunkCount: Int = 1
+    /// The score was put on the text scale already (a kind named in the query, fuseKindWords):
+    /// whatever compares scores across kinds must not scale it a second time.
+    public var onTextScale = false
 }
 
 /// One matching passage (chunk) within a file.
@@ -4477,6 +4480,8 @@ public final class VectorStore: @unchecked Sendable {
     private lazy var lexical = LexicalIndex(indexURL: dbURL)
     /// Identifiers inside files, for exact lookup (IDIndex). The indexer records; search reads.
     public private(set) lazy var idIndex = IDIndex(indexURL: dbURL)
+    /// Which contents have their screenshot text, soundtrack and audio windows (EnrichLedger).
+    public private(set) lazy var enrichLedger = EnrichLedger(indexURL: dbURL)
 
     /// Distinct indexed paths. Used to build the filename index; runs on the queue like any read.
     /// FROM MEMORY, not SQLite. This is the filename index's input, built right after launch; as a
@@ -6151,7 +6156,7 @@ public final class VectorStore: @unchecked Sendable {
     /// Small 0.832 -> 0.828, spoken answers Nano R@1 0.44 -> 0.22) and is not used.
     public static func weakFold(_ hits: [SearchHit], ratio: Double = 0.6) -> [Bool] {
         guard hits.count > 1 else { return hits.map { _ in false } }
-        func scaled(_ h: SearchHit) -> Double { Double(h.score) / (kindScoreScale[h.kind] ?? 1.0) }
+        func scaled(_ h: SearchHit) -> Double { Double(h.score) / (h.onTextScale ? 1.0 : kindScoreScale[h.kind] ?? 1.0) }
         let top = hits.map(scaled).max() ?? 0
         guard top > 0 else { return hits.map { _ in false } }
         return hits.indices.map { $0 > 0 && scaled(hits[$0]) < top * ratio }
@@ -6315,12 +6320,24 @@ public final class VectorStore: @unchecked Sendable {
         narrow.kinds = want.kind == FileKind.text.rawValue ? [FileKind.text.rawValue, FileKind.scan.rawValue] : [want.kind]
         if let ext = want.ext { narrow.ext = ext }
         let more = searchDense(denseQuery, filter: narrow, topK: 30, markActive: false)
-        var pool = hits
-        let have = Set(hits.map(\.path))
-        pool += more.filter { !have.contains($0.path) }
-        for i in pool.indices where KindWords.matches(want, path: pool[i].path, kind: pool[i].kind) {
-            pool[i].score = Float(Double(pool[i].score) / (Self.kindScoreScale[pool[i].kind] ?? 1.0) + Self.kindWordBonus)
+        func lifted(_ h: SearchHit) -> SearchHit {
+            var h = h
+            h.score = Float(Double(h.score) / (Self.kindScoreScale[h.kind] ?? 1.0) + Self.kindWordBonus)
+            h.onTextScale = true
+            return h
         }
+        // A file is in the list by its BEST chunk, which for a screenshot found by its text is the
+        // text: the kind-filtered pass has the chunk of the kind asked for (the picture), and the
+        // file is lifted by whichever of the two scores higher once lifted.
+        let ofKind = Dictionary(more.map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
+        var pool = hits.map { h -> SearchHit in
+            guard KindWords.matches(want, path: h.path, kind: h.kind) else { return h }
+            let mine = lifted(h)
+            guard let other = ofKind[h.path].map(lifted), other.score > mine.score else { return mine }
+            return other
+        }
+        let have = Set(hits.map(\.path))
+        pool += more.filter { !have.contains($0.path) && KindWords.matches(want, path: $0.path, kind: $0.kind) }.map(lifted)
         pool.sort { $0.score > $1.score }
         return Array(pool.prefix(topK))
     }
@@ -6353,6 +6370,56 @@ public final class VectorStore: @unchecked Sendable {
         let exactSet = Set(top.map(\.path))
         top += hits.filter { !exactSet.contains($0.path) }
         return Array(top.prefix(topK))
+    }
+
+    /// A file's stored chunks with their vectors, as they are now (nil: not indexed). What an
+    /// enrichment keeps of a file - its picture, its frames - instead of embedding them again.
+    public func storedChunks(path: String) -> [IndexedChunk]? {
+        guard let f = storedFiles(paths: [path])[path] else { return nil }
+        return queue.sync { dbOpen() ? chunksForCurrentPathLocked(path, modified: f.modified) : nil }
+    }
+
+    /// Files an enrichment may have work for: audio longer than `audioLongerThan` seconds, every
+    /// video, and images named like screenshots - the system's name in the languages macOS writes
+    /// it in (the decode stage reads the screen-capture attribute itself; this narrows a scan of
+    /// the whole table to the files worth asking). Read in slices of file ids, so no single hold of
+    /// the store's queue grows with the index.
+    public func enrichmentCandidates(audioLongerThan: Double) -> [(path: String, kind: String, modified: Double, size: Int, duration: Double)] {
+        let maxID: Int64 = queue.sync {
+            guard dbOpen() else { return 0 }
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, "SELECT max(id) FROM files;", -1, &stmt, nil) == SQLITE_OK, sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
+            return sqlite3_column_int64(stmt, 0)
+        }
+        let names = ["Screenshot%", "Screen Shot%", "截屏%", "截圖%", "スクリーンショット%", "스크린샷%", "Bildschirmfoto%",
+                     "Capture d%", "Captura de pantalla%", "Снимок экрана%", "Schermata%", "Skjermbilde%", "Schermafbeelding%"]
+        let nameSQL = names.map { "f.name LIKE '\($0)'" }.joined(separator: " OR ")
+        var out: [(path: String, kind: String, modified: Double, size: Int, duration: Double)] = []
+        var lo: Int64 = 0
+        while lo <= maxID {
+            let hi = lo + 20_000
+            queue.sync {
+                guard dbOpen() else { return }
+                var stmt: OpaquePointer?
+                defer { sqlite3_finalize(stmt) }
+                guard sqlite3_prepare_v2(db, """
+                    SELECT \(StoreSchema.pathExpr), f.kind, f.modified, f.size, f.duration
+                      FROM files f JOIN dirs d ON d.id = f.dir_id
+                     WHERE f.id >= ? AND f.id < ?
+                       AND ((f.kind = 4 AND f.duration > ?) OR f.kind = 3 OR (f.kind = 1 AND (\(nameSQL))));
+                    """, -1, &stmt, nil) == SQLITE_OK else { return }
+                sqlite3_bind_int64(stmt, 1, lo); sqlite3_bind_int64(stmt, 2, hi)
+                sqlite3_bind_double(stmt, 3, audioLongerThan)
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    guard sqlite3_column_type(stmt, 2) != SQLITE_NULL, let t = sqlite3_column_text(stmt, 0) else { continue }
+                    out.append((String(cString: t), kindNameLocked(Int(sqlite3_column_int(stmt, 1))),
+                                sqlite3_column_double(stmt, 2), Int(sqlite3_column_int64(stmt, 3)), sqlite3_column_double(stmt, 4)))
+                }
+            }
+            lo = hi
+        }
+        return out
     }
 
     /// Which of these content digests (hex, StoreSchema.contentDigestHex) a file in the index

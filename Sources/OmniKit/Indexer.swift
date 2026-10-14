@@ -184,6 +184,14 @@ final class DecodedItem: @unchecked Sendable {
     /// CWR crop patches for HQ tag refinement (retag pass, single-frame images only): the 5
     /// study crops, preprocessed on the decode stage. Empty = tag at base quality.
     var hqCrops: [OmniVisionPreprocess.RawPatches] = []
+    /// A screenshot's text (ScreenText), chunked: indexed beside the picture (extraChunks).
+    var screenPieces: [TextPiece] = []
+    /// A video's soundtrack, open and unread: embedded a window at a time beside the frames.
+    var soundtrack: OmniAudioPreprocess.AudioSegmentReader?
+    /// Indexed with its enrichment (screenshot text, soundtrack, audio windows): the ledger
+    /// records it once stored, unless an extra failed.
+    var enrichable = false
+    var enrichFailed = false
     /// A file this item's decode downloaded, to be handed back to the cloud (IndexSettings
     /// .evictDownloaded). ON RELEASE, because that is the one point every payload agrees on: a long
     /// text file or a scanned PDF is read again by the embed stage, long after decode returned, and
@@ -1033,6 +1041,7 @@ public final class Indexer: @unchecked Sendable {
         // what was taken plus what is still queued - or by the count walk, for a root too big for
         // the queue. Time is measured per kind phase and priced back per kind.
         costs.begin(regime: IndexCosts.regime(dim: embedder.dim, settings: settings))
+        store.enrichLedger.prepare(settings)
         // Per file on the consumer, so no lock: the long files part-way at the pass's start (a file
         // that starts one in this pass was work already). Usually empty.
         let streamingAtStart = streams.paths
@@ -1640,7 +1649,7 @@ public final class Indexer: @unchecked Sendable {
                 // scatter back per file; per-image values are identical (the tower is block-
                 // diagonal per image regardless of grouping - the imgbatchparity gate proves it).
                 var stage: [(file: CrawledFile, kind: String, raws: [OmniVisionPreprocess.RawPatches],
-                             meta: (width: Int, height: Int, duration: Double))] = []
+                             meta: (width: Int, height: Int, duration: Double), item: DecodedItem)] = []
                 var stagedRaws = 0
                 func flushImages() {
                     guard !stage.isEmpty else { return }
@@ -1676,7 +1685,7 @@ public final class Indexer: @unchecked Sendable {
                                                     height: b.raws.count == 1 ? b.meta.height : 0,
                                                     locator: b.raws.count > 1 ? "Page \(i + 1)" : ""))
                         }
-                        storeChunks(b.file.path, out)
+                        storeChunks(b.file.path, self.withExtras(b.item, out, settings: settings))
                         off += b.raws.count
                     }
                     onProgress(p)
@@ -1692,7 +1701,7 @@ public final class Indexer: @unchecked Sendable {
                         // Anything that did not decode to patches keeps the per-file path.
                         storeChunks(path, self.embed(item)); return
                     }
-                    stage.append((item.file, item.kind, raws, item.meta))
+                    stage.append((item.file, item.kind, raws, item.meta, item))
                     stagedRaws += raws.count
                     if stagedRaws >= 16 { flushImages() }
                 }
@@ -1704,7 +1713,7 @@ public final class Indexer: @unchecked Sendable {
                     else {
                         noteWork(item)
                         if case .textStream = item.payload { handleStream(item) }
-                        else { storeChunks(item.file.path, self.embed(item)) }
+                        else { storeChunks(item.file.path, self.withExtras(item, self.embed(item), settings: settings)) }
                     }
                     tick(item.file.path)
                 }
@@ -1828,6 +1837,10 @@ public final class Indexer: @unchecked Sendable {
                 let read = backfillIdentifiers(settings: settings) { path in p.currentPath = path; onProgress(p) }
                 if !isCancelled { ids.backfilled = true }
                 if omniPerfEnabled { omniPerfLog("identifiers backfilled for \(read) file(s)") }
+            }
+            if !isCancelled, !store.enrichLedger.backfilled {
+                let n = enrichMedia(settings: settings) { path in p.currentPath = path; onProgress(p) }
+                if omniPerfEnabled { omniPerfLog("enrichment: \(n) file(s)") }
             }
             // Against every file the pass started with, not the text ones: counting those walks the
             // whole table, on every pass, to decide something that rarely happens.
@@ -1989,6 +2002,9 @@ public final class Indexer: @unchecked Sendable {
 
     enum StreamStep { case more, done, failed }
 
+    /// A window after the first needs this many mel frames (one second) to be embedded.
+    static let minTailMelFrames = 100
+
     /// Identifiers for text files the index holds whose content IDIndex has not read: an index
     /// built before it existed, or a sidecar that was lost. Text only - no model, no embedding -
     /// chunked exactly as indexing chunks it, so the chunk numbers point at the stored chunks. A
@@ -2063,6 +2079,152 @@ public final class Indexer: @unchecked Sendable {
     func recordIdentifiers(_ pieces: [TextPiece], contentKey: String?, firstChunk: Int = 0, replace: Bool = true) {
         guard let key = contentKey else { return }
         recordIdentifiers(pieces, digest: StoreSchema.contentDigestHex(key), firstChunk: firstChunk, replace: replace)
+    }
+
+    /// A screenshot's text as chunks, its identifiers recorded. [] when it has none. The text
+    /// chunks are stored after the picture's one chunk, so their identifiers point from chunk 1.
+    func screenPieces(_ image: CGImage, contentKey: String?, settings: IndexSettings) -> [TextPiece] {
+        let text = ScreenText.recognize(image)
+        guard !text.isEmpty else { return [] }
+        let pieces = chunk(text, settings: settings, origin: .opaque)
+        recordIdentifiers(pieces, contentKey: contentKey, firstChunk: 1)
+        return pieces
+    }
+
+    /// The chunks a file has beside its picture or frames, numbered from `first`: a screenshot's
+    /// text (kind text, locator "Text", on the text tower) and a video's soundtrack (kind audio, one
+    /// a minute, time locators). Their kinds are what they are, so every score scale applies to them
+    /// as to any text or audio - and an enrichment can keep a file's picture or frames (kind image or
+    /// video) and replace the rest, which makes it safe to redo. nil: cancelled, or an embed failed.
+    func extraChunks(file f: CrawledFile, screen: [TextPiece], soundtrack: OmniAudioPreprocess.AudioSegmentReader?,
+                     duration: Double, first: Int, settings: IndexSettings) -> [IndexedChunk]? {
+        var out: [IndexedChunk] = []
+        if !screen.isEmpty {
+            let keyed = screen.map { (text: $0.text, key: chunkKey($0.text, settings: settings)) }
+            var groups: [[(text: String, key: String)]] = []
+            var i = 0
+            while i < keyed.count { groups.append(Array(keyed[i ..< min(i + textBatchSize, keyed.count)])); i += textBatchSize }
+            let vecs = embedGroupsReusing(groups, width: textBatchSize).flatMap { $0 }
+            guard !isCancelled, vecs.count == screen.count, vecs.allSatisfy({ !$0.isEmpty && Self.isFinite($0) }) else { return nil }
+            for (j, piece) in screen.enumerated() {
+                out.append(IndexedChunk(path: f.path, modified: f.modified, size: f.size, kind: FileKind.text.rawValue,
+                                        chunkIndex: first + out.count, snippet: snippet(piece.text), embedding: vecs[j],
+                                        locator: "Text", chunkKey: keyed[j].key))
+            }
+        }
+        if let reader = soundtrack {
+            var k = 0
+            while let seg = reader.nextMelSegment() {
+                if isCancelled { return nil }
+                if seg.frames >= (k == 0 ? 1 : Self.minTailMelFrames) {   // a tail under a second is skipped, as for audio files
+                    guard let v = embedder.embedAudioMel(seg.mel, frames: seg.frames), Self.isFinite(v) else { return nil }
+                    out.append(IndexedChunk(path: f.path, modified: f.modified, size: f.size, kind: FileKind.audio.rawValue,
+                                            chunkIndex: first + out.count, snippet: "", embedding: v, duration: duration,
+                                            locator: Self.timeLocator(Double(k) * OmniAudioPreprocess.segmentSeconds)))
+                }
+                k += 1
+            }
+        }
+        return out
+    }
+
+    /// A file's own chunks and its extra ones. A failed extra keeps the file indexed without it
+    /// (the enrichment pass retries it: the ledger is written only on success); a cancel stores
+    /// nothing, as every embed path does.
+    func withExtras(_ item: DecodedItem, _ base: [IndexedChunk], settings: IndexSettings) -> [IndexedChunk] {
+        guard !base.isEmpty, !item.screenPieces.isEmpty || item.soundtrack != nil else { return base }
+        guard let more = extraChunks(file: item.file, screen: item.screenPieces, soundtrack: item.soundtrack,
+                                     duration: item.meta.duration, first: base.count, settings: settings) else {
+            item.enrichFailed = true
+            return isCancelled ? [] : base
+        }
+        return base + more
+    }
+
+    /// THE ENRICHMENT of an index built before screenshot text, soundtracks and one-minute audio
+    /// windows: the files that lack them get them, once. A screenshot keeps its picture chunk and a
+    /// video its frames - read back from the store, not embedded again - and gains the rest; audio
+    /// is embedded again in the new windows. Each file is one transaction, so a kill leaves it as it
+    /// was or as it will be, and redoing it is the same work with the same result: the chunks kept
+    /// are the picture's or the frames' (kind image, kind video), never the added ones (kind text,
+    /// kind audio). The ledger records the file after its write; until every file is, the phase runs
+    /// at the end of each complete pass. Returns how many files were enriched.
+    func enrichMedia(settings: IndexSettings, onFile: (String) -> Void) -> Int {
+        let ledger = store.enrichLedger
+        let candidates = store.enrichmentCandidates(audioLongerThan: OmniAudioPreprocess.segmentSeconds)
+            .filter { !PhotoLibrary.isPhotoPath($0.path) }
+        if omniPerfEnabled { omniPerfLog("enrichment-start candidates=\(candidates.count)") }
+        var enriched = 0
+        for start in stride(from: 0, to: candidates.count, by: 64) {
+            let batch = Array(candidates[start ..< min(candidates.count, start + 64)])
+            let digests = store.contentDigests(paths: batch.map(\.path))
+            let done = ledger.done(digests.map { EnrichLedger.key(digest: $0.value, path: $0.key) })
+            for c in batch {
+                if isCancelled { return enriched }
+                guard let d = digests[c.path], !done.contains(EnrichLedger.key(digest: d, path: c.path)) else { continue }
+                onFile(c.path)
+                if enrichOne(c, digest: d, settings: settings) {
+                    ledger.record([EnrichLedger.key(digest: d, path: c.path)])
+                    enriched += 1
+                }
+            }
+        }
+        if !isCancelled { ledger.backfilled = true }
+        return enriched
+    }
+
+    /// One file's enrichment (see enrichMedia). True: stored, or nothing to add (a silent video,
+    /// a screenshot with no text); false: not now (changed on disk, cancelled, an embed failed).
+    func enrichOne(_ c: (path: String, kind: String, modified: Double, size: Int, duration: Double), digest: String,
+                   settings: IndexSettings) -> Bool {
+        let file = CrawledFile(path: c.path, modified: c.modified, size: c.size)
+        var st = stat()
+        guard stat(c.path, &st) == 0, Int(st.st_size) == c.size,
+              abs(Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9 - c.modified) < 0.001 else { return false }
+        func write(_ chunks: [IndexedChunk]) -> Bool {
+            guard !chunks.isEmpty, !isCancelled else { return false }
+            do { try Self.writeWaitingOutLocks { try store.replaceMany([(c.path, chunks)]) }; return true }
+            catch { Self.log.error("enrich store failed \(c.path, privacy: .public)"); return false }
+        }
+        /// The file's own chunks: those of its kind, in order, as stored.
+        func own(_ kind: FileKind) -> [IndexedChunk]? {
+            guard let stored = store.storedChunks(path: c.path) else { return nil }
+            let mine = stored.filter { $0.kind == kind.rawValue }.sorted { $0.chunkIndex < $1.chunkIndex }
+            guard !mine.isEmpty, mine.enumerated().allSatisfy({ $0.offset == $0.element.chunkIndex }) else { return nil }
+            return mine
+        }
+        switch c.kind {
+        case FileKind.audio.rawValue:
+            // Whole again, in the new windows. Its content key is the new one (the window length is
+            // part of it), so content dedup can only answer from a file already done.
+            let item = decode(file, settings: settings)
+            let chunks: [IndexedChunk]
+            if case .duplicate(let rows) = item.payload { chunks = rows } else { chunks = embed(item) }
+            guard write(chunks) else { return false }
+            if let ck = item.contentKey { store.recordContentKeys([(c.path, ck, c.modified, c.size)]) }
+            return true
+        case FileKind.image.rawValue:
+            guard settings.screenText, Self.isScreenshot(c.path) else { return true }   // not a screenshot: nothing to add
+            guard let base = own(.image), base.count == 1,
+                  case .images(let images) = ContentSources.source(for: file).content(file, kind: .image, settings: settings),
+                  let image = images.first else { return false }
+            let text = ScreenText.recognize(image)
+            guard !text.isEmpty else { return true }
+            let pieces = chunk(text, settings: settings, origin: .opaque)
+            recordIdentifiers(pieces, digest: digest, firstChunk: base.count)
+            guard let more = extraChunks(file: file, screen: pieces, soundtrack: nil, duration: 0, first: base.count, settings: settings)
+            else { return false }
+            return write(base + more)
+        case FileKind.video.rawValue:
+            guard settings.soundtrack else { return true }
+            guard let reader = OmniAudioPreprocess.AudioSegmentReader(url: file.url) else { return true }   // silent
+            guard let base = own(.video),
+                  let more = extraChunks(file: file, screen: [], soundtrack: reader, duration: c.duration, first: base.count, settings: settings)
+            else { return false }
+            return more.isEmpty ? true : write(base + more)
+        default:
+            return true
+        }
     }
 
     /// The same, for a content already named by its digest (the backfill reads digests).
@@ -2536,7 +2698,7 @@ public final class Indexer: @unchecked Sendable {
         // RawPatches each, so per-file embedding fed the batch-N tower one image at a time.
         var iStage: [(file: CrawledFile, kind: String, raws: [OmniVisionPreprocess.RawPatches],
                       meta: (width: Int, height: Int, duration: Double),
-                      hqCrops: [OmniVisionPreprocess.RawPatches])] = []
+                      hqCrops: [OmniVisionPreprocess.RawPatches], item: DecodedItem)] = []
         var iStagedRaws = 0
         func flushImagesU() {
             guard !iStage.isEmpty else { return }
@@ -2571,7 +2733,7 @@ public final class Indexer: @unchecked Sendable {
                                             height: b.raws.count == 1 ? b.meta.height : 0,
                                             locator: b.raws.count > 1 ? "Page \(i + 1)" : ""))
                 }
-                acceptCompleted(b.file.path, out)
+                acceptCompleted(b.file.path, self.withExtras(b.item, out, settings: settings))
                 off += b.raws.count
             }
         }
@@ -2619,7 +2781,7 @@ public final class Indexer: @unchecked Sendable {
                     if tBuf.count >= tWindow { flushTextU(drainAll: false) }
                 }
             case .imagePatches(let raws) where !raws.isEmpty:
-                iStage.append((item.file, item.kind, raws, item.meta, item.hqCrops))
+                iStage.append((item.file, item.kind, raws, item.meta, item.hqCrops, item))
                 // HQ crops are full RawPatches (~fp32 megabytes each): count them toward the
                 // flush threshold so a retag batch holds ~3 files' crops at once, not 16 - the
                 // staging byte ceiling stays what it was for plain images on low-RAM machines.
@@ -2631,7 +2793,7 @@ public final class Indexer: @unchecked Sendable {
                 // cursor for it is done with: a pass must not resume it and append again.
                 if self.storeStreamedText(item, settings: settings) { self.streams.finish(item.file.path) }
             default:
-                acceptCompleted(path, self.embed(item))
+                acceptCompleted(path, self.withExtras(item, self.embed(item), settings: settings))
             }
         }
         flushTextU(drainAll: true)
@@ -2736,6 +2898,7 @@ public final class Indexer: @unchecked Sendable {
         // landed under a different mtime) fails duplicateChunks' lockstep check, so over-recording
         // can never leak wrong vectors - it is just an unused row until the file re-embeds.
         var keyBuf: [(path: String, key: String, modified: Double, size: Int)] = []
+        var ledgerBuf: [String] = []
         for i in 0 ..< files.count {
             cond.lock()
             // WAIT WITH A LIMIT. Unbounded, one read that never returned held the whole pass - and
@@ -2783,14 +2946,21 @@ public final class Indexer: @unchecked Sendable {
             // is recorded when its last window is stored (recordFinishedKey).
             if let ck = item.contentKey, !streams.inProgress(item.file.path) {
                 keyBuf.append((item.file.path, ck, item.file.modified, item.file.size))
+                if item.enrichable, !item.enrichFailed, !item.unchanged {
+                    ledgerBuf.append(EnrichLedger.key(digest: StoreSchema.contentDigestHex(ck), path: item.file.path))
+                }
                 // Flush eagerly (small rows, one txn): keys must be VISIBLE for later files in the
                 // same pass to dedup against - a media phase is often well under a few hundred
                 // items, so a lazy flush would publish keys only after every duplicate already
                 // decoded, forfeiting all within-pass hits.
-                if keyBuf.count >= 64 { store.recordContentKeys(keyBuf); keyBuf.removeAll(keepingCapacity: true) }
+                if keyBuf.count >= 64 {
+                    store.recordContentKeys(keyBuf); keyBuf.removeAll(keepingCapacity: true)
+                    store.enrichLedger.record(ledgerBuf); ledgerBuf.removeAll(keepingCapacity: true)
+                }
             }
         }
         store.recordContentKeys(keyBuf)
+        store.enrichLedger.record(ledgerBuf)
     }
 
     /// Cheap (extension-only, no IO) upper estimate of a file's decoded resident bytes, for the
@@ -2885,11 +3055,20 @@ public final class Indexer: @unchecked Sendable {
         }
         if category == .video {
             guard let out = source.video(file, probe: probe, settings: settings) else { return DecodedItem(file: file) }
-            return DecodedItem(file: file, kind: kind, payload: out.payload, meta: out.meta, contentKey: contentKey)
+            let item = DecodedItem(file: file, kind: kind, payload: out.payload, meta: out.meta, contentKey: contentKey)
+            // The soundtrack is opened here and read by the embed stage, a window at a time. A file
+            // with no audio track opens nothing. Not for a Photos video: no file to open.
+            if settings.soundtrack, !file.isPhoto {
+                item.soundtrack = OmniAudioPreprocess.AudioSegmentReader(url: file.url)
+                item.enrichable = true
+            }
+            return item
         }
         if category == .audio {
             guard let out = source.audio(file, probe: probe, settings: settings) else { return DecodedItem(file: file) }
-            return DecodedItem(file: file, kind: kind, payload: out.payload, meta: out.meta, contentKey: contentKey)
+            let item = DecodedItem(file: file, kind: kind, payload: out.payload, meta: out.meta, contentKey: contentKey)
+            item.enrichable = !file.isPhoto   // in this length of window
+            return item
         }
 
         switch source.content(file, kind: category, settings: settings) {
@@ -2924,6 +3103,11 @@ public final class Indexer: @unchecked Sendable {
             // concurrent decode stage, so the serialized GPU thread only does the tower.
             let raws = images.map { OmniVisionPreprocess.preprocessRaw($0) }
             let item = DecodedItem(file: file, kind: kind, payload: .imagePatches(raws), meta: meta, contentKey: contentKey)
+            // A screenshot's text, read here on the concurrent decode stage (ScreenText).
+            if settings.screenText, images.count == 1, let img = images.first, Self.isScreenshot(file.path) {
+                item.screenPieces = screenPieces(img, contentKey: contentKey, settings: settings)
+                item.enrichable = true
+            }
             // HQ tag refinement (retag pass only): cut the study's 5 CWR crops here on the
             // concurrent decode stage, so the GPU stage just scores them. Single-frame images
             // only - multi-page images get per-page tags already.
@@ -2963,9 +3147,12 @@ public final class Indexer: @unchecked Sendable {
             let cut = Indexer.contentDefinedChunking ? Indexer.cutterParams(settings).fingerprint
                                                      : "c\(settings.maxCharsPerChunk)|o\(chunkOverlap)"
             fp = "\(cut)|d\(settings.maxImageDimension)"   // d: scanned-PDF render size
-        case .image: fp = "d\(settings.maxImageDimension)"
+        // t1: a screenshot is indexed with its text.
+        case .image: fp = "d\(settings.maxImageDimension)" + (settings.screenText && isScreenshot(file.path) ? "|t1" : "")
         // v2: uniform frame sampling + 240 s segmentation (pre-upgrade rows must not alias).
+        // a: the soundtrack is indexed with the frames, in windows of that many mel frames.
         case .video: fp = "v2|d\(settings.maxImageDimension)|f\(settings.maxVideoFrames)|s\(Int(mediaSegmentSeconds))"
+            + (settings.soundtrack ? "|a\(OmniAudioPreprocess.segmentMelFrames)" : "")
         case .audio: fp = "s\(OmniAudioPreprocess.segmentMelFrames)"   // segmenting changes long-audio chunking
         }
         // SIZE is part of the identity, and the version is 2 because of it. The digest covers only
@@ -3189,7 +3376,9 @@ public final class Indexer: @unchecked Sendable {
                 sync.enter()
                 prefetchQ.async { box.next = reader.nextMelSegment(); sync.leave() }
             }
-            if cur.frames > 0 {   // frames == 0: tail too short for the tower - skip the segment
+            // A tail under a second (the encoder's padding past the end, measured on AAC files) is
+            // skipped: it holds nothing to find, and was a chunk of its own at "1:00" or "2:00".
+            if cur.frames >= (seg == 0 ? 1 : Self.minTailMelFrames) {
                 guard let vec = embedder.embedAudioMel(cur.mel, frames: cur.frames) else {
                     sync.wait()
                     return []   // audio path unavailable: nothing to index

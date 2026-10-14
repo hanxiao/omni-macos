@@ -24,3 +24,15 @@ extension ChunkHit {
         ChunkHit(chunkIndex: chunkIndex, score: score, snippet: snippet, locator: locator)
     }
 }
+
+extension SearchHit {
+    /// What the FILE is, for showing it: a screenshot found by its text, or a video found by its
+    /// soundtrack, is still a picture or a video. `kind` stays the kind of the chunk that matched,
+    /// which is what every score scale and filter is about. Only those two cases differ.
+    public var fileKind: String {
+        guard kind == FileKind.text.rawValue || kind == FileKind.audio.rawValue,
+              let k = FileExtractor.kind(forExtension: (path as NSString).pathExtension.lowercased()),
+              k == .image || k == .video else { return kind }
+        return k.rawValue
+    }
+}

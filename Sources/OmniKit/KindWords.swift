@@ -44,9 +44,11 @@ public enum KindWords {
     }
 
     /// A hit is what the request asks for.
+    /// By the file, not by the chunk that matched: a screenshot found by its text is a picture.
     public static func matches(_ r: Request, path: String, kind: String) -> Bool {
         if let ext = r.ext { return (path as NSString).pathExtension.lowercased() == ext }
-        guard kind == r.kind || (r.kind == FileKind.text.rawValue && kind == FileKind.scan.rawValue) else { return false }
+        let fileKind = SearchHit(path: path, score: 0, snippet: "", kind: kind, chunkIndex: 0, modified: 0).fileKind
+        guard fileKind == r.kind || (r.kind == FileKind.text.rawValue && fileKind == FileKind.scan.rawValue) else { return false }
         return !r.screenshot || Indexer.isScreenshot(path)
     }
 }

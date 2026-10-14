@@ -4120,8 +4120,28 @@ if args.count >= 2 && args[1] == "sidecarcheck" {
     exit(pass ? 0 : 1)
 }
 
+// Is an audio embedding the same twice? omni-verify audiodet <modelDir> <audio-or-video file>
+// In one engine, batched or not, and from a second engine in the same process. Found 2026-10-14:
+// Nano's audio is NOT the same from a second engine (cosine 0.97-0.997 a window; Small exact,
+// Nano's text exact, the audio tower's output bit-identical) - the difference is in the backbone
+// pass over a long injected sequence. Not yet explained; this is the probe for it.
+if args.count >= 4 && args[1] == "audiodet" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    guard let reader = OmniAudioPreprocess.AudioSegmentReader(url: URL(fileURLWithPath: args[3])), let seg = reader.nextMelSegment() else { print("no audio"); exit(1) }
+    let melSum = seg.mel.reduce(0.0) { $0 + Double($1) }
+    let a = engine.embedAudioMel(seg.mel, frames: seg.frames)!, b = engine.embedAudioMel(seg.mel, frames: seg.frames)!
+    let batch = engine.embedAudioMelBatch([seg.mel, seg.mel], frames: [seg.frames, seg.frames])!
+    func cos(_ x: [Float], _ y: [Float]) -> Float { zip(x, y).reduce(0) { $0 + $1.0 * $1.1 } / (x.reduce(0) { $0 + $1 * $1 }.squareRoot() * y.reduce(0) { $0 + $1 * $1 }.squareRoot()) }
+    let engine2 = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let c = engine2.embedAudioMel(seg.mel, frames: seg.frames)!
+    let t1 = engine.embedText("a test sentence about audio", as: .query), t2 = engine2.embedText("a test sentence about audio", as: .query)
+    print(String(format: "audiodet frames=%d melsum=%.6f same-process cos=%.6f batch-vs-single cos=%.6f second-engine audio cos=%.6f text cos=%.6f first=%@", seg.frames, melSum,
+                 cos(a, b), cos(a, batch[0]), cos(a, c), cos(t1, t2), a.prefix(4).map { String(format: "%.5f", $0) }.joined(separator: ",")))
+    exit(0)
+}
+
 // The labeled retrieval eval (Eval.swift): evalbed generates the testbed, eval measures search on it.
-if args.count >= 2 && (args[1] == "evalbed" || args[1] == "eval") {
+if args.count >= 2 && ["evalbed", "eval", "killbed", "statedigest", "statecompare"].contains(args[1]) {
     await EvalCommand.run(args)
     exit(0)
 }

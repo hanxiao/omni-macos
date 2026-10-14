@@ -59,6 +59,11 @@ public struct IndexSettings: Sendable, Equatable {
     /// Off: they keep the 2 MB cut. A 946 MB agent log or a model's weights as JSON is not text
     /// anyone searches by meaning, and read to the end it doubled a real index (index.md).
     public var readLongDataFiles: Bool = false
+    /// Read the text on screenshots (ScreenText) and index it with the picture: searchable by what
+    /// it says, and by the codes in it (IDIndex).
+    public var screenText: Bool = true
+    /// Index a video's soundtrack beside its frames: one audio embedding a minute, opened at its moment.
+    public var soundtrack: Bool = true
     /// Skip new files in folders that look like training data (DatasetRule); files already indexed stay.
     public var skipDatasets: Bool = true
     /// Folders the user let in from that rule: never datasets, nor anything under them.

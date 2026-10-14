@@ -170,7 +170,7 @@ struct ResultsList<Footer: View>: View {
                             if expanded.contains(hit.path), hit.chunkCount > 1 {
                                 PassagesView(passages: passagesCache[hit.path],
                                              fileName: (hit.path as NSString).lastPathComponent,
-                                             path: hit.path, kind: hit.kind)
+                                             path: hit.path, kind: hit.fileKind)
                                     .padding(10)
                                     // A flat elevated fill, not vibrancy: blur belongs on sidebars and
                                     // popovers; this excerpt card sits inside the opaque scrolling
@@ -341,7 +341,7 @@ struct ResultsList<Footer: View>: View {
                 ScrollView {
                     PassagesView(passages: passagesCache[hit.path],
                                  fileName: (hit.path as NSString).lastPathComponent,
-                                 path: hit.path, kind: hit.kind)
+                                 path: hit.path, kind: hit.fileKind)
                         .padding(12)
                 }
                 .frame(width: 380)
@@ -494,7 +494,7 @@ struct ResultsList<Footer: View>: View {
             // The shared per-file menu (App/FileMenu.swift): the folder and Photos browsers show
             // exactly these items, in this order. Only what is specific to a ranked result list
             // stays here - the stack block above, and the passages slot below.
-            FileMenuItems(path: path, kind: hit.kind, showsSelectAll: true,
+            FileMenuItems(path: path, kind: hit.fileKind, showsSelectAll: true,
                           trashAll: stack.map { g in ("Move All \(g.count) Copies to Trash", { model.moveToTrash(g.paths) }) }) {
                 // Per-chunk breakdown (pages of a PDF, passages of a long doc) - only for files
                 // that actually have several chunks. The list expands inline; the grid opens a
@@ -649,8 +649,8 @@ struct ResultRow: View {
                 Text(showSnippet ? hit.snippet : " ").font(.body).foregroundStyle(.secondary).lineLimit(1)
                     .accessibilityHidden(!showSnippet)
                 HStack(spacing: 5) {
-                    KindGlyph(kind: hit.kind)
-                    MediaInfoLabel(path: hit.path, kind: hit.kind, width: hit.width, height: hit.height, duration: hit.duration, separator: true)
+                    KindGlyph(kind: hit.fileKind)
+                    MediaInfoLabel(path: hit.path, kind: hit.fileKind, width: hit.width, height: hit.height, duration: hit.duration, separator: true)
                     if !hit.locator.isEmpty {
                         // Where in the file the best-matching chunk sits ("Page 3", "Line 1240").
                         Text(hit.locator)
@@ -903,7 +903,7 @@ struct ResultGridItem: View {
             }
             ZStack {
                 Text(verbatim: "0").font(.caption2).hidden()
-                MediaInfoLabel(path: hit.path, kind: hit.kind, width: hit.width, height: hit.height, duration: hit.duration, separator: false)
+                MediaInfoLabel(path: hit.path, kind: hit.fileKind, width: hit.width, height: hit.height, duration: hit.duration, separator: false)
                     .font(.caption2).foregroundStyle(.tertiary)
             }
         }

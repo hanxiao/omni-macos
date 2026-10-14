@@ -138,6 +138,13 @@
       {"start": 240, "src": "/Library/User Pictures/Animals/Zebra.heic"},
       {"start": 480, "src": "/Library/User Pictures/Animals/Parrot.heic"}
     ]},
+    {"path": "Movies/Team update.mp4", "duration": 540, "scenes": [
+      {"start": 0, "src": "/Library/User Pictures/Nature/Leaf.heic"}
+    ], "soundtrack": {"path": "", "duration": 540, "voice": "Daniel", "segments": [
+      {"start": 0, "text": "Welcome to the team update. First, the budget. We spent eighty percent of our cloud budget in the first quarter alone, so the nightly batch jobs move to cheaper reserved machines starting next month."},
+      {"start": 240, "text": "Next, hiring. We are opening two positions for mobile engineers in Berlin. The job posts go live on Monday, and interviews start in three weeks."},
+      {"start": 480, "text": "Finally, the office. Our lease runs out in June, and we will move to a smaller office next to the central train station."}
+    ]}},
     {"path": "Movies/Party clip.mp4", "duration": 15, "scenes": [
       {"start": 0, "src": "/Library/User Pictures/Fun/Fortune Cookie.heic"},
       {"start": 5, "src": "/Library/User Pictures/Fun/Medal.heic"},
@@ -259,6 +266,9 @@
     {"q": "zebra in a video", "tag": "video-moment", "expect": ["Movies/Zoo trip.mp4@t240"]},
     {"q": "parrot in a video", "tag": "video-moment", "expect": ["Movies/Zoo trip.mp4@t480"]},
     {"q": "fortune cookie", "tag": "video", "expect": ["Movies/Party clip.mp4", "Pictures/2026/IMG_1202.heic"]},
+    {"q": "we spent most of the cloud budget in the first quarter", "tag": "soundtrack", "expect": ["Movies/Team update.mp4@t0"]},
+    {"q": "two positions for mobile engineers in Berlin", "tag": "soundtrack", "expect": ["Movies/Team update.mp4@t240"]},
+    {"q": "moving to a smaller office next to the train station", "tag": "soundtrack", "expect": ["Movies/Team update.mp4@t480"]},
     {"q": "the boat engine broke down and we fixed it", "tag": "long", "expect": ["Documents/Books/Sailing log 2025.pdf@p41"]},
     {"q": "dolphins swimming alongside the boat at sunset", "tag": "long", "expect": ["Documents/Books/Sailing log 2025.pdf@p66"]},
     {"q": "sailing blind in thick fog", "tag": "long", "expect": ["Documents/Books/Sailing log 2025.pdf@p100"]},

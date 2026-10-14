@@ -70,16 +70,18 @@ public enum OmniAudioPreprocess {
         return sinM
     }()
 
-    /// Mel frames per long-audio segment: 24000 frames = 240 s. Matches the indexer's audio
-    /// frame budget, so one segment fills exactly one batched-forward budget; the backbone cost
-    /// of a segment is the same as the longest clip the budget already allowed.
-    public static let segmentMelFrames = 24000
-    /// Seconds of audio per segment (240.0).
+    /// Mel frames per audio window: 6000 frames = 60 s. One embedding a minute, so a hit opens
+    /// within a minute of what was said. It was 240 s, one embedding for four minutes, and the
+    /// labeled eval's spoken moments (a lecture whose topics change at 0, 4 and 8 minutes) were
+    /// answered at the right moment by Nano 0 of 3 times at 240 s, 1 at 120 s, 2 at 60 s and 1 at
+    /// 30 s; Small, 3 of 3 at every length. Indexing time did not move (33-34 s for the testbed).
+    public static let segmentMelFrames = 6000
+    /// Seconds of audio per segment (60.0).
     public static var segmentSeconds: Double { Double(segmentMelFrames) * Double(hop) / sampleRate }
 
     /// Decode + log-mel as a plain Float buffer (mel-major `[128*frames]`) + frame count.
     /// CPU-only and Sendable, so it can run in the concurrent decode stage of indexing.
-    /// Capped at ONE segment (240 s): a whole-file decode of a multi-hour file overflows
+    /// Capped at ONE segment (`segmentSeconds`): a whole-file decode of a multi-hour file overflows
     /// AudioToolbox's 32-bit byte count (issue #7) and its mel would feed the backbone an
     /// O(L^2) sequence no machine survives. Files at or under the cap are byte-identical to
     /// the old whole-file path; longer audio streams segment by segment via AudioSegmentReader.
@@ -150,7 +152,7 @@ public enum OmniAudioPreprocess {
     // MARK: - Decode
 
     /// Sequential decoder: any audio file -> 16 kHz mono Float32 PCM, one bounded segment
-    /// (240 s) at a time. Reads the file's native float32 processing format in <= 60 s slices
+    /// (`segmentSeconds`) at a time. Reads the file's native float32 processing format in <= 60 s slices
     /// into ONE reusable buffer, downmixes each slice to mono, and linearly resamples per
     /// segment. Never sizes a buffer by the file's length: the old whole-file
     /// `AVAudioPCMBuffer(frameCapacity: file.length)` made AudioToolbox compute
@@ -167,7 +169,7 @@ public enum OmniAudioPreprocess {
         private let slice: AVAudioPCMBuffer
         private let channelCount: Int
         private let nativeRate: Double
-        private let nativeSegmentFrames: Int   // native frames per 240 s segment
+        private let nativeSegmentFrames: Int   // native frames per segment
         private var done = false
 
         public init?(url: URL) {

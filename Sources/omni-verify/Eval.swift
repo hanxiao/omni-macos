@@ -50,6 +50,8 @@ struct EvalSpec: Decodable {
     struct Video: Decodable {
         struct Scene: Decodable { let start: Double; let src: String }
         let path: String; let duration: Double; let scenes: [Scene]
+        /// Spoken segments laid into the video's audio track at their start times.
+        let soundtrack: LongAudio?
     }
     struct LongText: Decodable { let path: String; let lines: Int; let filler: String; let needles: [String: String] }
     struct Distractors: Decodable { let count: Int; let folders: [String]; let topics: [[String]] }
@@ -71,7 +73,11 @@ struct EvalSpec: Decodable {
 enum EvalCommand {
     static func run(_ args: [String]) async {
         do {
-            if args[1] == "evalbed" { try generate(args) } else { try await evaluate(args) }
+            if args[1] == "evalbed" { try generate(args) }
+            else if args[1] == "killbed" { try killbed(args) }
+            else if args[1] == "statedigest" { try stateDigest(args) }
+            else if args[1] == "statecompare" { try stateCompare(args) }
+            else { try await evaluate(args) }
         } catch {
             print("eval: \(error)")
             exit(1)
@@ -115,7 +121,15 @@ enum EvalCommand {
         for a in spec.longAudio { try writeLongAudio(a, to: try dest(a.path), scratch: scratch) }
         // The built-in pictures are symlinks into the system template: copy what they point at.
         for p in spec.photos { try fm.copyItem(at: URL(fileURLWithPath: p.src).resolvingSymlinksInPath(), to: try dest(p.path)) }
-        for v in spec.videos { try writeVideo(v, to: try dest(v.path)) }
+        for v in spec.videos {
+            let out = try dest(v.path)
+            guard let track = v.soundtrack else { try writeVideo(v, to: out); continue }
+            let silent = scratch.appendingPathComponent(UUID().uuidString + ".mp4")
+            let audio = scratch.appendingPathComponent(UUID().uuidString + ".m4a")
+            try writeVideo(v, to: silent)
+            try writeLongAudio(track, to: audio, scratch: scratch)
+            try mux(video: silent, audio: audio, to: out)
+        }
         for l in spec.longText { try writeLongText(l, to: try dest(l.path)) }
         try writeDistractors(spec.distractors, tree: tree)
 
@@ -318,6 +332,24 @@ enum EvalCommand {
         guard writer.status == .completed else { throw Failure("video: \(writer.error.map { "\($0)" } ?? "?")") }
     }
 
+    /// A video's frames with an audio file as its soundtrack, copied as they are (no re-encode).
+    static func mux(video: URL, audio: URL, to url: URL) throws {
+        let comp = AVMutableComposition()
+        let v = AVURLAsset(url: video), a = AVURLAsset(url: audio)
+        guard let vt = v.tracks(withMediaType: .video).first, let at = a.tracks(withMediaType: .audio).first,
+              let cv = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid),
+              let ca = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid) else { throw Failure("mux tracks") }
+        try cv.insertTimeRange(CMTimeRange(start: .zero, duration: v.duration), of: vt, at: .zero)
+        try ca.insertTimeRange(CMTimeRange(start: .zero, duration: Swift.min(a.duration, v.duration)), of: at, at: .zero)
+        guard let export = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetPassthrough) else { throw Failure("mux export") }
+        export.outputURL = url
+        export.outputFileType = .mp4
+        let done = DispatchSemaphore(value: 0)
+        export.exportAsynchronously { done.signal() }
+        done.wait()
+        guard export.status == .completed else { throw Failure("mux: \(export.error.map { "\($0)" } ?? "?")") }
+    }
+
     static func writeLongText(_ l: EvalSpec.LongText, to url: URL) throws {
         let topics = ["Standup: reviewed the board, no blockers.", "Design sync: agreed to keep the sidebar collapsed by default.",
                       "Hiring: two phone screens scheduled for next week.", "Ops: rotated the on-call schedule.",
@@ -371,6 +403,123 @@ enum EvalCommand {
         return String(format: "%016llx", h)
     }
 
+    // MARK: - The enrichment's kill test
+
+    /// A tree with a lot of enrichment to do, for killing it part-way: `n` screenshots with their
+    /// own text, n/10 audio files of 150 s and n/20 videos of 120 s with a soundtrack.
+    ///   omni-verify killbed <dir> <n>
+    static func killbed(_ args: [String]) throws {
+        guard args.count >= 4, let n = Int(args[3]) else { throw Failure("usage: omni-verify killbed <dir> <n>") }
+        let out = URL(fileURLWithPath: (args[2] as NSString).expandingTildeInPath, isDirectory: true)
+        let tree = out.appendingPathComponent("tree", isDirectory: true)
+        let fm = FileManager.default
+        if fm.fileExists(atPath: tree.path) {
+            guard fm.fileExists(atPath: out.appendingPathComponent("manifest.json").path) else { throw Failure("\(tree.path) was not written by killbed") }
+            try fm.removeItem(at: tree)
+        }
+        let scratch = out.appendingPathComponent("scratch", isDirectory: true)
+        try fm.createDirectory(at: scratch, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: scratch) }
+        let names = ["Lindqvist", "Okafor", "Tanaka", "Moreau", "Schmidt", "Rossi", "Kowalski", "Haddad"]
+        for i in 0 ..< n {
+            let shot = EvalSpec.Shot(path: "", title: "Orders", lines: [
+                "Order #\(100_000 + i)-\(i * 7 % 1000) confirmed", "Invoice INV-\(5000 + i)",
+                "Customer: \(names[i % names.count]) \(i)", String(format: "Total %d.%02d EUR", 10 + i * 3, i % 100)])
+            let u = tree.appendingPathComponent("Desktop/Screens").appendingPathComponent(
+                String(format: "Screenshot 2026-%02d-%02d at %02d.%02d.%02d.png", 1 + i % 9, 10 + i % 18, i % 24, i % 60, (i / 60) % 60))
+            try fm.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try writeScreenshot(shot, to: u)
+        }
+        func tone(_ seconds: Int, _ hz: Double, to url: URL) throws {
+            let fmt = AVAudioFormat(standardFormatWithSampleRate: 16000, channels: 1)!
+            let file = try AVAudioFile(forWriting: url, settings: [AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 16000,
+                                                                  AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 32000])
+            let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: 16000)!
+            for s in 0 ..< seconds {
+                buf.frameLength = 16000
+                let d = buf.floatChannelData![0]
+                for k in 0 ..< 16000 { d[k] = Float(sin(Double(s * 16000 + k) * 2 * .pi * (hz + Double(s % 7) * 20) / 16000)) * 0.2 }
+                try file.write(from: buf)
+            }
+        }
+        let pictures = try fm.contentsOfDirectory(atPath: "/Library/User Pictures/Animals").map { "/Library/User Pictures/Animals/" + $0 }
+        for i in 0 ..< max(1, n / 10) {
+            let u = tree.appendingPathComponent("Recordings/Session \(i + 1).m4a")
+            try fm.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try tone(150, 220 + Double(i * 13 % 400), to: u)
+        }
+        for i in 0 ..< max(1, n / 20) {
+            let u = tree.appendingPathComponent("Movies/Clip \(i + 1).mp4")
+            try fm.createDirectory(at: u.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let silent = scratch.appendingPathComponent("v\(i).mp4"), audio = scratch.appendingPathComponent("a\(i).m4a")
+            let v = EvalSpec.Video(path: "", duration: 120, scenes: [.init(start: 0, src: URL(fileURLWithPath: pictures[i % pictures.count]).resolvingSymlinksInPath().path),
+                                                                     .init(start: 60, src: URL(fileURLWithPath: pictures[(i + 1) % pictures.count]).resolvingSymlinksInPath().path)],
+                                   soundtrack: nil)
+            try writeVideo(v, to: silent)
+            try tone(120, 300 + Double(i * 17 % 300), to: audio)
+            try mux(video: silent, audio: audio, to: u)
+        }
+        try JSONSerialization.data(withJSONObject: ["killbed": n, "files": try fileCount(tree)]).write(to: out.appendingPathComponent("manifest.json"))
+        print("killbed: \(try fileCount(tree)) files -> \(tree.path)")
+    }
+
+    /// What an index holds, as one number: every file's chunks - kind, place, snippet, vector to
+    /// three decimals - in path and chunk order. Two indexes with the same digest hold the same.
+    ///   omni-verify statedigest <index.sqlite>
+    static func stateDigest(_ args: [String]) throws {
+        guard args.count >= 3 else { throw Failure("usage: omni-verify statedigest <index.sqlite>") }
+        let store = try VectorStore(dbURL: URL(fileURLWithPath: (args[2] as NSString).expandingTildeInPath))
+        defer { store.close() }
+        var h: UInt64 = 0xcbf29ce484222325
+        func mix(_ s: String) { for b in s.utf8 { h = (h ^ UInt64(b)) &* 0x100000001b3 } }
+        var kinds: [String: Int] = [:]
+        let paths = store.indexedFiles().keys.sorted()
+        let dump = args.count >= 4 ? args[3] : nil
+        var lines: [String] = []
+        for p in paths {
+            mix(p)
+            for c in (store.storedChunks(path: p) ?? []).sorted(by: { $0.chunkIndex < $1.chunkIndex }) {
+                kinds[c.kind, default: 0] += 1
+                mix("|\(c.chunkIndex)|\(c.kind)|\(c.locator)|\(c.snippet)|")
+                for v in c.embedding { mix(String(Int((v * 1000).rounded()))) }
+                if dump != nil {
+                    lines.append("\(p)|\(c.chunkIndex)|\(c.kind)|\(c.locator)|\(c.snippet.prefix(60))|"
+                                 + c.embedding.prefix(4).map { String(format: "%.4f", $0) }.joined(separator: ","))
+                }
+            }
+        }
+        if let dump { try lines.joined(separator: "\n").write(toFile: dump, atomically: true, encoding: .utf8) }
+        print(String(format: "statedigest %016llx files=%d chunks=%@", h, paths.count,
+                     kinds.sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: ",")))
+    }
+
+    /// Two indexes chunk by chunk: the same files, chunks, kinds, places and snippets, and the
+    /// lowest cosine between corresponding vectors, per kind. The audio tower is not bit-exact from
+    /// run to run (two clean runs of the same files differ in every audio vector), so a digest is
+    /// the wrong test for audio and this is the right one.
+    ///   omni-verify statecompare <a/index.sqlite> <b/index.sqlite>
+    static func stateCompare(_ args: [String]) throws {
+        guard args.count >= 4 else { throw Failure("usage: omni-verify statecompare <a> <b>") }
+        let a = try VectorStore(dbURL: URL(fileURLWithPath: args[2])), b = try VectorStore(dbURL: URL(fileURLWithPath: args[3]))
+        defer { a.close(); b.close() }
+        let pa = a.indexedFiles().keys.sorted(), pb = b.indexedFiles().keys.sorted()
+        var structural = pa == pb ? 0 : 1
+        var minCos: [String: Float] = [:]
+        for p in pa where pb.contains(p) {
+            let ca = (a.storedChunks(path: p) ?? []).sorted { $0.chunkIndex < $1.chunkIndex }
+            let cb = (b.storedChunks(path: p) ?? []).sorted { $0.chunkIndex < $1.chunkIndex }
+            guard ca.count == cb.count else { structural += 1; continue }
+            for (x, y) in zip(ca, cb) {
+                guard x.kind == y.kind, x.locator == y.locator, x.snippet == y.snippet, x.chunkIndex == y.chunkIndex else { structural += 1; continue }
+                let nx = x.embedding.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot(), ny = y.embedding.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot()
+                let c = zip(x.embedding, y.embedding).reduce(Float(0)) { $0 + $1.0 * $1.1 } / Swift.max(1e-9, nx * ny)
+                minCos[x.kind] = Swift.min(minCos[x.kind] ?? 1, c)
+            }
+        }
+        print("statecompare files \(pa.count) vs \(pb.count), structural differences \(structural), min cosine "
+              + minCos.sorted { $0.key < $1.key }.map { String(format: "%@ %.5f", $0.key, $0.value) }.joined(separator: ", "))
+    }
+
     // MARK: - Evaluate
 
     static func evaluate(_ args: [String]) async throws {
@@ -385,7 +534,12 @@ enum EvalCommand {
         let treePath = URL(fileURLWithPath: String(cString: realpath(tree.path, nil))).path
 
         let engine = try await OmniEngine(modelDir: modelDir)
-        let indexDir = bed.appendingPathComponent("index-\(modelDir.lastPathComponent)-\(engine.dim)-\(treeHash.prefix(8))", isDirectory: true)
+        // A/B of the indexing features: --no-screen-text, --no-soundtrack, each its own index.
+        var settings = IndexSettings()
+        if args.contains("--no-screen-text") { settings.screenText = false }
+        if args.contains("--no-soundtrack") { settings.soundtrack = false }
+        let arm = (settings.screenText ? "" : "-nst") + (settings.soundtrack ? "" : "-nsd")
+        let indexDir = bed.appendingPathComponent("index-\(modelDir.lastPathComponent)-\(engine.dim)-\(treeHash.prefix(8))\(arm)", isDirectory: true)
         let doneMark = indexDir.appendingPathComponent("built")
         if args.contains("--rebuild") { try? FileManager.default.removeItem(at: indexDir) }
         try FileManager.default.createDirectory(at: indexDir, withIntermediateDirectories: true)
@@ -410,7 +564,7 @@ enum EvalCommand {
             let t0 = Date()
             let last: IndexProgress = await withCheckedContinuation { cont in
                 DispatchQueue.global().async {
-                    indexer.index(roots: [URL(fileURLWithPath: treePath)], settings: IndexSettings()) { p in
+                    indexer.index(roots: [URL(fileURLWithPath: treePath)], settings: settings) { p in
                         if p.done { cont.resume(returning: p) }
                     }
                 }
