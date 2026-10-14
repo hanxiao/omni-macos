@@ -645,6 +645,8 @@ public final class Indexer: @unchecked Sendable {
 
     /// Long files being indexed a window at a time (see StreamCursors).
     public let streams: StreamCursors
+    /// The dataset folders the last full pass found (DatasetRule), for Settings to show.
+    public private(set) var lastDatasets = DatasetFolders()
 
     /// Files whose reading never finished; skipped until they change (see ExtractionQuarantine).
     public let quarantine: ExtractionQuarantine
@@ -845,6 +847,8 @@ public final class Indexer: @unchecked Sendable {
         // something from each to take - walking them one at a time meant a paused run indexed the
         // first root and nothing else, which is the starvation the interleaving exists to prevent.
         feed.producers = photos.isEmpty ? 1 : 2
+        let datasets = DatasetFolders()
+        lastDatasets = datasets
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             var counts: [String: Int] = [:]
@@ -852,6 +856,10 @@ public final class Indexer: @unchecked Sendable {
                                       ownDataPaths: settings.ownDataPaths,
                                       ownDataExceptions: settings.ownDataExceptions)
             crawler.onPolicyFile = self.onPolicyFile
+            if settings.skipDatasets {
+                crawler.datasets = datasets
+                crawler.datasetAllowed = settings.datasetAllowed
+            }
             crawler.walk(shouldContinue: { !self.isCancelled }) { f in
                     guard let r = rootOf(f.path) else { return }
                     feed.lock.lock()
@@ -1113,7 +1121,15 @@ public final class Indexer: @unchecked Sendable {
                 omniPerfLog(String(format: "first-wave=%d files at %.2fs after pass start", wave.files.count, -passStart.timeIntervalSinceNow))
             }
             byKind.removeAll(keepingCapacity: true)
-            for f in wave.files { byKind[FileExtractor.kind(forExtension: f.ext) ?? .text, default: []].append(f) }
+            for f in wave.files {
+                // Training data (DatasetRule): new files skipped, ones already indexed kept. The
+                // folder was judged before its files were handed over, so the answer is in.
+                if known[f.path] == nil, let slash = f.path.lastIndex(of: "/"), datasets.contains(f.path[..<slash]) {
+                    tick(f.path)
+                    continue
+                }
+                byKind[FileExtractor.kind(forExtension: f.ext) ?? .text, default: []].append(f)
+            }
             // Within a wave: screenshots first (Self.indexingOrder). Newest-first is the walker's
             // (newest folder and newest file first); the wave keeps its root-by-root alternation.
             for k in Array(byKind.keys) { byKind[k] = Self.indexingOrder(byKind[k]!, kind: k) }
@@ -1930,6 +1946,10 @@ public final class Indexer: @unchecked Sendable {
                                           ownDataPaths: settings.ownDataPaths,
                                       ownDataExceptions: settings.ownDataExceptions)
                 crawler.onPolicyFile = onPolicyFile
+                if settings.skipDatasets {
+                    crawler.datasets = lastDatasets
+                    crawler.datasetAllowed = settings.datasetAllowed
+                }
                 crawler.walk(shouldContinue: { !self.isCancelled }) { crawled.append($0) }
             } else {
                 files.append(CrawledFile(path: path,
@@ -1945,6 +1965,17 @@ public final class Indexer: @unchecked Sendable {
         files = files.filter { seenPaths.insert($0.path).inserted }
         var lookup = seenPaths; lookup.formUnion(deletedTop)
         let known = store.storedFiles(paths: lookup)
+        // Training data (DatasetRule), as in a full pass: a new file in a folder the last pass or a
+        // directory event above judged a dataset is not indexed - a training run writing frames
+        // into one would otherwise be embedded file by file as they land.
+        if settings.skipDatasets {
+            files = files.filter { f in
+                guard known[f.path] == nil, let slash = f.path.lastIndex(of: "/") else { return true }
+                let dir = f.path[..<slash]
+                return !lastDatasets.contains(dir)
+                    || settings.datasetAllowed.contains { dir == $0 || dir.hasPrefix($0 + "/") }
+            }
+        }
         arrivalLock.withLock {
             arrivalNames = Set(files.lazy.map { ($0.path as NSString).lastPathComponent })
             for p in paths where !deletedTop.contains(p) { arrivalNames.insert((p as NSString).lastPathComponent) }

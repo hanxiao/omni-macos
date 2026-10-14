@@ -79,6 +79,8 @@ public struct OmniIgnore: Sendable, Equatable {
     /// used to fall under that root's rules - `.openclaw` under a home folder lost all 180,911 of
     /// its files to the default hidden-name rule, though the user had added it by name.
     private let kept: Set<String>
+    /// The folders the user added (see `kept`).
+    public var keptFolders: Set<String> { kept }
     /// Stable hash of the source text.
     public let textHash: String
 

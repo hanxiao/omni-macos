@@ -1970,6 +1970,29 @@ final class AppModel {
         }
     }
 
+    /// Skip new files in folders that look like training data (DatasetRule). On by default.
+    var skipDatasets: Bool = true {
+        didSet {
+            guard oldValue != skipDatasets else { return }
+            persistPerf()
+            requestIndexPass()
+        }
+    }
+    /// Folders let in from that rule ("Index" in Settings): never datasets, nor anything under them.
+    var datasetAllowed: [String] = [] {
+        didSet { if oldValue != datasetAllowed { persistPerf() } }
+    }
+    /// The training-data folders the last full pass skipped, with their file counts.
+    private(set) var datasetFolders: [String: Int] = [:]
+
+    /// "Index" on a skipped training-data folder: let it in, and index it.
+    func allowDataset(_ path: String) {
+        guard !datasetAllowed.contains(path) else { return }
+        datasetAllowed.append(path)
+        datasetFolders[path] = nil
+        requestIndexPass()
+    }
+
     /// Search-as-you-type (default). OFF = the search runs on Return only; typing still parses
     /// filters and offers suggestions. Kinder to low-end GPUs, where every keystroke's embed +
     /// scan is noticeable.
@@ -3529,6 +3552,8 @@ final class AppModel {
         if d.object(forKey: "omni.skipDataless") != nil { skipDatalessFiles = d.bool(forKey: "omni.skipDataless") }
         evictDownloadedFiles = d.bool(forKey: "omni.evictDownloaded")
         if d.object(forKey: "omni.readLongDataFiles") != nil { readLongDataFiles = d.bool(forKey: "omni.readLongDataFiles") }
+        if d.object(forKey: "omni.skipDatasets") != nil { skipDatasets = d.bool(forKey: "omni.skipDatasets") }
+        datasetAllowed = (d.array(forKey: "omni.datasetAllowed") as? [String]) ?? []
         if d.object(forKey: "omni.imageTags") != nil { imageTagsEnabled = d.bool(forKey: "omni.imageTags") }
         if d.object(forKey: "omni.instantSearch") != nil { instantSearchEnabled = d.bool(forKey: "omni.instantSearch") }
     }
@@ -3547,6 +3572,8 @@ final class AppModel {
         OmniPrefs.set(skipDatalessFiles, forKey: "omni.skipDataless")
         OmniPrefs.set(evictDownloadedFiles, forKey: "omni.evictDownloaded")
         OmniPrefs.set(readLongDataFiles, forKey: "omni.readLongDataFiles")
+        OmniPrefs.set(skipDatasets, forKey: "omni.skipDatasets")
+        OmniPrefs.set(datasetAllowed, forKey: "omni.datasetAllowed")
         OmniPrefs.set(imageTagsEnabled, forKey: "omni.imageTags")
         OmniPrefs.set(instantSearchEnabled, forKey: "omni.instantSearch")
     }
@@ -6486,6 +6513,8 @@ final class AppModel {
         s.skipDataless = skipDatalessFiles
         s.evictDownloaded = evictDownloadedFiles
         s.readLongDataFiles = readLongDataFiles
+        s.skipDatasets = skipDatasets
+        s.datasetAllowed = datasetAllowed
         s.imageTags = imageTagsEnabled
         return s
     }
@@ -6909,6 +6938,10 @@ final class AppModel {
                         // folder-removal restart - updated the index just now; a clean finish with
                         // nothing left to do also confirms it is current as of now.
                         if p.embedded > 0 || !p.cancelled { self.markIndexed(store) }
+                        // Training-data folders this pass skipped (DatasetRule), for Settings.
+                        if !p.cancelled, let found = self.indexer?.lastDatasets.all, found != self.datasetFolders {
+                            self.datasetFolders = found
+                        }
                         // The browser follows a pass by polling (followIndexing), and its last
                         // poll can land before the pass's last write: settle it once here.
                         self.requestBrowserReload()

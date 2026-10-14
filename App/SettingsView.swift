@@ -415,6 +415,28 @@ private struct ContentTypesTab: View {
             }
 
             Section {
+                Toggle("Skip folders that look like training data", isOn: Binding(get: { model.skipDatasets },
+                                                                                  set: { model.skipDatasets = $0 }))
+                if model.skipDatasets {
+                    ForEach(model.datasetFolders.sorted { $0.key < $1.key }, id: \.key) { path, count in
+                        LabeledContent {
+                            Button("Index") { model.allowDataset(path) }.controlSize(.small)
+                        } label: {
+                            Text((path as NSString).lastPathComponent)
+                            Text("\(count.formatted()) files \u{00B7} \((path as NSString).deletingLastPathComponent)")
+                                .lineLimit(1).truncationMode(.middle)
+                        }
+                        .help(path)
+                    }
+                }
+            } header: {
+                Text("Training data")
+            } footer: {
+                Text("A folder with hundreds of media files named like clip_000123 or 3f9a1c0e is skipped. Files already indexed stay. A folder you added yourself is never skipped.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            Section {
                 // ONE ROW, not two. A second row makes the Form draw a separator straight across
                 // the section, between the editor and the controls that act on it - a rule with
                 // nothing on either side of it worth separating.

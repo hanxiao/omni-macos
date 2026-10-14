@@ -92,6 +92,11 @@ public struct FileCrawler: Sendable {
         "Caches", ".Trash", "vendor", "dist", "build", "_build", ".next", "target",
     ]
 
+    /// Set to collect dataset folders (DatasetRule) during the walk; nil, no check at all.
+    public var datasets: DatasetFolders?
+    /// Folders the user let in: never datasets, nor anything under them.
+    public var datasetAllowed: [String] = []
+
     public init(roots: [URL], ignore: OmniIgnore = .hiddenOnly,
                 enabledKinds: Set<FileKind> = [.text, .image, .video, .audio],
                 maxFileSize: [FileKind: Int] = FileCrawler.defaultMaxFileSize,
@@ -237,6 +242,15 @@ public struct FileCrawler: Sendable {
                 let path = dir + "/" + e.name
                 guard !ignore.isIgnored(path, isDir: false), !isOwnData(path) else { return nil }
                 return CrawledFile(path: path, modified: e.mtime, size: e.size)
+            },
+            inspect: datasets.map { sink in
+                { dir, files in
+                    // Never a root, never a folder the user let in, nor anything under one.
+                    guard rootDevice[dir] == nil, !self.ignore.keptFolders.contains(dir),
+                          !self.datasetAllowed.contains(where: { dir == $0 || dir.hasPrefix($0 + "/") }),
+                          DatasetRule.isDataset(files) else { return }
+                    sink.insert(dir, count: files.count)
+                }
             },
             deliver: { batch in for f in batch { onFile(f) } })
     }

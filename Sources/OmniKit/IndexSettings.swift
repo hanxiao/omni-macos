@@ -59,6 +59,10 @@ public struct IndexSettings: Sendable, Equatable {
     /// Off: they keep the 2 MB cut. A 946 MB agent log or a model's weights as JSON is not text
     /// anyone searches by meaning, and read to the end it doubled a real index (index.md).
     public var readLongDataFiles: Bool = false
+    /// Skip new files in folders that look like training data (DatasetRule); files already indexed stay.
+    public var skipDatasets: Bool = true
+    /// Folders the user let in from that rule: never datasets, nor anything under them.
+    public var datasetAllowed: [String] = []
 
     /// Open-vocabulary image tags (OmniTagger): images indexed while the tagger is ready get a
     /// content-tag snippet ("kitty, cosy, plush") instead of the bare filename. Rides the same

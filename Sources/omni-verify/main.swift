@@ -4120,6 +4120,21 @@ if args.count >= 2 && args[1] == "sidecarcheck" {
     exit(pass ? 0 : 1)
 }
 
+// Training-data folders a crawl would skip (DatasetRule), read-only: omni-verify datasets <folder>...
+if args.count >= 3 && args[1] == "datasets" {
+    let roots = args.dropFirst(2).map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+    var crawler = FileCrawler(roots: roots, ignore: .hiddenOnly)
+    let found = DatasetFolders()
+    crawler.datasets = found
+    var files = 0
+    let t0 = Date()
+    crawler.walk { _ in files += 1 }
+    let all = found.all.sorted { $0.value > $1.value }
+    print(String(format: "datasets: %d folder(s), %d files of %d crawled, %.1fs", all.count, all.reduce(0) { $0 + $1.value }, files, -t0.timeIntervalSinceNow))
+    for (dir, n) in all { print(String(format: "%8d  %@", n, dir)) }
+    exit(0)
+}
+
 // Crawl benchmark: omni-verify crawlbench [folder]
 // Quantifies the single-pass-crawl win: OLD two-pass (count walk + collect walk) vs NEW one-pass
 // (collect only) on a real folder. Warm-cache, so it's a LOWER BOUND on the cold-start saving

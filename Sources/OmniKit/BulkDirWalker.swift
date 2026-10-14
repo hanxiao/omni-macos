@@ -187,6 +187,7 @@ enum BulkDirWalker {
                         shouldContinue: () -> Bool,
                         shouldDescend: (String, Entry?) -> Bool,
                         keep: (String, Entry) -> T?,
+                        inspect: ((String, [T]) -> Void)? = nil,
                         deliver: ([T]) -> Void) {
         let live = roots.filter { shouldDescend($0, nil) }
         guard !live.isEmpty else { return }
@@ -226,6 +227,10 @@ enum BulkDirWalker {
                         kept.append(k)
                     }
                 }
+
+                // A look at the whole folder's files, in the worker, before they are handed over
+                // (the dataset rule) - per-folder work stays off the pool's lock.
+                if !kept.isEmpty { inspect?(dir, kept) }
 
                 shared.lock.lock()
                 if !kept.isEmpty { deliver(kept) }
