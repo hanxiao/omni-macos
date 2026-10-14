@@ -7408,6 +7408,8 @@ final class AppModel {
     func quiesceForQuit() {
         isTerminating = true
         indexer?.cancel()
+        // A clean quit: a long read in flight is not what stopped the app (ExtractionQuarantine).
+        indexer?.quarantine.clearJournal()
         serving.shutdown()      // the CLI socket file goes with the app (a crash leaves it; launch clears it)
         // See VectorStore.stampRowSidecarBeforeExit: without it, the next launch of a large index
         // that was being written to reads every row out of SQLite.

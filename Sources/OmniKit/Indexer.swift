@@ -194,6 +194,10 @@ final class DecodedItem: @unchecked Sendable {
 
 private final class ReadyBox: @unchecked Sendable {
     var items = [Int: DecodedItem]()
+    /// When each read now in flight started, for the journal of long reads (ExtractionQuarantine).
+    var started = [Int: Date]()
+    /// Reads the consumer stopped waiting for: their result, if it ever comes, is dropped.
+    var gaveUp = Set<Int>()
     var estimates = [Int: Int]()   // admitted-but-not-consumed decoded-byte estimate, per index
     var outstandingBytes = 0       // sum of the above; gates the producer (guarded by `cond`)
 }
@@ -617,7 +621,16 @@ public final class Indexer: @unchecked Sendable {
     public init(store: VectorStore, embedder: Embedder) {
         self.store = store
         self.embedder = embedder
+        self.quarantine = ExtractionQuarantine(directory: store.dbURL.deletingLastPathComponent())
     }
+
+    /// Files whose reading never finished; skipped until they change (see ExtractionQuarantine).
+    public let quarantine: ExtractionQuarantine
+    /// How long the pass waits for one file's read before it gives up on it. Far past any read
+    /// measured: a 5,000-page PDF's text is ~12 s at PDFKit's ~2.4 ms a page. Tests shorten it.
+    public var stallLimit: TimeInterval = 300
+    /// Tests: a read made to take this long (by path), standing in for a framework that never returns.
+    nonisolated(unsafe) static var testReadDelay: ((String) -> TimeInterval?)?
 
     /// Handed to every crawl: the folder of each `.omniignore` it walks past (see
     /// `FileCrawler.onPolicyFile`). Set once, right after init, before any pass runs.
@@ -2090,9 +2103,12 @@ public final class Indexer: @unchecked Sendable {
                 while ready.outstandingBytes > 0 && ready.outstandingBytes + est > byteCap { cond.wait() }
                 ready.outstandingBytes += est; ready.estimates[i] = est
                 cond.unlock()
-                let unchanged = !force && (known[file.path].map {
+                // A file whose read never finished is passed over like an unchanged one until it
+                // changes; a forced pass (a full reindex) tries it again.
+                let unchanged = !force && ((known[file.path].map {
                     $0.modified == file.modified && $0.size == file.size
                 } ?? false) && !(self.retextLargeFiles && Self.isLongText(file))
+                    || self.quarantine.contains(path: file.path, modified: file.modified, size: file.size))
                 if self.isCancelled || unchanged {
                     // On cancel, mark abandoned (unless genuinely unchanged) so the consumer skips it
                     // instead of counting it as "skipped" - it just hasn't been processed yet.
@@ -2103,10 +2119,19 @@ public final class Indexer: @unchecked Sendable {
                     cond.lock(); ready.items[i] = item; cond.broadcast(); cond.unlock()
                 } else {
                     decodeQ.async {
+                        cond.lock(); ready.started[i] = Date(); cond.unlock()
+                        if let d = Self.testReadDelay?(file.path) { Thread.sleep(forTimeInterval: d) }
                         let item = self.isCancelled
                             ? DecodedItem(file: file, abandoned: true)
                             : self.decode(file, settings: settings)
-                        cond.lock(); ready.items[i] = item; cond.broadcast(); cond.unlock()
+                        cond.lock()
+                        ready.started[i] = nil
+                        let late = ready.gaveUp.remove(i) != nil
+                        if !late { ready.items[i] = item; cond.broadcast() }
+                        cond.unlock()
+                        self.quarantine.finished(path: file.path)
+                        // Read through after all (a forced retry): out of quarantine.
+                        if !late, !item.abandoned { self.quarantine.release(path: file.path) }
                     }
                 }
             }
@@ -2119,12 +2144,44 @@ public final class Indexer: @unchecked Sendable {
         var keyBuf: [(path: String, key: String, modified: Double, size: Int)] = []
         for i in 0 ..< files.count {
             cond.lock()
-            while ready.items[i] == nil { cond.wait() }
-            let item = ready.items.removeValue(forKey: i)!
+            // WAIT WITH A LIMIT. Unbounded, one read that never returned held the whole pass - and
+            // every pause - forever. Past `stallLimit` the file is quarantined and the pass goes on;
+            // after a cancel it is only abandoned (it was paused, not broken). Reads running past
+            // `journalAfter` are journaled meanwhile, so an app killed by a runaway read skips it
+            // next time.
+            var waitStart: Date?
+            var stalled = false, cancelledWait = false
+            while ready.items[i] == nil {
+                let now = Date()
+                if waitStart == nil { waitStart = now }
+                let waited = now.timeIntervalSince(waitStart!)
+                if waited >= stallLimit { stalled = true; break }
+                if isCancelled && waited >= 2 { cancelledWait = true; break }
+                if waited >= ExtractionQuarantine.journalAfter {
+                    let long = ready.started.filter { now.timeIntervalSince($0.value) >= ExtractionQuarantine.journalAfter }
+                        .map { (files[$0.key].path, files[$0.key].modified, files[$0.key].size) }
+                    if !long.isEmpty { cond.unlock(); quarantine.journal(long); cond.lock() }
+                }
+                _ = cond.wait(until: now.addingTimeInterval(1))
+            }
+            let item: DecodedItem
+            if stalled || cancelledWait {
+                ready.gaveUp.insert(i)
+                item = DecodedItem(file: files[i], abandoned: true)
+            } else {
+                item = ready.items.removeValue(forKey: i)!
+            }
             ready.outstandingBytes -= ready.estimates.removeValue(forKey: i) ?? 0   // release the byte budget
             cond.broadcast()                                                        // wake a byte-blocked producer
             cond.unlock()
             sem.signal()
+            if stalled {
+                let f = files[i]
+                quarantine.quarantine(path: f.path, modified: f.modified, size: f.size,
+                                      reason: "Reading this file did not finish in \(Int(stallLimit)) s")
+                omniPerfLog("read-stall quarantined \(f.path) after \(Int(stallLimit))s")
+                Self.log.error("read stalled \(Int(self.stallLimit), privacy: .public)s, quarantined: \(f.path, privacy: .private)")
+            }
             if item.abandoned { continue }   // paused: don't consume/count files left unprocessed
             consume(item)
             if let ck = item.contentKey {
