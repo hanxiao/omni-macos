@@ -88,6 +88,10 @@ codebase were already measured there, and many were rejected.
 - The benchmark (Settings > Benchmark this Mac; testing.md, "The benchmark"): `omni-verify bench
   <nano model> [--scale 0.05]` runs the same suite headless on generated data. Run the scaled smoke
   first; a full run is minutes on a wide Mac and longer on a small one.
+- Search QUALITY: `omni-verify evalbed /Volumes/han2tb/omni-eval` once, then `omni-verify eval <model>
+  /Volumes/han2tb/omni-eval [--json out] [--tag t]` - 116 labeled queries in 16 tags through the app's
+  own search, scored at the right place and the right file. Any ranking change is judged here, A/B on
+  the same cached index; baselines in docs/notes/roadmap.md.
 - Search digest on the real index (a CLONE, never the live one): `omni-verify searchreal
   ~/Library/Application\ Support/Omni/nano <index>` -> 134b9ff183fd2f29, p50 ~4 ms.
 - OCR quality gate (hard pages vs the torch oracle): `ocr-verify <ocrModel>

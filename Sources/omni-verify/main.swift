@@ -4120,6 +4120,12 @@ if args.count >= 2 && args[1] == "sidecarcheck" {
     exit(pass ? 0 : 1)
 }
 
+// The labeled retrieval eval (Eval.swift): evalbed generates the testbed, eval measures search on it.
+if args.count >= 2 && (args[1] == "evalbed" || args[1] == "eval") {
+    await EvalCommand.run(args)
+    exit(0)
+}
+
 // Training-data folders a crawl would skip (DatasetRule), read-only: omni-verify datasets <folder>...
 if args.count >= 3 && args[1] == "datasets" {
     let roots = args.dropFirst(2).map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }

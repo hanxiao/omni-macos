@@ -19,7 +19,7 @@ Order (dependencies first; index-content changes last, in ONE backfill):
 | 10 | Long files: read 2 MB, send the rest to the END of the queue, repeat (Han, 2026-10-13: iterative, not two passes) | DONE for long text (past 2 MB, first index): window stored at once (searchable), cursor (offset, carried piece, line base, chunk count) in streams.json beside the index, continuation to the end of the pass's queue, one window per turn round-robin after every other file. A stopped pass resumes at the cursor next launch, nothing re-embedded. A changed, already-indexed long file keeps the one-turn stream, whose vector reuse a split would lose. Found and fixed on the way: the content key was recorded after the first window, so dedup handed the PARTIAL rows to the file itself next pass (and would have to any copy); keys are recorded at the last window. Tests: whole-file chunk set, small files ahead of later windows, resume without re-embedding. 768 pass. Scans, long audio and video still stream in their turn: next |
 | 13 | Training-dataset folders detected, skipped and reported | DONE. DatasetRule (DigUp's rule: >= 300 media files of one kind in one folder, >= 70% machine-named, camera names excepted), judged per folder inside the walker's worker before the files are handed over, so the pass's wave filter has the answer. New files skipped, indexed ones kept, an added folder itself never judged, "Index" in Settings > Content lets a folder in (and everything under it). The watcher path drops new files in a known dataset folder too. Read-only run (`omni-verify datasets`) over Desktop, Documents, Downloads and two han2tb trees: 135 folders, 268,148 of 3,810,212 files - agent frame dumps, celeba, harness transcode work; nothing of the user's own. The regex cost ~10% of a ~/Documents walk (200k frames there); a byte scan with early exit, held to the regex by a 15,625-name equivalence test, brought it to noise: 6 interleaved pairs, median 2,477 ms on vs 2,456 off. Known trade: 300+ exported slides or scanned pages named page_001 are skipped too, and listed in Settings with Index. |
 | 12 | First-pass time estimate per folder before adding it | DONE, fitted to Omni: a folder is indexed the moment it is added, so the time shows beside it (and on the status line) from the moment its files are counted, not in a step before. IndexCosts learns this Mac's costs from indexing itself (costs.json beside the index): images per file, audio per second and video per 240 s segment (lengths from headers, MediaDuration: 0.12 ms a file cold), text per chunk that reached the model (reused vectors excluded) with chunks per MB learned per sort (PDF, office, plain), scanned pages timed apart. Remaining work is counted exactly per root (the pipeline's unchanged test), from the queue once a root's walk ends or by a metadata-only count walk for a root bigger than the queue. Live pace: stored costs scaled by this pass's measured time, and a kind with 3 s of its own evidence priced by that. Real runs (demo corpus learned, a 242-file mixed folder estimated, another indexer loading the GPU): first estimate +10%, +16%, +29%; mid-pass within 20%. Mistakes found on the way and fixed: media priced per MB (WAV at AAC rates, 184 s said for 15 s); dedup and scans polluting the text rate; one global pace (+43% on the last phase); a kind with one sample never trusted (no estimate all pass). Cost: classification starts at the pass's first work file - looked up earlier it slowed a pass over 30k unchanged files 8%; now 0.224 vs 0.226 s (10 passes each), first index equal within the machine's two speed modes (5.76 vs 5.72 s, 9.24 vs 9.30 s). |
-| 7 | Labeled multilingual, multimodal retrieval eval (`omni-verify eval`) | |
+| 7 | Labeled multilingual, multimodal retrieval eval (`omni-verify eval`) | DONE. `evalbed <dir>` generates 225 files from Tools/eval/bed.json and what every Mac has (built-in user pictures under camera names, offline voices, drawn screenshots, PDFs and video): documents in ten languages with confusable twins, page-per-topic PDFs, a scan, a 120-page log, nine voice memos, a 600 s lecture and a 540 s video with a topic per 240 s segment, a 3.8 MB log with one needle, 120 distractor notes. `eval <model> <dir>` indexes with the app's settings and tagger (index cached by tree hash), searches exactly as the app does, scores 116 queries in 16 tags at the right PLACE (page, line, moment) and at the right FILE. Baselines, ALL R@1 / MRR / file R@1: Nano 0.64 / 0.716 / 0.68, Small 0.72 / 0.782 / 0.77 (per tag in the notes below). Found on the first run: PDF hits open a page or two early (a chunk spans short pages and takes the first page as its locator: `long` file R@1 1.00, place 0.25); a long filler log is a hub that ranks for unrelated non-English queries; exact IDs and numbers are weak (`exact` 0.36). |
 | 6 | Adaptive relevance gate per query (modality-centred z) + relative weak fold | |
 | 8 | ID/number queries lean on exact matches | |
 | 9 | Kind words in plain queries: a soft boost | |
@@ -30,3 +30,25 @@ Proof per item: unit tests where the logic is pure; the search digest and latenc
 real index where search is touched; `mutbench` where a write path is touched; an isolated in-app run
 for anything the app does; the eval for any ranking change (an arm that loses is deleted, its
 numbers recorded here).
+
+### Eval baselines (2026-10-14, tree a7ebb656)
+
+| tag | n | Nano R@1 | Nano MRR | Small R@1 | Small MRR |
+|---|---|---|---|---|---|
+| audio | 9 | 0.44 | 0.588 | 0.44 | 0.579 |
+| audio-moment | 3 | 0.00 | 0.111 | 1.00 | 1.000 |
+| doc | 23 | 1.00 | 1.000 | 0.91 | 0.949 |
+| doc-xl | 10 | 1.00 | 1.000 | 1.00 | 1.000 |
+| exact | 11 | 0.36 | 0.467 | 0.36 | 0.460 |
+| image | 13 | 0.54 | 0.641 | 0.77 | 0.841 |
+| image-ml | 10 | 0.30 | 0.491 | 0.60 | 0.679 |
+| kind | 7 | 0.57 | 0.750 | 0.71 | 0.857 |
+| long | 4 | 0.25 | 0.250 | 0.25 | 0.250 |
+| name | 4 | 1.00 | 1.000 | 1.00 | 1.000 |
+| pdf-page | 4 | 0.00 | 0.125 | 0.00 | 0.125 |
+| scan | 2 | 1.00 | 1.000 | 1.00 | 1.000 |
+| screenshot | 9 | 0.67 | 0.815 | 0.78 | 0.870 |
+| shot-exact | 4 | 1.00 | 1.000 | 0.75 | 0.875 |
+| video | 1 | 1.00 | 1.000 | 1.00 | 1.000 |
+| video-moment | 2 | 0.50 | 0.500 | 1.00 | 1.000 |
+| ALL | 116 | 0.64 | 0.716 | 0.72 | 0.782 |
