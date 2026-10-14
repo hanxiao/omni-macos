@@ -6192,8 +6192,9 @@ public final class VectorStore: @unchecked Sendable {
             return (fuseLexical(dense: r.hits, text: explicit, filter: filter, topK: topK, explicit: true, denseQuery: r.query), r.query)
         }
         guard let text = textQuery else { return r }
+        let kinded = fuseKindWords(r.hits, text: text, filter: filter, topK: topK, denseQuery: r.query)
         let named = LexicalIndex.shouldFuse(text)
-            ? fuseLexical(dense: r.hits, text: text, filter: filter, topK: topK, explicit: false, denseQuery: r.query) : r.hits
+            ? fuseLexical(dense: kinded, text: text, filter: filter, topK: topK, explicit: false, denseQuery: r.query) : kinded
         return (fuseIdentifiers(named, text: text, filter: filter, topK: topK, denseQuery: r.query), r.query)
     }
 
@@ -6281,9 +6282,47 @@ public final class VectorStore: @unchecked Sendable {
             return fuseLexical(dense: dense, text: explicit, filter: filter, topK: topK, explicit: true, denseQuery: query)
         }
         guard let text = textQuery else { return dense }
+        let kinded = fuseKindWords(dense, text: text, filter: filter, topK: topK, denseQuery: query)
         let named = LexicalIndex.shouldFuse(text)
-            ? fuseLexical(dense: dense, text: text, filter: filter, topK: topK, explicit: false, denseQuery: query) : dense
+            ? fuseLexical(dense: kinded, text: text, filter: filter, topK: topK, explicit: false, denseQuery: query) : kinded
         return fuseIdentifiers(named, text: text, filter: filter, topK: topK, denseQuery: query)
+    }
+
+    /// What a kind named in words adds, once its hit is on the text scale (`kindScoreScale`).
+    /// Measured on the labeled eval: 7 queries that name the kind of their answer, and 6 that name
+    /// a kind their answer is NOT ("photo of my vaccination record", "pdf of the lease agreement"):
+    ///
+    ///     bonus     names its answer (Nano / Small R@1)   names another kind (Nano / Small R@1)
+    ///     none, no lift        0.57 / 0.71                      1.00 / 1.00
+    ///     lift only            0.86 / 1.00                      1.00 / 1.00
+    ///     lift + 0.02-0.10     1.00 / 1.00                      1.00 / 1.00
+    ///     lift + 0.15          1.00 / 1.00                      1.00 / 0.83
+    ///     lift + 0.30          1.00 / 1.00                      0.67 / 0.17
+    ///     the kind first       1.00 / 1.00                      0.00 / 0.00
+    ///
+    /// 0.05 is in the middle of the plateau, a third of the smallest value that breaks the second set.
+    static let kindWordBonus = 0.05
+
+    /// A plain query that names a kind ("photo of a penguin") lifts hits of that kind onto the text
+    /// scale and adds `kindWordBonus`. Candidates of the kind are searched for too (a kind-filtered
+    /// pass, 30 deep), so on an index where text fills the first page they are still in the running.
+    /// Soft: see KindWords. A `type:` or `ext:` filter already says it, and turns this off.
+    private func fuseKindWords(_ hits: [SearchHit], text: String, filter: SearchFilter, topK: Int,
+                               denseQuery: [Float]) -> [SearchHit] {
+        guard filter.kinds.isEmpty, filter.ext == nil,
+              let want = KindWords.requested(in: text) else { return hits }
+        var narrow = filter
+        narrow.kinds = want.kind == FileKind.text.rawValue ? [FileKind.text.rawValue, FileKind.scan.rawValue] : [want.kind]
+        if let ext = want.ext { narrow.ext = ext }
+        let more = searchDense(denseQuery, filter: narrow, topK: 30, markActive: false)
+        var pool = hits
+        let have = Set(hits.map(\.path))
+        pool += more.filter { !have.contains($0.path) }
+        for i in pool.indices where KindWords.matches(want, path: pool[i].path, kind: pool[i].kind) {
+            pool[i].score = Float(Double(pool[i].score) / (Self.kindScoreScale[pool[i].kind] ?? 1.0) + Self.kindWordBonus)
+        }
+        pool.sort { $0.score > $1.score }
+        return Array(pool.prefix(topK))
     }
 
     /// A LOOKUP - a query that is identifiers only ("INV-2041", "K7Q2LM 2026") - puts the files that

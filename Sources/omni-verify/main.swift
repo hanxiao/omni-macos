@@ -4428,6 +4428,24 @@ if args.count >= 4 && args[1] == "searchreal" {
     print(String(format: "SEARCHREAL sharing=%@ chunks=%d n=%d p50=%.1fms p90=%.1fms p99=%.1fms digest=%016llx (plain+kind+folder)",
                  true ? "on " : "off", store.count, lat.count,
                  pct(0.5), pct(0.9), pct(0.99), digest))
+    // WITH THE QUERY TEXT, as the app searches: the text channels (names, a kind named in words, an
+    // identifier lookup) and what each costs on top of the scan. Interleaved, every arm each round.
+    var withText: [String: [Double]] = [:]
+    let arms: [(String, (String) -> String)] = [("text", { $0 }), ("kind word", { "photo of " + $0 }), ("identifier", { _ in "INV-2041" })]
+    for _ in 0 ..< max(3, reps / 3) {
+        for (name, form) in arms {
+            for (i, p) in probes.enumerated() {
+                let text = form(p)
+                let t = Date()
+                _ = store.search(qvecs[i], topK: 10, textQuery: text)
+                withText[name, default: []].append(-t.timeIntervalSinceNow * 1000)
+            }
+        }
+    }
+    for (name, _) in arms {
+        let v = withText[name, default: []].sorted()
+        print(String(format: "SEARCHREAL %@ p50=%.1fms p90=%.1fms", name, v[v.count / 2], v[Swift.min(v.count - 1, v.count * 9 / 10)]))
+    }
     exit(0)
 }
 
