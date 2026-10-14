@@ -606,6 +606,24 @@ public final class Indexer: @unchecked Sendable {
     /// can seek a segment's midpoint when previewing a matched chunk.
     public static let mediaSegmentSeconds: Double = 240
 
+    /// The order a wave's files of one kind are indexed in: screenshots first (what people search
+    /// for soonest, and quick to do), everything else in the order the wave has it. STABLE, so the
+    /// wave's alternation between roots - which keeps a paused pass from leaving a later folder with
+    /// nothing - and the walker's newest-first order both survive. The screenshot test is one
+    /// getxattr per IMAGE, for the marker macOS writes on every screenshot it takes (it survives
+    /// moves and copies, and does not depend on the file's localized name).
+    static func indexingOrder(_ files: [CrawledFile], kind: FileKind) -> [CrawledFile] {
+        guard kind == .image, files.count > 1 else { return files }
+        var shots: [CrawledFile] = [], rest: [CrawledFile] = []
+        for f in files { if isScreenshot(f.path) { shots.append(f) } else { rest.append(f) } }
+        return shots.isEmpty ? files : shots + rest
+    }
+
+    /// macOS's screenshot marker (the attribute behind Spotlight's kMDItemIsScreenCapture).
+    static func isScreenshot(_ path: String) -> Bool {
+        getxattr(path, "com.apple.metadata:kMDItemIsScreenCapture", nil, 0, 0, 0) > 0
+    }
+
     /// Start-of-segment timestamp locator: "4:00", "1:20:00".
     static func timeLocator(_ seconds: Double) -> String {
         let s = Int(seconds)
@@ -1060,6 +1078,9 @@ public final class Indexer: @unchecked Sendable {
             }
             byKind.removeAll(keepingCapacity: true)
             for f in wave.files { byKind[FileExtractor.kind(forExtension: f.ext) ?? .text, default: []].append(f) }
+            // Within a wave: screenshots first (Self.indexingOrder). Newest-first is the walker's
+            // (newest folder and newest file first); the wave keeps its root-by-root alternation.
+            for k in Array(byKind.keys) { byKind[k] = Self.indexingOrder(byKind[k]!, kind: k) }
 
         for kind in kindOrder {
             guard !isCancelled, let files = byKind[kind], !files.isEmpty else { continue }

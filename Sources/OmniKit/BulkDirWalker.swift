@@ -212,14 +212,16 @@ enum BulkDirWalker {
                     break
                 }
 
-                let entries = list(dir, into: &buf) ?? []
-                var subdirs: [String] = []
+                // Newest first within the folder too: the files go out in the order a first index
+                // should reach them. The bulk read already has every mtime; this is one small sort.
+                let entries = (list(dir, into: &buf) ?? []).sorted { $0.mtime > $1.mtime }
+                var subdirs: [(path: String, mtime: Double)] = []
                 var kept: [T] = []
                 kept.reserveCapacity(entries.count)
                 for e in entries {
                     if e.isDir && !e.isSymlink {
                         let child = dir + "/" + e.name
-                        if shouldDescend(child, e) { subdirs.append(child) }
+                        if shouldDescend(child, e) { subdirs.append((child, e.mtime)) }
                     } else if let k = keep(dir, e) {
                         kept.append(k)
                     }
@@ -227,7 +229,14 @@ enum BulkDirWalker {
 
                 shared.lock.lock()
                 if !kept.isEmpty { deliver(kept) }
-                shared.stack.append(contentsOf: subdirs)
+                // NEWEST FOLDER NEXT. The stack pops its last entry, so the children go on oldest
+                // first and the most recently changed one is walked next: a first index reaches what
+                // was made lately before the archive behind it, with no memory spent on ordering
+                // (the crawl queue is capped, so sorting the whole crawl is not an option). A folder's
+                // mtime moves when an entry is added or removed in it - the bulk read already
+                // returned it, so this costs one small sort per directory.
+                subdirs.sort { $0.mtime < $1.mtime }
+                shared.stack.append(contentsOf: subdirs.map(\.path))
                 // This directory is finished; its surviving children are new work.
                 shared.pending += subdirs.count - 1
                 shared.lock.broadcast()
