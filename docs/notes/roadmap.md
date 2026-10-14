@@ -154,3 +154,11 @@ cache is named by its label list too, and the Storage pane counts it.
   media turn's time is now priced in its own units (it was added to the text rate).
 - Vision's taxonomy as tag labels: reverted (see "Image tags").
 - The UI review page with every visible change: https://claude.ai/artifact/HfLVWSXUwjyzXVyo7GNarT
+
+### Screenshot text off the image phase's clock (2026-10-14)
+
+600-screenshot media tree, isolated app runs, old build vs this one interleaved, two reps:
+old 82.2 / 84.3 s; text read on the decode stage 102 s; a lane that read AND embedded 115 s (each
+job waited on the GPU behind the audio batches, 157 ms a screenshot); a lane that only reads, with
+the consumer adding what is read in batches, 90.3 / 93.2 s (+9-10%). Its image phase is the old
+build's (34.3 vs 33.7 s); what is left is new content: the soundtracks and one-minute audio windows.
