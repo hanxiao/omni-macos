@@ -1817,6 +1817,24 @@ public final class Indexer: @unchecked Sendable {
                 Self.log.error("reconcile: \(blindRoots.count, privacy: .public) root(s) crawled empty; skipped deletion (likely no file-access permission)")
             }
         }
+        // Identifiers of files indexed before IDIndex existed, then the contents no file holds.
+        // A complete pass only, like the sweep above; cancellable like everything in it.
+        // Once per sidecar: it marks itself done, and files indexed since are recorded as read. The
+        // sweep only when stale contents have piled up (20% over the text files the index holds):
+        // each costs a read per content, which a pass over unchanged files should not pay.
+        if !isCancelled, walkFinished {
+            let ids = store.idIndex
+            if !ids.backfilled {
+                let read = backfillIdentifiers(settings: settings) { path in p.currentPath = path; onProgress(p) }
+                if !isCancelled { ids.backfilled = true }
+                if omniPerfEnabled { omniPerfLog("identifiers backfilled for \(read) file(s)") }
+            }
+            // Against every file the pass started with, not the text ones: counting those walks the
+            // whole table, on every pass, to decide something that rarely happens.
+            if !isCancelled, ids.count > known.count + known.count / 5 + 100 {
+                ids.sweep(live: { self.store.liveContentDigests($0) })
+            }
+        }
         let dedupHits = takeDedupHits()
         if dedupHits > 0 { Self.log.info("content dedup: \(dedupHits, privacy: .public) file(s) reused stored vectors") }
         embedder.indexingIdle()   // arm the debounced GPU buffer-cache trim
@@ -1971,6 +1989,88 @@ public final class Indexer: @unchecked Sendable {
 
     enum StreamStep { case more, done, failed }
 
+    /// Identifiers for text files the index holds whose content IDIndex has not read: an index
+    /// built before it existed, or a sidecar that was lost. Text only - no model, no embedding -
+    /// chunked exactly as indexing chunks it, so the chunk numbers point at the stored chunks. A
+    /// file that changed since it was indexed is left to the next pass, which re-reads it anyway.
+    /// Returns how many files were read.
+    func backfillIdentifiers(settings: IndexSettings, onFile: (String) -> Void) -> Int {
+        let files = store.indexedFiles().filter { $0.value.kind == FileKind.text.rawValue }
+        var read = 0
+        let paths = Array(files.keys)
+        for start in stride(from: 0, to: paths.count, by: 512) {
+            if isCancelled { break }
+            let batch = Array(paths[start ..< min(paths.count, start + 512)])
+            let keys = store.contentDigests(paths: batch)
+            let have = store.idIndex.recorded(Array(keys.values))
+            let todo: [(file: CrawledFile, key: String)] = batch.compactMap { path in
+                guard let k = keys[path], !have.contains(k), let f = files[path] else { return nil }
+                return (CrawledFile(path: path, modified: f.modified, size: f.size), k)
+            }
+            guard !todo.isEmpty else { continue }
+            onFile(todo[0].file.path)
+            DispatchQueue.concurrentPerform(iterations: todo.count) { i in
+                guard !self.isCancelled else { return }
+                self.readIdentifiers(todo[i].file, contentKey: todo[i].key, settings: settings)
+            }
+            read += todo.count
+        }
+        return read
+    }
+
+    /// One file's identifiers, read the way indexing reads it: a whole text, or a long one window by
+    /// window (streamWindow's cut, carry and filter, so the chunk numbers line up).
+    func readIdentifiers(_ file: CrawledFile, contentKey ck: String, settings: IndexSettings) {
+        var st = stat()
+        guard stat(file.path, &st) == 0, Int(st.st_size) == file.size,
+              abs(Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9 - file.modified) < 0.001 else { return }
+        if Self.streamsText(file, settings: settings) {
+            guard let handle = try? FileHandle(forReadingFrom: file.url) else { return }
+            defer { try? handle.close() }
+            var undecoded = Data(), carry = "", written = 0, offset: UInt64 = 0
+            while true {
+                let data = (try? handle.read(upToCount: FileExtractor.maxTextBytes)) ?? Data()
+                offset += UInt64(data.count)
+                let eof = data.isEmpty || offset >= UInt64(file.size)
+                undecoded.append(data)
+                let (decoded, rest) = Self.decodeTextWindow(undecoded, final: eof)
+                undecoded = rest
+                let text = carry + decoded
+                var pieces = text.isEmpty ? [] : chunk(text, settings: settings, origin: .plain, filterOpaque: false)
+                carry = (!eof && !pieces.isEmpty) ? pieces.removeLast().text : ""
+                let kept = OpaqueText.filter(pieces) { $0.text }
+                recordIdentifiers(kept, digest: ck, firstChunk: written, replace: written == 0)
+                written += kept.count
+                if eof { break }
+            }
+            if written == 0 { store.idIndex.record(contentKey: ck, chunks: []) }
+            return
+        }
+        switch ContentSources.source(for: file).content(file, kind: .text, settings: settings) {
+        case .text(let text):
+            let origin: TextOrigin = FileExtractor.textExtensions.contains(file.ext.lowercased()) ? .plain : .opaque
+            recordIdentifiers(chunk(text, settings: settings, origin: origin), digest: ck)
+        case .pagedText(let text, let pageStarts):
+            recordIdentifiers(chunk(text, settings: settings, origin: .paged(pageStarts)), digest: ck)
+        default:
+            store.idIndex.record(contentKey: ck, chunks: [])   // read; nothing to look up
+        }
+    }
+
+    /// The identifiers in a file's chunks, for exact lookup (IDIndex). Taken where the pieces are
+    /// made - the concurrent decode stage, never the embed thread. A content without a key (dedup
+    /// off) is not recorded: the lookup is keyed by content.
+    func recordIdentifiers(_ pieces: [TextPiece], contentKey: String?, firstChunk: Int = 0, replace: Bool = true) {
+        guard let key = contentKey else { return }
+        recordIdentifiers(pieces, digest: StoreSchema.contentDigestHex(key), firstChunk: firstChunk, replace: replace)
+    }
+
+    /// The same, for a content already named by its digest (the backfill reads digests).
+    func recordIdentifiers(_ pieces: [TextPiece], digest ck: String, firstChunk: Int = 0, replace: Bool = true) {
+        store.idIndex.record(contentKey: ck, chunks: pieces.map { IDTokens.tokens(in: $0.text) },
+                             firstChunk: firstChunk, replace: replace)
+    }
+
     /// A long file read to its end over several turns: now its content key may be recorded, so
     /// later copies reuse the complete rows.
     static func recordFinishedKey(_ item: DecodedItem, store: VectorStore) {
@@ -2007,6 +2107,7 @@ public final class Indexer: @unchecked Sendable {
             return TextPiece(text: piece.text, locator: "Line \(n + lineBase)")
         }
         if !kept.isEmpty {
+            recordIdentifiers(kept, contentKey: item.contentKey, firstChunk: c.written, replace: c.written == 0)
             let keyed = kept.map { (text: $0.text, key: chunkKey($0.text, settings: settings)) }
             var groups: [[(text: String, key: String)]] = []
             var i = 0
@@ -2091,6 +2192,7 @@ public final class Indexer: @unchecked Sendable {
             }
             lineBase += text.prefix(text.count - carry.count).reduce(0) { $1.isNewline ? $0 + 1 : $0 }
             if !kept.isEmpty {
+                recordIdentifiers(kept, contentKey: item.contentKey, firstChunk: total, replace: total == 0)
                 let keyed = kept.map { (text: $0.text, key: chunkKey($0.text, settings: settings)) }
                 var groups: [[(text: String, key: String)]] = []
                 var i = 0
@@ -2799,10 +2901,14 @@ public final class Indexer: @unchecked Sendable {
             // office doc's converted string are meaningless to the user.
             let ext = file.ext.lowercased()
             let origin: TextOrigin = FileExtractor.textExtensions.contains(ext) ? .plain : .opaque
-            return DecodedItem(file: file, kind: kind, payload: .text(chunk(text, settings: settings, origin: origin)), contentKey: contentKey)
+            let pieces = chunk(text, settings: settings, origin: origin)
+            recordIdentifiers(pieces, contentKey: contentKey)
+            return DecodedItem(file: file, kind: kind, payload: .text(pieces), contentKey: contentKey)
         case .pagedText(let text, let pageStarts):
             if settings.minTextChars > 0, text.count < settings.minTextChars { return DecodedItem(file: file) }
-            return DecodedItem(file: file, kind: kind, payload: .text(chunk(text, settings: settings, origin: .paged(pageStarts))), contentKey: contentKey)
+            let pieces = chunk(text, settings: settings, origin: .paged(pageStarts))
+            recordIdentifiers(pieces, contentKey: contentKey)
+            return DecodedItem(file: file, kind: kind, payload: .text(pieces), contentKey: contentKey)
         case .scannedPDF(let pageCount):
             return DecodedItem(file: file, kind: kind,
                                payload: .pdfScan(pageCount: pageCount, maxDimension: settings.maxImageDimension), meta: meta, contentKey: contentKey)

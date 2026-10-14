@@ -4456,7 +4456,9 @@ public final class VectorStore: @unchecked Sendable {
             defer { sqlite3_finalize(stmt) }
             for p in Set(paths) {
                 sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
-                sqlite3_bind_text(stmt, 1, p, -1, SQLITE_TRANSIENT)
+                // fileIDByPath takes the directory AND the name. Binding the whole path to the first
+                // left the name unbound, so this matched nothing - MCP's content_key was empty.
+                bindPath(stmt, 1, p)
                 if sqlite3_step(stmt) == SQLITE_ROW, let k = sqlite3_column_text(stmt, 0) {
                     out[p] = (String(cString: k), sqlite3_column_double(stmt, 1))
                 }
@@ -4473,6 +4475,8 @@ public final class VectorStore: @unchecked Sendable {
     // touching the vector path: it is built from paths already in the store, queried on its own
     // connection off this queue, and fused only when the query looks like a name.
     private lazy var lexical = LexicalIndex(indexURL: dbURL)
+    /// Identifiers inside files, for exact lookup (IDIndex). The indexer records; search reads.
+    public private(set) lazy var idIndex = IDIndex(indexURL: dbURL)
 
     /// Distinct indexed paths. Used to build the filename index; runs on the queue like any read.
     /// FROM MEMORY, not SQLite. This is the filename index's input, built right after launch; as a
@@ -4609,7 +4613,7 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Materialize display rows for paths the dense scan did not return. One lookup per path by
     /// its file id, so this is a handful of indexed point lookups, not a scan.
-    private func hitsForPaths(_ paths: [String], query: [Float]? = nil) -> [SearchHit] {
+    private func hitsForPaths(_ paths: [String], query: [Float]? = nil, chunk preferred: [String: Int] = [:]) -> [SearchHit] {
         guard !paths.isEmpty else { return [] }
         return queue.sync {
             guard dbOpen() else { return [] }
@@ -4654,7 +4658,7 @@ public final class VectorStore: @unchecked Sendable {
                 sqlite3_reset(st)
                 bindPath(st, 1, p)
                 var meta: (Double, Int, String, Int, String, Int, Int, Double, String)? = nil
-                let wantChunk = scoreOf[p]?.chunkIndex
+                let wantChunk = preferred[p] ?? scoreOf[p]?.chunkIndex
                 while sqlite3_step(st) == SQLITE_ROW {
                     // Metadata from the WINNING chunk when the scorer named one, so the snippet and
                     // locator describe the chunk the score came from. Otherwise the first row: every
@@ -6187,8 +6191,10 @@ public final class VectorStore: @unchecked Sendable {
         if let explicit = filter.filenameQuery, !explicit.isEmpty {
             return (fuseLexical(dense: r.hits, text: explicit, filter: filter, topK: topK, explicit: true, denseQuery: r.query), r.query)
         }
-        guard let text = textQuery, LexicalIndex.shouldFuse(text) else { return r }
-        return (fuseLexical(dense: r.hits, text: text, filter: filter, topK: topK, explicit: false, denseQuery: r.query), r.query)
+        guard let text = textQuery else { return r }
+        let named = LexicalIndex.shouldFuse(text)
+            ? fuseLexical(dense: r.hits, text: text, filter: filter, topK: topK, explicit: false, denseQuery: r.query) : r.hits
+        return (fuseIdentifiers(named, text: text, filter: filter, topK: topK, denseQuery: r.query), r.query)
     }
 
     private func searchGraphDense(queryGraph: MLXArray, filter: SearchFilter = SearchFilter(), topK: Int = 40) -> (hits: [SearchHit], query: [Float]) {
@@ -6274,8 +6280,113 @@ public final class VectorStore: @unchecked Sendable {
         if let explicit = filter.filenameQuery, !explicit.isEmpty {
             return fuseLexical(dense: dense, text: explicit, filter: filter, topK: topK, explicit: true, denseQuery: query)
         }
-        guard let text = textQuery, LexicalIndex.shouldFuse(text) else { return dense }
-        return fuseLexical(dense: dense, text: text, filter: filter, topK: topK, explicit: false, denseQuery: query)
+        guard let text = textQuery else { return dense }
+        let named = LexicalIndex.shouldFuse(text)
+            ? fuseLexical(dense: dense, text: text, filter: filter, topK: topK, explicit: false, denseQuery: query) : dense
+        return fuseIdentifiers(named, text: text, filter: filter, topK: topK, denseQuery: query)
+    }
+
+    /// A LOOKUP - a query that is identifiers only ("INV-2041", "K7Q2LM 2026") - puts the files that
+    /// contain every one of them first, opened at the chunk where the first one is (IDIndex). Their
+    /// meaning order is kept among them; everything else follows as it was. A query with words in it
+    /// is left to meaning and names: one code in a sentence is not a request for that code alone.
+    private func fuseIdentifiers(_ hits: [SearchHit], text: String, filter: SearchFilter, topK: Int,
+                                 denseQuery: [Float]?) -> [SearchHit] {
+        let words = text.split(whereSeparator: \.isWhitespace)
+        guard !words.isEmpty, words.allSatisfy({ IDTokens.isIdentifier($0.trimmingCharacters(in: .punctuationCharacters)) }) else { return hits }
+        let tokens = IDTokens.tokens(in: text)
+        guard !tokens.isEmpty else { return hits }
+        let found = idIndex.lookup(tokens)
+        guard !found.isEmpty else { return hits }
+        let chunkOf = Dictionary(found.map { ($0.contentKey, $0.chunk) }, uniquingKeysWith: Swift.min)
+        var at: [String: Int] = [:]
+        for (ck, paths) in pathsForContentDigests(Array(chunkOf.keys)) {
+            for p in paths { at[p] = chunkOf[ck] }
+        }
+        guard !at.isEmpty else { return hits }
+        let resolved = !filter.needsPathSets ? filter : queue.sync { resolveTagFilterLocked(filter) }
+        let exact = hitsForPaths(Array(at.keys), query: denseQuery, chunk: at)
+            .filter { resolved.accepts(path: $0.path, kind: $0.kind, modified: $0.modified) }
+        guard !exact.isEmpty else { return hits }
+        let tier = Float(Self.exactTier)
+        var top = exact.map { h -> SearchHit in var h = h; h.score = tier + Swift.max(0, Swift.min(1, h.score)); return h }
+            .sorted { $0.score > $1.score }
+        let exactSet = Set(top.map(\.path))
+        top += hits.filter { !exactSet.contains($0.path) }
+        return Array(top.prefix(topK))
+    }
+
+    /// Which of these content digests (hex, StoreSchema.contentDigestHex) a file in the index
+    /// still holds: IDIndex's sweep.
+    public func liveContentDigests(_ keys: [String]) -> Set<String> {
+        guard !keys.isEmpty else { return [] }
+        return queue.sync {
+            guard dbOpen() else { return [] }
+            var out = Set<String>()
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, "SELECT 1 FROM dedup WHERE key = ? LIMIT 1;", -1, &stmt, nil) == SQLITE_OK else { return [] }
+            defer { sqlite3_finalize(stmt) }
+            for key in keys {
+                sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
+                let digest = StoreSchema.hexToBytes(key)
+                digest.withUnsafeBytes { _ = sqlite3_bind_blob(stmt, 1, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
+                if sqlite3_step(stmt) == SQLITE_ROW { out.insert(key) }
+            }
+            return out
+        }
+    }
+
+    /// The content digest (hex) of each of these files, under the lockstep content dedup keeps:
+    /// only a digest recorded for the file's current version. The identifier backfill's keys.
+    public func contentDigests(paths: [String]) -> [String: String] {
+        guard !paths.isEmpty else { return [:] }
+        return queue.sync {
+            guard dbOpen() else { return [:] }
+            var out: [String: String] = [:]
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, """
+                SELECT k.key, k.modified, f.modified FROM dedup k JOIN files f ON f.id = k.file_id
+                 WHERE k.file_id = \(StoreSchema.fileIDByPath);
+                """, -1, &stmt, nil) == SQLITE_OK else { return out }
+            defer { sqlite3_finalize(stmt) }
+            for p in Set(paths) {
+                sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
+                bindPath(stmt, 1, p)
+                guard sqlite3_step(stmt) == SQLITE_ROW, sqlite3_column_double(stmt, 1) == sqlite3_column_double(stmt, 2),
+                      let blob = sqlite3_column_blob(stmt, 0) else { continue }
+                let n = Int(sqlite3_column_bytes(stmt, 0))
+                out[p] = Data(bytes: blob, count: n).map { String(format: "%02x", $0) }.joined()
+            }
+            return out
+        }
+    }
+
+    /// The files that currently hold each content (digest hex), under the same lockstep
+    /// `duplicateChunks` uses: a key row whose file has since changed is not that file's content.
+    public func pathsForContentDigests(_ keys: [String]) -> [String: [String]] {
+        guard !keys.isEmpty else { return [:] }
+        return queue.sync {
+            guard dbOpen() else { return [:] }
+            var out: [String: [String]] = [:]
+            var stmt: OpaquePointer?
+            guard sqlite3_prepare_v2(db, """
+                SELECT \(StoreSchema.pathExpr), k.modified, f.modified
+                  FROM dedup k JOIN files f ON f.id = k.file_id JOIN dirs d ON d.id = f.dir_id
+                 WHERE k.key = ? LIMIT 16;
+                """, -1, &stmt, nil) == SQLITE_OK else { return [:] }
+            defer { sqlite3_finalize(stmt) }
+            for key in Set(keys) {
+                sqlite3_reset(stmt); sqlite3_clear_bindings(stmt)
+                let digest = StoreSchema.hexToBytes(key)
+                digest.withUnsafeBytes { _ = sqlite3_bind_blob(stmt, 1, $0.baseAddress, Int32($0.count), SQLITE_TRANSIENT) }
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    guard sqlite3_column_double(stmt, 1) == sqlite3_column_double(stmt, 2),
+                          let t = sqlite3_column_text(stmt, 0) else { continue }
+                    out[key, default: []].append(String(cString: t))
+                }
+            }
+            return out
+        }
     }
 
     /// Weight of the filename channel, in the dense channel's units.

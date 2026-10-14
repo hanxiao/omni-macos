@@ -53,6 +53,9 @@ final class LexicalIndex: @unchecked Sendable {
 
     /// True when FTS5 is compiled into the linked SQLite. Not guaranteed on every deployment target,
     /// so it is probed once rather than assumed; a false result leaves the channel permanently off.
+    /// For the other FTS5 sidecar (IDIndex), which has the same dependency.
+    static var fts5Present: Bool { fts5Available }
+
     private static let fts5Available: Bool = {
         var probe: OpaquePointer?
         guard sqlite3_open(":memory:", &probe) == SQLITE_OK else { return false }

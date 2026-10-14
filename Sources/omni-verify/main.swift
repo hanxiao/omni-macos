@@ -4126,6 +4126,31 @@ if args.count >= 2 && (args[1] == "evalbed" || args[1] == "eval") {
     exit(0)
 }
 
+// ID-like tokens in real text, for sizing an exact-lookup index (item 8): omni-verify idtokens <folder>...
+if args.count >= 3 && args[1] == "idtokens" {
+    let roots = args.dropFirst(2).map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+    var files: [CrawledFile] = []
+    FileCrawler(roots: roots, ignore: .hiddenOnly, enabledKinds: [.text]).walk { files.append($0) }
+    let t0 = Date()
+    var textBytes = 0, tokenOcc = 0, tokenBytes = 0, filesWithIDs = 0, read = 0
+    var vocab = Set<String>()
+    var sample: [String] = []
+    for f in files {
+        guard case .text(let text)? = try? FileExtractor.extract(URL(fileURLWithPath: f.path)) else { continue }
+        read += 1
+        textBytes += text.utf8.count
+        let ids = Set(IDTokens.tokens(in: text))
+        if !ids.isEmpty { filesWithIDs += 1 }
+        tokenOcc += ids.count
+        for t in ids { tokenBytes += t.utf8.count; if vocab.insert(t).inserted, sample.count < 60, read % 7 == 0 { sample.append(t) } }
+    }
+    print(String(format: "idtokens: %d text files read (%.1f MB text) in %.0fs", read, Double(textBytes) / 1e6, -t0.timeIntervalSinceNow))
+    print(String(format: "  files with IDs %d; unique (file,token) pairs %d; distinct tokens %d; token bytes %.1f MB",
+                 filesWithIDs, tokenOcc, vocab.count, Double(tokenBytes) / 1e6))
+    print("  sample: " + sample.prefix(60).joined(separator: "  "))
+    exit(0)
+}
+
 // Training-data folders a crawl would skip (DatasetRule), read-only: omni-verify datasets <folder>...
 if args.count >= 3 && args[1] == "datasets" {
     let roots = args.dropFirst(2).map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }

@@ -73,6 +73,13 @@ enum StoreSchema {
         Data(SHA256.hash(data: Data(key.utf8)).prefix(16))
     }
 
+    /// The digest as hex: how the identifier index (IDIndex) names a content, the same 16 bytes
+    /// the dedup table stores, so a key recorded while indexing and one read back by the backfill
+    /// are the same string.
+    static func contentDigestHex(_ key: String) -> String {
+        contentKeyDigest(key).map { String(format: "%02x", $0) }.joined()
+    }
+
     /// The per-chunk key travels through the indexer as a hex string and is STORED as the bytes it
     /// spells - 16 instead of 32, across every chunk in the index. Invalid hex (an odd length, a
     /// stray character) returns empty, which reads downstream as "no key": that chunk simply gets
