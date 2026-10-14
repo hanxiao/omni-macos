@@ -6126,6 +6126,33 @@ public final class VectorStore: @unchecked Sendable {
         "image": 0.615, "audio": 0.615, "video": 0.615, "scan": 0.615,
     ]
 
+    /// The WEAKER MATCHES of a result list, folded under a button rather than shown: a hit whose
+    /// score, on its kind's scale (`kindScoreScale`), is under `ratio` of the best one's. The first
+    /// hit is never weak. Hits are in relevance order; the answer is per hit, not a prefix - a photo
+    /// can stand out on its own scale below documents that do not.
+    ///
+    /// Measured on the labeled eval (`omni-verify eval`, 116 queries), from 120 hits shown per query:
+    ///
+    ///     rule (Nano / Small)         shown per query   answers folded   of them in the top 10
+    ///     scaled, 0.5                    9.5 / 14.2         4 / 3              0 / 0
+    ///     scaled, 0.6  (this)            5.6 / 7.7          5 / 3              0 / 0
+    ///     scaled, 0.65                   4.1 / 5.8          6 / 4              1 / 1
+    ///     raw cosine, 0.6                7.2 / 7.3          7 / 5              1 / 2
+    ///     z >= 2 (DigUp's gate)         17.3 / 20.6        14 / 9         (5 / 5 queries empty)
+    ///
+    /// Raw cosine folds spoken answers under documents (a recipe read aloud at rank 3), because a
+    /// text query scores audio on a lower scale. DigUp's per-query z gate folds more answers while
+    /// showing more results, and leaves some queries with nothing; its other half, ranking by score
+    /// minus the query's mean for the row's kind, measured no better here (MRR Nano 0.779 -> 0.771,
+    /// Small 0.832 -> 0.828, spoken answers Nano R@1 0.44 -> 0.22) and is not used.
+    public static func weakFold(_ hits: [SearchHit], ratio: Double = 0.6) -> [Bool] {
+        guard hits.count > 1 else { return hits.map { _ in false } }
+        func scaled(_ h: SearchHit) -> Double { Double(h.score) / (kindScoreScale[h.kind] ?? 1.0) }
+        let top = hits.map(scaled).max() ?? 0
+        guard top > 0 else { return hits.map { _ in false } }
+        return hits.indices.map { $0 > 0 && scaled(hits[$0]) < top * ratio }
+    }
+
     /// The floor a hit of this kind must clear, given the threshold the user set. `base` is stated
     /// in text-score units, which is what the UI picker and the `score:` qualifier mean.
     public static func relevanceFloor(kind: String, base: Double) -> Double {

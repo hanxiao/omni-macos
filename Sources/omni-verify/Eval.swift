@@ -429,6 +429,8 @@ enum EvalCommand {
         struct Row { var n = 0, at1 = 0, at5 = 0, at10 = 0, file1 = 0, file10 = 0; var mrr = 0.0 }
         var rows: [String: Row] = [:]
         var perQuery: [[String: Any]] = []
+        // The weaker-matches fold (VectorStore.weakFold), as the app applies it to this list.
+        var shownTotal = 0, hitsTotal = 0, foldedAnswers = 0, foldedTop10 = 0
         for query in spec.queries where onlyTag == nil || query.tag == onlyTag {
             let hits: [SearchHit]
             if let g = engine.queryVectorGraph(query.q) {
@@ -440,6 +442,13 @@ enum EvalCommand {
             let fileRank = hits.firstIndex { hit in
                 query.expect.contains { matches(hit, String($0.split(separator: "@")[0]), tree: treePath) }
             }.map { $0 + 1 }
+            let weak = VectorStore.weakFold(hits)
+            shownTotal += weak.filter { !$0 }.count
+            hitsTotal += hits.count
+            if let fileRank, weak[fileRank - 1] {
+                foldedAnswers += 1
+                if fileRank <= 10 { foldedTop10 += 1 }
+            }
             for key in [query.tag, "ALL"] {
                 var r = rows[key] ?? Row()
                 r.n += 1
@@ -469,6 +478,10 @@ enum EvalCommand {
                   + String(format: " %3d  %5.2f  %5.2f  %5.2f  %5.3f   %5.2f  %5.2f", r.n, Double(r.at1) / n, Double(r.at5) / n,
                                   Double(r.at10) / n, r.mrr / n, Double(r.file1) / n, Double(r.file10) / n))
         }
+        let nq = Double(max(1, perQuery.count))
+        print(String(format: "weaker-matches fold: %.1f of %.1f results shown per query; %d found answers folded, %d of them in the top 10",
+                     Double(shownTotal) / nq, Double(hitsTotal) / nq,
+                     foldedAnswers, foldedTop10))
         if let out = opt("--json") {
             let summary = rows.mapValues { r -> [String: Double] in
                 let n = Double(r.n)

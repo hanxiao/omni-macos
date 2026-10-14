@@ -2750,7 +2750,15 @@ final class AppModel {
     /// render them.
     private(set) var results: [SearchHit] = []
     private(set) var groups: [ResultGroup] = []
-    private(set) var hiddenByThreshold: Int = 0
+    /// Hits not on the list: under the strong-matches floor (`minScore`) or folded as weaker matches
+    /// of this query (`VectorStore.weakFold`). The footer's "Show N weaker matches" brings them back.
+    private(set) var hiddenWeaker: Int = 0
+    /// The ones under the floor alone: the button lowers the floor only when it is hiding something.
+    private var hiddenByFloor = 0
+    /// This query's weaker matches are on the list (the footer button). A new query folds them again.
+    var showWeakMatches = false {
+        didSet { if oldValue != showWeakMatches { recomputeResults() } }
+    }
     /// Paths of stacks the user expanded, kept across recomputes so typing does not re-collapse a
     /// stack the user opened. Keyed by representative path.
     var expandedStacks: Set<String> = []
@@ -2795,9 +2803,22 @@ final class AppModel {
         // again when `loadGroupingInputs` brings the grouping keys - and on every live refresh of
         // the same query, and an @Observable property notifies on every write, equal or not. Each
         // unguarded pass re-rendered the results list and every visible row for nothing.
-        let above = rawResults.filter { Self.relevance($0.score) >= VectorStore.relevanceFloor(kind: $0.kind, base: minScore) }
+        var above = rawResults.filter { Self.relevance($0.score) >= VectorStore.relevanceFloor(kind: $0.kind, base: minScore) }
+        if hiddenByFloor != rawResults.count - above.count { hiddenByFloor = rawResults.count - above.count }
+        // WEAKER MATCHES FOLD, on the relevance order the store produced and before any sort, one
+        // vector space at a time: a linked Mac in another space scores on its own scale, and its
+        // best hit would otherwise decide what is weak on this Mac.
+        if !showWeakMatches, above.count > 1 {
+            var spaces: [String: [Int]] = [:]
+            for (i, h) in above.enumerated() { spaces[isGroupedRemote(h.path) ?? "", default: []].append(i) }
+            var weak = Set<Int>()
+            for idx in spaces.values {
+                for (j, w) in VectorStore.weakFold(idx.map { above[$0] }).enumerated() where w { weak.insert(idx[j]) }
+            }
+            if !weak.isEmpty { above = above.enumerated().filter { !weak.contains($0.offset) }.map(\.element) }
+        }
         let hidden = rawResults.count - above.count
-        if hiddenByThreshold != hidden { hiddenByThreshold = hidden }
+        if hiddenWeaker != hidden { hiddenWeaker = hidden }
         // Collapse duplicates BEFORE sorting, on the relevance order the store produced: grouping is
         // anchor-first, and the anchor must be the best-ranked member, not whichever file happens to
         // sort first by name. Grouping only ever runs over hits that already passed the threshold,
@@ -3597,7 +3618,12 @@ final class AppModel {
         suppressFilterEffects = false
         syncBoxFromFilters(reSearch: true)   // drop all qualifiers from the box, then search once
     }
-    func showAllBelowThreshold() { minScore = 0 }
+    /// "Show N weaker matches": unfold this query's weaker matches, and lower the floor if it is
+    /// hiding some too.
+    func showWeakerMatches() {
+        showWeakMatches = true
+        if hiddenByFloor > 0 { minScore = 0 }
+    }
 
     // MARK: - Query language
 
@@ -6251,6 +6277,7 @@ final class AppModel {
         localLanded = true
         hits = combinedHits()
         let isNewQuery = resolvedQuery != resolved
+        if isNewQuery, showWeakMatches { showWeakMatches = false }   // a new query folds its weaker matches
         if omniPerfEnabled {
             omniPerfLog(String(format: "results n=%d was=%d new=%@ view=%@ sidebar=%@ local=%d since-search=%.1fms",
                                hits.count, rawResults.count, isNewQuery ? "true" : "false", viewMode.rawValue,

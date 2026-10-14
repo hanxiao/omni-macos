@@ -324,6 +324,8 @@ enum MCPAdapter {
         } else {
             var inlined = 0          // thumbnails emitted so far (capped)
             var cappedSkips = 0      // media hits skipped specifically because the cap was already reached
+            // The app folds these under "Show N weaker matches"; an agent is told the same thing.
+            let weaker = VectorStore.weakFold(reps)
             for (i, h) in reps.enumerated() {
                 let score = Int((max(0, min(1, h.score)) * 100).rounded())
                 let loc = h.locator.isEmpty ? "" : ", \(h.locator)"
@@ -344,6 +346,7 @@ enum MCPAdapter {
                 // and the date is what a "most recent" question turns on. A few characters each.
                 if h.chunkCount > 1 { meta += ", \(h.chunkCount) passages" }
                 meta += ", \(Self.shortDate(h.modified))"
+                if weaker[i] { meta += ", weaker match" }
                 var text = "\(i + 1). \(h.path)  (\(h.kind), \(score)%\(loc)\(meta))"
                 if maxSnippet > 0 {
                     let snippet = h.snippet.replacingOccurrences(of: "\n", with: " ")

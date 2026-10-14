@@ -414,14 +414,14 @@ struct ContentView: View {
                 showSpinner: model.isResolving,
                 symbol: reach == 0 ? CenteredStatus.moleSearch
                     : reach == 1 ? CenteredStatus.moleSearchLinked : CenteredStatus.moleSearchLinkedMany)
-        } else if model.hiddenByThreshold > 0 {
+        } else if model.hiddenWeaker > 0 {
             // The count sits in the BUTTON, the only thing that acts on it. As a subtitle it
             // restated the title and then named the mechanism doing it.
             CenteredStatus(symbol: CenteredStatus.moleSad,
                            title: "No results above \(Int(model.minScore * 100))%",
                            subtitle: "", showSpinner: false,
-                           action: (Self.weakerMatchesTitle(model.hiddenByThreshold),
-                                    { model.showAllBelowThreshold() }))
+                           action: (Self.weakerMatchesTitle(model.hiddenWeaker),
+                                    { model.showWeakerMatches() }))
         } else if model.filtersActive {
             // Filters can hide every result; the empty state is the only place left to escape
             // them. The cause goes in the TITLE - as a subtitle it was a sentence explaining the
@@ -451,12 +451,12 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity)
                 .padding(.top, 8)
         }
-        if model.hiddenByThreshold > 0 {
+        if model.hiddenWeaker > 0 {
             // THE SAME BUTTON as the empty state's, same words, same style, same size - it is the
             // same action, so it should not look like two. It was a `.plain` text label, and a
             // plain button is hit only on its drawn glyphs: a click between the letters or beside
             // them did nothing, which is how it "sometimes did not respond".
-            Button(Self.weakerMatchesTitle(model.hiddenByThreshold)) { model.showAllBelowThreshold() }
+            Button(Self.weakerMatchesTitle(model.hiddenWeaker)) { model.showWeakerMatches() }
                 .controlSize(.large)
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 10)

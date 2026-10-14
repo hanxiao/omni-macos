@@ -378,7 +378,9 @@ enum SearchAdapter {
     static func rows(_ groups: [ResultGroup], backend: any ServingBackend) -> [[String: Any]] {
         // Lockstep rule as duplicateChunks: only trust a key whose modified matches the hit's.
         let contentKeys = backend.contentKeys(paths: groups.map { $0.representative.path })
-        return groups.map { g in
+        // Present only on a weaker match (VectorStore.weakFold), so a strong row is unchanged.
+        let weaker = VectorStore.weakFold(groups.map(\.representative))
+        return groups.enumerated().map { i, g in
             let hit = g.representative
             var row: [String: Any] = [
                 "path": hit.path,
@@ -401,6 +403,7 @@ enum SearchAdapter {
             if hit.size > 0 { row["bytes"] = hit.size }
             if let mime = mimeType(forPath: hit.path) { row["mime_type"] = mime }
             if let ck = contentKeys[hit.path], ck.modified == hit.modified { row["content_key"] = ck.key }
+            if weaker[i] { row["weaker"] = true }
             // What this row stands for. Present only on a stack, so a flat result set is byte-for-byte
             // what it was before grouping existed. "exact" = byte-identical (same content key AND
             // size); "near" = same kind and extension, sizes within 10%, cosine >= 0.98.
