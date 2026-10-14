@@ -1,4 +1,6 @@
 import Foundation
+import Vision
+import CoreML
 import PDFKit
 import SQLite3
 import OmniKit
@@ -3962,6 +3964,16 @@ if args.count >= 2 && args[1] == "concbench2" {
 // Load benchmark: omni-verify loadbench [N] [dim]
 // Times VectorStore(dbURL) reopening an existing N-row index (loadIntoMemory) - the store load that
 // bootstrap now overlaps with the engine load (opt 2A), i.e. the wall-clock 2A removes from launch.
+// How long a real index takes to open: omni-verify opentime <index.sqlite>
+if args.count >= 3 && args[1] == "opentime" {
+    let t = Date()
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[2]))
+    print(String(format: "opentime %.0f ms, sidecar %@", -t.timeIntervalSinceNow * 1000, store.adoptedRowSidecar ? "adopted" : "not adopted"))
+    if args.count >= 4, let wait = Double(args[3]) { try await Task.sleep(nanoseconds: UInt64(wait * 1e9)) }   // background work after open
+    store.close()
+    exit(0)
+}
+
 if args.count >= 2 && args[1] == "loadbench" {
     let N = (args.count >= 3 ? Int(args[2]) : nil) ?? 420_000
     let dim = (args.count >= 4 ? Int(args[3]) : nil) ?? 1024
@@ -4185,6 +4197,113 @@ if args.count >= 7 && args[1] == "turncost" {
         _ = engine.embedTextBatches(stride(from: 0, to: pieces.count, by: 8).map { Array(pieces[$0 ..< min($0 + 8, pieces.count)]) }, as: .passage)
     }
     exit(0)
+}
+
+// A video's soundtrack, three ways (sizing the soundtrack path): omni-verify soundcost <model> <video>
+if args.count >= 4 && args[1] == "soundcost" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    SoundCost.run(engine, URL(fileURLWithPath: args[3]))
+    exit(0)
+}
+
+// Screenshot OCR, cold and warm: omni-verify ocrcost <png>...
+if args.count >= 3 && args[1] == "ocrcost" {
+    let imgs = args[2...].compactMap { p -> CGImage? in
+        guard let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: p) as CFURL, nil) else { return nil }
+        return CGImageSourceCreateImageAtIndex(src, 0, nil)
+    }
+    let probe = VNRecognizeTextRequest()
+    probe.recognitionLevel = .accurate
+    if let stages = try? probe.supportedComputeStageDevices {
+        for (stage, devices) in stages { print("ocrcost stage \(stage.rawValue): \(devices.map { String(describing: $0) })") }
+        for (stage, devices) in stages {
+            for d in devices {
+                var texts: [String] = []
+                var t = Date()
+                for run in 0 ..< 4 {
+                    if run == 1 { t = Date() }
+                    texts = imgs.map { img in
+                        let r = VNRecognizeTextRequest(); r.recognitionLevel = .accurate; r.usesLanguageCorrection = true
+                        r.automaticallyDetectsLanguage = true; r.setComputeDevice(d, for: stage)
+                        try? VNImageRequestHandler(cgImage: img).perform([r])
+                        return (r.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+                    }
+                }
+                let same = zip(texts, imgs.map { ScreenText.recognize($0) }).filter { $0 == $1 }.count
+                print(String(format: "ocrcost %@ on %@: %.0f ms for %d warm, same text %d/%d", stage.rawValue, String(describing: d), -t.timeIntervalSinceNow * 1000 / 3, imgs.count, same, imgs.count))
+            }
+        }
+    }
+    let base = imgs.map { ScreenText.recognize($0) }
+    for (label, correct, auto) in [("noCorrection", false, true), ("fixedLanguages", true, false), ("default", true, true)] {
+        var t = Date(); var texts: [String] = []
+        for run in 0 ..< 4 {
+            if run == 1 { t = Date() }
+            texts = imgs.map { img in
+                let r = VNRecognizeTextRequest(); r.recognitionLevel = .accurate; r.usesLanguageCorrection = correct
+                r.automaticallyDetectsLanguage = auto
+                if !auto { r.recognitionLanguages = ["en-US", "zh-Hans", "ja-JP", "de-DE", "fr-FR"] }
+                try? VNImageRequestHandler(cgImage: img).perform([r])
+                return (r.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: "\n")
+            }
+        }
+        for (x, y) in zip(texts, base) where x != y && label == "noCorrection" {
+            let xl = x.split(separator: "\n"), yl = y.split(separator: "\n")
+            for (p, q) in zip(xl, yl) where p != q { print("ocrdiff without: \(p)\nocrdiff with:    \(q)") }
+        }
+        print(String(format: "ocrcost %@: %.0f ms for %d warm, same text %d/%d", label, -t.timeIntervalSinceNow * 1000 / 3, imgs.count,
+                     zip(texts, base).filter { $0 == $1 }.count, imgs.count))
+    }
+    for rep in 0 ..< 3 {
+        for (k, img) in imgs.enumerated() {
+            let t = Date(); let text = ScreenText.recognize(img)
+            if rep == 0 || k == 0 { print(String(format: "ocrcost rep%d image%d %.0f ms, %d chars", rep, k, -t.timeIntervalSinceNow * 1000, text.count)) }
+        }
+        let t = Date()
+        DispatchQueue.concurrentPerform(iterations: imgs.count) { _ = ScreenText.recognize(imgs[$0]) }
+        print(String(format: "ocrcost rep%d all %d concurrent %.0f ms", rep, imgs.count, -t.timeIntervalSinceNow * 1000))
+    }
+    exit(0)
+}
+
+enum SoundCost {
+    final class Box: @unchecked Sendable { var next: (mel: [Float], frames: Int)? }
+    static func cos(_ a: [Float], _ b: [Float]) -> Float { zip(a, b).map { $0 * $1 }.reduce(0, +) }
+    static func run(_ engine: OmniEngine, _ url: URL) {
+        var reference: [[Float]] = []
+        for rep in 0 ..< 3 {
+            var t = Date()
+            guard let r1 = OmniAudioPreprocess.AudioSegmentReader(url: url) else { print("soundcost: no audio"); return }
+            var seq: [[Float]] = []
+            while let m = r1.nextMelSegment() { if let v = engine.embedAudioMel(m.mel, frames: m.frames) { seq.append(v) } }
+            let tSeq = -t.timeIntervalSinceNow
+            if rep == 0 { reference = seq }
+            t = Date()
+            let r2 = OmniAudioPreprocess.AudioSegmentReader(url: url)!
+            let q = DispatchQueue(label: "pf")
+            var cur = r2.nextMelSegment()
+            var pf: [[Float]] = []
+            while let c = cur {
+                let box = Box(), g = DispatchGroup()
+                g.enter(); q.async { box.next = r2.nextMelSegment(); g.leave() }
+                if let v = engine.embedAudioMel(c.mel, frames: c.frames) { pf.append(v) }
+                g.wait(); cur = box.next
+            }
+            let tPf = -t.timeIntervalSinceNow
+            t = Date()
+            let r3 = OmniAudioPreprocess.AudioSegmentReader(url: url)!
+            var mels: [[Float]] = [], frames: [Int] = []
+            while let m = r3.nextMelSegment() { mels.append(m.mel); frames.append(m.frames) }
+            var bat: [[Float]] = []
+            for i in stride(from: 0, to: mels.count, by: 4) {
+                bat += engine.embedAudioMelBatch(Array(mels[i ..< min(i + 4, mels.count)]), frames: Array(frames[i ..< min(i + 4, mels.count)])) ?? []
+            }
+            let tBat = -t.timeIntervalSinceNow
+            print(String(format: "soundcost %d/%d/%d windows: sequential %.0f ms, prefetch %.0f ms (min cos %.5f), batch4 %.0f ms (min cos %.5f)",
+                         seq.count, pf.count, bat.count, tSeq * 1000, tPf * 1000, zip(reference, pf).map { cos($0, $1) }.min() ?? -1,
+                         tBat * 1000, zip(reference, bat).map { cos($0, $1) }.min() ?? -1))
+        }
+    }
 }
 
 // The labeled retrieval eval (Eval.swift): evalbed generates the testbed, eval measures search on it.

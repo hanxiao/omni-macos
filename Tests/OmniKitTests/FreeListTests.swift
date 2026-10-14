@@ -355,6 +355,76 @@ final class FreeListTests: XCTestCase {
         XCTAssertEqual(hits.first?.path, "/reused.txt")
     }
 
+    /// KILLED BEFORE THE STAMP: the debt is in memory only, so the reopen has to find it again -
+    /// the blob beside a covered position whose bytes the file holds - and settle it, or the blob
+    /// stays for good and the coverage audit fails on every open.
+    func testAReuseNeverSettledBeforeAKillIsSettledAfterTheReopen() throws {
+        try reuseKilledThenReopened(stampSidecar: false)
+    }
+
+    /// The same, when the row sidecar is current and the open adopts it instead of loading rows.
+    func testAReuseNeverSettledIsSettledWhenTheSidecarIsAdopted() throws {
+        try reuseKilledThenReopened(stampSidecar: true)
+    }
+
+    private func reuseKilledThenReopened(stampSidecar: Bool) throws {
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        let url = tempDB()
+        do {
+            let store = try VectorStore(dbURL: url)
+            for i in 0 ..< 60 { try store.replace(path: "/a/f\(i).txt", chunks: [chunk("/a/f\(i).txt", i)]) }
+            _ = store.search(vec(1), topK: 3)
+            store.advanceCoverageForTest()
+            store.deletePath("/a/f3.txt")
+            try store.replace(path: "/reused.txt", chunks: [chunk("/reused.txt", 903)])
+            XCTAssertEqual(pendingCount(url), 1, "the fixture did not reuse a covered position")
+            if stampSidecar { store.stampRowSidecarForTest() }
+            // No close(): a kill. Committed rows and the mapped file's pages survive, nothing else.
+        }
+        let store = try VectorStore(dbURL: url)
+        XCTAssertEqual(store.adoptedRowSidecar, stampSidecar, "the open took the other loader: the case under test never ran")
+        XCTAssertNil(store.coverageAudit(), "the reopened index reports its unsettled reuse as broken")
+        XCTAssertEqual(pendingCount(url), 0, "the open did not settle the reuse (a session killed again would carry it on)")
+        XCTAssertEqual(store.search(vec(903), topK: 3).first?.path, "/reused.txt")
+        store.close()
+        let again = try VectorStore(dbURL: url); defer { again.close() }
+        XCTAssertNil(again.coverageAudit())
+        XCTAssertEqual(again.search(vec(903), topK: 3).first?.path, "/reused.txt")
+    }
+
+    /// AN OLDER BUILD'S DEBT: killed with a reuse owed and nothing on disk to say so. It is found
+    /// where it does harm - the identity at the end of coverage, which it broke for good - and
+    /// settled there, so coverage completes on the next stamp.
+    func testADebtAnOlderBuildLeftIsSettledWhereCoverageCompletes() throws {
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        let url = tempDB()
+        do {
+            let store = try VectorStore(dbURL: url)
+            for i in 0 ..< 60 { try store.replace(path: "/a/f\(i).txt", chunks: [chunk("/a/f\(i).txt", i)]) }
+            _ = store.search(vec(1), topK: 3)
+            store.advanceCoverageForTest()
+            store.deletePath("/a/f3.txt")
+            try store.replace(path: "/reused.txt", chunks: [chunk("/reused.txt", 903)])
+            store.stampRowSidecarForTest()
+        }   // killed
+        // What an older build left: the blob, and no record of the debt.
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        XCTAssertEqual(sqlite3_exec(db, "DELETE FROM vec_reuse_debt;", nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        XCTAssertEqual(pendingCount(url), 1, "settled at open: the older debt is not what is under test")
+        XCTAssertNotNil(store.coverageAudit(), "the fixture holds no leaked blob (control)")
+        // Writing again grows the file past the claim; the stamps that cover it meet the identity.
+        for i in 0 ..< 5 { try store.replace(path: "/new\(i).txt", chunks: [chunk("/new\(i).txt", 700 + i)]) }
+        store.stampCoverageForTest()
+        store.stampCoverageForTest()
+        XCTAssertNil(store.coverageAudit(), "the older debt still breaks the coverage bookkeeping")
+        XCTAssertEqual(pendingCount(url), 0, "coverage never completed past the older debt")
+        XCTAssertEqual(store.search(vec(903), topK: 3).first?.path, "/reused.txt")
+        XCTAssertEqual(store.search(vec(702), topK: 3).first?.path, "/new2.txt")
+    }
+
     /// THE RELOAD THE RANK WALK CANNOT DO.
     ///
     /// `loadFromCoverageLocked` derives a position from a row's rank in id order counted through

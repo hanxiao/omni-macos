@@ -1,0 +1,83 @@
+import XCTest
+import CoreText
+import CoreGraphics
+@testable import OmniKit
+
+/// A chunk of a PDF opens at the page holding most of it, and an index built before that is
+/// relocated by the enrichment without embedding anything.
+final class PageChunkTests: XCTestCase {
+    func testAChunkOpensAtThePageHoldingMostOfIt() {
+        // Pages start at 0, 100, 1000: a chunk [50, 1050) is 50 on page 1, 900 on page 2, 50 on page 3.
+        XCTAssertEqual(Indexer.pageOf([0, 100, 1000], from: 50, to: 1050), 1)
+        XCTAssertEqual(Indexer.pageOf([0, 100, 1000], from: 0, to: 100), 0)
+        XCTAssertEqual(Indexer.pageOf([0, 500, 1000], from: 250, to: 750), 0, "a tie goes to the first page")
+        XCTAssertEqual(Indexer.pageOf([0, 100, 1000], from: 1200, to: 3000), 2)
+    }
+
+    /// A PDF of `pages`, each page's text drawn as lines PDFKit reads back.
+    private func pdf(_ pages: [String], at url: URL) {
+        var box = CGRect(x: 0, y: 0, width: 612, height: 792)
+        let ctx = CGContext(url as CFURL, mediaBox: &box, nil)!
+        let font = CTFontCreateWithName("Helvetica" as CFString, 9, nil)
+        for page in pages {
+            ctx.beginPDFPage(nil)
+            var y: CGFloat = 770
+            var line = ""
+            func flush() {
+                let l = CTLineCreateWithAttributedString(NSAttributedString(string: line, attributes: [.init(kCTFontAttributeName as String): font]))
+                ctx.textPosition = CGPoint(x: 20, y: y); CTLineDraw(l, ctx); y -= 11; line = ""
+            }
+            for word in page.split(separator: " ") {
+                if line.count + word.count > 110 { flush() }
+                line += (line.isEmpty ? "" : " ") + word
+            }
+            if !line.isEmpty { flush() }
+            ctx.endPDFPage()
+        }
+        ctx.closePDF()
+    }
+
+    func testAnOlderIndexIsRelocatedWithoutEmbedding() throws {
+        var r = FileManager.default.temporaryDirectory.appendingPathComponent("reloc-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: r, withIntermediateDirectories: true)
+        if let rp = realpath(r.path, nil) { r = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+        let root = r
+        let db = root.deletingLastPathComponent().appendingPathComponent("reloc-db-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: db, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root); try? FileManager.default.removeItem(at: db) }
+        // Pages of 300, 3000, 3000, 3000 characters: chunks begin near the ends of pages.
+        let words = ["harbor", "engine", "fog", "sail", "anchor", "tide", "compass", "deck", "rope", "storm"]
+        let pages = [300, 3000, 3000, 3000].enumerated().map { k, n in
+            var s = "", i = k
+            while s.count < n { s += words[i % words.count] + "\(k) "; i += 3 }
+            return s
+        }
+        let file = root.appendingPathComponent("log.pdf")
+        pdf(pages, at: file)
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let embedder = EnrichmentTests.Fake()
+        let indexer = Indexer(store: store, embedder: embedder)
+        let done = expectation(description: "pass")
+        indexer.index(roots: [root], settings: IndexSettings()) { p in if p.done { done.fulfill() } }
+        wait(for: [done], timeout: 120)
+        let now = try XCTUnwrap(store.storedChunks(path: file.path)).sorted { $0.chunkIndex < $1.chunkIndex }
+        XCTAssertGreaterThan(now.count, 2)
+
+        // An older layout: chunks placed elsewhere than today's rule places them.
+        let older = now.map { row -> IndexedChunk in var o = row; o.locator = "Page 1"; return o }
+        XCTAssertNotEqual(older.map(\.locator), now.map(\.locator), "no chunk moved: the test proves nothing (control)")
+        try store.replaceMany([(file.path, older)])
+        XCTAssertEqual(try XCTUnwrap(store.storedChunks(path: file.path)).map(\.locator), older.map(\.locator))
+        let embeddedBefore = indexer.textsEmbedded.value
+
+        let f = try XCTUnwrap(store.storedFiles(paths: [file.path])[file.path])
+        let d = try XCTUnwrap(store.contentDigests(paths: [file.path])[file.path])
+        XCTAssertTrue(indexer.enrichOne((file.path, f.kind, f.modified, f.size, 0), digest: d, settings: IndexSettings()))
+        let after = try XCTUnwrap(store.storedChunks(path: file.path)).sorted { $0.chunkIndex < $1.chunkIndex }
+        XCTAssertEqual(after.map(\.locator), now.map(\.locator))
+        XCTAssertEqual(after.map(\.embedding), now.map(\.embedding))
+        XCTAssertEqual(after.map(\.chunkKey), now.map(\.chunkKey))
+        XCTAssertEqual(indexer.textsEmbedded.value, embeddedBefore, "relocation embedded text")
+    }
+}

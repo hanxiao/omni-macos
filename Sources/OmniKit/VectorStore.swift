@@ -2639,6 +2639,9 @@ public final class VectorStore: @unchecked Sendable {
         // it is a handful of integers in practice - not a per-row column. That is the point: a
         // compaction then costs two metadata writes instead of restating millions of row numbers.
         exec("CREATE TABLE IF NOT EXISTS vec_holes(slot INTEGER PRIMARY KEY);")
+        // The covered positions a reuse has written and no sync has made durable yet: what
+        // `unsyncedReuse` holds in memory, kept where a kill cannot take it (settleInheritedReuseLocked).
+        exec("CREATE TABLE IF NOT EXISTS vec_reuse_debt(slot INTEGER PRIMARY KEY);")
         mutationGen = Int64(scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='mutation_gen'"))
         // Legacy layout -> interned, before a single query runs against it. Verified against the
         // original inside its own transaction, so a failure leaves the old table in place and the
@@ -6380,7 +6383,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     /// Files an enrichment may have work for: audio longer than `audioLongerThan` seconds, every
-    /// video, and images named like screenshots - the system's name in the languages macOS writes
+    /// video, text PDFs (their page locators), and images named like screenshots - the system's name in the languages macOS writes
     /// it in (the decode stage reads the screen-capture attribute itself; this narrows a scan of
     /// the whole table to the files worth asking). Read in slices of file ids, so no single hold of
     /// the store's queue grows with the index.
@@ -6407,7 +6410,8 @@ public final class VectorStore: @unchecked Sendable {
                     SELECT \(StoreSchema.pathExpr), f.kind, f.modified, f.size, f.duration
                       FROM files f JOIN dirs d ON d.id = f.dir_id
                      WHERE f.id >= ? AND f.id < ?
-                       AND ((f.kind = 4 AND f.duration > ?) OR f.kind = 3 OR (f.kind = 1 AND (\(nameSQL))));
+                       AND ((f.kind = 4 AND f.duration > ?) OR f.kind = 3 OR (f.kind = 1 AND (\(nameSQL)))
+                            OR (f.kind = 0 AND f.name LIKE '%.pdf'));
                     """, -1, &stmt, nil) == SQLITE_OK else { return }
                 sqlite3_bind_int64(stmt, 1, lo); sqlite3_bind_int64(stmt, 2, hi)
                 sqlite3_bind_double(stmt, 3, audioLongerThan)
@@ -8837,7 +8841,11 @@ public final class VectorStore: @unchecked Sendable {
         // different bytes now, and those bytes are not durable until the next msync - so the new
         // row keeps its pending blob, and the coverage stamp drops it once the file is synced.
         if p < baseRows { patchedSlots.append(Int32(p)) }
-        if p < coveredRows { unsyncedReuse.insert(Int32(p)) }
+        if p < coveredRows {
+            // And durably which one is owed, in the same transaction: a kill takes the set above
+            // with it, and this is how the next open finds it (settleInheritedReuseLocked).
+            if unsyncedReuse.insert(Int32(p)).inserted { exec("INSERT OR IGNORE INTO vec_reuse_debt(slot) VALUES(\(p));") }
+        }
         return Int32(p)
     }
 
@@ -9467,15 +9475,90 @@ public final class VectorStore: @unchecked Sendable {
     /// Scoped through `pending_vecs`, which is empty at rest and otherwise holds only the uncovered
     /// tail, so this is a walk of a small B-tree with one indexed lookup per row - not a scan of
     /// the covered prefix.
+    /// The sidecar adopt's half of what loadBySlotLocked finds while it seats rows: the positions
+    /// a killed session's reuses left owed, read from `vec_reuse_debt` - empty on every open but one
+    /// after such a kill, so this costs one lookup in an empty table.
+    private func findInheritedReuseLocked() {
+        guard flat16.isPersistent, coveredRows > 0, dim > 0,
+              scalarQuery("SELECT COUNT(*) FROM vec_reuse_debt") > 0 else { return }
+        adoptReuseDebtsLocked(where: "c.slot >= 0 AND c.slot IN (SELECT slot FROM vec_reuse_debt)")
+    }
+
+    /// Covered positions whose row still has its blob, under `filter` on the chunk row `c`: each
+    /// recorded as an unsettled reuse when the file holds the blob's bytes. If ANY blob disagrees
+    /// with the file, none is recorded: that blob may be the only right copy (the file stale after
+    /// a power loss), and the settle that follows drops every covered blob it finds.
+    @discardableResult
+    private func adoptReuseDebtsLocked(where filter: String, scanPending: Bool = false) -> Bool {
+        let unit = splitBuilt ? "chunk" : "chunks"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, """
+            SELECT c.slot, p.vec FROM pending_vecs p \(scanPending ? "CROSS JOIN" : "JOIN") \(unit) c ON c.id = p.chunk_id WHERE \(filter);
+            """, -1, &stmt, nil) == SQLITE_OK else { return false }
+        let d = dim, bytes = d * MemoryLayout<UInt16>.size
+        var agreed: [Int32] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let pos = Int(sqlite3_column_int64(stmt, 0))
+            guard pos >= 0, pos < coveredRows else { continue }
+            guard Int(sqlite3_column_bytes(stmt, 1)) >= bytes, let blob = sqlite3_column_blob(stmt, 1) else { return false }
+            let agrees = flat16.withUnsafeBufferPointer { buf -> Bool in
+                guard (pos + 1) * d <= buf.count else { return false }
+                return memcmp(buf.baseAddress! + pos * d, blob, bytes) == 0
+            }
+            guard agrees else { return false }
+            agreed.append(Int32(pos))
+        }
+        for p in agreed where unsyncedReuse.insert(p).inserted { exec("INSERT OR IGNORE INTO vec_reuse_debt(slot) VALUES(\(p));") }
+        return true
+    }
+
+    /// A DEBT AN OLDER BUILD LEFT, which has no `vec_reuse_debt` row: found where it does its harm.
+    /// The blob beside its covered position is one more than the identity at the end of coverage
+    /// allows, so the slice that would complete coverage rolled back on every stamp, for good, and
+    /// every row past it kept its blob. At that moment pending_vecs holds next to nothing, so
+    /// reading all of it is cheap: what agrees with the file is settled, and the next stamp
+    /// completes. Nothing is touched if any covered blob disagrees with the file.
+    private func settleLeakedReuseLocked() {
+        guard flat16.isPersistent, coveredRows > 0, dim > 0 else { return }
+        let before = unsyncedReuse.count
+        guard adoptReuseDebtsLocked(where: "c.slot >= 0 AND c.slot < \(coveredRows)", scanPending: true),
+              unsyncedReuse.count > before else { return }
+        for p in unsyncedReuse { flat16.msync(elements: Int(p) * dim, (Int(p) + 1) * dim) }
+        clearSyncedReuseBlobsLocked()
+        omniPerfLog("store settled the reuse(s) an older session left")
+    }
+
+    /// A reuse the last session never settled (loadBySlotLocked records them), settled now: the
+    /// pages holding those positions synced, the blobs dropped. Only after a kill, so it costs
+    /// nothing on any other open, and not later at a stamp - an idle session writes nothing and
+    /// never stamps, and one killed again would carry the debt into the next open once more.
+    private func settleInheritedReuseLocked() {
+        guard scalarQuery("SELECT COUNT(*) FROM vec_reuse_debt") > 0 else { return }
+        guard flat16.isPersistent, !unsyncedReuse.isEmpty, dim > 0 else {
+            // Nothing the file agrees with is owed: the record is spent.
+            exec("DELETE FROM vec_reuse_debt;")
+            return
+        }
+        for p in unsyncedReuse { flat16.msync(elements: Int(p) * dim, (Int(p) + 1) * dim) }
+        clearSyncedReuseBlobsLocked()
+    }
+
     private func clearSyncedReuseBlobsLocked() {
         guard dbOpen(), !unsyncedReuse.isEmpty else { return }
         let unit = splitBuilt ? "chunk" : "chunks"
+        // THE RECORDED POSITIONS, NOT THE COVERED RANGE. Every reuse is in vec_reuse_debt, so this
+        // drops exactly the blobs whose bytes the sync just made durable - a blob at a covered
+        // position nobody recorded is not this function's to judge - and it reads the debts, not
+        // a join over every covered position (2.7 s on the 9.7M-row bench index).
         let ok = execChecked("""
             DELETE FROM pending_vecs WHERE chunk_id IN
-              (SELECT p.chunk_id FROM pending_vecs p JOIN \(unit) c ON c.id = p.chunk_id
-                WHERE c.slot >= 0 AND c.slot < \(coveredRows));
+              (SELECT c.id FROM \(unit) c WHERE c.slot >= 0 AND c.slot IN (SELECT slot FROM vec_reuse_debt));
             """)
-        if ok { unsyncedReuse.removeAll(keepingCapacity: true) }
+        if ok {
+            unsyncedReuse.removeAll(keepingCapacity: true)
+            exec("DELETE FROM vec_reuse_debt;")
+        }
     }
 
     /// Write every covered row's vector back into its SQLite blob, and stand the coverage claim
@@ -9787,6 +9870,14 @@ public final class VectorStore: @unchecked Sendable {
                     return memcmp(buf.baseAddress! + pos * d, blob, bytesPerRow) == 0
                 }
                 if !agrees { ok = false; why = "a covered position and a surviving blob disagree at \(pos)"; break }
+                // AGREEING, IT IS A REUSE THE LAST SESSION NEVER SETTLED: a write placed it, and the
+                // process was killed before the stamp synced the file and dropped the blob. Only
+                // `unsyncedReuse` remembers that debt and it died with the process, so the blob
+                // stayed beside its covered position for good - the coverage audit failing on
+                // every open, pending_vecs never shrinking. The file holds the blob's bytes (just
+                // compared), so it is the same debt as a reuse made now: recorded, and settled by
+                // the next stamp or close like any other. Found by killing the 0.17 upgrade.
+                if unsyncedReuse.insert(Int32(pos)).inserted { exec("INSERT OR IGNORE INTO vec_reuse_debt(slot) VALUES(\(pos));") }
             }
             rows.append(newRowLocked(path: path, kind: kind, chunkIndex: Int(sqlite3_column_int(stmt, 2)),
                             meta: FileMeta(modified: sqlite3_column_double(stmt, 5),
@@ -9878,7 +9969,7 @@ public final class VectorStore: @unchecked Sendable {
         // is its only copy. Gating this was a one-line way to turn the safety valve into total data
         // loss - flipping the lever on a migrated index dropped all 4.5M rows.
         guard dbOpen(), coveredRows > 0 else { return false }
-        if loadBySlotLocked() { return true }
+        if loadBySlotLocked() { settleInheritedReuseLocked(); return true }
         // A SPLIT INDEX HAS NO SECOND LOADER, AND MUST NOT PRETEND TO. The walk below hands out
         // one position per row-or-hole; the split's whole point is that several rows share one,
         // so on the measured index it would run 3.5M positions off the end of the file. Falling
@@ -10812,7 +10903,9 @@ public final class VectorStore: @unchecked Sendable {
             let staged = onSplit ? scalarQuery("SELECT COUNT(*) FROM chunk") : live
             let clearedRows = scalarQuery("SELECT COUNT(*) FROM \(unit) WHERE slot >= 0 AND slot < \(target)")
             guard scalarQuery("SELECT COUNT(*) FROM pending_vecs") == staged - clearedRows else {
-                rollbackTxnLocked(); return false
+                rollbackTxnLocked()
+                settleLeakedReuseLocked()   // a blob an older build's kill left: the next stamp completes
+                return false
             }
             laps.lap("identity")
         }
@@ -14121,6 +14214,10 @@ public final class VectorStore: @unchecked Sendable {
         if splitBuilt, coveredRows > 0, !vecHoles.isEmpty { _ = releaseHolesOwnedByLiveContentsLocked() }
         if tryAdoptRowSidecarLocked() {
             omniPerfLog("store adopted row sidecar")
+            let t0 = CFAbsoluteTimeGetCurrent()
+            findInheritedReuseLocked()
+            settleInheritedReuseLocked()
+            if omniPerfEnabled { omniPerfLog(String(format: "store inherited-reuse check %.1fms", (CFAbsoluteTimeGetCurrent() - t0) * 1000)) }
             // Arm the coverage stamp HERE too. It used to be armed only at the end of the scan path
             // below and by bumpGenLocked, so on a launch that adopted the sidecar and then sat idle,
             // nothing ever scheduled one: coverage advanced a single slice per QUIT and otherwise

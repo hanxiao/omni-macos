@@ -100,7 +100,8 @@ final class ChunkLocatorTests: XCTestCase {
         }
     }
 
-    /// Text-layer PDFs get "Page N" locators from the page-start offsets.
+    /// Text-layer PDFs get "Page N" locators from the page-start offsets: the page holding most of
+    /// the chunk, the first of them on a tie (Indexer.pageOf - it was the page the chunk began on).
     func testPagedLocators() throws {
         let (indexer, store) = try makeIndexer()
         defer { store.close() }
@@ -110,10 +111,16 @@ final class ChunkLocatorTests: XCTestCase {
         let pageStarts = [0, text.count / 3, 2 * text.count / 3]
         let pieces = indexer.chunk(text, settings: settings, origin: .paged(pageStarts))
         XCTAssertGreaterThan(pieces.count, 3)
+        let bounds = pageStarts + [text.count]
+        var moved = 0
         for (k, off) in starts(pieces, in: text).enumerated() {
-            let expected = off >= pageStarts[2] ? 3 : (off >= pageStarts[1] ? 2 : 1)
-            XCTAssertEqual(pieces[k].locator, "Page \(expected)", "chunk \(k) starting at \(off)")
+            let end = off + pieces[k].text.count
+            let held = (0 ..< 3).map { p in max(0, min(end, bounds[p + 1]) - max(off, bounds[p])) }
+            let expected = held.firstIndex(of: held.max()!)! + 1
+            XCTAssertEqual(pieces[k].locator, "Page \(expected)", "chunk \(k) at \(off)..<\(end)")
+            if off < bounds[expected - 1] { moved += 1 }
         }
+        XCTAssertGreaterThan(moved, 0, "no chunk began on a page before the one holding most of it: the rule is untested (control)")
     }
 
     /// Office docs (opaque origin) carry no locator: their offsets map to nothing a reader sees.

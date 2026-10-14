@@ -77,5 +77,52 @@ is not worth it); audio is re-embedded by this release's enrichment anyway. Prob
   a penguin is tagged "bird, whale" (Small) or "pigeon, whale" (Nano). A design limit from the
   start, not a regression.
 
-- PDF hits open a page or two early: a chunk spans short pages and is located at the page it starts
-  on (`long` file R@1 1.00, place 0.25 on the eval).
+- A PDF short enough to be one chunk has one place, its first page: the eval's five-topic, 1,400-
+  character `pdf-page` file stays at place R@1 0.00 (file R@10 1.00). Cutting page by page fixes it
+  and costs 30% more chunks on real PDFs, more on slide decks (see "PDF page locators").
+- A covered vector whose blob DISAGREES with the file - what a power loss inside a reuse's stamp
+  window would leave - makes the open refuse the index ("The vector file could not be read").
+  Pre-existing, separate from the reuse debt below; the debt table would let the open tell this
+  case apart and write the blob back, not done.
+
+### PDF page locators (2026-10-14)
+
+A chunk (~1,800 characters) opened at the page it began on, so one beginning with a page's last
+lines opened a page early. It now opens at the page holding most of it (`Indexer.pageOf`, first page
+on a tie). Free: cuts, keys and vectors are unchanged, only the locator moves - 28% of them on 40 real
+PDFs (2,937 characters a page). Eval: `long` place R@1 0.25 -> 1.00 on both models, and `exact` 0.91
+-> 1.00 (its miss was this). Cutting page by page scored exactly the same at 30% more chunks on the
+real PDFs (each page's tail its own chunk), so it is not done. An index built before is relocated by
+the enrichment: the same chunks re-located, the stored vectors copied, nothing embedded (a fresh
+index records its PDFs as done, so it pays nothing).
+
+### Old build vs this one, same files (2026-10-14)
+
+Isolated app runs, two reps each, back to back. 690-file media tree: indexing 83.6 s -> 102 s, peak
+memory 5.7-5.8 -> 5.8-5.9 GB, disk 40.5 -> 42.1 MB. Eval tree (226 mixed files): 23.7 s -> 28 s,
+peak 4.8-4.9 -> 4.6-5.0 GB, disk 46.8 -> 47.7 MB. All of the time is screenshot text and soundtracks,
+new content: with both off this build indexes the eval tree in 22-24 s against the old build's 24-25
+(and scores MRR 0.786 against 0.766). Each costs 2-3 s there. Made cheaper:
+- OCR without language correction: 827 -> 673 ms for the nine screenshots, and it read code more
+  faithfully ("= 0" had become "= O", "+=" "+ ="); the other eight read the same. Neural Engine, GPU
+  and CPU measured equal for the recognizer (~120 ms an image).
+- The soundtrack decodes the next minute while the GPU embeds this one: 4% off, same vectors.
+  Batching minutes saved 2% more and moved the vectors (cos 0.9999) from an audio file's: not done.
+What is left is the embedding itself (~225 ms a soundtrack minute, ~100 ms a screenshot's OCR).
+Search on the 9.7M-chunk bench clone: digest 134b9ff183fd2f29 and p50 4.1-4.2 ms, both builds.
+
+An upgraded Nano index keeps its image vectors from before the special-token fix: scored as it
+stands, the upgraded eval index gives MRR 0.832 against 0.836 fresh (one German query for a violin
+ranks its photo 2nd, not 1st); images overall 0.639 vs 0.636. Re-embedding every Nano image at
+upgrade for that is not done.
+
+### Eval, all of the above (2026-10-14, tree 6d6ef9f3, 125 queries)
+
+ALL MRR Nano 0.837 (R@1 0.79), Small 0.885 (R@1 0.85). `long` and `exact` 1.00 on both;
+`screenshot` 1.00; `soundtrack` Nano 0.419 / Small 0.778; `pdf-page` 0.125 (one chunk, above).
+
+### The reuse debt, found by killing the upgrade (2026-10-14)
+
+Proving the enrichment under kill turned up a store bug older than it: docs/notes/index.md, "Reuse
+debt". Fixed in the open path and at coverage completion; open, search and write measured equal.
+

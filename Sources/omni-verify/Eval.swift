@@ -508,9 +508,12 @@ enum EvalCommand {
         for p in pa where pb.contains(p) {
             let ca = (a.storedChunks(path: p) ?? []).sorted { $0.chunkIndex < $1.chunkIndex }
             let cb = (b.storedChunks(path: p) ?? []).sorted { $0.chunkIndex < $1.chunkIndex }
-            guard ca.count == cb.count else { structural += 1; continue }
+            func note(_ why: String) { structural += 1; if structural <= 60 { print("statecompare differs: \(p) \(why)") } }
+            guard ca.count == cb.count else { note("\(ca.count) vs \(cb.count) chunks"); continue }
             for (x, y) in zip(ca, cb) {
-                guard x.kind == y.kind, x.locator == y.locator, x.snippet == y.snippet, x.chunkIndex == y.chunkIndex else { structural += 1; continue }
+                guard x.kind == y.kind, x.locator == y.locator, x.snippet == y.snippet, x.chunkIndex == y.chunkIndex else {
+                    note("chunk \(x.chunkIndex): \(x.kind) '\(x.locator)' vs \(y.kind) '\(y.locator)'\(x.snippet == y.snippet ? "" : ", snippet")"); continue
+                }
                 let nx = x.embedding.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot(), ny = y.embedding.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot()
                 let c = zip(x.embedding, y.embedding).reduce(Float(0)) { $0 + $1.0 * $1.1 } / Swift.max(1e-9, nx * ny)
                 minCos[x.kind] = Swift.min(minCos[x.kind] ?? 1, c)

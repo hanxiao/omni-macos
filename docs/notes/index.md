@@ -1520,3 +1520,36 @@ one `/Users/hanxiao` root and 180,911 `.openclaw` files out of the index. Its re
   `remove_source` as a direct tool.
 - LEFT AS IS: no SSE progress (the spec allows JSON), no rate limit on a loopback-only server,
   `top_k` clamped to its maximum rather than refused.
+
+## Reuse debt (2026-10-14, found by killing the 0.17 upgrade)
+
+A write the free list places on a covered position keeps its blob until a sync makes the file's new
+bytes durable; `unsyncedReuse` remembers that debt and the next stamp or `close()` settles it. That
+set lived in memory only. Killed inside the window (SIGTERM is as abrupt as SIGKILL for this app),
+the blob stayed beside its covered position for good: `storeaudit` failed "coverage covers 3186 rows
+but 3183 have no blob" on every later open, and - the real harm - the identity the slice completing
+coverage proves (`COUNT(pending_vecs) == staged - cleared`) could never hold again, so coverage
+never completed and every row past it kept its blob. Seen on the eval tree after the upgrade's
+enrichment rewrote files and the app was stopped 3 s after its pass.
+
+- Each reuse records its position in `vec_reuse_debt`, in the transaction that places it; settling
+  syncs those pages and drops exactly those blobs, and empties the table. The settle used to drop
+  every blob at a covered position (a join over the whole covered range): now only the recorded
+  ones, which is both safer and proportional to the debt.
+- The open settles a killed session's debts: the by-slot loader records a covered position whose
+  surviving blob equals the file's bytes; the sidecar adopt reads `vec_reuse_debt` (empty on every
+  healthy open: 0.1 ms on the 9.7M-chunk bench clone).
+- A debt an older build left has no record. It is found where it does harm: when the completing
+  slice's identity fails, pending_vecs is nearly empty, so it is read whole, every covered blob that
+  agrees with the file is settled, and the next stamp completes. If any covered blob disagrees with
+  the file, nothing is touched (that blob may be the only right copy).
+
+Rejected on the way, measured: scanning the covered range at every open (2.7 s added to a 4.9 s open
+on the bench clone, 5-8 s cold whichever join order); a one-time background sweep on the read lane
+(21-23 s once, and during it mutbench's browse p50 went 0.4 -> 75 ms with a 4.0 s stall). After the
+fix, mutbench `--crud update` old vs new: open 4.8-4.9 s, op 8.38-8.42 s, search p50 7.8-8.9 ms, browse
+0.4 ms, audit clean, both. Tests: FreeListTests - a kill then a reopen through each loader, and an
+older build's debt settled at coverage completion; each fails with its fix removed. On the real
+index the upgrade damaged, an earlier form of this fix (the sweep) settled the 3 through the app and
+it audited clean after a SIGKILL; the damage did not recur in 13 further attempts, so the final form
+is proven by the tests, not by that index.

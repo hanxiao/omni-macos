@@ -2108,6 +2108,28 @@ public final class Indexer: @unchecked Sendable {
         return last ? .done : .more
     }
 
+    /// THE PAGE A CHUNK SPANNING [from, to) OPENS AT: the one holding most of it, the first on a
+    /// tie. It was the page the chunk began on, and a chunk is ~1,800 characters: one that began
+    /// with a page's last lines opened a page before its text (the labeled eval's long PDF: right
+    /// file every time, right page 1 in 4; now 4 in 4; MRR 0.804 -> 0.836 on Nano). Free: the cuts,
+    /// keys and vectors are the same, only the locator moves (28% of them on 40 real PDFs).
+    /// Cutting page by page was measured beside it: the same eval score at 30% more chunks on the
+    /// real PDFs (more on slide decks), so it is not done. A PDF short enough to be one chunk keeps
+    /// one place, its first page (docs/notes/roadmap.md, item 11).
+    static func pageOf(_ starts: [Int], from: Int, to: Int) -> Int {
+        var lo = 0, hi = starts.count - 1   // last page whose start offset <= from
+        while lo < hi { let mid = (lo + hi + 1) / 2; if starts[mid] <= from { lo = mid } else { hi = mid - 1 } }
+        let first = lo
+        var best = first, bestLen = -1, p = first
+        while p < starts.count, starts[p] < to {
+            let lo = Swift.max(from, starts[p]), hi = Swift.min(to, p + 1 < starts.count ? starts[p + 1] : to)
+            if hi - lo > bestLen { best = p; bestLen = hi - lo }
+            p += 1
+        }
+        return best
+    }
+    nonisolated(unsafe) static var pageByPage = ProcessInfo.processInfo.environment["OMNI_PAGE_CHUNKS"] == "1"   // A/B, settled below
+
     /// A window after the first needs this many mel frames (one second) to be embedded.
     static let minTailMelFrames = 100
 
@@ -2219,15 +2241,26 @@ public final class Indexer: @unchecked Sendable {
             }
         }
         if let reader = soundtrack {
+            // The next minute decodes while the GPU embeds this one, as for audio files: 4% off a
+            // 9-minute soundtrack, same vectors (omni-verify soundcost). Batching minutes saved 2%
+            // more but moved the vectors (cos 0.9999) away from an audio file's.
+            final class Box: @unchecked Sendable { var next: (mel: [Float], frames: Int)? }
+            let prefetchQ = DispatchQueue(label: "omni.indexer.soundtrack-prefetch")
+            var current = reader.nextMelSegment()
             var k = 0
-            while let seg = reader.nextMelSegment() {
+            while let seg = current {
                 if isCancelled { return nil }
+                let box = Box(), sync = DispatchGroup()
+                sync.enter()
+                prefetchQ.async { box.next = reader.nextMelSegment(); sync.leave() }
                 if seg.frames >= (k == 0 ? 1 : Self.minTailMelFrames) {   // a tail under a second is skipped, as for audio files
-                    guard let v = embedder.embedAudioMel(seg.mel, frames: seg.frames), Self.isFinite(v) else { return nil }
+                    guard let v = embedder.embedAudioMel(seg.mel, frames: seg.frames), Self.isFinite(v) else { sync.wait(); return nil }
                     out.append(IndexedChunk(path: f.path, modified: f.modified, size: f.size, kind: FileKind.audio.rawValue,
                                             chunkIndex: first + out.count, snippet: "", embedding: v, duration: duration,
                                             locator: Self.timeLocator(Double(k) * OmniAudioPreprocess.segmentSeconds)))
                 }
+                sync.wait()
+                current = box.next
                 k += 1
             }
         }
@@ -2322,6 +2355,22 @@ public final class Indexer: @unchecked Sendable {
             guard let more = extraChunks(file: file, screen: pieces, soundtrack: nil, duration: 0, first: after(base), settings: settings)
             else { return false }
             return write(base + more)
+        case FileKind.text.rawValue:
+            // A PDF indexed before chunks opened at the page holding most of them (pageOf): the
+            // same chunks, keys and vectors, each at its page now. Nothing is embedded; a file
+            // whose stored chunks are not today's cut (other settings then) is left as it is.
+            guard c.path.lowercased().hasSuffix(".pdf"),
+                  case .pagedText(let text, let starts) = ContentSources.source(for: file).content(file, kind: .text, settings: settings),
+                  let stored = store.storedChunks(path: c.path)?.sorted(by: { $0.chunkIndex < $1.chunkIndex }) else { return true }
+            let pieces = chunk(text, settings: settings, origin: .paged(starts))
+            guard pieces.count == stored.count,
+                  zip(pieces, stored).allSatisfy({ chunkKey($0.text, settings: settings) == $1.chunkKey }) else { return true }
+            guard zip(pieces, stored).contains(where: { $0.locator != $1.locator }) else { return true }
+            return write(zip(pieces, stored).map { piece, row in
+                var moved = row
+                moved.locator = piece.locator
+                return moved
+            })
         case FileKind.video.rawValue:
             guard settings.soundtrack else { return true }
             guard let reader = OmniAudioPreprocess.AudioSegmentReader(url: file.url) else { return true }   // silent
@@ -3194,7 +3243,9 @@ public final class Indexer: @unchecked Sendable {
             if settings.minTextChars > 0, text.count < settings.minTextChars { return DecodedItem(file: file) }
             let pieces = chunk(text, settings: settings, origin: .paged(pageStarts))
             recordIdentifiers(pieces, contentKey: contentKey)
-            return DecodedItem(file: file, kind: kind, payload: .text(pieces), contentKey: contentKey)
+            let item = DecodedItem(file: file, kind: kind, payload: .text(pieces), contentKey: contentKey)
+            item.enrichable = true   // located by today's rule: the enrichment has nothing to move
+            return item
         case .scannedPDF(let pageCount):
             return DecodedItem(file: file, kind: kind,
                                payload: .pdfScan(pageCount: pageCount, maxDimension: settings.maxImageDimension), meta: meta, contentKey: contentKey)
@@ -3609,14 +3660,7 @@ public final class Indexer: @unchecked Sendable {
                     }
                     loc = "Line \(line)"
                 case .paged(let starts):
-                    if starts.isEmpty { loc = "" } else {
-                        var lo = 0, hi = starts.count - 1
-                        while lo < hi {
-                            let mid = (lo + hi + 1) / 2
-                            if starts[mid] <= startOff { lo = mid } else { hi = mid - 1 }
-                        }
-                        loc = "Page \(lo + 1)"
-                    }
+                    loc = starts.isEmpty ? "" : "Page \(Self.pageOf(starts, from: startOff, to: startOff + piece.text.count) + 1)"
                 case .opaque:
                     loc = ""
                 }
@@ -3643,9 +3687,7 @@ public final class Indexer: @unchecked Sendable {
                 return "Line \(line)"
             case .paged(let starts):
                 guard !starts.isEmpty else { return "" }
-                var lo = 0, hi = starts.count - 1   // last page whose start offset <= chunk start
-                while lo < hi { let mid = (lo + hi + 1) / 2; if starts[mid] <= sOff { lo = mid } else { hi = mid - 1 } }
-                return "Page \(lo + 1)"
+                return "Page \(Self.pageOf(starts, from: sOff, to: Swift.min(totalCount, sOff + limit)) + 1)"
             case .opaque:
                 return ""
             }
