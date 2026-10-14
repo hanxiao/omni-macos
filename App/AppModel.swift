@@ -1970,6 +1970,17 @@ final class AppModel {
         }
     }
 
+    /// About how long indexing has left (IndexCosts), nil while it cannot be priced. A full pass
+    /// carries one figure; folder-add passes only their roots' own, and the last of them to finish
+    /// is the answer - so it is nil unless every active root has one.
+    var indexTimeLeft: Double? {
+        if isIndexing { return progress.secondsLeft }
+        let rs = activeRoots.compactMap { progress.perRoot[$0] }.filter { $0.done < $0.total || $0.total == 0 }
+        guard !rs.isEmpty else { return nil }
+        let left = rs.compactMap(\.secondsLeft)
+        return left.count == rs.count ? left.max() : nil
+    }
+
     /// Skip new files in folders that look like training data (DatasetRule). On by default.
     var skipDatasets: Bool = true {
         didSet {

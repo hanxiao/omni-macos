@@ -47,6 +47,21 @@ struct SettingsView: View {
     }
 }
 
+/// "about 12 min", for an IndexCosts estimate. Coarse on purpose: to the minute under ten, to five
+/// under an hour, to ten past it - the estimate moves a little with every file, and a figure that
+/// ticks back and forth reads as a broken clock.
+enum TimeLeft {
+    static func text(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds >= 0 else { return "" }
+        if seconds < 60 { return "less than a minute" }
+        let m = seconds / 60
+        let step = m < 10 ? 1.0 : m < 60 ? 5.0 : 10.0
+        let rounded = Int((m / step).rounded() * step)
+        let d = Duration.seconds(rounded * 60)
+        return "about " + d.formatted(.units(allowed: [.hours, .minutes], width: .abbreviated))
+    }
+}
+
 /// Live indexing status and the manual Index / Pause / Update control. It sits at the top of
 /// Storage > Index, next to the file and chunk counts it is changing - one place to see what the
 /// index holds and whether it is still growing.
@@ -112,6 +127,9 @@ private struct IndexStatusRow: View {
                 HStack {
                     ProgressView().controlSize(.small)
                     Text(model.isPreparing ? "Preparing\u{2026}" : "Indexing\u{2026}")
+                    if !model.isPreparing, let s = model.indexTimeLeft {
+                        Text(TimeLeft.text(s) + " left").foregroundStyle(.secondary)
+                    }
                     Spacer()
                     Button("Pause") { model.userPauseIndexing() }.controlSize(.small)
                 }
@@ -166,7 +184,8 @@ private struct IndexStatusRow: View {
                     }
                     if activeCounts.total > 0 {
                         ProgressView(value: overall)
-                        Text("\(activeCounts.done.formatted()) of \(activeCounts.total.formatted()) files")
+                        Text("\(activeCounts.done.formatted()) of \(activeCounts.total.formatted()) files"
+                             + (model.indexTimeLeft.map { " \u{00B7} " + TimeLeft.text($0) + " left" } ?? ""))
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -285,7 +304,8 @@ private struct ActivityTab: View {
                         Spacer()
                         if let rp, rp.total > 0, rp.done < rp.total,
                            model.isIndexing || model.activeRoots.contains(url.path) {
-                            Text("\(rp.done.formatted()) of \(rp.total.formatted())")
+                            Text("\(rp.done.formatted()) of \(rp.total.formatted())"
+                                 + (rp.secondsLeft.map { " \u{00B7} " + TimeLeft.text($0) } ?? ""))
                                 .foregroundStyle(.secondary)
                         } else if (model.activeRoots.contains(url.path) || model.isFolderQueued(url)
                                     || (model.isIndexing && (rp?.total ?? 0) == 0))

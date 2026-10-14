@@ -96,6 +96,9 @@ public extension Embedder {
 public struct RootProgress: Sendable {
     public var done = 0
     public var total = 0
+    /// About how long this folder has left (IndexCosts); nil until its work is counted and this
+    /// Mac has measured the kinds in it.
+    public var secondsLeft: Double?
     public init() {}
     public var fraction: Double { total > 0 ? Double(done) / Double(total) : 0 }
 }
@@ -113,6 +116,8 @@ public struct IndexProgress: Sendable {
     public var done = false
     public var cancelled = false   // ended via pause rather than completing
     public var perRoot: [String: RootProgress] = [:]
+    /// About how long the whole pass has left; nil while any part of it cannot be priced.
+    public var secondsLeft: Double?
     public init() {}
 }
 
@@ -393,6 +398,7 @@ public final class Indexer: @unchecked Sendable {
     /// embedding every text.
     private func embedGroupsReusing(_ groups: [[(text: String, key: String)]], width: Int) -> [[[Float]]] {
         guard Self.globalChunkReuse, !settingsForceFresh else {
+            textsEmbedded.add(groups.reduce(0) { $0 + $1.count })
             return embedder.embedTextBatches(groups.map { $0.map(\.text) }, as: .passage)
         }
         var out = groups.map { [[Float]](repeating: [], count: $0.count) }
@@ -455,6 +461,7 @@ public final class Indexer: @unchecked Sendable {
             batchIdx.append(idxs); batches.append(idxs.map { uniqTexts[$0] })
             i = e
         }
+        textsEmbedded.add(uniqTexts.count)
         let vecs = embedder.embedTextBatches(batches, as: .passage)
         chunkVecLock.lock()
         for (bi, idxs) in batchIdx.enumerated() {
@@ -641,10 +648,34 @@ public final class Indexer: @unchecked Sendable {
         self.embedder = embedder
         self.quarantine = ExtractionQuarantine(directory: store.dbURL.deletingLastPathComponent())
         self.streams = StreamCursors(directory: store.dbURL.deletingLastPathComponent())
+        self.costs = IndexCosts(directory: store.dbURL.deletingLastPathComponent())
     }
 
     /// Long files being indexed a window at a time (see StreamCursors).
     public let streams: StreamCursors
+    /// What indexing costs on this Mac, for the time-left estimate.
+    public let costs: IndexCosts
+    /// The indexer's own files beside the index, never indexed themselves - whatever folder the
+    /// index lives in (the app also leaves its whole data folder out, but an index kept inside an
+    /// indexed folder would otherwise read its own cost table back in, changed on every pass).
+    var sidecarPaths: [String] {
+        let dir = store.dbURL.deletingLastPathComponent()
+        return ["costs.json", "streams.json", "quarantine.json", "extracting.json"].map { dir.appendingPathComponent($0).path }
+    }
+    /// Texts that reached the model (reused vectors never do): what text time is priced by.
+    final class Counter: @unchecked Sendable {
+        private let lock = NSLock(); private var n = 0
+        func add(_ k: Int) { lock.withLock { n += k } }
+        var value: Int { lock.withLock { n } }
+    }
+    let textsEmbedded = Counter()
+    /// Kinds whose first file this process has timed: that one carries the model's first load and
+    /// is left out of the costs.
+    var warmedKinds: Set<FileKind> = []
+    /// A pass still walking a root after this long counts that root's work with a second,
+    /// metadata-only walk (a root with more files than the crawl queue holds).
+    public var countWalkAfter: TimeInterval = 15
+    static let leftLogInterval: Double = Double(ProcessInfo.processInfo.environment["OMNI_LEFT_LOG_SECONDS"] ?? "") ?? 10
     /// The dataset folders the last full pass found (DatasetRule), for Settings to show.
     public private(set) var lastDatasets = DatasetFolders()
 
@@ -853,7 +884,7 @@ public final class Indexer: @unchecked Sendable {
             guard let self else { return }
             var counts: [String: Int] = [:]
             var crawler = FileCrawler(roots: roots, ignore: settings.ignore, enabledKinds: settings.enabledKinds,
-                                      ownDataPaths: settings.ownDataPaths,
+                                      ownDataPaths: settings.ownDataPaths + sidecarPaths,
                                       ownDataExceptions: settings.ownDataExceptions)
             crawler.onPolicyFile = self.onPolicyFile
             if settings.skipDatasets {
@@ -953,6 +984,13 @@ public final class Indexer: @unchecked Sendable {
         /// One wave: up to `max` files, taken round-robin so every root advances together. Blocks
         /// while the walk is still producing and nothing is ready; returns empty only when the walk
         /// is done and the queues are drained.
+        /// The files still queued for a root whose walk has finished (nil while it is walking).
+        func queuedIfWalked(_ r: String) -> ArraySlice<CrawledFile>? {
+            feed.lock.lock(); defer { feed.lock.unlock() }
+            guard feed.totals[r] != nil else { return nil }
+            let q = feed.pending[r] ?? []
+            return q[min(feed.cursor[r] ?? 0, q.count)...]
+        }
         func takeWave(max: Int) -> (files: [CrawledFile], newTotals: [String: Int]) {
             feed.lock.lock()
             defer { feed.lock.unlock() }
@@ -990,6 +1028,226 @@ public final class Indexer: @unchecked Sendable {
         knownReady.wait()             // join the concurrently-computed indexedFiles() before its first use (F6)
         let known = knownBox.v
 
+        // TIME LEFT (IndexCosts). A file is work if the pass will read it (the pipeline's unchanged
+        // test, below, decides the same way); a root's work is counted once its walk is done, from
+        // what was taken plus what is still queued - or by the count walk, for a root too big for
+        // the queue. Time is measured per kind phase and priced back per kind.
+        costs.begin(regime: IndexCosts.regime(dim: embedder.dim, settings: settings))
+        // Per file on the consumer, so no lock: the long files part-way at the pass's start (a file
+        // that starts one in this pass was work already). Usually empty.
+        let streamingAtStart = streams.paths
+        let quarantineRef = quarantine
+        let isWorkSendable: @Sendable (CrawledFile) -> Bool = { f in
+            if let k = known[f.path], k.modified == f.modified, k.size == f.size,
+               streamingAtStart.isEmpty || !streamingAtStart.contains(f.path) { return false }
+            return !quarantineRef.contains(path: f.path, modified: f.modified, size: f.size)
+        }
+        var workTotal: [String: WorkLeft] = [:]      // per root: all of its work, once counted
+        var workDone: [String: WorkLeft] = [:]       // per root: work finished this pass
+        var inflight: [String: (root: String, unit: WorkUnit)] = [:]   // this wave's work, by path
+        var textWork: [String: WorkUnit] = [:]        // this wave's text work, for chunks per MB
+        var phaseKind: FileKind?
+        var phaseClock = CFAbsoluteTimeGetCurrent()
+        var phaseUnits = 0.0, phaseFiles = 0
+        var phaseTextBase = textsEmbedded.value
+        // PACE. The costs say what each kind costs relative to the others; how fast this Mac runs
+        // RIGHT NOW is this pass's own evidence. The same work took 39 s, 48 s and 74 s in three
+        // runs on one Mac with another indexer sharing the GPU, so stored costs alone were off by
+        // -45% to +98%. A kind priced at the pass's start keeps that price, scaled by measured time
+        // over what that price predicted for the same work in this pass.
+        var startRate: [FileKind: Double] = [:]
+        for k in [FileKind.image, .audio, .video, .text, .scan] { startRate[k] = costs.rate(k) }
+        var paceActual = 0.0, pacePredicted = 0.0
+        // A kind with enough time of its own in this pass is priced by that alone: contention does
+        // not slow every kind alike, and the pace of the others misprices it (real run: audio, the
+        // last phase, at +43% on a pace set by video, images and text).
+        var passTime: [FileKind: (seconds: Double, units: Double)] = [:]
+        let ownEvidence = 3.0
+        func phaseCommit(force: Bool) {
+            let now = CFAbsoluteTimeGetCurrent()
+            if phaseKind == .text {
+                let t = textsEmbedded.value
+                phaseUnits += Double(t - phaseTextBase); phaseTextBase = t
+            }
+            // Time with nothing finished in it stays on the clock (a long video in progress).
+            guard let k = phaseKind, phaseUnits > 0, force || now - phaseClock >= 5 else { return }
+            costs.addTime(k, seconds: now - phaseClock, units: phaseUnits, files: phaseFiles)
+            if let r0 = startRate[k] { paceActual += now - phaseClock; pacePredicted += r0 * phaseUnits }
+            let t = passTime[k] ?? (0, 0)
+            passTime[k] = (t.seconds + now - phaseClock, t.units + phaseUnits)
+            if omniPerfEnabled {
+                omniPerfLog(String(format: "cost %@ %.2fs units=%.1f files=%d at %.1fs", k.rawValue, now - phaseClock,
+                                   phaseUnits, phaseFiles, -passStart.timeIntervalSinceNow))
+            }
+            phaseClock = now; phaseUnits = 0; phaseFiles = 0
+            updateTimeLeft()
+        }
+        func phaseBegin(_ k: FileKind?) {
+            phaseCommit(force: true)
+            phaseKind = k; phaseClock = CFAbsoluteTimeGetCurrent(); phaseUnits = 0; phaseFiles = 0
+            phaseTextBase = textsEmbedded.value
+        }
+        /// The first file of a kind in this process: restart the clock after it, uncounted.
+        func warm(_ k: FileKind) -> Bool {
+            guard !warmedKinds.contains(k) else { return true }
+            warmedKinds.insert(k)
+            phaseClock = CFAbsoluteTimeGetCurrent(); phaseUnits = 0; phaseFiles = 0
+            phaseTextBase = textsEmbedded.value
+            return false
+        }
+        /// A stored text file teaches how many chunks (or scanned pages) a MB of its sort makes.
+        /// Its time is priced through the texts that reached the model (`textsEmbedded`).
+        var scanPagesOf: [String: Int] = [:]
+        var servedFromStore = Set<String>()   // content-dedup hits: done, but no model time
+        func creditChunks(_ path: String, _ n: Int) {
+            guard let u = textWork.removeValue(forKey: path) else { return }
+            if let pages = scanPagesOf.removeValue(forKey: path) { costs.addChunks(u.sort, chunks: 0, scanPages: pages, mb: u.units) }
+            else { costs.addChunks(u.sort, chunks: n, scanPages: 0, mb: u.units) }
+            if phaseKind == .text, !warmedKinds.contains(.text) { _ = warm(.text) }
+            phaseFiles += 1
+        }
+        /// The big-root count: a second, metadata-only walk, started only when a pass has run a
+        /// while with a root still walking (its files outnumber the queue), so ordinary passes never
+        /// pay it. Same crawler, same rules, the same work test.
+        final class CountBox: @unchecked Sendable {
+            let lock = NSLock()
+            var counted: [String: WorkLeft]?
+            var started = false
+            /// Roots whose queue is being counted off the consumer, and their answers.
+            var queuedCounting = Set<String>()
+            var queuedCounted: [String: WorkLeft] = [:]
+            /// Per root, the work in the waves taken so far. Touched only on `queue`, in order.
+            var formed: [String: WorkLeft] = [:]
+            let queue = DispatchQueue(label: "omni.timeleft", qos: .utility)
+        }
+        let countBox = CountBox()
+        func startCountWalkIfNeeded() {
+            guard sawWork, !countBox.started, !filePaths.isEmpty, -passStart.timeIntervalSinceNow >= self.countWalkAfter,
+                  filePaths.contains(where: { workTotal[$0] == nil }) else { return }
+            countBox.started = true
+            let datasetsSeen = datasets
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else { return }
+                var crawler = FileCrawler(roots: roots, ignore: settings.ignore, enabledKinds: settings.enabledKinds,
+                                          ownDataPaths: settings.ownDataPaths + sidecarPaths, ownDataExceptions: settings.ownDataExceptions)
+                if settings.skipDatasets { crawler.datasets = datasetsSeen; crawler.datasetAllowed = settings.datasetAllowed }
+                var out: [String: WorkLeft] = [:]
+                let t0 = Date()
+                crawler.walk(shouldContinue: { !self.isCancelled }) { f in
+                    guard let r = rootOf(f.path) else { return }
+                    if known[f.path] == nil, settings.skipDatasets, let slash = f.path.lastIndex(of: "/"),
+                       datasetsSeen.contains(f.path[..<slash]) { return }
+                    guard isWorkSendable(f), let u = WorkUnit(f, settings: settings) else { return }
+                    out[r, default: WorkLeft()].add(u)
+                }
+                guard !self.isCancelled else { return }
+                omniPerfLog(String(format: "count-walk %.2fs roots=%d", -t0.timeIntervalSinceNow, out.count))
+                countBox.lock.withLock { countBox.counted = out }
+            }
+        }
+        /// A root whose walk is done: its work is what was taken plus what is still queued. Checked
+        /// on every update, not per wave: the first wave is often taken while the walk is still
+        /// running (9 files at 0.00 s on a real run), and the next can be minutes away.
+        /// ALL OF IT OFF THE CONSUMER THREAD, which is what a pass waits on: counted there, the
+        /// work test (one more lookup per file in the index's path table) cost ~8% of a pass over
+        /// unchanged files. A serial queue takes each wave in order, then a walked root's queue, so
+        /// a root's total is the waves before its walk ended plus what was still queued - and the
+        /// consumer credits what is done from the pipeline's own unchanged verdict (`noteWork`).
+        //
+        // AND ONLY ONCE THERE IS WORK. Even off the consumer, the lookups slowed a pass over 30k
+        // unchanged files by 8% (threads reading the same table; hashing the same paths cost
+        // nothing) - and such a pass has no time left worth telling. So nothing is classified until
+        // the pipeline reports the pass's first work file: every file consumed before it was
+        // unchanged, so only the wave it is in needs counting, and nothing is kept for the rest.
+        var sawWork = false
+        var currentWave: [CrawledFile] = []
+        func classifyWave(_ files: [CrawledFile]) {
+            currentWave = files
+            if sawWork { enqueueClassify(files) }
+        }
+        func enqueueClassify(_ files: [CrawledFile]) {
+            countBox.queue.async {
+                let work = files.filter(isWorkSendable)
+                for (f, unit) in zip(work, WorkUnit.of(work, settings: settings)) {
+                    guard let u = unit, let r = rootOf(f.path) else { continue }
+                    countBox.formed[r, default: WorkLeft()].add(u)
+                }
+            }
+        }
+        func countWalkedRoots() {
+            guard sawWork else { return }
+            for r in rootPaths where workTotal[r] == nil {
+                if let w = countBox.lock.withLock({ countBox.queuedCounted.removeValue(forKey: r) }) {
+                    workTotal[r] = w
+                    continue
+                }
+                guard !countBox.lock.withLock({ countBox.queuedCounting.contains(r) }),
+                      let queued = queuedIfWalked(r) else { continue }
+                let datasetsSeen = datasets
+                countBox.lock.withLock { _ = countBox.queuedCounting.insert(r) }
+                countBox.queue.async {
+                    var w = countBox.formed[r] ?? WorkLeft()
+                    let todo = queued.filter { f in
+                        guard isWorkSendable(f) else { return false }
+                        if known[f.path] == nil, let slash = f.path.lastIndex(of: "/"), datasetsSeen.contains(f.path[..<slash]) { return false }
+                        return true
+                    }
+                    for case let u? in WorkUnit.of(Array(todo), settings: settings) { w.add(u) }
+                    countBox.lock.withLock { countBox.queuedCounted[r] = w }
+                }
+            }
+        }
+        /// A file the pipeline found to be work, as it is consumed: what its tick will credit.
+        func noteWork(_ item: DecodedItem) {
+            if !sawWork { sawWork = true; enqueueClassify(currentWave) }
+            if case .duplicate = item.payload { servedFromStore.insert(item.file.path) }   // no model time
+            guard let u = WorkUnit(item.file, settings: settings), let r = rootOf(item.file.path) else { return }
+            inflight[item.file.path] = (r, u)
+            if u.kind == .text { textWork[item.file.path] = u }
+        }
+        func updateTimeLeft() {
+            countWalkedRoots()
+            startCountWalkIfNeeded()
+            if workTotal.count < rootPaths.count, let counted = countBox.lock.withLock({ countBox.counted }) {
+                for r in filePaths where workTotal[r] == nil { workTotal[r] = counted[r] ?? WorkLeft() }
+            }
+            var own: [String: Double] = [:]
+            var all = true
+            let pace = paceActual >= 3 && pacePredicted > 0 ? Swift.min(4, Swift.max(0.25, paceActual / pacePredicted)) : 1
+            let rate: (FileKind) -> Double? = { k in
+                if let t = passTime[k], t.seconds >= ownEvidence, t.units > 0 { return t.seconds / t.units }
+                if let r0 = startRate[k] { return r0 * pace }
+                return self.costs.rate(k)
+            }
+            for r in rootPaths {
+                guard var left = workTotal[r] else { all = false; continue }
+                left.subtract(workDone[r] ?? WorkLeft())
+                guard let sec = left.seconds(rate: rate, perMB: costs.perMB) else { all = false; continue }
+                own[r] = sec
+            }
+            // Roots take turns file by file, so a root is done once each other root has had as many
+            // turns as it has files left: its finish time counts the others' work up to that share.
+            func filesLeft(_ r: String) -> Double {
+                let rp = p.perRoot[r] ?? RootProgress()
+                return Double(max(1, rp.total - rp.done))
+            }
+            for r in rootPaths {
+                guard var rp = p.perRoot[r] else { continue }
+                if let mine = own[r] {
+                    var t = mine
+                    for (s, theirs) in own where s != r { t += theirs * min(1, filesLeft(r) / filesLeft(s)) }
+                    rp.secondsLeft = t
+                } else { rp.secondsLeft = nil }
+                p.perRoot[r] = rp
+            }
+            p.secondsLeft = all ? own.values.reduce(0, +) : nil
+            if omniPerfEnabled, let left = p.secondsLeft, CFAbsoluteTimeGetCurrent() - lastLeftLog >= Self.leftLogInterval {
+                lastLeftLog = CFAbsoluteTimeGetCurrent()
+                omniPerfLog(String(format: "time-left %.1fs at %.1fs", left, -passStart.timeIntervalSinceNow))
+            }
+        }
+        var lastLeftLog = 0.0, lastLeftUpdate = 0.0
+
         var doneByRoot: [String: Int] = [:]
         func tick(_ path: String) {
             // ONLY IF THE INDEX ALREADY KNOWS IT. The single reader iterates `known`, so a digest
@@ -1007,6 +1265,13 @@ public final class Indexer: @unchecked Sendable {
             // as "some stuck there for quite long time". The name is set at the START of an item
             // now, below.
             p.scanned += 1
+            if !inflight.isEmpty, let w = inflight.removeValue(forKey: path) {
+                workDone[w.root, default: WorkLeft()].add(w.unit)
+                if w.unit.kind != .text, servedFromStore.remove(path) == nil, warm(w.unit.kind) {
+                    phaseUnits += w.unit.units; phaseFiles += 1
+                }
+                if p.scanned % 50 == 0 { phaseCommit(force: false) }
+            }
             // The RESOLVED root, for the same reason the deletion sweep uses it: the crawl returns
             // paths with the root's symlinks followed, and matching them against the raw root finds
             // nothing - the per-folder progress would sit at zero for the whole pass.
@@ -1025,9 +1290,16 @@ public final class Indexer: @unchecked Sendable {
                     p.perRoot[r] = rp
                 }
             }
-            if p.scanned % 10 == 0 { p.photosNotLocal = PhotoLibrary.notLocal; onProgress(p) }
+            if p.scanned % 10 == 0 {
+                p.photosNotLocal = PhotoLibrary.notLocal
+                // At most ten times a second: a pass over unchanged files ticks thousands a second.
+                let now = CFAbsoluteTimeGetCurrent()
+                if now - lastLeftUpdate >= 0.1 { lastLeftUpdate = now; updateTimeLeft() }
+                onProgress(p)
+            }
         }
         func storeChunks(_ path: String, _ raw: [IndexedChunk]) {
+            creditChunks(path, raw.count)
             // The file being WRITTEN, not the one being crawled. The crawl sets `currentPath` too,
             // but it races far ahead of the encoder and on a small root it finishes in a blink, so
             // for most of a pass the crawl's value is stale - it named a folder the pass had long
@@ -1093,6 +1365,11 @@ public final class Indexer: @unchecked Sendable {
                 streams.set(f.path, c)
                 continuations.append((item, c))
                 if resume == nil { p.embedded += 1 }
+                // Its later windows are credited as they are read, so the rest is not done yet.
+                if let r = rootOf(f.path) {
+                    let rest = Double(max(0, Int64(f.size) - Int64(c.offset))) / 1_000_000
+                    workDone[r, default: WorkLeft()].add(WorkUnit(kind: .text, sort: IndexCosts.sort(ext: f.ext.lowercased()), units: rest), sign: -1)
+                }
             case .done:
                 streams.finish(f.path)
                 if resume != nil { Self.recordFinishedKey(item, store: store) }   // the pipeline records a one-turn file's
@@ -1121,6 +1398,7 @@ public final class Indexer: @unchecked Sendable {
                 omniPerfLog(String(format: "first-wave=%d files at %.2fs after pass start", wave.files.count, -passStart.timeIntervalSinceNow))
             }
             byKind.removeAll(keepingCapacity: true)
+            var waveWork: [CrawledFile] = []
             for f in wave.files {
                 // Training data (DatasetRule): new files skipped, ones already indexed kept. The
                 // folder was judged before its files were handed over, so the answer is in.
@@ -1129,13 +1407,18 @@ public final class Indexer: @unchecked Sendable {
                     continue
                 }
                 byKind[FileExtractor.kind(forExtension: f.ext) ?? .text, default: []].append(f)
+                waveWork.append(f)
             }
+            classifyWave(waveWork)
+            waveWork.removeAll(keepingCapacity: true)
+            updateTimeLeft()
             // Within a wave: screenshots first (Self.indexingOrder). Newest-first is the walker's
             // (newest folder and newest file first); the wave keeps its root-by-root alternation.
             for k in Array(byKind.keys) { byKind[k] = Self.indexingOrder(byKind[k]!, kind: k) }
 
         for kind in kindOrder {
             guard !isCancelled, let files = byKind[kind], !files.isEmpty else { continue }
+            phaseBegin(kind)
             if kind == .text {
                 // Cross-file text batching: buffer chunks from many files and embed them in
                 // batches of textBatchSize (one GPU forward). A file is stored once all of its
@@ -1163,6 +1446,7 @@ public final class Indexer: @unchecked Sendable {
                 // flush window - the same durability granularity reconcile already has.
                 var stagedStores: [(path: String, chunks: [IndexedChunk])] = []
                 func stageStore(_ path: String, _ raw: [IndexedChunk]) {
+                    creditChunks(path, raw.count)
                     // Mirrors storeChunks' guards: recover + retry once on any non-finite vector,
                     // then fail whole files that are still bad (next pass redoes them), skip empties.
                     var raw = raw
@@ -1231,6 +1515,7 @@ public final class Indexer: @unchecked Sendable {
                     p.currentPath = path
                     defer { tick(path) }
                     if item.unchanged { p.unchanged += 1; return }
+                    noteWork(item)
                     switch item.payload {
                     case .text(let pieces) where !pieces.isEmpty:
                         let fid = nextFid; nextFid += 1
@@ -1276,7 +1561,15 @@ public final class Indexer: @unchecked Sendable {
                         stageStore(path, chunks)
                         if stagedStores.count >= 256 { flushStagedStores() }
                     case .images, .imagePatches, .pdfScan:
-                        storeChunks(path, self.embed(item))   // scanned PDF (streamed) / image pages (batched)
+                        // Scanned pages cost as images, not as text: timed on their own (.scan)
+                        // and kept off the text phase's clock.
+                        let t0 = CFAbsoluteTimeGetCurrent()
+                        let chunks = self.embed(item)
+                        let dt = CFAbsoluteTimeGetCurrent() - t0
+                        phaseClock += dt
+                        if textWork[path] != nil { scanPagesOf[path] = chunks.count }
+                        costs.addTime(.scan, seconds: dt, units: Double(chunks.count), files: 1)
+                        storeChunks(path, chunks)   // scanned PDF (streamed) / image pages (batched)
                     case .textStream:
                         handleStream(item)
                     default:
@@ -1317,6 +1610,7 @@ public final class Indexer: @unchecked Sendable {
                     p.currentPath = path
                     defer { tick(path) }
                     if item.unchanged { p.unchanged += 1; return }
+                    noteWork(item)
                     if case .duplicate(let chunks) = item.payload { storeChunks(path, chunks); return }
                     if case .audioSegments = item.payload {
                         // Long audio streams per-file (one embedding per 240 s segment); the
@@ -1393,6 +1687,7 @@ public final class Indexer: @unchecked Sendable {
                     p.currentPath = path
                     defer { tick(path) }
                     if item.unchanged { p.unchanged += 1; return }
+                    noteWork(item)
                     guard case .imagePatches(let raws) = item.payload, !raws.isEmpty else {
                         // Anything that did not decode to patches keeps the per-file path.
                         storeChunks(path, self.embed(item)); return
@@ -1406,13 +1701,21 @@ public final class Indexer: @unchecked Sendable {
                 pipeline(files, force: force, known: known, settings: settings) { item in
                     p.currentPath = item.file.path
                     if item.unchanged { p.unchanged += 1 }
-                    else if case .textStream = item.payload {
-                        handleStream(item)
-                    } else { storeChunks(item.file.path, self.embed(item)) }
+                    else {
+                        noteWork(item)
+                        if case .textStream = item.payload { handleStream(item) }
+                        else { storeChunks(item.file.path, self.embed(item)) }
+                    }
                     tick(item.file.path)
                 }
             }
         }
+            phaseBegin(nil)
+            inflight.removeAll(keepingCapacity: true)
+            textWork.removeAll(keepingCapacity: true)
+            servedFromStore.removeAll(keepingCapacity: true)
+            scanPagesOf.removeAll(keepingCapacity: true)
+            costs.save()
         }   // end of the wave loop
 
         // The rest of the long files, a window each in turn, every unfinished one back to the end.
@@ -1420,6 +1723,16 @@ public final class Indexer: @unchecked Sendable {
         while !isCancelled, !continuations.isEmpty {
             var (item, c) = continuations.removeFirst()
             p.currentPath = item.file.path
+            let t0 = CFAbsoluteTimeGetCurrent(), before = (offset: c.offset, written: c.written, texts: textsEmbedded.value)
+            defer {
+                let mb = Double(c.offset - before.offset) / 1_000_000, n = c.written - before.written
+                costs.addTime(.text, seconds: CFAbsoluteTimeGetCurrent() - t0, units: Double(textsEmbedded.value - before.texts), files: 1)
+                costs.addChunks(IndexCosts.sort(ext: item.file.ext.lowercased()), chunks: n, scanPages: 0, mb: mb)
+                if let r = rootOf(item.file.path) {
+                    workDone[r, default: WorkLeft()].add(WorkUnit(kind: .text, sort: IndexCosts.sort(ext: item.file.ext.lowercased()), units: mb))
+                }
+                updateTimeLeft()
+            }
             switch streamWindow(item, cursor: &c, settings: settings) {
             case .more: streams.set(item.file.path, c); continuations.append((item, c))
             case .done:
@@ -1510,6 +1823,12 @@ public final class Indexer: @unchecked Sendable {
         p.photosNotLocal = PhotoLibrary.notLocal
         p.done = true
         p.cancelled = wasCancelled
+        p.secondsLeft = nil
+        costs.save()
+        if omniPerfEnabled {
+            omniPerfLog(String(format: "pass-done %.1fs embedded=%d unchanged=%d cancelled=%d",
+                               -passStart.timeIntervalSinceNow, p.embedded, p.unchanged, wasCancelled ? 1 : 0))
+        }
         onProgress(p)
     }
 
@@ -1925,7 +2244,7 @@ public final class Indexer: @unchecked Sendable {
         // The crawl's own admission rules, for paths that arrive one at a time (admitsEventPath).
         // Keyed on the deepest root holding the path; a path under no known root is not gated.
         let gate = FileCrawler(roots: [], ignore: settings.ignore, enabledKinds: settings.enabledKinds,
-                               ownDataPaths: settings.ownDataPaths,
+                               ownDataPaths: settings.ownDataPaths + sidecarPaths,
                                       ownDataExceptions: settings.ownDataExceptions)
         func rootOf(_ p: String) -> String? {
             roots.filter { p == $0 || p.hasPrefix($0 + "/") }.max { $0.count < $1.count }
@@ -1943,7 +2262,7 @@ public final class Indexer: @unchecked Sendable {
                 if let r = rootOf(path), !gate.admitsEventPath(path, isDir: true, size: 0, root: r) { continue }
                 var crawler = FileCrawler(roots: [URL(fileURLWithPath: path)], ignore: settings.ignore,
                                           enabledKinds: settings.enabledKinds,
-                                          ownDataPaths: settings.ownDataPaths,
+                                          ownDataPaths: settings.ownDataPaths + sidecarPaths,
                                       ownDataExceptions: settings.ownDataExceptions)
                 crawler.onPolicyFile = onPolicyFile
                 if settings.skipDatasets {

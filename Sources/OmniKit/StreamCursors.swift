@@ -50,6 +50,9 @@ public final class StreamCursors: @unchecked Sendable {
     /// In progress for some version (a partly indexed file is never "unchanged").
     public func inProgress(_ path: String) -> Bool { lock.withLock { cursors[path] != nil } }
 
+    /// The paths in progress right now, for a pass to test against without taking the lock per file.
+    public var paths: Set<String> { lock.withLock { Set(cursors.keys) } }
+
     public func set(_ path: String, _ c: Cursor) { lock.withLock { cursors[path] = c; save() } }
 
     public func finish(_ path: String) {
