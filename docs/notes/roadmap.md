@@ -72,10 +72,10 @@ is not worth it); audio is re-embedded by this release's enrichment anyway. Prob
 
 ### Found, not fixed (2026-10-14)
 
-- Image tags name only single-token words of the tokenizer (`OmniTagger.gatedLabels`): "penguin",
-  "zebra", "cactus", "sunflower" and "parrot" are not single tokens in either model's vocabulary, so
-  a penguin is tagged "bird, whale" (Small) or "pigeon, whale" (Nano). A design limit from the
-  start, not a regression.
+- Image tags are better, not good: past the fix below, the words around a right tag are often
+  noise ("walrus" beside the eagle, "australian shepherd" beside the penguin) and a sunflower is
+  still "petals, garden". The scoring (patch/global fusion, prior, NMS) is the study's, measured on
+  COCO-150; its noise is the next thing to look at, not the vocabulary.
 
 - A PDF short enough to be one chunk has one place, its first page: the eval's five-topic, 1,400-
   character `pdf-page` file stays at place R@1 0.00 (file R@10 1.00). Cutting page by page fixes it
@@ -125,4 +125,23 @@ ALL MRR Nano 0.837 (R@1 0.79), Small 0.885 (R@1 0.85). `long` and `exact` 1.00 o
 
 Proving the enrichment under kill turned up a store bug older than it: docs/notes/index.md, "Reuse
 debt". Fixed in the open path and at coverage completion; open, search and write measured equal.
+
+### Image tags: the words the tokenizer splits (2026-10-14)
+
+Tags could only be the tokenizer's whole words (~25k), so a penguin was "pigeon, whale, puppy" and a
+zebra "lions, horse": neither word is one token in either model. The label list now adds the names of
+the concepts macOS's own classifier knows (Vision's taxonomy, 1,303 on every Mac; the ~740 that are
+not already words), each embedded as text like the rest - no model, no dictionary shipped. `omni-verify
+tagvocab`, the shipped tagger with and without them, same images in the same order:
+
+| | built-in pictures named in the top 5 (14) | COCO-150 categories in the top 5 (439) |
+|---|---|---|
+| Nano | 2 -> 4 (refined 2 -> 5) | 38 -> 35 (refined 49 -> 49) |
+| Small | 4 -> 10 (refined 3 -> 6) | 45 -> 55 (refined 50 -> 63) |
+
+Cost: +1.2 MB (Nano) / +1.5 MB (Small) of label cache, built in 1.6-4 s once. The cache is named by
+its weights AND its label list, so a new list (or a macOS update that changes Vision's) builds a new
+one and the superseded caches are deleted. Search is unchanged (the eval: Nano 0.837, Small 0.885 ->
+0.889). Images already tagged keep their tags until they are tagged again; re-tagging a library is a
+vision forward per image, not done for this.
 

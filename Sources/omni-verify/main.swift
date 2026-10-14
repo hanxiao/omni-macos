@@ -3964,6 +3964,74 @@ if args.count >= 2 && args[1] == "concbench2" {
 // Load benchmark: omni-verify loadbench [N] [dim]
 // Times VectorStore(dbURL) reopening an existing N-row index (loadIntoMemory) - the store load that
 // bootstrap now overlaps with the engine load (opt 2A), i.e. the wall-clock 2A removes from launch.
+// Tag vocabulary A/B: the tokenizer's whole words vs those plus Vision's taxonomy names.
+//   omni-verify tagvocab <model> <workdir> <cocoWorkspace>
+if args.count >= 5 && args[1] == "tagvocab" {
+    let modelDir = URL(fileURLWithPath: args[2]), work = URL(fileURLWithPath: args[3]), ws = URL(fileURLWithPath: args[4])
+    try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+    let engine = try await OmniEngine.loadValidated(modelDir: modelDir, keepAudio: false)
+    let base = OmniTagger.gatedLabels(modelDir: modelDir)
+    let have = Set(base)
+    let vision = ((try? VNClassifyImageRequest().supportedIdentifiers()) ?? [])
+        .map { $0.lowercased().replacingOccurrences(of: "_", with: " ") }
+        .filter { $0.count >= 3 && $0.allSatisfy { ($0.isASCII && $0.isLetter) || $0 == " " } && !have.contains($0) }
+    let extra = Array(Set(vision)).sorted()
+    print("tagvocab base \(base.count) labels, vision adds \(extra.count)")
+    // Ground truth: user pictures by name; COCO-150 by category.
+    var items: [(name: String, img: CGImage, truth: [String])] = []
+    for dir in ["Animals", "Flowers"] {
+        let d = URL(fileURLWithPath: "/Library/User Pictures/\(dir)")
+        for f in (try? FileManager.default.contentsOfDirectory(atPath: d.path))?.sorted() ?? [] {
+            guard let src = CGImageSourceCreateWithURL(d.appendingPathComponent(f) as CFURL, nil),
+                  let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { continue }
+            let name = (f as NSString).deletingPathExtension.lowercased()
+            items.append((name, img, [name] + name.split(separator: " ").map(String.init).filter { $0.count >= 4 }))
+        }
+    }
+    let userCount = items.count
+    if let gtData = try? Data(contentsOf: ws.appendingPathComponent("eval_gt.json")),
+       let gt = try? JSONSerialization.jsonObject(with: gtData) as? [String: [String]] {
+        for id in gt.keys.sorted() {
+            guard let src = CGImageSourceCreateWithURL(ws.appendingPathComponent("eval_imgs/\(id).jpg") as CFURL, nil),
+                  let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { continue }
+            items.append((id, img, gt[id] ?? []))
+        }
+    }
+    for (arm, labels) in [("words", base), ("words+vision", base + extra)] {
+        let cache = work.appendingPathComponent("tags-\(arm)-\(engine.dim).bin")
+        if !FileManager.default.fileExists(atPath: cache.path) {
+            let t = Date()
+            _ = OmniTagger.buildCache(labels: labels, embedder: engine, to: cache)
+            print(String(format: "tagvocab %@ cache %.0f s, %.1f MB", arm, -t.timeIntervalSinceNow,
+                         Double((try? FileManager.default.attributesOfItem(atPath: cache.path)[.size] as? Int) ?? 0) / 1e6))
+        }
+        for priorFile in ["prior"] { try? FileManager.default.removeItem(at: cache.deletingPathExtension().appendingPathExtension(priorFile)) }
+        guard let tagger = OmniTagger(cacheURL: cache, dim: engine.dim) else { print("no tagger"); exit(1) }
+        engine.seedTaggerPrior(tagger)
+        engine.tagger = tagger
+        for hq in [false, true] {
+            var userHit = 0, cocoHit = 0, cocoTotal = 0
+            var shown: [String] = []
+            for (k, it) in items.enumerated() {
+                let raw = OmniVisionPreprocess.preprocessRaw(it.img)
+                let crops = hq ? OmniTagger.cwrCropRects(width: it.img.width, height: it.img.height)
+                    .compactMap { it.img.cropping(to: $0) }.map { OmniVisionPreprocess.preprocessRaw($0) } : []
+                guard let tags = engine.embedImagesTaggedHQ([raw], crops: [crops])?.tags.first else { continue }
+                if k < userCount {
+                    if tags.contains(where: { t in it.truth.contains(t) }) { userHit += 1 }
+                    shown.append("\(it.name): \(tags.joined(separator: ", "))")
+                } else {
+                    for c in it.truth { cocoTotal += 1; if tags.contains(c) { cocoHit += 1 } }
+                }
+            }
+            print(String(format: "tagvocab %@%@: user pictures %d/%d named in the top %d, COCO categories %d/%d (%.3f)",
+                         arm, hq ? " hq" : "", userHit, userCount, OmniTagger.topK, cocoHit, cocoTotal, Double(cocoHit) / Double(max(1, cocoTotal))))
+            if !hq { for l in shown { print("  \(l)") } }
+        }
+    }
+    exit(0)
+}
+
 // How long a real index takes to open: omni-verify opentime <index.sqlite>
 if args.count >= 3 && args[1] == "opentime" {
     let t = Date()

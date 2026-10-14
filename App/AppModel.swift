@@ -6592,13 +6592,15 @@ final class AppModel {
     /// vector dim so Nano and Small each get a cache built by their own text tower.
     /// Keyed by the WEIGHTS as well as the width (OmniTagger.modelIdentity): two checkpoints of one
     /// width embed labels differently. Off the main thread - it reads ~1 MB of the model.
-    nonisolated static func tagCacheURL(in dir: URL, dim: Int, modelDir: URL) throws -> URL {
+    /// And by the LABEL LIST (OmniTagger.labels): a cache's rows line up with the list it was built
+    /// from, so a new list is a new cache.
+    nonisolated static func tagCacheURL(in dir: URL, dim: Int, modelDir: URL, labels: [String]) throws -> URL {
         guard let id = OmniTagger.modelIdentity(modelDir: modelDir) else {
             throw OmniError.store("model weights unreadable")
         }
-        return dir.appendingPathComponent("tags-d\(dim)-\(id).cache")
+        return dir.appendingPathComponent("tags-d\(dim)-\(id)-\(OmniTagger.labelsFingerprint(labels)).cache")
     }
-    /// The width-only name every release before this used; removed once a keyed cache exists.
+    /// The width-only name of early releases; removed when a cache is built.
     nonisolated static func legacyTagCacheURL(in dir: URL, dim: Int) -> URL {
         dir.appendingPathComponent("tags-d\(dim).cache")
     }
@@ -6632,24 +6634,21 @@ final class AppModel {
         // The detached task builds/loads and SEEDS the tagger but never touches self; the
         // attach happens back on the main actor below, with the world re-checked.
         let task = Task.detached(priority: .utility) { () -> OmniTagger? in
-            guard let url = try? Self.tagCacheURL(in: cacheDir, dim: engine.dim, modelDir: modelDir) else { return nil }
-            // The width-only cache of earlier releases, with its prior, ADOPTED under the new name
-            // rather than rebuilt: one checkpoint per width has ever shipped, so it was built from
-            // these weights, and a rebuild is every label through the text tower again. Once.
+            let labels = OmniTagger.labels(modelDir: modelDir)
+            guard !labels.isEmpty, let url = try? Self.tagCacheURL(in: cacheDir, dim: engine.dim, modelDir: modelDir, labels: labels) else { return nil }
             let fm = FileManager.default
-            let legacy = Self.legacyTagCacheURL(in: cacheDir, dim: engine.dim)
-            if fm.fileExists(atPath: legacy.path) {
-                func prior(_ u: URL) -> URL { u.deletingPathExtension().appendingPathExtension("prior") }
-                if fm.fileExists(atPath: url.path) {
-                    try? fm.removeItem(at: legacy); try? fm.removeItem(at: prior(legacy))
-                } else {
-                    try? fm.moveItem(at: legacy, to: url)
-                    if fm.fileExists(atPath: prior(legacy).path) { try? fm.moveItem(at: prior(legacy), to: prior(url)) }
+            if !fm.fileExists(atPath: url.path) {
+                // A cache for this width under another name - the width-only one of early
+                // releases, other weights, another label list - is superseded: derived, rebuilt
+                // from the model in seconds, and 40-50 MB with its prior. (The width-only cache was
+                // once adopted under the keyed name; its labels are not this list's.)
+                let legacy = Self.legacyTagCacheURL(in: cacheDir, dim: engine.dim).lastPathComponent
+                let prefix = "tags-d\(engine.dim)-"
+                for n in (try? fm.contentsOfDirectory(atPath: cacheDir.path)) ?? []
+                where (n.hasPrefix(prefix) && (n.hasSuffix(".cache") || n.hasSuffix(".prior")))
+                    || n == legacy || n == (legacy as NSString).deletingPathExtension + ".prior" {
+                    try? fm.removeItem(at: cacheDir.appendingPathComponent(n))
                 }
-            }
-            if !FileManager.default.fileExists(atPath: url.path) {
-                let labels = OmniTagger.gatedLabels(modelDir: modelDir)
-                guard !labels.isEmpty else { return nil }
                 let t0 = Date()
                 guard OmniTagger.buildCache(labels: labels, embedder: engine, to: url,
                                             isCancelled: { Task.isCancelled }) else { return nil }

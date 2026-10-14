@@ -13175,8 +13175,17 @@ public final class VectorStore: @unchecked Sendable {
         // caches sit together, and the irreplaceable pair stays separate because that is the
         // distinction the chart exists to show.
         let scanCodes = size(base + ".quant") + size(base + ".rows")
-        let lookups = size(base + ".names") + size(base + ".names-wal") + size(base + ".names-shm")
-            + size("tags-d\(dim).cache") + size("tags-d\(dim).prior")
+        // The lookups: filenames, identifiers (IDIndex), the enrichment ledger, the long-file
+        // cursors and time-left costs, and the image-label cache under whichever name its weights
+        // and label list give it (tags-d768-<weights>-<labels>.cache) - all rebuilt from the files.
+        let names = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+        var lookupNames: [String] = ["streams.json", "costs.json"]
+        for side in [".names", ".ids", ".enriched"] {
+            lookupNames += [base + side, base + side + "-wal", base + side + "-shm"]
+        }
+        let tagPrefix = "tags-d\(dim)"
+        for n in names where n.hasPrefix(tagPrefix) && (n.hasSuffix(".cache") || n.hasSuffix(".prior")) { lookupNames.append(n) }
+        let lookups = lookupNames.reduce(Int64(0)) { $0 + size($1) }
         // VECTORS THE DATABASE IS STILL HOLDING count as vectors, not as snippets.
         //
         // A vector is durable in `pending_vecs` until the .vecs file can answer for it, and below
@@ -13204,17 +13213,16 @@ public final class VectorStore: @unchecked Sendable {
             .init(name: "Scan codes", bytes: scanCodes, irreplaceable: false,
                   detail: "1-bit codes the first-stage scan reads, plus the slot map"),
             .init(name: "Filename index", bytes: lookups, irreplaceable: false,
-                  detail: "filename search, image labels"),
+                  detail: "filename and identifier search, image labels"),
         ]
         // Anything else in the folder, so nothing is invisible. The model directory is excluded:
         // it is not the index, and it is reported in its own right elsewhere.
-        let known = Set(entries.flatMap { _ in [String]() }
+        let known = Set(lookupNames
             + [base, base + "-wal", base + "-shm", base + ".vecs", base + ".quant", base + ".rows",
-               base + ".names", base + ".names-wal", base + ".names-shm",
-               "tags-d\(dim).cache", "tags-d\(dim).prior", "nano", "query-images", ".omniignore"])
+               "nano", "query-images", ".omniignore"])
         var otherBytes: Int64 = 0
         var otherNames: [String] = []
-        for n in (try? fm.contentsOfDirectory(atPath: dir.path)) ?? [] where !known.contains(n) {
+        for n in names where !known.contains(n) {
             var isDir: ObjCBool = false
             fm.fileExists(atPath: dir.appendingPathComponent(n).path, isDirectory: &isDir)
             guard !isDir.boolValue else { continue }

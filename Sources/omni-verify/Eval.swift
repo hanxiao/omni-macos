@@ -550,9 +550,9 @@ enum EvalCommand {
         // The tagger, as the app attaches it (AppModel.ensureTagger): labels gated for this model,
         // a cache built once, the prior seeded before the tagger is used.
         if engine.supportsImages {
-            let cache = indexDir.appendingPathComponent("tags.bin")
+            let labels = OmniTagger.labels(modelDir: modelDir)
+            let cache = indexDir.appendingPathComponent("tags-\(OmniTagger.labelsFingerprint(labels)).bin")
             if !FileManager.default.fileExists(atPath: cache.path) {
-                let labels = OmniTagger.gatedLabels(modelDir: modelDir)
                 _ = OmniTagger.buildCache(labels: labels, embedder: engine, to: cache, isCancelled: { false })
             }
             if let tagger = OmniTagger(cacheURL: cache, dim: engine.dim) {
