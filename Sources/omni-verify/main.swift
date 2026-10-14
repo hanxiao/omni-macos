@@ -4133,8 +4133,20 @@ if args.count >= 4 && args[1] == "audiodet" {
     let batch = engine.embedAudioMelBatch([seg.mel, seg.mel], frames: [seg.frames, seg.frames])!
     func cos(_ x: [Float], _ y: [Float]) -> Float { zip(x, y).reduce(0) { $0 + $1.0 * $1.1 } / (x.reduce(0) { $0 + $1 * $1 }.squareRoot() * y.reduce(0) { $0 + $1 * $1 }.squareRoot()) }
     let engine2 = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    let aAfter = engine.embedAudioMel(seg.mel, frames: seg.frames)!
     let c = engine2.embedAudioMel(seg.mel, frames: seg.frames)!
+    let c2 = engine2.embedAudioMel(seg.mel, frames: seg.frames)!
+    // Images too: a synthetic picture through both engines.
+    let ctx = CGContext(data: nil, width: 256, height: 256, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    for i in 0 ..< 16 { ctx.setFillColor(CGColor(red: CGFloat(i) / 16, green: 0.4, blue: 1 - CGFloat(i) / 16, alpha: 1)); ctx.fill(CGRect(x: i * 16, y: 0, width: 16, height: 256)) }
+    let img = ctx.makeImage()!
+    let i1 = engine.embedImage(img)!, i2 = engine2.embedImage(img)!
+    print(String(format: "audiodet engine1 after engine2 exists cos=%.6f; engine2 repeat cos=%.6f; image engine1 vs engine2 cos=%.6f",
+                 cos(a, aAfter), cos(c, c2), cos(i1, i2)))
     let t1 = engine.embedText("a test sentence about audio", as: .query), t2 = engine2.embedText("a test sentence about audio", as: .query)
+    let longText = (0 ..< 300).map { "word\($0) of a long passage about sailing and engines" }.joined(separator: " ")
+    let l1 = engine.embedText(longText, as: .passage), l2 = engine2.embedText(longText, as: .passage)
+    print(String(format: "audiodet long text (%d chars) second-engine cos=%.6f", longText.count, cos(l1, l2)))
     print(String(format: "audiodet frames=%d melsum=%.6f same-process cos=%.6f batch-vs-single cos=%.6f second-engine audio cos=%.6f text cos=%.6f first=%@", seg.frames, melSum,
                  cos(a, b), cos(a, batch[0]), cos(a, c), cos(t1, t2), a.prefix(4).map { String(format: "%.5f", $0) }.joined(separator: ",")))
     exit(0)

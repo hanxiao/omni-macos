@@ -145,8 +145,9 @@ public final class OmniImageEncoder: @unchecked Sendable {
         let tLoop = Self.mediaTiming ? Date() : nil
         let dim = cfg.text.hiddenSize
         let preEmbed: MLXArray? = prefixIds.isEmpty ? nil : backbone.embed(prefixIds)
-        let startEmbed = backbone.embed([cfg.visionStartTokenId])
-        let endEmbed = backbone.embed([cfg.visionEndTokenId])
+        let startEmbed = backbone.embedSpecial(cfg.visionStartTokenId)
+        let endEmbed = backbone.embedSpecial(cfg.visionEndTokenId)
+        let wrap = (startEmbed == nil ? 0 : 1) + (endEmbed == nil ? 0 : 1)
         let sufEmbed: MLXArray? = suffixIds.isEmpty ? nil : backbone.embed(suffixIds)
         var pooled: [MLXArray] = []
         pooled.reserveCapacity(perImage.count)
@@ -156,11 +157,11 @@ public final class OmniImageEncoder: @unchecked Sendable {
             let n = feats.dim(0)
             var parts: [MLXArray] = []
             if let preEmbed { parts.append(preEmbed) }
-            parts.append(startEmbed)
+            if let startEmbed { parts.append(startEmbed) }
             parts.append(feats.asType(.float32).reshaped([1, n, dim]))
-            parts.append(endEmbed)
+            if let endEmbed { parts.append(endEmbed) }
             if let sufEmbed { parts.append(sufEmbed) }
-            let length = prefixIds.count + n + 2 + suffixIds.count
+            let length = prefixIds.count + n + wrap + suffixIds.count
             let hidden = backbone.forward(inputsEmbeds: MLX.concatenated(parts, axis: 1), length: length)
             let pool = backbone.poolGraph(hidden, length: length)
             pooled.append(pool)
@@ -168,7 +169,7 @@ public final class OmniImageEncoder: @unchecked Sendable {
                 // The image's patch rows sit between [prefix][vision_start] and [vision_end]:
                 // rows [prefixLen+1, prefixLen+1+n). Same hidden tensor the pool reads - the
                 // score graph joins this chunk's single eval below.
-                let pStart = prefixIds.count + 1
+                let pStart = prefixIds.count + (startEmbed == nil ? 0 : 1)
                 let patches = hidden[0, pStart ..< (pStart + n)]
                 tagGraphs.append(tagger.scoreGraph(patches: patches, pooled: pool))
             }
@@ -195,18 +196,19 @@ public final class OmniImageEncoder: @unchecked Sendable {
         let feats = features.asType(.float32).reshaped([1, n, dim])
         var parts: [MLXArray] = []
         if !prefixIds.isEmpty { parts.append(backbone.embed(prefixIds)) }
-        parts.append(backbone.embed([cfg.visionStartTokenId]))
+        let startEmbed = backbone.embedSpecial(cfg.visionStartTokenId), endEmbed = backbone.embedSpecial(cfg.visionEndTokenId)
+        if let startEmbed { parts.append(startEmbed) }
         parts.append(feats)
-        parts.append(backbone.embed([cfg.visionEndTokenId]))
+        if let endEmbed { parts.append(endEmbed) }
         if !suffixIds.isEmpty { parts.append(backbone.embed(suffixIds)) }
         let inputsEmbeds = MLX.concatenated(parts, axis: 1)
-        let length = prefixIds.count + n + 2 + suffixIds.count
+        let length = prefixIds.count + n + (startEmbed == nil ? 0 : 1) + (endEmbed == nil ? 0 : 1) + suffixIds.count
         let hidden = backbone.forward(inputsEmbeds: inputsEmbeds, length: length)
         guard let tagger else {
             return (backbone.pool(hidden, length: length), nil, length)
         }
         let pool = backbone.poolGraph(hidden, length: length)
-        let pStart = prefixIds.count + 1
+        let pStart = prefixIds.count + (startEmbed == nil ? 0 : 1)
         let score = tagger.scoreGraph(patches: hidden[0, pStart ..< (pStart + n)], pooled: pool)
         eval([pool, score])
         return (pool.asArray(Float.self), score.asArray(Float.self), length)

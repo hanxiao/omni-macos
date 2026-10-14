@@ -45,8 +45,11 @@ public struct OmniConfig: Sendable {
     public var audio = Audio()
     public var imageTokenId = 151655
     public var videoTokenId = 151656
-    public var visionStartTokenId = 151652
-    public var visionEndTokenId = 151653
+    /// The tokens around an image's rows - when the model has them. Nano has none: its processor
+    /// strips <|vision_start|>/<|vision_end|> and the image rows stand alone (reference
+    /// processing_llava_eurobert.py). Read from config.json; absent there means absent.
+    public var visionStartTokenId: Int? = 151652
+    public var visionEndTokenId: Int? = 151653
     public var audioTokenId = 151669
     public var audioStartTokenId = 151670
     public var audioEndTokenId = 151671
@@ -100,7 +103,16 @@ public struct OmniConfig: Sendable {
             cfg.audio.nWindow = ac["n_window"] as? Int ?? cfg.audio.nWindow
             cfg.audio.numMelBins = ac["num_mel_bins"] as? Int ?? cfg.audio.numMelBins
         }
-        cfg.imageTokenId = root["image_token_id"] as? Int ?? cfg.imageTokenId
+        // THE SPECIAL TOKENS COME FROM THE MODEL. They were Small's ids for every model, and Nano's
+        // embedding table has 128,260 rows: its audio wrappers (151670/151671) and image wrappers
+        // (151652/151653) were read from past the end of the table - undefined memory, zero in one
+        // engine and something else in the next, so Nano's audio and images embedded differently
+        // from one launch to the next (cosine as low as 0.957 for the same minute of audio).
+        cfg.imageTokenId = root["image_token_id"] as? Int ?? root["image_token_index"] as? Int ?? cfg.imageTokenId
+        cfg.visionStartTokenId = root["vision_start_token_id"] as? Int
+        cfg.visionEndTokenId = root["vision_end_token_id"] as? Int
+        cfg.audioStartTokenId = root["audio_start_token_id"] as? Int ?? cfg.audioStartTokenId
+        cfg.audioEndTokenId = root["audio_end_token_id"] as? Int ?? cfg.audioEndTokenId
         cfg.videoTokenId = root["video_token_id"] as? Int ?? cfg.videoTokenId
         cfg.audioTokenId = root["audio_token_id"] as? Int ?? cfg.audioTokenId
         self = cfg

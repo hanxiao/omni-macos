@@ -43,15 +43,16 @@ public final class OmniAudioEncoder: @unchecked Sendable {
         let feats = features.asType(.float32).reshaped([1, n, dim])
         var parts: [MLXArray] = []
         if !prefixIds.isEmpty { parts.append(backbone.embed(prefixIds)) }
-        parts.append(backbone.embed([cfg.audioStartTokenId]))
+        let startEmb = backbone.embedSpecial(cfg.audioStartTokenId), endEmb = backbone.embedSpecial(cfg.audioEndTokenId)
+        if let startEmb { parts.append(startEmb) }
         parts.append(feats)
-        parts.append(backbone.embed([cfg.audioEndTokenId]))
+        if let endEmb { parts.append(endEmb) }
         // Append the text suffix (e.g. Nano's end-of-text) so audio pools at the same token
         // the text path does, keeping audio and text in one shared space.
         if !suffixIds.isEmpty { parts.append(backbone.embed(suffixIds)) }
         let inputsEmbeds = MLX.concatenated(parts, axis: 1)
 
-        let length = prefixIds.count + n + 2 + suffixIds.count
+        let length = prefixIds.count + n + (startEmb == nil ? 0 : 1) + (endEmb == nil ? 0 : 1) + suffixIds.count
         lastSequenceLength = length
         let hidden = backbone.forward(inputsEmbeds: inputsEmbeds, length: length)
         return backbone.pool(hidden, length: length)
@@ -97,8 +98,9 @@ public final class OmniAudioEncoder: @unchecked Sendable {
         let dim = cfg.text.hiddenSize
 
         // Build one backbone sequence per clip: [prefix] + [audio_start] + feats_i + [audio_end] + [suffix].
-        let startEmb = backbone.embed([cfg.audioStartTokenId])
-        let endEmb = backbone.embed([cfg.audioEndTokenId])
+        let startEmb = backbone.embedSpecial(cfg.audioStartTokenId)
+        let endEmb = backbone.embedSpecial(cfg.audioEndTokenId)
+        let wrap = (startEmb == nil ? 0 : 1) + (endEmb == nil ? 0 : 1)
         let prefixEmb = prefixIds.isEmpty ? nil : backbone.embed(prefixIds)
         let suffixEmb = suffixIds.isEmpty ? nil : backbone.embed(suffixIds)
 
@@ -109,12 +111,12 @@ public final class OmniAudioEncoder: @unchecked Sendable {
             let feats = block.asType(.float32).reshaped([1, ni, dim])
             var parts: [MLXArray] = []
             if let p = prefixEmb { parts.append(p) }
-            parts.append(startEmb)
+            if let startEmb { parts.append(startEmb) }
             parts.append(feats)
-            parts.append(endEmb)
+            if let endEmb { parts.append(endEmb) }
             if let s = suffixEmb { parts.append(s) }
             seqs.append(MLX.concatenated(parts, axis: 1))   // [1, Li, dim]
-            lengths.append(prefixIds.count + ni + 2 + suffixIds.count)
+            lengths.append(prefixIds.count + ni + wrap + suffixIds.count)
         }
 
         // Right-pad to Lmax (zero embeddings) and run ONE batched backbone forward.

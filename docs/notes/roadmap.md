@@ -53,12 +53,29 @@ numbers recorded here).
 | video-moment | 2 | 0.50 | 0.500 | 1.00 | 1.000 |
 | ALL | 116 | 0.64 | 0.716 | 0.72 | 0.782 |
 
+### Found and fixed: Nano's media wrapped in undefined memory (2026-10-14)
+
+`OmniConfig` never read the special-token ids from config.json: every model got Small's
+(audio 151670/151671, vision 151652/151653). Nano's embedding table has 128,260 rows, so its audio
+and image sequences were wrapped in rows read from past the end of it - zero in one engine,
+something else in the next. Seen as Nano's audio from a second engine at cosine 0.97-0.997 (0.957
+across processes over 240 one-minute windows) and images at 0.995-0.997, while text, the audio
+tower and Small were exact; found by checksumming the backbone's input part by part. Now the ids
+come from the model (Nano: audio 128257/128258, no vision wrappers - its processor strips them,
+reference processing_llava_eurobert.py), and a special token with no row is left out
+(`Qwen3Backbone.embedSpecial`). Nano's audio and images are bit-identical across engines and
+processes; Small's outputs are unchanged (its parity tests pass on the reference fixtures). Eval,
+Nano rebuilt: MRR 0.800 -> 0.804, `image-ml` 0.491 -> 0.541. Stored Nano image and frame vectors are
+not re-embedded for it (0.995-0.997 from the correct form; hundreds of thousands of images for that
+is not worth it); audio is re-embedded by this release's enrichment anyway. Probe:
+`omni-verify audiodet <model> <file>`.
+
 ### Found, not fixed (2026-10-14)
 
-- Nano's audio embeddings are not the same from a second engine in one process (cosine 0.97-0.997 a
-  one-minute window; across processes as low as 0.957 over 240 windows). Small is exact, Nano's text
-  is exact, the audio tower's output is bit-identical between engines, eager or compiled, tail rows
-  on or off: the difference is in Nano's backbone pass over a long injected sequence. Probe:
-  `omni-verify audiodet <model> <file>`.
+- Image tags name only single-token words of the tokenizer (`OmniTagger.gatedLabels`): "penguin",
+  "zebra", "cactus", "sunflower" and "parrot" are not single tokens in either model's vocabulary, so
+  a penguin is tagged "bird, whale" (Small) or "pigeon, whale" (Nano). A design limit from the
+  start, not a regression.
+
 - PDF hits open a page or two early: a chunk spans short pages and is located at the page it starts
   on (`long` file R@1 1.00, place 0.25 on the eval).

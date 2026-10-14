@@ -58,6 +58,13 @@ final class Qwen3Backbone: @unchecked Sendable {
         self.compileOff = ProcessInfo.processInfo.environment["OMNI_COMPILE_BLOCK"] == "0"
     }
 
+    /// The embedding of one special token, or nil when the model has no such row: a gather past
+    /// the end of the table reads undefined memory instead of failing.
+    func embedSpecial(_ id: Int?) -> MLXArray? {
+        guard let id, id >= 0, id < w["language_model.embed_tokens.weight"].dim(0) else { return nil }
+        return embed([id])
+    }
+
     /// Embed token ids -> [1, L, dim] (computeDType, batch 1).
     func embed(_ ids: [Int]) -> MLXArray {
         let idArray = MLXArray(ids.map { Int32($0) })

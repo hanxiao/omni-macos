@@ -46,7 +46,7 @@ final class AVEncoderTests: XCTestCase {
         let g = f["grid_thw"]!.asArray(Int32.self)
         let grid = [(Int(g[0]), Int(g[1]), Int(g[2]))]
         let ref = f["embedding"]!.reshaped([-1]).asArray(Float.self)
-        let pre = prefix(f, startToken: config.visionStartTokenId)
+        let pre = prefix(f, startToken: config.visionStartTokenId ?? -1)
         let out = enc.encode(pixelValues: f["pixel_values_videos"]!, gridTHW: grid, prefixIds: pre)
         let c = cosine(out, ref)
         print(String(format: "[video] cosine vs og encode_video = %.5f (grid_t=%d)", c, Int(g[0])))
@@ -65,7 +65,7 @@ final class AVEncoderTests: XCTestCase {
             frames.append(img)
         }
         let vf = try fixture("video_ref")
-        guard let out = enc.encodeVideo(frames, prefixIds: prefix(vf, startToken: config.visionStartTokenId)) else { return XCTFail("encodeVideo returned nil") }
+        guard let out = enc.encodeVideo(frames, prefixIds: prefix(vf, startToken: config.visionStartTokenId ?? -1)) else { return XCTFail("encodeVideo returned nil") }
         let ref = vf["embedding"]!.reshaped([-1]).asArray(Float.self)
         let c = cosine(out, ref)
         print(String(format: "[video e2e] cosine vs og = %.5f", c))
