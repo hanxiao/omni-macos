@@ -64,10 +64,6 @@ public struct IndexSettings: Sendable, Equatable {
     public var screenText: Bool = true
     /// Index a video's soundtrack beside its frames: one audio embedding a minute, opened at its moment.
     public var soundtrack: Bool = true
-    /// Skip new files in folders that look like training data (DatasetRule); files already indexed stay.
-    public var skipDatasets: Bool = true
-    /// Folders the user let in from that rule: never datasets, nor anything under them.
-    public var datasetAllowed: [String] = []
 
     /// Open-vocabulary image tags (OmniTagger): images indexed while the tagger is ready get a
     /// content-tag snippet ("kitty, cosy, plush") instead of the bare filename. Rides the same

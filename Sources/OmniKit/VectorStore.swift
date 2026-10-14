@@ -66,9 +66,18 @@ public struct SearchHit: Sendable, Equatable {
     /// Total indexed chunks of this FILE (pages/passages), regardless of filters. 1 = single
     /// embedding; > 1 means the UI can offer a per-chunk breakdown (rankChunks).
     public var chunkCount: Int = 1
-    /// The score was put on the text scale already (a kind named in the query, fuseKindWords):
-    /// whatever compares scores across kinds must not scale it a second time.
-    public var onTextScale = false
+    /// What the score was multiplied by to rank it against text (fuseKinds): 1 for none, up to
+    /// 1 / kindScoreScale. Whatever judges a hit on its own kind's scale divides it back out.
+    public var lift = 1.0
+    /// How it was found, where the chunk's kind and locator cannot say it: by its file name
+    /// (fuseLexical), or by an identifier it contains (fuseIdentifiers). The reason a result list
+    /// shows ("File name", "Contains INV-2041", "Frame at 4:00") is read from this and the chunk.
+    public var via: Via = .content
+    public enum Via: Sendable, Equatable {
+        case content
+        case name
+        case identifier(String)
+    }
 }
 
 /// One matching passage (chunk) within a file.
@@ -6159,7 +6168,7 @@ public final class VectorStore: @unchecked Sendable {
     /// Small 0.832 -> 0.828, spoken answers Nano R@1 0.44 -> 0.22) and is not used.
     public static func weakFold(_ hits: [SearchHit], ratio: Double = 0.6) -> [Bool] {
         guard hits.count > 1 else { return hits.map { _ in false } }
-        func scaled(_ h: SearchHit) -> Double { Double(h.score) / (h.onTextScale ? 1.0 : kindScoreScale[h.kind] ?? 1.0) }
+        func scaled(_ h: SearchHit) -> Double { Double(h.score) / (h.lift * (kindScoreScale[h.kind] ?? 1.0)) }
         let top = hits.map(scaled).max() ?? 0
         guard top > 0 else { return hits.map { _ in false } }
         return hits.indices.map { $0 > 0 && scaled(hits[$0]) < top * ratio }
@@ -6200,7 +6209,7 @@ public final class VectorStore: @unchecked Sendable {
             return (fuseLexical(dense: r.hits, text: explicit, filter: filter, topK: topK, explicit: true, denseQuery: r.query), r.query)
         }
         guard let text = textQuery else { return r }
-        let kinded = fuseKindWords(r.hits, text: text, filter: filter, topK: topK, denseQuery: r.query)
+        let kinded = fuseKinds(r.hits, filter: filter, topK: topK, query: r.query)
         let named = LexicalIndex.shouldFuse(text)
             ? fuseLexical(dense: kinded, text: text, filter: filter, topK: topK, explicit: false, denseQuery: r.query) : kinded
         return (fuseIdentifiers(named, text: text, filter: filter, topK: topK, denseQuery: r.query), r.query)
@@ -6290,59 +6299,105 @@ public final class VectorStore: @unchecked Sendable {
             return fuseLexical(dense: dense, text: explicit, filter: filter, topK: topK, explicit: true, denseQuery: query)
         }
         guard let text = textQuery else { return dense }
-        let kinded = fuseKindWords(dense, text: text, filter: filter, topK: topK, denseQuery: query)
+        let kinded = fuseKinds(dense, filter: filter, topK: topK, query: query)
         let named = LexicalIndex.shouldFuse(text)
             ? fuseLexical(dense: kinded, text: text, filter: filter, topK: topK, explicit: false, denseQuery: query) : kinded
         return fuseIdentifiers(named, text: text, filter: filter, topK: topK, denseQuery: query)
     }
 
-    /// What a kind named in words adds, once its hit is on the text scale (`kindScoreScale`).
-    /// Measured on the labeled eval: 7 queries that name the kind of their answer, and 6 that name
-    /// a kind their answer is NOT ("photo of my vaccination record", "pdf of the lease agreement"):
-    ///
-    ///     bonus     names its answer (Nano / Small R@1)   names another kind (Nano / Small R@1)
-    ///     none, no lift        0.57 / 0.71                      1.00 / 1.00
-    ///     lift only            0.86 / 1.00                      1.00 / 1.00
-    ///     lift + 0.02-0.10     1.00 / 1.00                      1.00 / 1.00
-    ///     lift + 0.15          1.00 / 1.00                      1.00 / 0.83
-    ///     lift + 0.30          1.00 / 1.00                      0.67 / 0.17
-    ///     the kind first       1.00 / 1.00                      0.00 / 0.00
-    ///
-    /// 0.05 is in the middle of the plateau, a third of the smallest value that breaks the second set.
-    static let kindWordBonus = 0.05
+    /// Each kind's centroid in this index: the axis of its cone. Sampled (at most 65,536 rows a
+    /// refresh, ~1-2 ms) and kept for 5 minutes - a cone's axis is the same number for every file in
+    /// it (kindScoreScale's profile), so a sample finds it and it does not move with each write.
+    private var kindAxes: (at: Double, axes: [String: [Float]])?
+    private func kindAxesLocked() -> [String: [Float]] {
+        let now = CFAbsoluteTimeGetCurrent()
+        if let k = kindAxes, now - k.at < 300 { return k.axes }
+        let d = dim, n = rows.count
+        guard d > 0, n > 0 else { return [:] }
+        let step = Swift.max(1, n / 65_536)
+        var sums: [UInt8: [Float]] = [:]
+        flat16.withUnsafeBufferPointer { buf in
+            var i = 0
+            while i < n {
+                defer { i += step }
+                guard !deadRows.contains(Int32(i)) else { continue }
+                let pos = slotOf(i)
+                guard pos >= 0, (pos + 1) * d <= buf.count else { continue }
+                var acc = sums[rows[i].kc] ?? [Float](repeating: 0, count: d)
+                for j in 0 ..< d { acc[j] += Self.fromBF16(buf[pos * d + j]) }
+                sums[rows[i].kc] = acc
+            }
+        }
+        var axes: [String: [Float]] = [:]
+        for (kc, v) in sums {
+            let m = v.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot()
+            if m > 0 { axes[canonicalKind(idKind[Int(kc)])] = v.map { $0 / m } }
+        }
+        kindAxes = (now, axes)
+        return axes
+    }
 
-    /// A plain query that names a kind ("photo of a penguin") lifts hits of that kind onto the text
-    /// scale and adds `kindWordBonus`. Candidates of the kind are searched for too (a kind-filtered
-    /// pass, 30 deep), so on an index where text fills the first page they are still in the running.
-    /// Soft: see KindWords. A `type:` or `ext:` filter already says it, and turns this off.
-    private func fuseKindWords(_ hits: [SearchHit], text: String, filter: SearchFilter, topK: Int,
-                               denseQuery: [Float]) -> [SearchHit] {
-        guard filter.kinds.isEmpty, filter.ext == nil,
-              let want = KindWords.requested(in: text) else { return hits }
-        var narrow = filter
-        narrow.kinds = want.kind == FileKind.text.rawValue ? [FileKind.text.rawValue, FileKind.scan.rawValue] : [want.kind]
-        if let ext = want.ext { narrow.ext = ext }
-        let more = searchDense(denseQuery, filter: narrow, topK: 30, markActive: false)
-        func lifted(_ h: SearchHit) -> SearchHit {
-            var h = h
-            h.score = Float(Double(h.score) / (Self.kindScoreScale[h.kind] ?? 1.0) + Self.kindWordBonus)
-            h.onTextScale = true
-            return h
+    /// How far a query leans toward each media kind's cone, past the text cone's: a query for
+    /// something seen ("black and white striped animal", "黄色的花") leans toward pictures in any
+    /// language; "photo of my vaccination record" leans to text.
+    func kindPulls(_ query: [Float]) -> [String: Double] {
+        let axes = queue.sync { kindAxesLocked() }
+        guard let t = axes["text"], t.count == query.count else { return [:] }
+        func cos(_ a: [Float]) -> Double { Double(zip(a, query).reduce(Float(0)) { $0 + $1.0 * $1.1 }) }
+        let base = cos(t)
+        var out: [String: Double] = [:]
+        for (k, a) in axes where k != "text" && a.count == query.count { out[k] = cos(a) - base }
+        return out
+    }
+
+    /// THE KIND A QUERY ASKS FOR, READ FROM ITS VECTOR. A photo scores a text query on a lower
+    /// scale than a document does (kindScoreScale), so a query for something seen needs its media
+    /// lifted - and the query says so by leaning toward that kind's cone (kindPulls), in any
+    /// language, with or without the word "photo". A kind is lifted by `gain` from 0 at a pull of
+    /// `kindPullBand.lo` to the full text scale at `.hi`; at full gain its own 30 best are brought
+    /// in too, for an index where text fills the first page. This replaced KindWords, which read
+    /// the kind from word lists in ten languages. Eval (125 queries, MRR), lists -> pull:
+    ///
+    ///                 ALL     kind   kind-x  image  image-ml  doc    audio
+    ///     Nano   0.837 -> 0.843  1.00->0.86  1.00  0.64->0.73  0.54->0.63  1.00->0.96  0.52->0.63
+    ///     Small  0.889 -> 0.888  1.00->0.86  1.00  0.84->0.88  0.68->0.69  0.95->0.94  0.63->0.68
+    ///
+    /// Lost: "screenshot of the payment error" (only a list knew "screenshot") and "photo of a
+    /// penguin" (a zoo video above the photo: the eval has 7 video rows, so its video axis is
+    /// zoo animals); a lavender photo now heads "champs de lavande en fleur". Bands swept: (0,
+    /// 0.15) (0.05, 0.2) (0.1, 0.25) (0, 0.1) (-0.05, 0.1) - this one best on both. Axes from the
+    /// model's answer to neutral inputs (the tagger's seed images, silence) scored lower (Nano
+    /// 0.833). Bringing a kind's candidates in at ANY gain put a 20 ms p90 on plain queries (the
+    /// 9.7M-chunk clone); at full gain only, plain p50/p90 4.2/4.5 ms as before and a query
+    /// naming a kind 8.7 -> 4.1 ms.
+    static let kindPullBand = (lo: -0.05, hi: 0.10)
+
+    private func fuseKinds(_ hits: [SearchHit], filter: SearchFilter, topK: Int, query: [Float]) -> [SearchHit] {
+        let band = Self.kindPullBand
+        guard filter.kinds.isEmpty, filter.ext == nil else { return hits }
+        var gain: [String: Double] = [:]
+        for (k, pull) in kindPulls(query) {
+            let g = Swift.min(1, Swift.max(0, (pull - band.lo) / (band.hi - band.lo)))
+            if g > 0 { gain[k] = g }
         }
-        // A file is in the list by its BEST chunk, which for a screenshot found by its text is the
-        // text: the kind-filtered pass has the chunk of the kind asked for (the picture), and the
-        // file is lifted by whichever of the two scores higher once lifted.
-        let ofKind = Dictionary(more.map { ($0.path, $0) }, uniquingKeysWith: { a, _ in a })
-        var pool = hits.map { h -> SearchHit in
-            guard KindWords.matches(want, path: h.path, kind: h.kind) else { return h }
-            let mine = lifted(h)
-            guard let other = ofKind[h.path].map(lifted), other.score > mine.score else { return mine }
-            return other
-        }
+        guard !gain.isEmpty else { return hits }
+        var pool = hits
         let have = Set(hits.map(\.path))
-        pool += more.filter { !have.contains($0.path) && KindWords.matches(want, path: $0.path, kind: $0.kind) }.map(lifted)
-        pool.sort { $0.score > $1.score }
-        return Array(pool.prefix(topK))
+        for (k, g) in gain where g >= 1 {   // its own candidates only when it leans all the way
+            var narrow = filter
+            narrow.kinds = [k]
+            pool += searchDense(query, filter: narrow, topK: 30, markActive: false).filter { !have.contains($0.path) }
+        }
+        var best: [String: SearchHit] = [:]
+        for var h in pool {
+            if let g = gain[h.kind] {
+                h.lift = 1 / pow(Self.kindScoreScale[h.kind] ?? 1.0, g)
+                h.score = Float(Double(h.score) * h.lift)
+            }
+            if let b = best[h.path], b.score >= h.score { continue }
+            best[h.path] = h
+        }
+        return Array(best.values.sorted { $0.score > $1.score }.prefix(topK))
     }
 
     /// A LOOKUP - a query that is identifiers only ("INV-2041", "K7Q2LM 2026") - puts the files that
@@ -6368,7 +6423,13 @@ public final class VectorStore: @unchecked Sendable {
             .filter { resolved.accepts(path: $0.path, kind: $0.kind, modified: $0.modified) }
         guard !exact.isEmpty else { return hits }
         let tier = Float(Self.exactTier)
-        var top = exact.map { h -> SearchHit in var h = h; h.score = tier + Swift.max(0, Swift.min(1, h.score)); return h }
+        let asked = words.map { $0.trimmingCharacters(in: .punctuationCharacters) }.joined(separator: " ")
+        var top = exact.map { h -> SearchHit in
+            var h = h
+            h.score = tier + Swift.max(0, Swift.min(1, h.score))
+            h.via = .identifier(asked)
+            return h
+        }
             .sorted { $0.score > $1.score }
         let exactSet = Set(top.map(\.path))
         top += hits.filter { !exactSet.contains($0.path) }
@@ -6383,7 +6444,8 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     /// Files an enrichment may have work for: audio longer than `audioLongerThan` seconds, every
-    /// video, text PDFs (their page locators), and images named like screenshots - the system's name in the languages macOS writes
+    /// video, text PDFs (their page locators), and every image (the caller keeps the screenshots, by
+    /// the screen-capture attribute, not by a name in some language) - the system's name in the languages macOS writes
     /// it in (the decode stage reads the screen-capture attribute itself; this narrows a scan of
     /// the whole table to the files worth asking). Read in slices of file ids, so no single hold of
     /// the store's queue grows with the index.
@@ -6395,9 +6457,6 @@ public final class VectorStore: @unchecked Sendable {
             guard sqlite3_prepare_v2(db, "SELECT max(id) FROM files;", -1, &stmt, nil) == SQLITE_OK, sqlite3_step(stmt) == SQLITE_ROW else { return 0 }
             return sqlite3_column_int64(stmt, 0)
         }
-        let names = ["Screenshot%", "Screen Shot%", "截屏%", "截圖%", "スクリーンショット%", "스크린샷%", "Bildschirmfoto%",
-                     "Capture d%", "Captura de pantalla%", "Снимок экрана%", "Schermata%", "Skjermbilde%", "Schermafbeelding%"]
-        let nameSQL = names.map { "f.name LIKE '\($0)'" }.joined(separator: " OR ")
         var out: [(path: String, kind: String, modified: Double, size: Int, duration: Double)] = []
         var lo: Int64 = 0
         while lo <= maxID {
@@ -6410,7 +6469,7 @@ public final class VectorStore: @unchecked Sendable {
                     SELECT \(StoreSchema.pathExpr), f.kind, f.modified, f.size, f.duration
                       FROM files f JOIN dirs d ON d.id = f.dir_id
                      WHERE f.id >= ? AND f.id < ?
-                       AND ((f.kind = 4 AND f.duration > ?) OR f.kind = 3 OR (f.kind = 1 AND (\(nameSQL)))
+                       AND ((f.kind = 4 AND f.duration > ?) OR f.kind IN (1, 3)
                             OR (f.kind = 0 AND f.name LIKE '%.pdf'));
                     """, -1, &stmt, nil) == SQLITE_OK else { return }
                 sqlite3_bind_int64(stmt, 1, lo); sqlite3_bind_int64(stmt, 2, hi)
@@ -6655,6 +6714,10 @@ public final class VectorStore: @unchecked Sendable {
         }
         // The score the caller sees is the score the sort uses. This is the whole point.
         for i in pool.indices { pool[i].score = Float(fused[pool[i].path] ?? Double(pool[i].score)) }
+        // Found by its name: the name is the query, or the name is all that brought it in.
+        for i in pool.indices where exactNames.contains(pool[i].path) || !denseSet.contains(pool[i].path) {
+            pool[i].via = .name
+        }
         // Total order: fused score, then the dense order, then the lexical order, then the path.
         // Swift's sort is not stable, so a comparator with ties would order them unpredictably.
         pool.sort {
@@ -9795,6 +9858,16 @@ public final class VectorStore: @unchecked Sendable {
         var filled = [Bool](repeating: false, count: highWater)
         var ok = true
         var why = ""
+        // Positions a killed session's reuses left owed (vec_reuse_debt): for these, and only
+        // these, a blob that disagrees with the file is explained - see below.
+        var owed = Set<Int>()
+        do {
+            var dst: OpaquePointer?
+            if sqlite3_prepare_v2(db, "SELECT slot FROM vec_reuse_debt;", -1, &dst, nil) == SQLITE_OK {
+                while sqlite3_step(dst) == SQLITE_ROW { owed.insert(Int(sqlite3_column_int64(dst, 0))) }
+            }
+            sqlite3_finalize(dst)
+        }
         let bytesPerRow = d0 * MemoryLayout<UInt16>.size
         // WHERE A ROW THAT NEVER GOT A POSITION IS PUT. Past everything the column names, so it
         // cannot land on a position another row owns; `unseatedPlaced` says whether any did.
@@ -9869,7 +9942,22 @@ public final class VectorStore: @unchecked Sendable {
                     guard (pos + 1) * d <= buf.count else { return false }
                     return memcmp(buf.baseAddress! + pos * d, blob, bytesPerRow) == 0
                 }
-                if !agrees { ok = false; why = "a covered position and a surviving blob disagree at \(pos)"; break }
+                if !agrees {
+                    // A RECORDED REUSE THE DISK NEVER GOT: the write placed the new bytes in the
+                    // mapped file and recorded the position in the same transaction as the blob,
+                    // and a power loss took the pages before any sync. The file holds what the
+                    // position held before; the blob is the bytes the transaction committed. It
+                    // goes back into the file, and the settle below syncs it and drops the blob.
+                    // Anywhere else a disagreement means the layouts differ, and the load declines.
+                    guard owed.contains(pos), (pos + 1) * d <= flat16.count else {
+                        ok = false; why = "a covered position and a surviving blob disagree at \(pos)"; break
+                    }
+                    flat16.withUnsafeMutableBufferPointer { buf in
+                        let src = blob.assumingMemoryBound(to: UInt16.self)
+                        for j in 0 ..< d { buf[pos * d + j] = src[j] }
+                    }
+                    omniPerfLog("store wrote back position \(pos) from its blob (a reuse the disk lost)")
+                }
                 // AGREEING, IT IS A REUSE THE LAST SESSION NEVER SETTLED: a write placed it, and the
                 // process was killed before the stamp synced the file and dropped the blob. Only
                 // `unsyncedReuse` remembers that debt and it died with the process, so the blob

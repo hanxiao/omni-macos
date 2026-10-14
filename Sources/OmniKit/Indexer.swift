@@ -184,8 +184,8 @@ final class DecodedItem: @unchecked Sendable {
     /// CWR crop patches for HQ tag refinement (retag pass, single-frame images only): the 5
     /// study crops, preprocessed on the decode stage. Empty = tag at base quality.
     var hqCrops: [OmniVisionPreprocess.RawPatches] = []
-    /// A screenshot's text (ScreenText), chunked: indexed beside the picture (extraChunks).
-    var screenPieces: [TextPiece] = []
+    /// A screenshot: its text is read on the screen-text lane once its picture is stored.
+    var needsScreenText = false
     /// A video's soundtrack, open and unread: embedded a window at a time beside the frames.
     var soundtrack: OmniAudioPreprocess.AudioSegmentReader?
     /// Indexed with its enrichment (screenshot text, soundtrack, audio windows): the ledger
@@ -657,6 +657,7 @@ public final class Indexer: @unchecked Sendable {
         self.quarantine = ExtractionQuarantine(directory: store.dbURL.deletingLastPathComponent())
         self.streams = StreamCursors(directory: store.dbURL.deletingLastPathComponent())
         self.costs = IndexCosts(directory: store.dbURL.deletingLastPathComponent())
+        screenLane.read = { [weak self] job in self?.readScreenText(job.file, settings: job.settings) }
     }
 
     /// Long files being indexed a window at a time (see StreamCursors).
@@ -677,6 +678,7 @@ public final class Indexer: @unchecked Sendable {
         var value: Int { lock.withLock { n } }
     }
     let textsEmbedded = Counter()
+    let screenLane = ScreenTextLane()
     /// Kinds whose first file this process has timed: that one carries the model's first load and
     /// is left out of the costs.
     var warmedKinds: Set<FileKind> = []
@@ -684,8 +686,6 @@ public final class Indexer: @unchecked Sendable {
     /// metadata-only walk (a root with more files than the crawl queue holds).
     public var countWalkAfter: TimeInterval = 15
     static let leftLogInterval: Double = Double(ProcessInfo.processInfo.environment["OMNI_LEFT_LOG_SECONDS"] ?? "") ?? 10
-    /// The dataset folders the last full pass found (DatasetRule), for Settings to show.
-    public private(set) var lastDatasets = DatasetFolders()
 
     /// Files whose reading never finished; skipped until they change (see ExtractionQuarantine).
     public let quarantine: ExtractionQuarantine
@@ -886,8 +886,6 @@ public final class Indexer: @unchecked Sendable {
         // something from each to take - walking them one at a time meant a paused run indexed the
         // first root and nothing else, which is the starvation the interleaving exists to prevent.
         feed.producers = photos.isEmpty ? 1 : 2
-        let datasets = DatasetFolders()
-        lastDatasets = datasets
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             var counts: [String: Int] = [:]
@@ -895,10 +893,6 @@ public final class Indexer: @unchecked Sendable {
                                       ownDataPaths: settings.ownDataPaths + sidecarPaths,
                                       ownDataExceptions: settings.ownDataExceptions)
             crawler.onPolicyFile = self.onPolicyFile
-            if settings.skipDatasets {
-                crawler.datasets = datasets
-                crawler.datasetAllowed = settings.datasetAllowed
-            }
             crawler.walk(shouldContinue: { !self.isCancelled }) { f in
                     guard let r = rootOf(f.path) else { return }
                     feed.lock.lock()
@@ -1134,18 +1128,14 @@ public final class Indexer: @unchecked Sendable {
             guard sawWork, !countBox.started, !filePaths.isEmpty, -passStart.timeIntervalSinceNow >= self.countWalkAfter,
                   filePaths.contains(where: { workTotal[$0] == nil }) else { return }
             countBox.started = true
-            let datasetsSeen = datasets
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 guard let self else { return }
-                var crawler = FileCrawler(roots: roots, ignore: settings.ignore, enabledKinds: settings.enabledKinds,
+                let crawler = FileCrawler(roots: roots, ignore: settings.ignore, enabledKinds: settings.enabledKinds,
                                           ownDataPaths: settings.ownDataPaths + sidecarPaths, ownDataExceptions: settings.ownDataExceptions)
-                if settings.skipDatasets { crawler.datasets = datasetsSeen; crawler.datasetAllowed = settings.datasetAllowed }
                 var out: [String: WorkLeft] = [:]
                 let t0 = Date()
                 crawler.walk(shouldContinue: { !self.isCancelled }) { f in
                     guard let r = rootOf(f.path) else { return }
-                    if known[f.path] == nil, settings.skipDatasets, let slash = f.path.lastIndex(of: "/"),
-                       datasetsSeen.contains(f.path[..<slash]) { return }
                     guard isWorkSendable(f), let u = WorkUnit(f, settings: settings) else { return }
                     out[r, default: WorkLeft()].add(u)
                 }
@@ -1192,15 +1182,10 @@ public final class Indexer: @unchecked Sendable {
                 }
                 guard !countBox.lock.withLock({ countBox.queuedCounting.contains(r) }),
                       let queued = queuedIfWalked(r) else { continue }
-                let datasetsSeen = datasets
                 countBox.lock.withLock { _ = countBox.queuedCounting.insert(r) }
                 countBox.queue.async {
                     var w = countBox.formed[r] ?? WorkLeft()
-                    let todo = queued.filter { f in
-                        guard isWorkSendable(f) else { return false }
-                        if known[f.path] == nil, let slash = f.path.lastIndex(of: "/"), datasetsSeen.contains(f.path[..<slash]) { return false }
-                        return true
-                    }
+                    let todo = queued.filter(isWorkSendable)
                     for case let u? in WorkUnit.of(Array(todo), settings: settings) { w.add(u) }
                     countBox.lock.withLock { countBox.queuedCounted[r] = w }
                 }
@@ -1355,69 +1340,76 @@ public final class Indexer: @unchecked Sendable {
 
         // LONG FILES TAKE TURNS (StreamCursors): a window now, the rest to the end of the queue.
         var continuations: [(item: DecodedItem, cursor: StreamCursors.Cursor)] = []
-        func handleStream(_ item: DecodedItem) {
-            let f = item.file
-            let resume = streams.cursor(path: f.path, modified: f.modified, size: f.size)
-            // A file the index already holds in full that changed - a log that grew, an edited
-            // book - goes through the whole-file stream, which reuses every stored window's
-            // vectors; splitting it would lose that. Window-at-a-time is for a first index and
-            // for a file already part-way.
-            guard resume != nil || known[f.path] == nil else {
-                streams.finish(f.path)   // a cursor left by an older version
-                if storeStreamedText(item, settings: settings) { p.embedded += 1 } else if !isCancelled { p.failed += 1 }
-                return
-            }
-            var c = resume ?? StreamCursors.Cursor(modified: f.modified, size: f.size, offset: 0, undecoded: Data(),
-                                                   carry: "", lineBase: 0, written: 0)
-            switch streamWindow(item, cursor: &c, settings: settings) {
+        /// One turn of a long file: a 2 MB text window, or a turn of a recording, video or scan.
+        func step(_ item: DecodedItem, _ c: inout StreamCursors.Cursor) -> StreamStep {
+            if case .textStream = item.payload { return streamWindow(item, cursor: &c, settings: settings) }
+            guard let plan = mediaPlan(item) else { return .failed }
+            return mediaTurn(item, cursor: &c, plan: plan, settings: settings)
+        }
+        /// A media turn's share of its file, units `from ..< to` of the plan: the work it finishes
+        /// (in the file's own work units) and the time it costs (scanned pages are priced by page).
+        func share(_ item: DecodedItem, _ from: Int, _ to: Int) -> (done: WorkUnit, kind: FileKind, units: Double)? {
+            guard let plan = mediaPlan(item), let u = WorkUnit(item.file, settings: settings), to > from else { return nil }
+            let part = u.units * Double(to - from) / Double(plan.total)
+            if case .pdfScan = item.payload { return (WorkUnit(kind: u.kind, sort: u.sort, units: part), .scan, Double(to - from)) }
+            return (WorkUnit(kind: u.kind, sort: u.sort, units: part), u.kind, part)
+        }
+        /// What a turn's outcome means for the cursor file and the queue. `first`: the file had no
+        /// cursor, so the pipeline records its content key (a one-turn file) and counts it.
+        func settle(_ item: DecodedItem, _ c: StreamCursors.Cursor, _ outcome: StreamStep, first: Bool) {
+            let path = item.file.path
+            switch outcome {
             case .more:
-                streams.set(f.path, c)
+                streams.set(path, c)
                 continuations.append((item, c))
-                if resume == nil { p.embedded += 1 }
-                // Its later windows are credited as they are read, so the rest is not done yet.
-                if let r = rootOf(f.path) {
-                    let rest = Double(max(0, Int64(f.size) - Int64(c.offset))) / 1_000_000
-                    workDone[r, default: WorkLeft()].add(WorkUnit(kind: .text, sort: IndexCosts.sort(ext: f.ext.lowercased()), units: rest), sign: -1)
-                }
             case .done:
-                streams.finish(f.path)
-                if resume != nil { Self.recordFinishedKey(item, store: store) }   // the pipeline records a one-turn file's
-                if resume == nil { p.embedded += 1 }
+                streams.finish(path)
+                guard !first else { return }
+                Self.recordFinishedKey(item, store: store)
+                if item.enrichable, let ck = item.contentKey {
+                    store.enrichLedger.record([EnrichLedger.key(digest: StoreSchema.contentDigestHex(ck), path: path)])
+                }
             case .failed:
                 // Cancelled: the cursor stays, and the next pass resumes there. Anything else (the
                 // file changed, a write failed): start over next time, as a changed file.
-                if !isCancelled { streams.finish(f.path); p.failed += 1 }
+                if !isCancelled { streams.finish(path) }
             }
         }
-        /// A long recording, video or scan: its first turn now, the rest to the end of the queue,
-        /// as for long text. False: not long - the caller indexes it in one turn, as before.
-        func handleMediaStream(_ item: DecodedItem) -> Bool {
-            guard !item.file.isPhoto, let plan = mediaPlan(item) else { return false }
+        /// LONG FILES TAKE TURNS: a turn now, the rest to the end of the queue. False: not a long
+        /// file - the caller indexes it in one turn.
+        func handleStream(_ item: DecodedItem) -> Bool {
             let f = item.file
-            var c = streams.cursor(path: f.path, modified: f.modified, size: f.size)
-                ?? StreamCursors.Cursor(modified: f.modified, size: f.size, offset: 0, undecoded: Data(),
-                                        carry: "", lineBase: 0, written: 0, unit: 0)
-            let resumed = (c.unit ?? 0) > 0
-            switch mediaTurn(item, cursor: &c, plan: plan, settings: settings) {
-            case .more:
-                streams.set(f.path, c)
-                continuations.append((item, c))
-                if !resumed { p.embedded += 1 }
-            case .done:
-                streams.finish(f.path)
-                finishMedia(item)
-                if !resumed { p.embedded += 1 }
-            case .failed:
-                if !isCancelled { streams.finish(f.path); p.failed += 1 }
+            let text: Bool
+            if case .textStream = item.payload { text = true } else {
+                guard !f.isPhoto, mediaPlan(item) != nil else { return false }
+                text = false
+            }
+            let resume = streams.cursor(path: f.path, modified: f.modified, size: f.size)
+            // A text file the index already holds in full that changed - a log that grew, an edited
+            // book - goes through the whole-file stream, which reuses every stored window's
+            // vectors; splitting it would lose that. Window-at-a-time is for a first index and
+            // for a file already part-way.
+            if text, resume == nil, known[f.path] != nil {
+                streams.finish(f.path)   // a cursor left by an older version
+                if storeStreamedText(item, settings: settings) { p.embedded += 1 } else if !isCancelled { p.failed += 1 }
+                return true
+            }
+            var c = resume ?? StreamCursors.Cursor(modified: f.modified, size: f.size, offset: 0, undecoded: Data(),
+                                                   carry: "", lineBase: 0, written: 0, unit: text ? nil : 0)
+            let startUnit = c.unit ?? 0
+            let outcome = step(item, &c)
+            settle(item, c, outcome, first: resume == nil)
+            if case .failed = outcome { if !isCancelled { p.failed += 1 } } else if resume == nil { p.embedded += 1 }
+            // What is left of it is not done yet: its later turns are credited as they run.
+            if case .more = outcome {
+                if text, let r = rootOf(f.path) {
+                    let rest = Double(max(0, Int64(f.size) - Int64(c.offset))) / 1_000_000
+                    workDone[r, default: WorkLeft()].add(WorkUnit(kind: .text, sort: IndexCosts.sort(ext: f.ext.lowercased()), units: rest), sign: -1)
+                } else if !text, let w = inflight[f.path], let turn = share(item, startUnit, c.unit ?? 0) {
+                    inflight[f.path] = (w.root, turn.done)
+                }
             }
             return true
-        }
-        /// A long medium's last turn stored: its content key, and its enrichment, recorded now.
-        func finishMedia(_ item: DecodedItem) {
-            Self.recordFinishedKey(item, store: store)
-            if item.enrichable, let ck = item.contentKey {
-                store.enrichLedger.record([EnrichLedger.key(digest: StoreSchema.contentDigestHex(ck), path: item.file.path)])
-            }
         }
         while !isCancelled {
             let wave = takeWave(max: 20_000)
@@ -1439,12 +1431,6 @@ public final class Indexer: @unchecked Sendable {
             byKind.removeAll(keepingCapacity: true)
             var waveWork: [CrawledFile] = []
             for f in wave.files {
-                // Training data (DatasetRule): new files skipped, ones already indexed kept. The
-                // folder was judged before its files were handed over, so the answer is in.
-                if known[f.path] == nil, let slash = f.path.lastIndex(of: "/"), datasets.contains(f.path[..<slash]) {
-                    tick(f.path)
-                    continue
-                }
                 byKind[FileExtractor.kind(forExtension: f.ext) ?? .text, default: []].append(f)
                 waveWork.append(f)
             }
@@ -1600,7 +1586,7 @@ public final class Indexer: @unchecked Sendable {
                         stageStore(path, chunks)
                         if stagedStores.count >= 256 { flushStagedStores() }
                     case .images, .imagePatches, .pdfScan:
-                        if case .pdfScan = item.payload, handleMediaStream(item) { return }   // a long scan takes turns
+                        if case .pdfScan = item.payload, handleStream(item) { return }   // a long scan takes turns
                         // Scanned pages cost as images, not as text: timed on their own (.scan)
                         // and kept off the text phase's clock.
                         let t0 = CFAbsoluteTimeGetCurrent()
@@ -1611,7 +1597,7 @@ public final class Indexer: @unchecked Sendable {
                         costs.addTime(.scan, seconds: dt, units: Double(chunks.count), files: 1)
                         storeChunks(path, chunks)   // scanned PDF (streamed) / image pages (batched)
                     case .textStream:
-                        handleStream(item)
+                        _ = handleStream(item)
                     default:
                         p.skipped += 1
                     }
@@ -1655,7 +1641,7 @@ public final class Indexer: @unchecked Sendable {
                     if case .audioSegments = item.payload {
                         // Long audio streams per-file (one embedding a minute); the cross-file mel
                         // staging below is for clips within one frame budget. A very long one takes turns.
-                        if !handleMediaStream(item) { storeChunks(path, self.embed(item)) }
+                        if !handleStream(item) { storeChunks(path, self.embed(item)) }
                         return
                     }
                     guard case .audioMel(let mel, let frames) = item.payload else { p.skipped += 1; return }
@@ -1744,8 +1730,7 @@ public final class Indexer: @unchecked Sendable {
                     if item.unchanged { p.unchanged += 1 }
                     else {
                         noteWork(item)
-                        if case .textStream = item.payload { handleStream(item) }
-                        else if !handleMediaStream(item) {
+                        if !handleStream(item) {
                             storeChunks(item.file.path, self.withExtras(item, self.embed(item), settings: settings))
                         }
                     }
@@ -1766,27 +1751,22 @@ public final class Indexer: @unchecked Sendable {
         while !isCancelled, !continuations.isEmpty {
             var (item, c) = continuations.removeFirst()
             p.currentPath = item.file.path
-            let t0 = CFAbsoluteTimeGetCurrent(), before = (offset: c.offset, written: c.written, texts: textsEmbedded.value)
-            defer {
-                let mb = Double(c.offset - before.offset) / 1_000_000, n = c.written - before.written
-                costs.addTime(.text, seconds: CFAbsoluteTimeGetCurrent() - t0, units: Double(textsEmbedded.value - before.texts), files: 1)
-                costs.addChunks(IndexCosts.sort(ext: item.file.ext.lowercased()), chunks: n, scanPages: 0, mb: mb)
-                if let r = rootOf(item.file.path) {
-                    workDone[r, default: WorkLeft()].add(WorkUnit(kind: .text, sort: IndexCosts.sort(ext: item.file.ext.lowercased()), units: mb))
-                }
-                updateTimeLeft()
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let before = (offset: c.offset, written: c.written, unit: c.unit ?? 0, texts: textsEmbedded.value)
+            let outcome = step(item, &c)
+            settle(item, c, outcome, first: false)
+            // The turn's time and work, each in its own units.
+            let dt = CFAbsoluteTimeGetCurrent() - t0
+            if case .textStream = item.payload {
+                let mb = Double(c.offset - before.offset) / 1_000_000, sort = IndexCosts.sort(ext: item.file.ext.lowercased())
+                costs.addTime(.text, seconds: dt, units: Double(textsEmbedded.value - before.texts), files: 1)
+                costs.addChunks(sort, chunks: c.written - before.written, scanPages: 0, mb: mb)
+                if let r = rootOf(item.file.path) { workDone[r, default: WorkLeft()].add(WorkUnit(kind: .text, sort: sort, units: mb)) }
+            } else if let turn = share(item, before.unit, c.unit ?? before.unit) {
+                costs.addTime(turn.kind, seconds: dt, units: turn.units, files: 0)
+                if let r = rootOf(item.file.path) { workDone[r, default: WorkLeft()].add(turn.done) }
             }
-            let step: StreamStep
-            if case .textStream = item.payload { step = streamWindow(item, cursor: &c, settings: settings) }
-            else if let plan = mediaPlan(item) { step = mediaTurn(item, cursor: &c, plan: plan, settings: settings) }
-            else { step = .failed }
-            switch step {
-            case .more: streams.set(item.file.path, c); continuations.append((item, c))
-            case .done:
-                streams.finish(item.file.path)
-                if case .textStream = item.payload { Self.recordFinishedKey(item, store: store) } else { finishMedia(item) }
-            case .failed: if !isCancelled { streams.finish(item.file.path) }
-            }
+            updateTimeLeft()
             onProgress(p)
         }
 
@@ -1864,6 +1844,7 @@ public final class Indexer: @unchecked Sendable {
                 Self.log.error("reconcile: \(blindRoots.count, privacy: .public) root(s) crawled empty; skipped deletion (likely no file-access permission)")
             }
         }
+        drainScreenText()
         // Identifiers of files indexed before IDIndex existed, then the contents no file holds.
         // A complete pass only, like the sweep above; cancellable like everything in it.
         // Once per sidecar: it marks itself done, and files indexed since are recorded as read. The
@@ -2209,16 +2190,6 @@ public final class Indexer: @unchecked Sendable {
         recordIdentifiers(pieces, digest: StoreSchema.contentDigestHex(key), firstChunk: firstChunk, replace: replace)
     }
 
-    /// A screenshot's text as chunks, its identifiers recorded. [] when it has none. The text
-    /// chunks are stored after the picture's one chunk, so their identifiers point from chunk 1.
-    func screenPieces(_ image: CGImage, contentKey: String?, settings: IndexSettings) -> [TextPiece] {
-        let text = ScreenText.recognize(image)
-        guard !text.isEmpty else { return [] }
-        let pieces = chunk(text, settings: settings, origin: .opaque)
-        recordIdentifiers(pieces, contentKey: contentKey, firstChunk: 1)
-        return pieces
-    }
-
     /// The chunks a file has beside its picture or frames, numbered from `first`: a screenshot's
     /// text (kind text, locator "Text", on the text tower) and a video's soundtrack (kind audio, one
     /// a minute, time locators). Their kinds are what they are, so every score scale applies to them
@@ -2240,39 +2211,128 @@ public final class Indexer: @unchecked Sendable {
                                         locator: "Text", chunkKey: keyed[j].key))
             }
         }
-        if let reader = soundtrack {
-            // The next minute decodes while the GPU embeds this one, as for audio files: 4% off a
-            // 9-minute soundtrack, same vectors (omni-verify soundcost). Batching minutes saved 2%
-            // more but moved the vectors (cos 0.9999) away from an audio file's.
-            final class Box: @unchecked Sendable { var next: (mel: [Float], frames: Int)? }
-            let prefetchQ = DispatchQueue(label: "omni.indexer.soundtrack-prefetch")
-            var current = reader.nextMelSegment()
-            var k = 0
-            while let seg = current {
-                if isCancelled { return nil }
-                let box = Box(), sync = DispatchGroup()
-                sync.enter()
-                prefetchQ.async { box.next = reader.nextMelSegment(); sync.leave() }
-                if seg.frames >= (k == 0 ? 1 : Self.minTailMelFrames) {   // a tail under a second is skipped, as for audio files
-                    guard let v = embedder.embedAudioMel(seg.mel, frames: seg.frames), Self.isFinite(v) else { sync.wait(); return nil }
-                    out.append(IndexedChunk(path: f.path, modified: f.modified, size: f.size, kind: FileKind.audio.rawValue,
-                                            chunkIndex: first + out.count, snippet: "", embedding: v, duration: duration,
-                                            locator: Self.timeLocator(Double(k) * OmniAudioPreprocess.segmentSeconds)))
-                }
-                sync.wait()
-                current = box.next
-                k += 1
+        // A soundtrack is an audio file's stream, read by the same code (prefetch, tail skip,
+        // locators); only its numbers follow the file's own chunks.
+        if let reader = soundtrack, let head = reader.nextMelSegment() {
+            let track = embedStreamedAudio(file: f, kind: FileKind.audio.rawValue, firstMel: head.mel,
+                                           firstFrames: head.frames, reader: reader, duration: duration)
+            if isCancelled || (track.isEmpty && head.frames > 0) || !track.allSatisfy({ Self.isFinite($0.embedding) }) { return nil }
+            for var c in track {
+                c.chunkIndex = first + out.count
+                out.append(c)
             }
         }
         return out
     }
 
+    /// SCREENSHOT TEXT ON ITS OWN LANE. Vision reads text one image at a time for the whole process
+    /// - ~67 ms an image whatever the device or the number of threads (omni-verify ocrcost, and a
+    /// 36-image probe at 1, 4 and 8 wide on the Neural Engine, GPU and CPU) - which is slower than
+    /// the GPU embeds pictures, so reading it on the decode stage made it the image phase's pace:
+    /// 600 screenshots 33.7 s -> 45.2 s. The picture is stored at the GPU's pace; the lane only READS
+    /// the text, alongside the audio and video phases that follow, and the consumer embeds and adds
+    /// what is read in batches (addScreenText, as the enrichment adds it). A lane that also embedded
+    /// waited on the GPU behind each audio batch: 157 ms a screenshot, the pass 115 s, not 102.
+    final class ScreenTextLane: @unchecked Sendable {
+        struct Job { let file: CrawledFile; let digest: String; let settings: IndexSettings }
+        struct Read { let job: Job; let pieces: [TextPiece]? }
+        private let lock = NSLock()
+        private var jobs: [Job] = []
+        private var reads: [Read] = []
+        private var running = false
+        private let group = DispatchGroup()
+        private let queue = DispatchQueue(label: "omni.indexer.screen-text", qos: .utility)
+        var read: ((Job) -> [TextPiece]?)?
+        var readyCount: Int { lock.withLock { reads.count } }
+
+        func add(_ job: Job) {
+            let start: Bool = lock.withLock {
+                jobs.append(job)
+                if running { return false }
+                running = true
+                group.enter()   // under the lock: a drain can never see the job without the runner
+                return true
+            }
+            if start { queue.async { self.run() } }
+        }
+
+        private func run() {
+            while true {
+                let next: Job? = lock.withLock { jobs.isEmpty ? nil : jobs.removeFirst() }
+                guard let job = next else {
+                    lock.withLock { running = false }
+                    group.leave()
+                    return
+                }
+                let pieces = read?(job)
+                lock.withLock { reads.append(Read(job: job, pieces: pieces)) }
+            }
+        }
+
+        /// What has been read so far, handed over. `all`: wait for the lane to finish first (a
+        /// cancelled pass drops what is still queued).
+        func take(all: Bool, cancelled: Bool) -> (reads: [Read], dropped: Int) {
+            var dropped = 0
+            if all {
+                lock.withLock { if cancelled { dropped = jobs.count; jobs.removeAll() } }
+                group.wait()
+            }
+            return lock.withLock { defer { reads.removeAll() }; return (reads, dropped) }
+        }
+    }
+
+    /// A screenshot's text, read and chunked; [] when it has none, nil when it could not be read.
+    func readScreenText(_ file: CrawledFile, settings: IndexSettings) -> [TextPiece]? {
+        guard case .images(let images) = ContentSources.source(for: file).content(file, kind: .image, settings: settings),
+              let image = images.first else { return nil }
+        let text = ScreenText.recognize(image)
+        return text.isEmpty ? [] : chunk(text, settings: settings, origin: .opaque)
+    }
+
+    /// A screenshot's text added beside its stored picture, its identifiers recorded: one
+    /// transaction. False: the file changed or is not stored as one picture, or an embed failed.
+    func addScreenText(_ file: CrawledFile, digest: String, pieces: [TextPiece], settings: IndexSettings) -> Bool {
+        guard let f = store.storedFiles(paths: [file.path])[file.path], f.modified == file.modified,
+              let base = store.storedChunks(path: file.path)?.filter({ $0.kind == FileKind.image.rawValue }), base.count == 1
+        else { return false }
+        let first = base[0].chunkIndex + 1
+        recordIdentifiers(pieces, digest: digest, firstChunk: first)
+        guard let more = extraChunks(file: file, screen: pieces, soundtrack: nil, duration: 0, first: first, settings: settings),
+              !isCancelled else { return false }
+        do { try Self.writeWaitingOutLocks { try store.replaceMany([(file.path, base + more)]) } } catch { return false }
+        return true
+    }
+
+    /// What the lane has read, added - on the consumer, between items, so the GPU never waits on
+    /// Vision nor Vision on the GPU. `all`: the end of a pass, the lane drained first. Anything not
+    /// added is left to the enrichment (re-armed).
+    func addReadScreenText(all: Bool) {
+        let (reads, dropped) = screenLane.take(all: all, cancelled: isCancelled)
+        var notDone = dropped
+        for r in reads {
+            if isCancelled { notDone += 1; continue }
+            guard let pieces = r.pieces else { notDone += 1; continue }
+            if pieces.isEmpty || addScreenText(r.job.file, digest: r.job.digest, pieces: pieces, settings: r.job.settings) {
+                store.enrichLedger.record([EnrichLedger.key(digest: r.job.digest, path: r.job.file.path)])
+            } else { notDone += 1 }
+        }
+        if notDone > 0 { store.enrichLedger.backfilled = false }
+    }
+
+    /// The end of a pass or an update.
+    func drainScreenText() { addReadScreenText(all: true) }
+
     /// A file's own chunks and its extra ones. A failed extra keeps the file indexed without it
     /// (the enrichment pass retries it: the ledger is written only on success); a cancel stores
     /// nothing, as every embed path does.
     func withExtras(_ item: DecodedItem, _ base: [IndexedChunk], settings: IndexSettings) -> [IndexedChunk] {
-        guard !base.isEmpty, !item.screenPieces.isEmpty || item.soundtrack != nil else { return base }
-        guard let more = extraChunks(file: item.file, screen: item.screenPieces, soundtrack: item.soundtrack,
+        if item.needsScreenText, !base.isEmpty, let ck = item.contentKey {
+            screenLane.add(.init(file: item.file, digest: StoreSchema.contentDigestHex(ck), settings: settings))
+            // What is read so far is added once it is a batch: it is held in memory until then.
+            if screenLane.readyCount >= 256 { addReadScreenText(all: false) }
+        }
+        guard !base.isEmpty, item.soundtrack != nil else { return base }
+        guard let more = extraChunks(file: item.file, screen: [], soundtrack: item.soundtrack,
                                      duration: item.meta.duration, first: base.count, settings: settings) else {
             item.enrichFailed = true
             return isCancelled ? [] : base
@@ -2291,7 +2351,7 @@ public final class Indexer: @unchecked Sendable {
     func enrichMedia(settings: IndexSettings, onFile: (String) -> Void) -> Int {
         let ledger = store.enrichLedger
         let candidates = store.enrichmentCandidates(audioLongerThan: OmniAudioPreprocess.segmentSeconds)
-            .filter { !PhotoLibrary.isPhotoPath($0.path) }
+            .filter { !PhotoLibrary.isPhotoPath($0.path) && ($0.kind != FileKind.image.rawValue || Self.isScreenshot($0.path)) }
         if omniPerfEnabled { omniPerfLog("enrichment-start candidates=\(candidates.count)") }
         var enriched = 0
         for start in stride(from: 0, to: candidates.count, by: 64) {
@@ -2345,16 +2405,8 @@ public final class Indexer: @unchecked Sendable {
             return true
         case FileKind.image.rawValue:
             guard settings.screenText, Self.isScreenshot(c.path) else { return true }   // not a screenshot: nothing to add
-            guard let base = own(.image), base.count == 1,
-                  case .images(let images) = ContentSources.source(for: file).content(file, kind: .image, settings: settings),
-                  let image = images.first else { return false }
-            let text = ScreenText.recognize(image)
-            guard !text.isEmpty else { return true }
-            let pieces = chunk(text, settings: settings, origin: .opaque)
-            recordIdentifiers(pieces, digest: digest, firstChunk: after(base))
-            guard let more = extraChunks(file: file, screen: pieces, soundtrack: nil, duration: 0, first: after(base), settings: settings)
-            else { return false }
-            return write(base + more)
+            guard let pieces = readScreenText(file, settings: settings) else { return false }
+            return pieces.isEmpty || addScreenText(file, digest: digest, pieces: pieces, settings: settings)
         case FileKind.text.rawValue:
             // A PDF indexed before chunks opened at the page holding most of them (pageOf): the
             // same chunks, keys and vectors, each at its page now. Nothing is embedded; a file
@@ -2685,10 +2737,6 @@ public final class Indexer: @unchecked Sendable {
                                           ownDataPaths: settings.ownDataPaths + sidecarPaths,
                                       ownDataExceptions: settings.ownDataExceptions)
                 crawler.onPolicyFile = onPolicyFile
-                if settings.skipDatasets {
-                    crawler.datasets = lastDatasets
-                    crawler.datasetAllowed = settings.datasetAllowed
-                }
                 crawler.walk(shouldContinue: { !self.isCancelled }) { crawled.append($0) }
             } else {
                 files.append(CrawledFile(path: path,
@@ -2704,17 +2752,6 @@ public final class Indexer: @unchecked Sendable {
         files = files.filter { seenPaths.insert($0.path).inserted }
         var lookup = seenPaths; lookup.formUnion(deletedTop)
         let known = store.storedFiles(paths: lookup)
-        // Training data (DatasetRule), as in a full pass: a new file in a folder the last pass or a
-        // directory event above judged a dataset is not indexed - a training run writing frames
-        // into one would otherwise be embedded file by file as they land.
-        if settings.skipDatasets {
-            files = files.filter { f in
-                guard known[f.path] == nil, let slash = f.path.lastIndex(of: "/") else { return true }
-                let dir = f.path[..<slash]
-                return !lastDatasets.contains(dir)
-                    || settings.datasetAllowed.contains { dir == $0 || dir.hasPrefix($0 + "/") }
-            }
-        }
         arrivalLock.withLock {
             arrivalNames = Set(files.lazy.map { ($0.path as NSString).lastPathComponent })
             for p in paths where !deletedTop.contains(p) { arrivalNames.insert((p as NSString).lastPathComponent) }
@@ -2976,6 +3013,7 @@ public final class Indexer: @unchecked Sendable {
         omniPerfLog(String(format: "update events=%d files=%d work=%d dedup=%d deleted=%d prefixes=%d tokens=%d %.0fms",
                            paths.count, files.count, work.count, dedupHits, toDelete.count, vanishedPrefixes.count,
                            ((embedder as? OmniEngine)?.tokensProcessed ?? 0) - tok0, -tUpdate.timeIntervalSinceNow * 1000))
+        drainScreenText()
         embedder.indexingIdle()   // arm the debounced GPU buffer-cache trim
         return !work.isEmpty || !toDelete.isEmpty || (finished && !vanishedPrefixes.isEmpty)
     }
@@ -3261,11 +3299,8 @@ public final class Indexer: @unchecked Sendable {
             // concurrent decode stage, so the serialized GPU thread only does the tower.
             let raws = images.map { OmniVisionPreprocess.preprocessRaw($0) }
             let item = DecodedItem(file: file, kind: kind, payload: .imagePatches(raws), meta: meta, contentKey: contentKey)
-            // A screenshot's text, read here on the concurrent decode stage (ScreenText).
-            if settings.screenText, images.count == 1, let img = images.first, Self.isScreenshot(file.path) {
-                item.screenPieces = screenPieces(img, contentKey: contentKey, settings: settings)
-                item.enrichable = true
-            }
+            // A screenshot's text is read on its own lane once the picture is stored (ScreenTextLane).
+            if settings.screenText, images.count == 1, Self.isScreenshot(file.path) { item.needsScreenText = true }
             // HQ tag refinement (retag pass only): cut the study's 5 CWR crops here on the
             // concurrent decode stage, so the GPU stage just scores them. Single-frame images
             // only - multi-page images get per-page tags already.

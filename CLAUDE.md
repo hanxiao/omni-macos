@@ -110,6 +110,17 @@ codebase were already measured there, and many were rejected.
 - Model-free probes for MLX regressions: `ocr-verify x --probe-qmm | --probe-gather |
   --probe-rowexact [--causal-sweep]`. Re-run them on any MLX or toolchain change.
 
+## Principles (Han, 2026-10-14)
+
+- REUSE THE EXISTING PIPELINE. Search, indexing, tagging: each is already tuned for its purpose. A
+  new purpose improves that pipeline and its algorithms; it does not add a second one. No duplicate
+  or near-duplicate logic kept in conditional branches or spread across the codebase.
+- NO AD-HOC HEURISTICS OR PATTERN MATCHING, above all language-specific ones (stopword lists,
+  English-only regexes, word lists per language). Use embedding-based test-time compute with the
+  model we already run (https://hanxiao.io/tencent-elastic-search-ai-2026/#1).
+- EVERY UI CHANGE IS SHOWN TO HAN and follows macOS Tahoe, Liquid Glass and native macOS design.
+  UI text and hints are plain: no mannered prose.
+
 ## Rules that keep biting
 
 - NO STORE-QUEUE HOLD THAT GROWS WITH THE INDEX OR WITH THE INPUT. Searches wait on the same serial

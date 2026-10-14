@@ -146,15 +146,20 @@ enum HistoryMode: String, CaseIterable, Identifiable {
 }
 
 enum SortOrder: String, CaseIterable, Identifiable {
-    case relevance, name, dateModified
+    case relevance, name, kind, folder, dateModified
     var id: String { rawValue }
     var title: String {
         switch self {
         case .relevance: return "Relevance"
         case .name: return "Name"
+        case .kind: return "Kind"
+        case .folder: return "Folder"
         case .dateModified: return "Date Modified"
         }
     }
+    /// The direction a first click on its column header gives: names A to Z, the rest best,
+    /// newest or largest first - Finder's rule.
+    var ascendingFirst: Bool { self == .name || self == .kind || self == .folder }
 }
 
 enum DateRange: String, CaseIterable, Identifiable {
@@ -1792,7 +1797,19 @@ final class AppModel {
             if !suppressFilterSearch { syncBoxFromFilters(reSearch: false) }
         }
     }
-    var sortOrder: SortOrder = .relevance { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: false) } } }
+    var sortOrder: SortOrder = .relevance {
+        didSet {
+            if oldValue != sortOrder { sortAscending = sortOrder.ascendingFirst }
+            if !suppressFilterSearch { syncBoxFromFilters(reSearch: false) }
+        }
+    }
+    /// The direction of `sortOrder`, reversed by a second click on its column header.
+    var sortAscending = false { didSet { if oldValue != sortAscending { recomputeResults() } } }
+
+    /// A click on the search list's column header: sort by it, or reverse it.
+    func sortResults(by order: SortOrder) {
+        if sortOrder == order { sortAscending.toggle() } else { sortOrder = order }
+    }
     private var suppressFilterEffects = false   // set while bulk-clearing filters for the folder map
     private var suppressFilterSearch: Bool { applyingParsedQuery || suppressFilterEffects }
 
@@ -1979,29 +1996,6 @@ final class AppModel {
         guard !rs.isEmpty else { return nil }
         let left = rs.compactMap(\.secondsLeft)
         return left.count == rs.count ? left.max() : nil
-    }
-
-    /// Skip new files in folders that look like training data (DatasetRule). On by default.
-    var skipDatasets: Bool = true {
-        didSet {
-            guard oldValue != skipDatasets else { return }
-            persistPerf()
-            requestIndexPass()
-        }
-    }
-    /// Folders let in from that rule ("Index" in Settings): never datasets, nor anything under them.
-    var datasetAllowed: [String] = [] {
-        didSet { if oldValue != datasetAllowed { persistPerf() } }
-    }
-    /// The training-data folders the last full pass skipped, with their file counts.
-    private(set) var datasetFolders: [String: Int] = [:]
-
-    /// "Index" on a skipped training-data folder: let it in, and index it.
-    func allowDataset(_ path: String) {
-        guard !datasetAllowed.contains(path) else { return }
-        datasetAllowed.append(path)
-        datasetFolders[path] = nil
-        requestIndexPass()
     }
 
     /// Search-as-you-type (default). OFF = the search runs on Return only; typing still parses
@@ -2804,7 +2798,7 @@ final class AppModel {
         // the same query, and an @Observable property notifies on every write, equal or not. Each
         // unguarded pass re-rendered the results list and every visible row for nothing.
         var above = rawResults.filter {
-            Self.relevance($0.score) >= VectorStore.relevanceFloor(kind: $0.onTextScale ? FileKind.text.rawValue : $0.kind, base: minScore)
+            Self.relevance(Float(Double($0.score) / $0.lift)) >= VectorStore.relevanceFloor(kind: $0.kind, base: minScore)
         }
         if hiddenByFloor != rawResults.count - above.count { hiddenByFloor = rawResults.count - above.count }
         // WEAKER MATCHES FOLD, on the relevance order the store produced and before any sort, one
@@ -2828,13 +2822,28 @@ final class AppModel {
         let collapsed = collapse(above)
         if collapsedCount != above.count - collapsed.count { collapsedCount = above.count - collapsed.count }
         var ordered: [ResultGroup]
+        // Each order in its own direction; ties keep the relevance order the store produced.
+        func text(_ g: ResultGroup) -> String {
+            let p = g.representative.path as NSString
+            switch sortOrder {
+            case .kind: return g.representative.fileKind
+            case .folder: return (p.deletingLastPathComponent as NSString).lastPathComponent
+            default: return p.lastPathComponent
+            }
+        }
         switch sortOrder {
         case .relevance:
-            ordered = collapsed
-        case .name:
-            ordered = collapsed.sorted { ($0.representative.path as NSString).lastPathComponent.localizedCaseInsensitiveCompare(($1.representative.path as NSString).lastPathComponent) == .orderedAscending }
+            ordered = sortAscending ? collapsed.reversed() : collapsed
+        case .name, .kind, .folder:
+            ordered = collapsed.enumerated().sorted { a, b in
+                let c = text(a.element).localizedStandardCompare(text(b.element))
+                return c == .orderedSame ? a.offset < b.offset : (c == .orderedAscending) == sortAscending
+            }.map(\.element)
         case .dateModified:
-            ordered = collapsed.sorted { $0.representative.modified > $1.representative.modified }
+            ordered = collapsed.enumerated().sorted { a, b in
+                let x = a.element.representative.modified, y = b.element.representative.modified
+                return x == y ? a.offset < b.offset : (x < y) == sortAscending
+            }.map(\.element)
         }
         // A linked Mac in another vector space: its hits stay a group of their own, after this
         // Mac's, in every sort order - scores from two different models do not rank against each
@@ -3586,8 +3595,6 @@ final class AppModel {
         if d.object(forKey: "omni.skipDataless") != nil { skipDatalessFiles = d.bool(forKey: "omni.skipDataless") }
         evictDownloadedFiles = d.bool(forKey: "omni.evictDownloaded")
         if d.object(forKey: "omni.readLongDataFiles") != nil { readLongDataFiles = d.bool(forKey: "omni.readLongDataFiles") }
-        if d.object(forKey: "omni.skipDatasets") != nil { skipDatasets = d.bool(forKey: "omni.skipDatasets") }
-        datasetAllowed = (d.array(forKey: "omni.datasetAllowed") as? [String]) ?? []
         if d.object(forKey: "omni.imageTags") != nil { imageTagsEnabled = d.bool(forKey: "omni.imageTags") }
         if d.object(forKey: "omni.instantSearch") != nil { instantSearchEnabled = d.bool(forKey: "omni.instantSearch") }
     }
@@ -3606,8 +3613,6 @@ final class AppModel {
         OmniPrefs.set(skipDatalessFiles, forKey: "omni.skipDataless")
         OmniPrefs.set(evictDownloadedFiles, forKey: "omni.evictDownloaded")
         OmniPrefs.set(readLongDataFiles, forKey: "omni.readLongDataFiles")
-        OmniPrefs.set(skipDatasets, forKey: "omni.skipDatasets")
-        OmniPrefs.set(datasetAllowed, forKey: "omni.datasetAllowed")
         OmniPrefs.set(imageTagsEnabled, forKey: "omni.imageTags")
         OmniPrefs.set(instantSearchEnabled, forKey: "omni.instantSearch")
     }
@@ -6553,8 +6558,6 @@ final class AppModel {
         s.skipDataless = skipDatalessFiles
         s.evictDownloaded = evictDownloadedFiles
         s.readLongDataFiles = readLongDataFiles
-        s.skipDatasets = skipDatasets
-        s.datasetAllowed = datasetAllowed
         s.imageTags = imageTagsEnabled
         return s
     }
@@ -6634,7 +6637,7 @@ final class AppModel {
         // The detached task builds/loads and SEEDS the tagger but never touches self; the
         // attach happens back on the main actor below, with the world re-checked.
         let task = Task.detached(priority: .utility) { () -> OmniTagger? in
-            let labels = OmniTagger.labels(modelDir: modelDir)
+            let labels = OmniTagger.gatedLabels(modelDir: modelDir)
             guard !labels.isEmpty, let url = try? Self.tagCacheURL(in: cacheDir, dim: engine.dim, modelDir: modelDir, labels: labels) else { return nil }
             let fm = FileManager.default
             if !fm.fileExists(atPath: url.path) {
@@ -6977,10 +6980,6 @@ final class AppModel {
                         // folder-removal restart - updated the index just now; a clean finish with
                         // nothing left to do also confirms it is current as of now.
                         if p.embedded > 0 || !p.cancelled { self.markIndexed(store) }
-                        // Training-data folders this pass skipped (DatasetRule), for Settings.
-                        if !p.cancelled, let found = self.indexer?.lastDatasets.all, found != self.datasetFolders {
-                            self.datasetFolders = found
-                        }
                         // The browser follows a pass by polling (followIndexing), and its last
                         // poll can land before the pass's last write: settle it once here.
                         self.requestBrowserReload()

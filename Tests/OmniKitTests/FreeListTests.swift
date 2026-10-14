@@ -392,6 +392,67 @@ final class FreeListTests: XCTestCase {
         XCTAssertEqual(again.search(vec(903), topK: 3).first?.path, "/reused.txt")
     }
 
+    /// A POWER LOSS INSIDE THE WINDOW: the reuse's bytes never reached the disk, so the file holds
+    /// what the position held before, and the blob beside it is the only right copy. The debt
+    /// record says which positions those are, so the open writes the blob back rather than refusing
+    /// the index. Simulated by putting the old bytes back into the file after a kill.
+    func testAReuseThePowerLossTookIsWrittenBackFromItsBlob() throws {
+        try powerLoss(stampSidecar: false)
+    }
+
+    func testAReuseThePowerLossTookIsWrittenBackWhenTheSidecarIsAdopted() throws {
+        try powerLoss(stampSidecar: true)
+    }
+
+    /// The same disagreement with NO debt record is not explained by a lost reuse, and the blob is
+    /// not written over the file: the load declines, as it always has.
+    func testADisagreementNoReuseExplainsIsNotWrittenBack() throws {
+        XCTAssertThrowsError(try powerLoss(stampSidecar: false, forgetDebt: true))
+    }
+
+    private func powerLoss(stampSidecar: Bool, forgetDebt: Bool = false) throws {
+        VectorStore.quantBaseOverride = VectorStore.scanBits
+        let url = tempDB()
+        let vecs = URL(fileURLWithPath: url.path + ".vecs")
+        let rowBytes = Self.dim * 2
+        var slot = -1
+        var before = Data()
+        do {
+            let store = try VectorStore(dbURL: url)
+            for i in 0 ..< 60 { try store.replace(path: "/a/f\(i).txt", chunks: [chunk("/a/f\(i).txt", i)]) }
+            _ = store.search(vec(1), topK: 3)
+            store.advanceCoverageForTest()
+            store.deletePath("/a/f3.txt")
+            try store.replace(path: "/reused.txt", chunks: [chunk("/reused.txt", 903)])
+            XCTAssertEqual(pendingCount(url), 1, "the fixture did not reuse a covered position")
+            if stampSidecar { store.stampRowSidecarForTest() }
+        }   // killed
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        var st: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT slot FROM vec_reuse_debt;", -1, &st, nil), SQLITE_OK)
+        if sqlite3_step(st) == SQLITE_ROW { slot = Int(sqlite3_column_int64(st, 0)) }
+        sqlite3_finalize(st)
+        if forgetDebt { sqlite3_exec(db, "DELETE FROM vec_reuse_debt;", nil, nil, nil) }
+        sqlite3_close(db)
+        XCTAssertGreaterThanOrEqual(slot, 0, "the reuse left no record")
+        // The power loss: the position's bytes are what they were before the reuse (f3's vector).
+        let h = try FileHandle(forUpdating: vecs)
+        try h.seek(toOffset: UInt64(slot * rowBytes))
+        let now = try XCTUnwrap(h.read(upToCount: rowBytes))
+        let f3 = vec(3).map { VectorStore.toBF16($0) }
+        before = f3.withUnsafeBytes { Data($0) }
+        XCTAssertNotEqual(now, before, "the file never held the reuse (control)")
+        try h.seek(toOffset: UInt64(slot * rowBytes))
+        try h.write(contentsOf: before)
+        try h.close()
+
+        let store = try VectorStore(dbURL: url); defer { store.close() }
+        XCTAssertEqual(store.search(vec(903), topK: 3).first?.path, "/reused.txt", "the reused file reads the lost bytes")
+        XCTAssertNil(store.coverageAudit())
+        XCTAssertEqual(pendingCount(url), 0, "the blob was not written back and settled")
+    }
+
     /// AN OLDER BUILD'S DEBT: killed with a reuse owed and nothing on disk to say so. It is found
     /// where it does harm - the identity at the end of coverage, which it broke for good - and
     /// settled there, so coverage completes on the next stamp.

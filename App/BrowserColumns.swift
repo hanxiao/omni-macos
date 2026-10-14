@@ -22,9 +22,19 @@ enum BrowserColumn: String, CaseIterable, Identifiable, Sendable {
     case size
     case filesIndexed
     case tags
-    /// The folder a file is in. Only for listings that span folders (Recents); in the folder
+    /// The folder a file is in. Only for listings that span folders (Recents, search); in the folder
     /// browser every row would say the same thing, so its column menu leaves it out.
     case folder
+    // SEARCH RESULTS. A result is a file found by what is in it, so the list says what matched
+    // and where, beside the facts the browsers show.
+    /// Why it matched, and where: "Frame at 4:00", "Speech at 4:00", "Words in the image",
+    /// "Page 3", "Line 1240", "File name", "Contains INV-2041" (SearchHit.matchReason).
+    case match
+    /// The passage that matched, or the words read from a screenshot. A picture's tags go under Tags.
+    case excerpt
+    case dimensions
+    case duration
+    case relevance
 
     var id: String { rawValue }
 
@@ -38,6 +48,11 @@ enum BrowserColumn: String, CaseIterable, Identifiable, Sendable {
         case .filesIndexed: return "Files Indexed"
         case .tags:         return "Tags"
         case .folder:       return "Folder"
+        case .match:        return "Match"
+        case .excerpt:      return "Excerpt"
+        case .dimensions:   return "Dimensions"
+        case .duration:     return "Duration"
+        case .relevance:    return "Relevance"
         }
     }
 
@@ -54,14 +69,22 @@ enum BrowserColumn: String, CaseIterable, Identifiable, Sendable {
         case .filesIndexed: return 109
         case .tags:         return 197
         case .folder:       return 177
+        case .match:        return 181
+        case .excerpt:      return 160   // the least it gets: it shares the free width with Name
+        case .dimensions:   return 101
+        case .duration:     return 81
+        case .relevance:    return 85
         }
     }
+
+    /// Takes a share of the free width, the way Name does, instead of a fixed slot.
+    var flexible: Bool { self == .excerpt }
 
     /// Numbers read from the right, everything else from the left - the same rule Finder applies
     /// to its Size column.
     var alignment: Alignment {
         switch self {
-        case .size, .filesIndexed: return .trailing
+        case .size, .filesIndexed, .dimensions, .duration, .relevance: return .trailing
         default:                   return .leading
         }
     }
@@ -70,25 +93,40 @@ enum BrowserColumn: String, CaseIterable, Identifiable, Sendable {
     /// with no name is not a row.
     static let defaultVisible: [BrowserColumn] = [.kind, .dateIndexed, .size, .filesIndexed]
 
-    /// What the folder browser's header menu offers: everything but Folder.
-    static let folderBrowserChoices: [BrowserColumn] = allCases.filter { $0 != .folder }
+    /// What the folder browser's header menu offers: its own facts, not where or how well a file matched.
+    static let folderBrowserChoices: [BrowserColumn] = [.kind, .dateModified, .dateAdded, .dateIndexed, .size, .filesIndexed, .tags]
+
+    /// What the search list's header menu offers, IN ITS ORDER: what is about the search first
+    /// (how well, why, what matched), then the file's own facts.
+    static let searchChoices: [BrowserColumn] = [.relevance, .match, .excerpt, .tags, .folder, .kind, .dimensions,
+                                                 .duration, .size, .dateModified, .dateIndexed]
+    /// Not Kind: the icon and the name's extension already say it, and Name needs the room.
+    static let searchDefault: [BrowserColumn] = [.relevance, .match, .excerpt, .tags, .folder]
 }
 
 /// Which columns are on, persisted. A comma-joined list of raw values so an unknown column added
 /// by a later build is simply ignored rather than resetting the whole choice.
 @MainActor
 final class BrowserColumnSettings: ObservableObject {
-    static let shared = BrowserColumnSettings()
-    private static let key = "omni.browserColumns"
+    /// The folder browser's.
+    static let shared = BrowserColumnSettings(key: "omni.browserColumns", defaults: BrowserColumn.defaultVisible,
+                                              order: BrowserColumn.allCases)
+    /// The search list's: its own choice, as Finder keeps one per kind of window, in its own order.
+    static let search = BrowserColumnSettings(key: "omni.searchColumns", defaults: BrowserColumn.searchDefault,
+                                              order: BrowserColumn.searchChoices)
+    private let key: String
+    /// Left to right, whatever order the columns were switched on in.
+    private let order: [BrowserColumn]
 
     @Published private(set) var visible: [BrowserColumn]
 
-    private init() {
-        if let raw = UserDefaults.standard.string(forKey: Self.key) {
-            let parsed = raw.split(separator: ",").compactMap { BrowserColumn(rawValue: String($0)) }
-            visible = parsed
+    private init(key: String, defaults: [BrowserColumn], order: [BrowserColumn]) {
+        self.key = key
+        self.order = order
+        if let raw = UserDefaults.standard.string(forKey: key) {
+            visible = raw.split(separator: ",").compactMap { BrowserColumn(rawValue: String($0)) }
         } else {
-            visible = BrowserColumn.defaultVisible
+            visible = defaults
         }
     }
 
@@ -98,16 +136,14 @@ final class BrowserColumnSettings: ObservableObject {
         if let i = visible.firstIndex(of: c) { visible.remove(at: i) }
         else { visible.append(c) }
         // Keep a stable left-to-right order regardless of the order they were switched on.
-        visible.sort { a, b in
-            (BrowserColumn.allCases.firstIndex(of: a) ?? 0) < (BrowserColumn.allCases.firstIndex(of: b) ?? 0)
-        }
-        OmniPrefs.set(visible.map(\.rawValue).joined(separator: ","), forKey: Self.key)
+        visible.sort { a, b in (order.firstIndex(of: a) ?? order.count) < (order.firstIndex(of: b) ?? order.count) }
+        OmniPrefs.set(visible.map(\.rawValue).joined(separator: ","), forKey: key)
     }
 }
 
-/// What the browser sorts by. Local to the browser, the way a Finder window's column sort is: the
-/// toolbar's Sort menu goes on governing search RESULTS, which are ranked by relevance and have no
-/// columns to click.
+/// What a list sorts by. A browser's is local, the way a Finder window's column sort is; the search
+/// list's header drives the results' sort (AppModel.sortResults), the same one the toolbar's Sort
+/// menu sets.
 enum BrowserSort: Equatable, Sendable {
     case name
     case column(BrowserColumn)
@@ -174,10 +210,14 @@ struct ColumnSlot: ViewModifier {
     /// aligned, so the header does not follow the column's alignment.
     let alignment: Alignment
     func body(content: Content) -> some View {
-        content
+        let padded = content
             .padding(.leading, BrowserMetrics.colLead)
             .padding(.trailing, BrowserMetrics.colTrail)
-            .frame(width: col.width, alignment: alignment)
+        if col.flexible {
+            padded.frame(minWidth: col.width, maxWidth: .infinity, alignment: alignment)
+        } else {
+            padded.frame(width: col.width, alignment: alignment)
+        }
     }
 }
 
@@ -195,6 +235,8 @@ struct BrowserHeader<Menu: View>: View {
     /// Where the rows' last column ends, as the rows report it (`reportsCellsMaxX`); 0 until then.
     let rowCellsMaxX: CGFloat
     let click: (BrowserSort) -> Void
+    /// The least the Name column gets. The rows must use the same number (the search list's do).
+    var nameMinWidth: CGFloat = 0
     @ViewBuilder let menu: () -> Menu
     @State private var headerMaxX: CGFloat = 0
 
@@ -204,7 +246,7 @@ struct BrowserHeader<Menu: View>: View {
             // the first character of every file name under it.
             Color.clear.frame(width: BrowserMetrics.icon + BrowserMetrics.iconGap, height: 1)
             cell("Name", target: .name)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(minWidth: nameMinWidth, maxWidth: .infinity, alignment: .leading)
             ForEach(columns) { col in
                 cell(col.title, target: .column(col))
                     .modifier(ColumnSlot(col: col, alignment: .leading))

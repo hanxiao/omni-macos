@@ -73,13 +73,28 @@ final class PendingVectorCountTests: XCTestCase {
 
     // Any sequence of writes - replaces, appends, deletes, re-added contents, collects, searches -
     // with coverage advancing one small slice at a time, so the claim is usually part-way.
-    func testRandomWritesContentKeyed() throws { try random(legacy: false) }
-    func testRandomWritesRowKeyed() throws { try random(legacy: true) }
+    // SEEDED, so a failure replays and a pass means the same sequences every run: with the system
+    // generator the "part-way claim" precondition below fell short now and then (98 of 100 seen
+    // over 30 runs of the previous build, 161 at worst over 30 of this one) and failed a full suite.
+    func testRandomWritesContentKeyed() throws { for seed: UInt64 in [1, 2, 3, 4] { try random(legacy: false, seed: seed) } }
+    func testRandomWritesRowKeyed() throws { for seed: UInt64 in [1, 2, 3, 4] { try random(legacy: true, seed: seed) } }
 
-    private func random(legacy: Bool) throws {
+    /// SplitMix64: a fixed sequence per seed.
+    struct Seeded: RandomNumberGenerator {
+        var state: UInt64
+        mutating func next() -> UInt64 {
+            state &+= 0x9E37_79B9_7F4A_7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+            z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+            return z ^ (z >> 31)
+        }
+    }
+
+    private func random(legacy: Bool, seed: UInt64) throws {
         let (store, dir) = try makeStore(legacy: legacy)
         defer { store.close(); try? FileManager.default.removeItem(at: dir) }
-        var rng = SystemRandomNumberGenerator()
+        var rng = Seeded(state: seed)
         var seedOf: [String: [Int]] = [:]
         var partial = 0
         for step in 0 ..< 400 {
@@ -103,11 +118,11 @@ final class PendingVectorCountTests: XCTestCase {
                 store.advanceCoverageSliceForTest(budget: Int.random(in: 1 ... 8, using: &rng))
             }
             let pv = store.pendingVectorUnitsForTest()
-            XCTAssertEqual(pv.kept, pv.scanned, "step \(step)")
+            XCTAssertEqual(pv.kept, pv.scanned, "seed \(seed) step \(step)")
             if pv.kept != pv.scanned { return }
             if store.coveredRowsForTest > 0, pv.scanned > 0 { partial += 1 }
         }
         // Only meaningful if the claim was part-way with vectors pending past it.
-        XCTAssertGreaterThan(partial, 100, "a part-way claim in \(partial) checks")
+        XCTAssertGreaterThan(partial, 100, "seed \(seed): a part-way claim in \(partial) checks")
     }
 }

@@ -144,6 +144,14 @@ enum PerfScript {
                 menu.performActionForItem(at: i)
             }
             NotificationCenter.default.post(name: .omniPerfSettingsTab, object: arg)
+        case "settingsscroll":  // scroll the Settings pane: top, bottom, or a fraction 0...1 (screenshots)
+            if let w = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil && $0 !== NSApp.mainWindow && $0.title != "Omni" }),
+               let sv = Self.firstScrollView(in: w.contentView) {
+                let doc = sv.documentView?.bounds.height ?? 0, view = sv.contentView.bounds.height
+                let f = arg == "top" ? 0 : (arg == "bottom" ? 1 : (Double(arg) ?? 1))
+                sv.contentView.scroll(to: NSPoint(x: 0, y: max(0, (doc - view) * f)))
+                sv.reflectScrolledClipView(sv.contentView)
+            }
         case "sidebarselect":   // select the n-th indexed folder in the sidebar (-1: Recents, -2: Clipboard), as a click would
             NotificationCenter.default.post(name: .omniPerfSidebarSelect, object: Int(arg) ?? 0)
         case "sidebarhistory":  // select the n-th history row in the sidebar, as a click would
@@ -354,4 +362,15 @@ extension Notification.Name {
     static let omniPerfLinkFold = Notification.Name("omni.perf.linkFold")
     static let omniPerfOCRView = Notification.Name("omni.perf.ocrView")
     static let omniPerfOCRPage = Notification.Name("omni.perf.ocrPage")
+}
+
+
+extension PerfScript {
+    /// The first scroll view under `view`, depth first (settingsscroll).
+    static func firstScrollView(in view: NSView?) -> NSScrollView? {
+        guard let view else { return nil }
+        if let sv = view as? NSScrollView, sv.documentView != nil { return sv }
+        for v in view.subviews { if let sv = firstScrollView(in: v) { return sv } }
+        return nil
+    }
 }

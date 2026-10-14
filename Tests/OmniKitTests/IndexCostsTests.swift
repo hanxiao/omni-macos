@@ -169,10 +169,15 @@ final class IndexCostsTests: XCTestCase {
         try writeImages(200, in: e, seed: 5)
         slow.perImage = 0.1
         let (slowActual, _) = pass(e)
-        let late = try XCTUnwrap(timeline.first { $0.at >= slowActual / 2 }, "no estimate in the second half")
-        let truth = slowActual - late.at
-        XCTAssertGreaterThan(late.left, truth * 0.67, "said \(late.left) s with \(truth) s left")
-        XCTAssertLessThan(late.left, truth * 1.5, "said \(late.left) s with \(truth) s left")
+        // OVER THE SECOND HALF, not at one moment: between two batches the figure is the one the
+        // last batch left, and it corrects as the next lands (seen: 6.23 s said, then 10.34 s, with
+        // 10.21 s left), so any single sample can be a stale one - it failed one run in ten.
+        let ratios = timeline.filter { $0.at >= slowActual / 2 && slowActual - $0.at > 1 }
+            .map { $0.left / (slowActual - $0.at) }.sorted()
+        XCTAssertFalse(ratios.isEmpty, "no estimate in the second half")
+        let median = ratios[ratios.count / 2]
+        XCTAssertGreaterThan(median, 0.67, "said \(median)x the time left, over the second half")
+        XCTAssertLessThan(median, 1.5, "said \(median)x the time left, over the second half")
         XCTAssertEqual(slow.embedded, 820, "every image embedded once - the work the estimate prices")
         XCTAssertGreaterThan(first, actual * 0.7, "first estimate \(first) s vs \(actual) s")
         XCTAssertLessThan(first, actual * 1.4, "first estimate \(first) s vs \(actual) s")

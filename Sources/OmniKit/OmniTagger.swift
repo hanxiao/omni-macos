@@ -1,6 +1,5 @@
 import Foundation
 import CoreGraphics
-import Vision
 import CryptoKit
 import MLX
 
@@ -113,27 +112,6 @@ public final class OmniTagger: @unchecked Sendable {
             hasher.update(data: d)
         }
         return hasher.finalize().prefix(6).map { String(format: "%02x", $0) }.joined()
-    }
-
-    /// THE LABELS A CACHE IS BUILT FROM: the tokenizer's whole words, then the names of the
-    /// concepts macOS's own image classifier knows (Vision's taxonomy, on every Mac) that are not
-    /// one of those words. A word the tokenizer splits could never be a tag: a penguin came out
-    /// "pigeon, whale, puppy" and a zebra "lions, horse". Measured with omni-verify tagvocab
-    /// (docs/notes/roadmap.md, "Image tags"): the 14 built-in animal and flower pictures named in
-    /// their top 5, Nano 2 -> 4, Small 4 -> 10; COCO-150 categories in the top 5, Small 45 -> 55
-    /// (refined 50 -> 63), Nano 38 -> 35 (refined 49 -> 49). ~740 labels, +1.2-1.5 MB of cache.
-    public static func labels(modelDir: URL) -> [String] {
-        let words = gatedLabels(modelDir: modelDir)
-        return words.isEmpty ? [] : words + visionLabels(excluding: Set(words))
-    }
-
-    /// Vision's classifier identifiers as labels: lowercased, "_" as a space, letters and spaces
-    /// only, sorted - so the list, and the cache named by it, is the same on every Mac of one OS.
-    static func visionLabels(excluding words: Set<String>) -> [String] {
-        let ids = (try? VNClassifyImageRequest().supportedIdentifiers()) ?? []
-        let names = ids.map { $0.lowercased().replacingOccurrences(of: "_", with: " ") }
-            .filter { $0.count >= 3 && $0.allSatisfy { ($0.isASCII && $0.isLetter) || $0 == " " } && !words.contains($0) }
-        return Array(Set(names)).sorted()
     }
 
     /// 8 hex digits naming a label list, for the cache's file name: a new list (a macOS update

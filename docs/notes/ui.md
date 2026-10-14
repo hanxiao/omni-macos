@@ -1273,3 +1273,21 @@ results list - every thumbnail comes from the one iCloud keeps (QuickLook, no do
   store's `listMatching` now fills `size`, which it had dropped); a linked Mac shows Kind, Date
   Modified, Size, Files Indexed from what its listing already carried. No item counts: Finder
   shows none in the header, and the folder browser never did.
+
+## Search results in columns (Han, 2026-10-14)
+
+The list view of search results was a three-line row of its own (40 pt thumbnail; name; snippet; a
+metadata line of kind, size, position, folder and date). It now draws as the folder browser does:
+one line, the shared `BrowserHeader` as a safe-area bar, `ColumnSlot` geometry and `BrowserMetrics`,
+so a search and a folder are one kind of list. What is about the search comes first, right after
+Name (Han: not pushed to the end): Relevance; Match, why it matched and where (Han's P2 item 16 -
+"Frame at 4:00", "Speech at 4:00", "Words in the image", "Page 100", "Line 1", "Scanned page 3",
+"File name", "Contains INV-2041"; `SearchHit.matchReason`, with `SearchHit.via` from the store for
+the name and identifier cases); Excerpt, the passage or a screenshot's read words; Tags, a picture's
+or a frame's (Han: tags are not "Match"). Then the file's facts: Folder, Kind, Dimensions,
+Duration, Size, the dates. The header's right-click menu chooses them in that order
+(`BrowserColumnSettings.search`, kept apart from the folder browser's); the first view shows
+Relevance, Match, Excerpt, Tags and Folder, with Name at least 180 pt. A header click sorts the
+results (name, kind, folder, date modified, relevance) and a second click reverses it; the toolbar's
+Sort menu sets the same order. The passages disclosure is the row's leading triangle, where Finder
+draws one; an opened stack's copies are indented one icon width. The grid is unchanged.

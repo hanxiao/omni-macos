@@ -16,6 +16,9 @@ struct ResultsList<Footer: View>: View {
     @State private var gridWidth: CGFloat = 0
     /// Grid counterpart of the list's inline expansion: the path whose passages popover is open.
     @State private var passagesPopover: String?
+    /// The list's columns (its header's right-click menu), and where the rows' last one ends.
+    @ObservedObject private var columns = BrowserColumnSettings.search
+    @State private var rowCellsMaxX: CGFloat = 0
     /// One name shared by the frame reporters, the drag gesture, and the rubber-band overlay. The list
     /// and gallery are never on screen together, so reusing the string is safe. The realized-item frames
     /// themselves live as @State INSIDE the marquee modifier - they refresh on every scroll tick
@@ -139,8 +142,10 @@ struct ResultsList<Footer: View>: View {
                                       // control so it never fights the passages chevron next to it.
                                       stack: group.isStack ? (group.count, group.reason) : nil,
                                       stackOpen: model.expandedStacks.contains(group.id),
-                                      onToggleStack: { toggleStack(group.id) })
+                                      onToggleStack: { toggleStack(group.id) },
+                                      columns: columns.visible)
                                 .equatable()
+                                .reportsCellsMaxX($rowCellsMaxX)
                                 // Rows drag files OUT of the app from their icon and name (see
                                 // FileDrag). Never back in: an in-app drag was easy to misclick onto
                                 // the search drop target, so inside Omni the drag offers nothing.
@@ -176,7 +181,7 @@ struct ResultsList<Footer: View>: View {
                                     // popovers; this excerpt card sits inside the opaque scrolling
                                     // content where text must stay crisp and high-contrast.
                                     .background(Color(.controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
-                                    .padding(.leading, 52)
+                                    .padding(.leading, BrowserMetrics.rowLead + BrowserMetrics.icon + BrowserMetrics.iconGap)
                                     .padding(.trailing, 12)
                                     .padding(.bottom, 8)
                                     .transition(.opacity)
@@ -197,7 +202,8 @@ struct ResultsList<Footer: View>: View {
                                                   selected: model.selectedPaths.contains(member.path),
                                                   expandable: member.chunkCount > 1,
                                                   expanded: expanded.contains(member.path),
-                                                  onToggle: { toggle(member.path) })
+                                                  onToggle: { toggle(member.path) },
+                                                  columns: columns.visible)
                                             .equatable()
                                             .contentShape(Rectangle())
                                             .resultClick { handleTap(member.path) }
@@ -212,13 +218,13 @@ struct ResultsList<Footer: View>: View {
                                                 .background(Color(.controlBackgroundColor), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
                                                 // Indented one level deeper than the representative's
                                                 // panel, so the nesting is legible at a glance.
-                                                .padding(.leading, 52)
+                                                .padding(.leading, BrowserMetrics.rowLead + BrowserMetrics.icon + BrowserMetrics.iconGap)
                                                 .padding(.trailing, 12)
                                                 .padding(.bottom, 8)
                                                 .transition(.opacity)
                                         }
                                     }
-                                    .padding(.leading, 28)
+                                    .padding(.leading, BrowserMetrics.icon)
                                     .id(member.path)
                                     .transition(.opacity)
                                 }
@@ -244,6 +250,12 @@ struct ResultsList<Footer: View>: View {
                 withAnimation(.easeOut(duration: 0.12)) { proxy.scrollTo(sel, anchor: nil) }
             }
             .marqueeSelect(space: marqueeSpace)
+            // THE BROWSERS' HEADER: same component, same geometry, its columns this list's own.
+            .columnHeader {
+                BrowserHeader(columns: columns.visible, sort: headerSort, ascending: model.sortAscending,
+                              rowCellsMaxX: rowCellsMaxX, click: clickHeader,
+                              nameMinWidth: ResultRow.nameMinWidth) { columnMenu }
+            }
             // A new result set gets a NEW scroll view, which is what puts the top matches on screen,
             // and the only thing that does: a new scroll view starts at the top. (It also used to be
             // followed by a scroll to the first row on the next turn, a second layout of every
@@ -254,6 +266,37 @@ struct ResultsList<Footer: View>: View {
             // the result-set token, so a same-query refresh from live indexing does NOT rebuild and
             // does not throw away a scroll position the user chose.
             .id(model.resultsToken)
+        }
+    }
+
+    /// The results' sort as the header shows it: a column, or Name.
+    private var headerSort: BrowserSort {
+        switch model.sortOrder {
+        case .name: return .name
+        case .kind: return .column(.kind)
+        case .folder: return .column(.folder)
+        case .dateModified: return .column(.dateModified)
+        case .relevance: return .column(.relevance)
+        }
+    }
+
+    /// A header click sorts the results by that column, where the results can be sorted by it.
+    private func clickHeader(_ target: BrowserSort) {
+        let order: SortOrder?
+        switch target {
+        case .name: order = .name
+        case .column(.kind): order = .kind
+        case .column(.folder): order = .folder
+        case .column(.dateModified): order = .dateModified
+        case .column(.relevance): order = .relevance
+        default: order = nil
+        }
+        if let order { model.sortResults(by: order) }
+    }
+
+    @ViewBuilder private var columnMenu: some View {
+        ForEach(BrowserColumn.searchChoices) { col in
+            Toggle(col.title, isOn: Binding(get: { columns.isOn(col) }, set: { _ in columns.toggle(col) }))
         }
     }
 
@@ -592,7 +635,7 @@ extension ResultRow: Equatable {
     nonisolated static func == (a: ResultRow, b: ResultRow) -> Bool {
         a.hit == b.hit && a.selected == b.selected && a.expandable == b.expandable
             && a.expanded == b.expanded && a.stack?.count == b.stack?.count
-            && a.stack?.reason == b.stack?.reason && a.stackOpen == b.stackOpen
+            && a.stack?.reason == b.stack?.reason && a.stackOpen == b.stackOpen && a.columns == b.columns
     }
 }
 
@@ -628,80 +671,64 @@ struct ResultRow: View {
     /// white text. A non-key window falls back to the unemphasized grey, like every native list.
     private var emphasized: Bool { selected && controlActive == .key }
 
+    /// The columns this row lays out, the header's own (BrowserColumnSettings.search).
+    var columns: [BrowserColumn] = BrowserColumn.searchDefault
+    /// The least the name gets, the header's too (BrowserHeader.nameMinWidth).
+    static let nameMinWidth: CGFloat = 180
+
+    /// ONE LINE, IN COLUMNS, as the folder browser draws a file: the same header, slots and metrics
+    /// (BrowserHeader, ColumnSlot, BrowserMetrics), so a search and a folder read as one kind of
+    /// list. What matched and where are columns of their own (Match, Position), not a second and
+    /// third line under the name. The passages disclosure sits in the row's leading inset, where
+    /// Finder draws its disclosure triangle.
     var body: some View {
-        HStack(alignment: .center, spacing: 12) {
-            // The icon and the name are the drag handles, as in Finder's list view: a drag that
-            // starts there lifts the files, one that starts anywhere else in the row draws a marquee.
-            StackedThumbnail(path: hit.path, side: 40, corner: 6, depth: stack.map { min(2, $0.count - 1) } ?? 0)
-                .fileDragSource { [model, path = hit.path] in model.dragPaths(for: path) }
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(fileName).fontWeight(.medium).lineLimit(1).truncationMode(.middle)
-                        .fileDragSource { [model, path = hit.path] in model.dragPaths(for: path) }
-                    CloudBadge(path: hit.path)
-                    if let stack { stackBadge(stack) }
-                }
-                // The line is always there, blank when there is nothing to say: an image's tags are
-                // generated after the search that shows it, and a row that gained its snippet line
-                // on screen grew from 52 to 61 pt. Lazy-stack rows must not change size after they
-                // appear (see stackBadge).
-                let showSnippet = !hit.snippet.isEmpty && hit.snippet != fileName
-                Text(showSnippet ? hit.snippet : " ").font(.body).foregroundStyle(.secondary).lineLimit(1)
-                    .accessibilityHidden(!showSnippet)
-                HStack(spacing: 5) {
-                    KindGlyph(kind: hit.fileKind)
-                    MediaInfoLabel(path: hit.path, kind: hit.fileKind, width: hit.width, height: hit.height, duration: hit.duration, separator: true)
-                    if !hit.locator.isEmpty {
-                        // Where in the file the best-matching chunk sits ("Page 3", "Line 1240").
-                        Text(hit.locator)
-                        Text("\u{00B7}")
-                    }
-                    if let peer = RemotePath.peer(of: hit.path) {
-                        // A linked Mac's file: that Mac's computer, as its sidebar row draws it, at
-                        // the head of the path on it - where Finder's path bar puts a volume's icon.
-                        Image(systemName: LinkedMacIcon.symbol(model.link.peer(peer)?.model ?? ""))
-                            .help("On \(model.link.name(of: peer))")
-                    }
-                    Text(PhotoActions.location(hit.path, sources: model.photoSources))
-                        .lineLimit(1).truncationMode(.middle)
-                    if hit.modified > 0 {
-                        Text("·")
-                        Text(Date(timeIntervalSince1970: hit.modified), format: .relative(presentation: .named))
-                    }
-                }
-                .font(.caption2).foregroundStyle(.tertiary)
-            }
-            Spacer()
-            Text(scoreText(hit.score)).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-            // The disclosure occupies a slot of FIXED width that exists on every row, present or
-            // not. Making the whole control conditional shifted the score column by 24pt between
-            // neighbouring rows - the eye reads a results list down its right edge, and a number
-            // that jumps left and right by whether that file happens to have several chunks is
-            // noise the user cannot act on. Same reason Finder reserves its disclosure column.
+        HStack(spacing: 0) {
             Group {
                 if expandable {
                     Button { onToggle?() } label: {
                         Image(systemName: "chevron.right")
+                            .font(.system(size: 9, weight: .semibold))
                             .rotationEffect(.degrees(expanded ? 90 : 0))
-                            .foregroundStyle(.tertiary)
-                            // A bare glyph is a ~16px target; give it a comfortable hit area.
-                            .frame(width: 24, height: 24)
+                            .foregroundStyle(.secondary)
+                            .frame(width: BrowserMetrics.rowLead, height: BrowserMetrics.rowHeight)
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .help("Show matching passages (right arrow)")
                     .accessibilityLabel(expanded ? "Hide matching passages" : "Show matching passages")
                 } else {
-                    // An explicit filler, not an empty branch: a Group whose condition is false
-                    // yields no view at all and .frame() then has nothing to size, so the slot
-                    // collapsed and the score still jumped. Color.clear occupies the slot.
                     Color.clear
                 }
             }
-            .frame(width: 24, height: 24)
+            .frame(width: BrowserMetrics.rowLead)
+            // The icon and the name are the drag handles, as in Finder's list view: a drag that
+            // starts there lifts the files, one that starts anywhere else in the row draws a marquee.
+            Thumbnail(path: hit.path, side: BrowserMetrics.icon, corner: 3)
+                .padding(.trailing, BrowserMetrics.iconGap)
+                .fileDragSource { [model, path = hit.path] in model.dragPaths(for: path) }
+            HStack(spacing: 4) {
+                Text(fileName).lineLimit(1).truncationMode(.middle)
+                    .fileDragSource { [model, path = hit.path] in model.dragPaths(for: path) }
+                CloudBadge(path: hit.path)
+                if let peer = RemotePath.peer(of: hit.path) {
+                    // A linked Mac's file: that Mac's computer, as its sidebar row draws it.
+                    Image(systemName: LinkedMacIcon.symbol(model.link.peer(peer)?.model ?? ""))
+                        .foregroundStyle(.secondary)
+                        .help("On \(model.link.name(of: peer))")
+                }
+                if let stack { stackBadge(stack) }
+            }
+            .frame(minWidth: Self.nameMinWidth, maxWidth: .infinity, alignment: .leading)
+            ForEach(columns) { col in
+                cell(col)
+                    .font(.callout.monospacedDigit())
+                    .foregroundStyle(emphasized ? AnyShapeStyle(Color(nsColor: .alternateSelectedControlTextColor)) : AnyShapeStyle(.secondary))
+                    .lineLimit(1)
+                    .modifier(ColumnSlot(col: col, alignment: col.alignment))
+            }
         }
-        .padding(.vertical, 6)
-        .padding(.horizontal, 10)
+        .padding(.trailing, BrowserMetrics.rowTrail)
+        .frame(minHeight: BrowserMetrics.rowHeight + 4)
         // Native list selection (Finder, Mail): the SOLID emphasized accent fill with white text when
         // the window is key, the system's unemphasized grey (with normal label text) when it is not -
         // the cue for where keyboard input lands. White text comes from driving the whole row's
@@ -729,6 +756,39 @@ struct ResultRow: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("result.row")
         .accessibilityAddTraits(selected ? [.isSelected] : [])
+    }
+}
+
+extension ResultRow {
+    /// One column's value. Blank, not "--", where a fact does not apply (a document's duration):
+    /// a results list mixes kinds, and a column of dashes reads as missing data.
+    @ViewBuilder func cell(_ col: BrowserColumn) -> some View {
+        switch col {
+        case .match:
+            Text(hit.matchReason)
+        case .excerpt:
+            Text(hit.showsTags || hit.snippet == fileName ? "" : hit.snippet)
+        case .tags:
+            Text(hit.showsTags && hit.snippet != fileName ? hit.snippet : "")
+        case .kind:
+            Text(FileKind(rawValue: hit.fileKind)?.title ?? "")
+        case .folder:
+            // The folder's name, as Recents shows it; the whole location on hover.
+            let location = PhotoActions.location(hit.path, sources: model.photoSources)
+            Text((location as NSString).lastPathComponent).help(location)
+        case .dimensions:
+            Text(hit.width > 0 && hit.height > 0 ? "\(hit.width)\u{00D7}\(hit.height)" : "")
+        case .duration:
+            Text(hit.duration > 0 ? formatDuration(hit.duration) : "")
+        case .size:
+            Text(hit.size > 0 ? ByteSize.file(hit.size) : "")
+        case .dateModified:
+            Text(hit.modified > 0 ? Date(timeIntervalSince1970: hit.modified).formatted(date: .abbreviated, time: .shortened) : "")
+        case .dateIndexed, .dateAdded, .filesIndexed:
+            Text("")
+        case .relevance:
+            Text(scoreText(hit.score))
+        }
     }
 }
 
@@ -1251,4 +1311,32 @@ struct ResultSectionHeader: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .accessibilityAddTraits(.isHeader)
     }
+}
+
+
+extension SearchHit {
+    /// WHY IT MATCHED, AND WHERE, in the words a person uses (Han's P2: "a reason on each result").
+    /// The chunk that won says most of it - a video's frame or its soundtrack, a picture or the
+    /// words read from it, a page or a line - and the store says the rest: a file found by its
+    /// name, or by an identifier it contains (`via`).
+    var matchReason: String {
+        switch via {
+        case .name: return "File name"
+        case .identifier(let id): return "Contains \(id)"
+        case .content: break
+        }
+        let at = locator.isEmpty ? "" : " at \(locator)"
+        switch kind {
+        case FileKind.video.rawValue: return "Frame" + at
+        case FileKind.audio.rawValue: return (fileKind == FileKind.video.rawValue ? "Speech" : "Audio") + at
+        case FileKind.image.rawValue: return locator.isEmpty ? "Picture" : locator
+        case FileKind.scan.rawValue: return locator.isEmpty ? "Scanned page" : "Scanned " + locator.lowercased()
+        default:
+            if fileKind == FileKind.image.rawValue { return "Words in the image" }
+            return locator.isEmpty ? "Text" : locator
+        }
+    }
+
+    /// The snippet is a picture's or a video frame's tags, not a passage.
+    var showsTags: Bool { kind == FileKind.image.rawValue || kind == FileKind.video.rawValue || kind == FileKind.scan.rawValue }
 }

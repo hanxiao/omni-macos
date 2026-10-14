@@ -103,7 +103,9 @@ struct FolderBrowser: View {
             if a.isDirectory != b.isDirectory { return a.isDirectory }
             let result: Bool
             switch sort {
-            case .name, .column(.folder):   // every row is in the same folder here
+            // Every row is in the same folder here; the search-only columns are never offered.
+            case .name, .column(.folder), .column(.match), .column(.excerpt), .column(.dimensions),
+                 .column(.duration), .column(.relevance):
                 result = a.name.localizedStandardCompare(b.name) == .orderedAscending
             case .column(.kind):
                 result = a.kind == b.kind
@@ -327,6 +329,8 @@ struct FolderBrowser: View {
             Text(e.tags.isEmpty ? "--" : e.tags.joined(separator: ", "))
         case .folder:
             Text(folder.lastPathComponent)
+        case .match, .excerpt, .dimensions, .duration, .relevance:   // search-only, never offered here
+            Text("--")
         }
     }
 
