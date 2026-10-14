@@ -640,7 +640,11 @@ public final class Indexer: @unchecked Sendable {
         self.store = store
         self.embedder = embedder
         self.quarantine = ExtractionQuarantine(directory: store.dbURL.deletingLastPathComponent())
+        self.streams = StreamCursors(directory: store.dbURL.deletingLastPathComponent())
     }
+
+    /// Long files being indexed a window at a time (see StreamCursors).
+    public let streams: StreamCursors
 
     /// Files whose reading never finished; skipped until they change (see ExtractionQuarantine).
     public let quarantine: ExtractionQuarantine
@@ -1059,6 +1063,38 @@ public final class Indexer: @unchecked Sendable {
         // 20k files is large enough that the text staging window (batch * 6) still fills.
         var byKind: [FileKind: [CrawledFile]] = [:]
         var walkFinished = false
+
+        // LONG FILES TAKE TURNS (StreamCursors): a window now, the rest to the end of the queue.
+        var continuations: [(item: DecodedItem, cursor: StreamCursors.Cursor)] = []
+        func handleStream(_ item: DecodedItem) {
+            let f = item.file
+            let resume = streams.cursor(path: f.path, modified: f.modified, size: f.size)
+            // A file the index already holds in full that changed - a log that grew, an edited
+            // book - goes through the whole-file stream, which reuses every stored window's
+            // vectors; splitting it would lose that. Window-at-a-time is for a first index and
+            // for a file already part-way.
+            guard resume != nil || known[f.path] == nil else {
+                streams.finish(f.path)   // a cursor left by an older version
+                if storeStreamedText(item, settings: settings) { p.embedded += 1 } else if !isCancelled { p.failed += 1 }
+                return
+            }
+            var c = resume ?? StreamCursors.Cursor(modified: f.modified, size: f.size, offset: 0, undecoded: Data(),
+                                                   carry: "", lineBase: 0, written: 0)
+            switch streamWindow(item, cursor: &c, settings: settings) {
+            case .more:
+                streams.set(f.path, c)
+                continuations.append((item, c))
+                if resume == nil { p.embedded += 1 }
+            case .done:
+                streams.finish(f.path)
+                if resume != nil { Self.recordFinishedKey(item, store: store) }   // the pipeline records a one-turn file's
+                if resume == nil { p.embedded += 1 }
+            case .failed:
+                // Cancelled: the cursor stays, and the next pass resumes there. Anything else (the
+                // file changed, a write failed): start over next time, as a changed file.
+                if !isCancelled { streams.finish(f.path); p.failed += 1 }
+            }
+        }
         while !isCancelled {
             let wave = takeWave(max: 20_000)
             // Totals arrive as each root's walk ends; until then its ring stays indeterminate,
@@ -1226,8 +1262,7 @@ public final class Indexer: @unchecked Sendable {
                     case .images, .imagePatches, .pdfScan:
                         storeChunks(path, self.embed(item))   // scanned PDF (streamed) / image pages (batched)
                     case .textStream:
-                        if self.storeStreamedText(item, settings: settings) { p.embedded += 1 }
-                        else if !self.isCancelled { p.failed += 1 }
+                        handleStream(item)
                     default:
                         p.skipped += 1
                     }
@@ -1356,14 +1391,28 @@ public final class Indexer: @unchecked Sendable {
                     p.currentPath = item.file.path
                     if item.unchanged { p.unchanged += 1 }
                     else if case .textStream = item.payload {
-                        if self.storeStreamedText(item, settings: settings) { p.embedded += 1 }
-                        else if !self.isCancelled { p.failed += 1 }
+                        handleStream(item)
                     } else { storeChunks(item.file.path, self.embed(item)) }
                     tick(item.file.path)
                 }
             }
         }
         }   // end of the wave loop
+
+        // The rest of the long files, a window each in turn, every unfinished one back to the end.
+        // After everything else: a book's last pages matter less than every other file's first.
+        while !isCancelled, !continuations.isEmpty {
+            var (item, c) = continuations.removeFirst()
+            p.currentPath = item.file.path
+            switch streamWindow(item, cursor: &c, settings: settings) {
+            case .more: streams.set(item.file.path, c); continuations.append((item, c))
+            case .done:
+                streams.finish(item.file.path)
+                Self.recordFinishedKey(item, store: store)
+            case .failed: if !isCancelled { streams.finish(item.file.path) }
+            }
+            onProgress(p)
+        }
 
         if !isCancelled, walkFinished {
             for (r, total) in feed.totals {
@@ -1583,6 +1632,76 @@ public final class Indexer: @unchecked Sendable {
             }
         }
         return (String(data: d, encoding: .isoLatin1) ?? "", Data())
+    }
+
+    enum StreamStep { case more, done, failed }
+
+    /// A long file read to its end over several turns: now its content key may be recorded, so
+    /// later copies reuse the complete rows.
+    static func recordFinishedKey(_ item: DecodedItem, store: VectorStore) {
+        guard let ck = item.contentKey else { return }
+        store.recordContentKeys([(item.file.path, ck, item.file.modified, item.file.size)])
+    }
+
+    /// ONE WINDOW of a long text file being indexed for the first time (StreamCursors): read the
+    /// next FileExtractor.maxTextBytes from `cursor.offset`, cut it with the same chunker the whole
+    /// file would get (the last piece held back and cut again with the next window, so the chunks
+    /// and their keys are the whole-file ones), embed, and WRITE at once - searchable now - the
+    /// first window replacing the file's rows, the rest appending. Every row carries the file's
+    /// real modified time and size; what marks it unfinished is the cursor, not the rows.
+    func streamWindow(_ item: DecodedItem, cursor c: inout StreamCursors.Cursor, settings: IndexSettings) -> StreamStep {
+        let file = item.file
+        guard let handle = try? FileHandle(forReadingFrom: file.url) else { return .failed }
+        defer { try? handle.close() }
+        // A file that changed since this began starts over, as a changed file.
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
+              let mod = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970,
+              abs(mod - file.modified) < 0.001, (attrs[.size] as? Int) == file.size else { return .failed }
+        try? handle.seek(toOffset: c.offset)
+        let data = (try? handle.read(upToCount: FileExtractor.maxTextBytes)) ?? Data()
+        let eof = data.isEmpty || c.offset + UInt64(data.count) >= UInt64(file.size)
+        var undecoded = c.undecoded
+        undecoded.append(data)
+        let (decoded, rest) = Self.decodeTextWindow(undecoded, final: eof)
+        let text = c.carry + decoded
+        var pieces = text.isEmpty ? [] : chunk(text, settings: settings, origin: .plain, filterOpaque: false)
+        let carry = (!eof && !pieces.isEmpty) ? pieces.removeLast().text : ""
+        let lineBase = c.lineBase
+        let kept = OpaqueText.filter(pieces) { $0.text }.map { piece -> TextPiece in
+            guard lineBase > 0, piece.locator.hasPrefix("Line "), let n = Int(piece.locator.dropFirst(5)) else { return piece }
+            return TextPiece(text: piece.text, locator: "Line \(n + lineBase)")
+        }
+        if !kept.isEmpty {
+            let keyed = kept.map { (text: $0.text, key: chunkKey($0.text, settings: settings)) }
+            var groups: [[(text: String, key: String)]] = []
+            var i = 0
+            while i < keyed.count { groups.append(Array(keyed[i ..< min(i + textBatchSize, keyed.count)])); i += textBatchSize }
+            let vecs = embedGroupsReusing(groups, width: textBatchSize).flatMap { $0 }
+            if isCancelled { return .failed }
+            guard vecs.count == kept.count, vecs.allSatisfy({ !$0.isEmpty && Self.isFinite($0) }) else {
+                Self.log.error("stream window embed failed \(file.path, privacy: .public)")
+                return .failed
+            }
+            let chunks = kept.enumerated().map { j, piece in
+                IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: item.kind,
+                             chunkIndex: c.written + j, snippet: snippet(piece.text), embedding: vecs[j],
+                             locator: piece.locator, chunkKey: keyed[j].key)
+            }
+            do {
+                try Self.writeWaitingOutLocks { try store.replaceMany([(file.path, chunks)], keepExisting: c.written > 0) }
+            } catch {
+                Self.log.error("stream window store failed \(file.path, privacy: .public): \(String(describing: error), privacy: .public)")
+                return .failed
+            }
+            c.written += chunks.count
+        } else if eof && c.written == 0 {
+            store.deletePaths([file.path])   // nothing indexable after all
+        }
+        c.offset += UInt64(data.count)
+        c.undecoded = rest
+        c.carry = carry
+        c.lineBase += text.prefix(text.count - carry.count).reduce(0) { $1.isNewline ? $0 + 1 : $0 }
+        return eof ? .done : .more
     }
 
     /// STREAM A LONG TEXT FILE TO THE END. It used to be read to FileExtractor.maxTextBytes (2 MB)
@@ -2056,8 +2175,9 @@ public final class Indexer: @unchecked Sendable {
                 if iStagedRaws >= 16 { flushImagesU() }
             case .textStream:
                 // Stored window by window, never through acceptCompleted - whose empty-result
-                // branch would delete the file it just wrote.
-                _ = self.storeStreamedText(item, settings: settings)
+                // branch would delete the file it just wrote. Whole, so any window-at-a-time
+                // cursor for it is done with: a pass must not resume it and append again.
+                if self.storeStreamedText(item, settings: settings) { self.streams.finish(item.file.path) }
             default:
                 acceptCompleted(path, self.embed(item))
             }
@@ -2129,6 +2249,7 @@ public final class Indexer: @unchecked Sendable {
                 let unchanged = !force && ((known[file.path].map {
                     $0.modified == file.modified && $0.size == file.size
                 } ?? false) && !(self.retextLargeFiles && Self.isLongText(file))
+                    && !self.streams.inProgress(file.path)
                     || self.quarantine.contains(path: file.path, modified: file.modified, size: file.size))
                 if self.isCancelled || unchanged {
                     // On cancel, mark abandoned (unless genuinely unchanged) so the consumer skips it
@@ -2205,7 +2326,10 @@ public final class Indexer: @unchecked Sendable {
             }
             if item.abandoned { continue }   // paused: don't consume/count files left unprocessed
             consume(item)
-            if let ck = item.contentKey {
+            // NOT FOR A LONG FILE STILL BEING READ: content dedup would hand its PARTIAL rows to
+            // any copy of it - and to itself on the next pass, which then never resumed. Its key
+            // is recorded when its last window is stored (recordFinishedKey).
+            if let ck = item.contentKey, !streams.inProgress(item.file.path) {
                 keyBuf.append((item.file.path, ck, item.file.modified, item.file.size))
                 // Flush eagerly (small rows, one txn): keys must be VISIBLE for later files in the
                 // same pass to dedup against - a media phase is often well under a few hundred

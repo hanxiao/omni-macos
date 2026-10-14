@@ -155,4 +155,92 @@ final class TextStreamTests: XCTestCase {
         XCTAssertNotEqual(stamped, file.modified)
         indexer.resetCancelled()
     }
+
+    /// A recording embedder: the texts it was asked for, in order.
+    final class RecordingEmbedder: Embedder, @unchecked Sendable {
+        let dim = 16
+        private let lock = NSLock()
+        private var _texts: [String] = []
+        var texts: [String] { lock.withLock { _texts } }
+        let inner = CountingEmbedder()
+        func embedText(_ text: String, as type: OmniInputType) -> [Float] { lock.withLock { _texts.append(text) }; return inner.embedText(text, as: type) }
+        func embedTextBatch(_ texts: [String], as type: OmniInputType) -> [[Float]] {
+            lock.withLock { _texts += texts }; return inner.embedTextBatch(texts, as: type)
+        }
+        func embedImage(_ image: CGImage) -> [Float]? { nil }
+        func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? { nil }
+        func embedVideoFrames(_ frames: [CGImage]) -> [Float]? { nil }
+        func embedAudio(_ url: URL) -> [Float]? { nil }
+        func embedAudioMel(_ mel: [Float], frames: Int) -> [Float]? { nil }
+        func embedAudioMelBatch(_ mels: [[Float]], frames: [Int]) -> [[Float]]? { nil }
+    }
+
+    private func freshRoot(_ name: String) throws -> (root: URL, db: URL) {
+        var root = FileManager.default.temporaryDirectory.appendingPathComponent("\(name)-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        if let rp = realpath(root.path, nil) { root = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+        let db = root.deletingLastPathComponent().appendingPathComponent("\(name)-db-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: db, withIntermediateDirectories: true)
+        let r = root
+        addTeardownBlock { try? FileManager.default.removeItem(at: r); try? FileManager.default.removeItem(at: db) }
+        return (root, db)
+    }
+
+    /// A LONG FILE NO LONGER HOLDS THE QUEUE (Han, 2026-10-13): its first 2 MB is indexed in its
+    /// turn, the rest after every other file. The small files here sort AFTER the long one, so
+    /// before, all of the long file's windows were embedded ahead of every one of them.
+    func testALongFileTakesTurnsWithTheRest() throws {
+        let (root, db) = try freshRoot("turns")
+        let big = root.appendingPathComponent("aaa-big.txt")
+        try lines(0 ..< 70_000).write(to: big, atomically: true, encoding: .utf8)     // ~6 MB: 3+ windows
+        for i in 0 ..< 40 { try "small note \(i) about zebra-\(i)-marker".write(to: root.appendingPathComponent("z\(i).txt"), atomically: true, encoding: .utf8) }
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        let embedder = RecordingEmbedder()
+        let indexer = Indexer(store: store, embedder: embedder)
+        pass(indexer, root)
+        let texts = embedder.texts
+        let lastSmall = texts.lastIndex { $0.contains("-marker") }!
+        // A chunk from the long file's last window: line numbers past 60,000.
+        let firstLate = texts.firstIndex { $0.contains("line 60000:") || $0.contains("line 65000:") }!
+        XCTAssertLessThan(lastSmall, firstLate, "the long file's later windows went ahead of the small files")
+        // And it is all there, exactly the whole-file chunks.
+        let settings = IndexSettings(enabledKinds: [.text])
+        let whole = Set(indexer.chunk(lines(0 ..< 70_000), settings: settings, origin: .plain).map { indexer.chunkKey($0.text, settings: settings) })
+        XCTAssertEqual(Set(store.chunkVectors(path: big.path, dim: 16, cap: 1_000_000).keys), whole)
+        XCTAssertEqual(indexer.streams.count, 0, "a finished file kept its cursor")
+    }
+
+    /// Stopped after its first window, a long file resumes from there in the next pass: nothing
+    /// already embedded is embedded again, and the result is the whole-file chunk set.
+    func testAStoppedLongFileResumesWhereItWas() throws {
+        let (root, db) = try freshRoot("resume")
+        let big = root.appendingPathComponent("big.txt")
+        let text = lines(0 ..< 70_000)
+        try text.write(to: big, atomically: true, encoding: .utf8)
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        let embedder = RecordingEmbedder()
+        var indexer = Indexer(store: store, embedder: embedder)
+        // First pass: stop once the first window is stored.
+        let done = expectation(description: "pass 1")
+        indexer.index(roots: [root], settings: IndexSettings(enabledKinds: [.text])) { p in
+            if p.embedded >= 1 { indexer.cancel(.pause) }
+            if p.done { done.fulfill() }
+        }
+        wait(for: [done], timeout: 300)
+        let afterFirst = embedder.texts.count
+        let partial = store.chunkVectors(path: big.path, dim: 16, cap: 1_000_000).count
+        XCTAssertGreaterThan(partial, 0, "the first window was not stored")
+        XCTAssertEqual(indexer.streams.count, 1, "no cursor left to resume from")
+        // A new launch: a new Indexer reads the cursor from disk.
+        indexer = Indexer(store: store, embedder: embedder)
+        pass(indexer, root)
+        let settings = IndexSettings(enabledKinds: [.text])
+        let whole = indexer.chunk(text, settings: settings, origin: .plain)
+        XCTAssertEqual(Set(store.chunkVectors(path: big.path, dim: 16, cap: 1_000_000).keys),
+                       Set(whole.map { indexer.chunkKey($0.text, settings: settings) }))
+        XCTAssertLessThan(embedder.texts.count - afterFirst, whole.count - partial / 2,
+                          "the resumed pass embedded the first window again")
+        XCTAssertEqual(indexer.streams.count, 0)
+    }
 }
+
