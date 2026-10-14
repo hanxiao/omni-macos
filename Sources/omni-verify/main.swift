@@ -1,4 +1,5 @@
 import Foundation
+import PDFKit
 import SQLite3
 import OmniKit
 import ImageIO
@@ -4149,6 +4150,40 @@ if args.count >= 4 && args[1] == "audiodet" {
     print(String(format: "audiodet long text (%d chars) second-engine cos=%.6f", longText.count, cos(l1, l2)))
     print(String(format: "audiodet frames=%d melsum=%.6f same-process cos=%.6f batch-vs-single cos=%.6f second-engine audio cos=%.6f text cos=%.6f first=%@", seg.frames, melSum,
                  cos(a, b), cos(a, batch[0]), cos(a, c), cos(t1, t2), a.prefix(4).map { String(format: "%.5f", $0) }.joined(separator: ",")))
+    exit(0)
+}
+
+// What one turn of each long medium costs (sizing item 10's turns): omni-verify turncost <model> <video> <audio> <pdf> <text>
+if args.count >= 7 && args[1] == "turncost" {
+    let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[2]))
+    func time(_ label: String, _ n: Int, _ body: () -> Void) {
+        body()   // warm
+        let t = Date(); for _ in 0 ..< n { body() }
+        print(String(format: "turncost %@ %.0f ms a unit", label, -t.timeIntervalSinceNow * 1000 / Double(n)))
+    }
+    let v = URL(fileURLWithPath: args[3])
+    time("video segment (240 s, 32 frames)", 3) {
+        let frames = FileExtractor.videoFrames(v, maxFrames: 32, maxDimension: 1568, start: 0, end: 240)
+        _ = engine.embedVideoFrames(frames)
+    }
+    time("audio window (60 s)", 5) {
+        let r = OmniAudioPreprocess.AudioSegmentReader(url: URL(fileURLWithPath: args[4]))!
+        let m = r.nextMelSegment()!
+        _ = engine.embedAudioMel(m.mel, frames: m.frames)
+    }
+    let doc = PDFDocument(url: URL(fileURLWithPath: args[5]))!
+    time("scanned page", 8) {
+        let img = FileExtractor.renderPDFPage(doc, index: 3, maxDimension: 1568)!
+        _ = engine.embedImages([OmniVisionPreprocess.preprocessRaw(img)])
+    }
+    let text = String(decoding: try Data(contentsOf: URL(fileURLWithPath: args[6])).prefix(2_000_000), as: UTF8.self)
+    let pieces = stride(from: 0, to: text.count, by: 1800).map { i -> String in
+        let a = text.index(text.startIndex, offsetBy: i), b = text.index(a, offsetBy: min(1800, text.count - i))
+        return String(text[a ..< b])
+    }
+    time("2 MB text window (\(pieces.count) chunks)", 1) {
+        _ = engine.embedTextBatches(stride(from: 0, to: pieces.count, by: 8).map { Array(pieces[$0 ..< min($0 + 8, pieces.count)]) }, as: .passage)
+    }
     exit(0)
 }
 

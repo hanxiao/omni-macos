@@ -226,6 +226,17 @@ public enum OmniAudioPreprocess {
             return OmniAudioPreprocess.melFrom(samples: samples) ?? ([], 0)
         }
 
+        /// Read from segment `k` on: a long file indexed a turn at a time starts each turn here,
+        /// in this process or after a restart.
+        public func seek(toSegment k: Int) {
+            pending = nil
+            file.framePosition = AVAudioFramePosition(k) * AVAudioFramePosition(nativeSegmentFrames)
+            done = file.framePosition >= file.length
+        }
+
+        /// Segments in the file (the last may be short).
+        public var segmentCount: Int { Int((Double(file.length) / Double(nativeSegmentFrames)).rounded(.up)) }
+
         /// Hand a segment back so the next `nextMelSegment()` returns it again. The indexer's
         /// decode stage peeks one segment ahead to tell single-segment files (the common case,
         /// which keeps the batched path) from long ones, then returns the peeked segment.

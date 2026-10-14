@@ -290,7 +290,7 @@ public enum FileExtractor {
     /// The average-hash dedup is kept purely as a token saver for static content (screen
     /// recordings, slideshows): it collapses near-identical frames, never re-searches for
     /// replacements, so kept frames stay uniformly placed.
-    static func videoFrames(_ url: URL, maxFrames: Int = 6, maxDimension: Int = 1568,
+    public static func videoFrames(_ url: URL, maxFrames: Int = 6, maxDimension: Int = 1568,
                             start: Double = 0, end: Double = .infinity) -> [CGImage] {
         videoFrames(asset: AVURLAsset(url: url), maxFrames: maxFrames, maxDimension: maxDimension,
                     start: start, end: end)

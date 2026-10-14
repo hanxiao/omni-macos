@@ -26,6 +26,8 @@ public final class StreamCursors: @unchecked Sendable {
         public var lineBase: Int
         /// Chunks written so far (the next one's index).
         public var written: Int
+        /// A long recording, video or scan: the next segment or page to read (text files: nil).
+        public var unit: Int? = nil
     }
 
     private let url: URL

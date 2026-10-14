@@ -1389,6 +1389,36 @@ public final class Indexer: @unchecked Sendable {
                 if !isCancelled { streams.finish(f.path); p.failed += 1 }
             }
         }
+        /// A long recording, video or scan: its first turn now, the rest to the end of the queue,
+        /// as for long text. False: not long - the caller indexes it in one turn, as before.
+        func handleMediaStream(_ item: DecodedItem) -> Bool {
+            guard !item.file.isPhoto, let plan = mediaPlan(item) else { return false }
+            let f = item.file
+            var c = streams.cursor(path: f.path, modified: f.modified, size: f.size)
+                ?? StreamCursors.Cursor(modified: f.modified, size: f.size, offset: 0, undecoded: Data(),
+                                        carry: "", lineBase: 0, written: 0, unit: 0)
+            let resumed = (c.unit ?? 0) > 0
+            switch mediaTurn(item, cursor: &c, plan: plan, settings: settings) {
+            case .more:
+                streams.set(f.path, c)
+                continuations.append((item, c))
+                if !resumed { p.embedded += 1 }
+            case .done:
+                streams.finish(f.path)
+                finishMedia(item)
+                if !resumed { p.embedded += 1 }
+            case .failed:
+                if !isCancelled { streams.finish(f.path); p.failed += 1 }
+            }
+            return true
+        }
+        /// A long medium's last turn stored: its content key, and its enrichment, recorded now.
+        func finishMedia(_ item: DecodedItem) {
+            Self.recordFinishedKey(item, store: store)
+            if item.enrichable, let ck = item.contentKey {
+                store.enrichLedger.record([EnrichLedger.key(digest: StoreSchema.contentDigestHex(ck), path: item.file.path)])
+            }
+        }
         while !isCancelled {
             let wave = takeWave(max: 20_000)
             // Totals arrive as each root's walk ends; until then its ring stays indeterminate,
@@ -1570,6 +1600,7 @@ public final class Indexer: @unchecked Sendable {
                         stageStore(path, chunks)
                         if stagedStores.count >= 256 { flushStagedStores() }
                     case .images, .imagePatches, .pdfScan:
+                        if case .pdfScan = item.payload, handleMediaStream(item) { return }   // a long scan takes turns
                         // Scanned pages cost as images, not as text: timed on their own (.scan)
                         // and kept off the text phase's clock.
                         let t0 = CFAbsoluteTimeGetCurrent()
@@ -1622,9 +1653,10 @@ public final class Indexer: @unchecked Sendable {
                     noteWork(item)
                     if case .duplicate(let chunks) = item.payload { storeChunks(path, chunks); return }
                     if case .audioSegments = item.payload {
-                        // Long audio streams per-file (one embedding per 240 s segment); the
-                        // cross-file mel staging below is for clips within one frame budget.
-                        storeChunks(path, self.embed(item)); return
+                        // Long audio streams per-file (one embedding a minute); the cross-file mel
+                        // staging below is for clips within one frame budget. A very long one takes turns.
+                        if !handleMediaStream(item) { storeChunks(path, self.embed(item)) }
+                        return
                     }
                     guard case .audioMel(let mel, let frames) = item.payload else { p.skipped += 1; return }
                     // Flush before adding if this clip would exceed the budget (but never
@@ -1713,7 +1745,9 @@ public final class Indexer: @unchecked Sendable {
                     else {
                         noteWork(item)
                         if case .textStream = item.payload { handleStream(item) }
-                        else { storeChunks(item.file.path, self.withExtras(item, self.embed(item), settings: settings)) }
+                        else if !handleMediaStream(item) {
+                            storeChunks(item.file.path, self.withExtras(item, self.embed(item), settings: settings))
+                        }
                     }
                     tick(item.file.path)
                 }
@@ -1742,11 +1776,15 @@ public final class Indexer: @unchecked Sendable {
                 }
                 updateTimeLeft()
             }
-            switch streamWindow(item, cursor: &c, settings: settings) {
+            let step: StreamStep
+            if case .textStream = item.payload { step = streamWindow(item, cursor: &c, settings: settings) }
+            else if let plan = mediaPlan(item) { step = mediaTurn(item, cursor: &c, plan: plan, settings: settings) }
+            else { step = .failed }
+            switch step {
             case .more: streams.set(item.file.path, c); continuations.append((item, c))
             case .done:
                 streams.finish(item.file.path)
-                Self.recordFinishedKey(item, store: store)
+                if case .textStream = item.payload { Self.recordFinishedKey(item, store: store) } else { finishMedia(item) }
             case .failed: if !isCancelled { streams.finish(item.file.path) }
             }
             onProgress(p)
@@ -2002,6 +2040,74 @@ public final class Indexer: @unchecked Sendable {
 
     enum StreamStep { case more, done, failed }
 
+    /// LONG MEDIA TAKE TURNS TOO (item 10, Han's rule for long files): a turn of a recording, a
+    /// video or a scan costs about what a 2 MB text window does, the rest goes to the end of the
+    /// queue. Measured on Nano (omni-verify turncost): a 2 MB text window 5.7 s; a 240 s video
+    /// segment 527 ms, a minute of audio 257 ms, a scanned page 132 ms.
+    static let videoSegmentsPerTurn = 10    // 40 minutes of video
+    static let audioWindowsPerTurn = 20     // 20 minutes of audio
+    static let scanPagesPerTurn = 40
+
+    /// How many units a long medium has and takes a turn; nil: not a long medium (one turn).
+    func mediaPlan(_ item: DecodedItem) -> (total: Int, perTurn: Int)? {
+        switch item.payload {
+        case .videoSegments(let duration, _, _):
+            let total = max(1, Int(ceil(duration / Self.mediaSegmentSeconds)))
+            return total > Self.videoSegmentsPerTurn ? (total, Self.videoSegmentsPerTurn) : nil
+        case .audioSegments(_, _, let reader):
+            let total = reader.segmentCount
+            return total > Self.audioWindowsPerTurn ? (total, Self.audioWindowsPerTurn) : nil
+        case .pdfScan(let pageCount, _):
+            return pageCount > Self.scanPagesPerTurn ? (pageCount, Self.scanPagesPerTurn) : nil
+        default:
+            return nil
+        }
+    }
+
+    /// One turn of a long medium: its next units embedded and stored (added to what earlier turns
+    /// stored - the same chunk numbers if a turn is redone after a kill, which the store replaces),
+    /// the cursor advanced. The last turn adds the soundtrack of a video, numbered after its frames.
+    func mediaTurn(_ item: DecodedItem, cursor c: inout StreamCursors.Cursor, plan: (total: Int, perTurn: Int),
+                   settings: IndexSettings) -> StreamStep {
+        let f = item.file
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: f.path),
+              let mod = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970,
+              abs(mod - f.modified) < 0.001, (attrs[.size] as? Int) == f.size else { return .failed }
+        let start = c.unit ?? 0
+        let range = start ..< min(plan.total, start + plan.perTurn)
+        var chunks: [IndexedChunk]
+        switch item.payload {
+        case .videoSegments(let duration, let maxFrames, let maxDimension):
+            chunks = embedStreamedVideo(file: f, kind: item.kind, duration: duration, maxFrames: maxFrames,
+                                        maxDimension: maxDimension, width: item.meta.width, height: item.meta.height,
+                                        segments: range)
+        case .audioSegments(let mel, let frames, let decodeReader):
+            // The first turn reads on from the decode stage's reader; a later one opens its own.
+            guard let reader = start == 0 ? decodeReader : OmniAudioPreprocess.AudioSegmentReader(url: f.url) else { return .failed }
+            chunks = embedStreamedAudio(file: f, kind: item.kind, firstMel: mel, firstFrames: frames, reader: reader,
+                                        duration: item.meta.duration, segments: range)
+        case .pdfScan(let pageCount, let maxDimension):
+            chunks = embedScannedPDF(file: f, pageCount: pageCount, maxDimension: maxDimension, pages: range)
+        default:
+            return .failed
+        }
+        if isCancelled { return .failed }
+        let last = range.upperBound >= plan.total
+        if last, settings.soundtrack, !f.isPhoto, case .videoSegments = item.payload,
+           let reader = OmniAudioPreprocess.AudioSegmentReader(url: f.url) {
+            guard let more = extraChunks(file: f, screen: [], soundtrack: reader, duration: item.meta.duration,
+                                         first: plan.total, settings: settings) else { return .failed }
+            chunks += more
+        }
+        if !chunks.isEmpty {
+            do { try Self.writeWaitingOutLocks { try store.replaceMany([(f.path, chunks)], keepExisting: start > 0) } }
+            catch { return .failed }
+        }
+        c.unit = range.upperBound
+        c.written += chunks.count
+        return last ? .done : .more
+    }
+
     /// A window after the first needs this many mel frames (one second) to be embedded.
     static let minTailMelFrames = 100
 
@@ -2186,13 +2292,14 @@ public final class Indexer: @unchecked Sendable {
             do { try Self.writeWaitingOutLocks { try store.replaceMany([(c.path, chunks)]) }; return true }
             catch { Self.log.error("enrich store failed \(c.path, privacy: .public)"); return false }
         }
-        /// The file's own chunks: those of its kind, in order, as stored.
+        /// The file's own chunks: those of its kind, in order, as stored. Their numbers are kept
+        /// (a video segment with no frames leaves a gap); what is added is numbered after them.
         func own(_ kind: FileKind) -> [IndexedChunk]? {
             guard let stored = store.storedChunks(path: c.path) else { return nil }
             let mine = stored.filter { $0.kind == kind.rawValue }.sorted { $0.chunkIndex < $1.chunkIndex }
-            guard !mine.isEmpty, mine.enumerated().allSatisfy({ $0.offset == $0.element.chunkIndex }) else { return nil }
-            return mine
+            return mine.isEmpty ? nil : mine
         }
+        func after(_ base: [IndexedChunk]) -> Int { (base.map(\.chunkIndex).max() ?? -1) + 1 }
         switch c.kind {
         case FileKind.audio.rawValue:
             // Whole again, in the new windows. Its content key is the new one (the window length is
@@ -2211,15 +2318,15 @@ public final class Indexer: @unchecked Sendable {
             let text = ScreenText.recognize(image)
             guard !text.isEmpty else { return true }
             let pieces = chunk(text, settings: settings, origin: .opaque)
-            recordIdentifiers(pieces, digest: digest, firstChunk: base.count)
-            guard let more = extraChunks(file: file, screen: pieces, soundtrack: nil, duration: 0, first: base.count, settings: settings)
+            recordIdentifiers(pieces, digest: digest, firstChunk: after(base))
+            guard let more = extraChunks(file: file, screen: pieces, soundtrack: nil, duration: 0, first: after(base), settings: settings)
             else { return false }
             return write(base + more)
         case FileKind.video.rawValue:
             guard settings.soundtrack else { return true }
             guard let reader = OmniAudioPreprocess.AudioSegmentReader(url: file.url) else { return true }   // silent
             guard let base = own(.video),
-                  let more = extraChunks(file: file, screen: [], soundtrack: reader, duration: c.duration, first: base.count, settings: settings)
+                  let more = extraChunks(file: file, screen: [], soundtrack: reader, duration: c.duration, first: after(base), settings: settings)
             else { return false }
             return more.isEmpty ? true : write(base + more)
         default:
@@ -3298,10 +3405,12 @@ public final class Indexer: @unchecked Sendable {
     func embedStreamedVideo(file: CrawledFile, kind: String, duration: Double,
                             maxFrames: Int, maxDimension: Int,
                             width: Int = 0, height: Int = 0,
-                            asset: AVAsset? = nil) -> [IndexedChunk] {   // internal for tests
+                            asset: AVAsset? = nil, segments: Range<Int>? = nil) -> [IndexedChunk] {   // internal for tests
         final class Box: @unchecked Sendable { var frames: [CGImage] = [] }
         let seg = Self.mediaSegmentSeconds
-        let count = max(1, Int(ceil(duration / seg)))
+        let total = max(1, Int(ceil(duration / seg)))
+        let first = segments?.lowerBound ?? 0
+        let count = Swift.min(total, segments?.upperBound ?? total)
         nonisolated(unsafe) let source = asset
         func sample(_ k: Int) -> [CGImage] {
             let lo = Double(k) * seg, hi = Swift.min(duration, Double(k + 1) * seg)
@@ -3315,8 +3424,8 @@ public final class Indexer: @unchecked Sendable {
         }
         let prefetchQ = DispatchQueue(label: "omni.indexer.video-prefetch")
         var out: [IndexedChunk] = []
-        var current = sample(0)
-        var k = 0
+        var current = sample(first)
+        var k = first
         while k < count {
             // Cancel contract: never return a partial chunk set (it would be stored under the
             // file's current mtime and silently truncate it forever) - same as embedScannedPDF.
@@ -3354,7 +3463,8 @@ public final class Indexer: @unchecked Sendable {
     /// 32-bit byte count on multi-hour files (issue #7) and would have fed the backbone an
     /// unbounded sequence. Chunks carry start-timestamp locators ("12:00").
     func embedStreamedAudio(file: CrawledFile, kind: String, firstMel: [Float], firstFrames: Int,
-                            reader: OmniAudioPreprocess.AudioSegmentReader, duration: Double) -> [IndexedChunk] {   // internal for tests
+                            reader: OmniAudioPreprocess.AudioSegmentReader, duration: Double,
+                            segments: Range<Int>? = nil) -> [IndexedChunk] {   // internal for tests
         // Reader calls are sequenced (the loop waits for the prefetch before starting the next
         // one), so `reader` is only ever used by one thread at a time.
         final class Box: @unchecked Sendable { var next: (mel: [Float], frames: Int)? }
@@ -3362,7 +3472,12 @@ public final class Indexer: @unchecked Sendable {
         var out: [IndexedChunk] = []
         var current: (mel: [Float], frames: Int)? = (firstMel, firstFrames)
         var exhausted = false
-        var seg = 0
+        var seg = segments?.lowerBound ?? 0
+        let end = segments?.upperBound ?? Int.max
+        if seg > 0 {   // a later turn: from its segment, read here
+            reader.seek(toSegment: seg)
+            current = reader.nextMelSegment()
+        }
         func locator(_ index: Int) -> String {
             Self.timeLocator(Double(index) * OmniAudioPreprocess.segmentSeconds)
         }
@@ -3372,7 +3487,7 @@ public final class Indexer: @unchecked Sendable {
             if isCancelled { return [] }
             let box = Box()
             let sync = DispatchGroup()
-            if !exhausted {
+            if !exhausted, seg + 1 < end {
                 sync.enter()
                 prefetchQ.async { box.next = reader.nextMelSegment(); sync.leave() }
             }
@@ -3388,7 +3503,7 @@ public final class Indexer: @unchecked Sendable {
                                         embedding: vec, duration: duration, locator: locator(seg)))
             }
             sync.wait()
-            current = box.next
+            current = seg + 1 < end ? box.next : nil
             if current == nil { exhausted = true }
             seg += 1
         }
@@ -3400,8 +3515,10 @@ public final class Indexer: @unchecked Sendable {
     /// queue so the GPU is not idle during PDFKit rasterization. Peak memory is two groups
     /// (~8 pages at the default cap) regardless of page count; the old design materialized every
     /// page up front, which is why it was capped at 8 pages.
-    func embedScannedPDF(file: CrawledFile, pageCount: Int, maxDimension: Int) -> [IndexedChunk] {   // internal for tests
+    func embedScannedPDF(file: CrawledFile, pageCount: Int, maxDimension: Int, pages: Range<Int>? = nil) -> [IndexedChunk] {   // internal for tests
         guard let doc = PDFDocument(url: file.url) else { return [] }
+        let firstPage = pages?.lowerBound ?? 0
+        let lastPage = Swift.min(pageCount, pages?.upperBound ?? pageCount)
         let group = scanPageGroup
         // PDFKit rendering is not concurrency-safe per document: prep() calls are sequenced (the
         // loop waits for the prefetch before starting the next one), so `doc` is only ever
@@ -3419,16 +3536,16 @@ public final class Indexer: @unchecked Sendable {
             return result
         }
         var out: [IndexedChunk] = []
-        var nextStart = min(group, pageCount)
-        var current = prep(0 ..< nextStart)
+        var nextStart = min(firstPage + group, lastPage)
+        var current = prep(firstPage ..< nextStart)
         let prefetchQ = DispatchQueue(label: "omni.indexer.scan-prefetch")
-        while !current.isEmpty || nextStart < pageCount {
+        while !current.isEmpty || nextStart < lastPage {
             if isCancelled { return [] }
             // Kick off the next group's render+patchify while the GPU embeds the current one.
             let box = ScanPrefetchBox(doc: doc)
             let sync = DispatchGroup()
-            if nextStart < pageCount {
-                let range = nextStart ..< min(nextStart + group, pageCount)
+            if nextStart < lastPage {
+                let range = nextStart ..< min(nextStart + group, lastPage)
                 nextStart = range.upperBound
                 sync.enter()
                 prefetchQ.async { box.result = prep(range); sync.leave() }
