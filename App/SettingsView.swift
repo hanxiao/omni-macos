@@ -131,11 +131,20 @@ private struct IndexStatusRow: View {
                 }
             }
         case .paused:
-            HStack(spacing: 8) {
-                Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
-                Text("Paused")
-                Spacer()
-                Button("Resume") { model.startIndexing() }.controlSize(.small)
+            if let hold = model.powerWaiting {
+                // Held by power or the set hours, not by the user: it resumes on its own, so no Resume.
+                HStack(spacing: 8) {
+                    Image(systemName: "pause.circle").foregroundStyle(.secondary)
+                    Text(hold.reason)
+                    Spacer()
+                }
+            } else {
+                HStack(spacing: 8) {
+                    Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
+                    Text("Paused")
+                    Spacer()
+                    Button("Resume") { model.startIndexing() }.controlSize(.small)
+                }
             }
         case .idle:
             // A background reconcile of a handful of files is done before it can be read, and this
@@ -174,6 +183,12 @@ private struct IndexStatusRow: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                     Button("Pause") { model.userPauseIndexing() }.controlSize(.small)
+                }
+            } else if let hold = model.powerWaiting {
+                HStack(spacing: 8) {
+                    Image(systemName: "pause.circle").foregroundStyle(.secondary)
+                    Text(hold.reason)
+                    Spacer()
                 }
             } else if model.ocrRunActive {
                 // Already true and previously invisible: a transcription stands indexing down for
@@ -595,6 +610,16 @@ private struct PerformanceTab: View {
     private static func gb(_ v: Double) -> String {
         v == v.rounded() ? "\(Int(v)) GB" : String(format: "%.1f GB", v)
     }
+    /// A time of day for minutes after midnight, as a DatePicker binds it.
+    private func hourBinding(_ key: ReferenceWritableKeyPath<PowerPolicy, Int>) -> Binding<Date> {
+        Binding(get: {
+            let m = model.power[keyPath: key]
+            return Calendar.current.date(bySettingHour: m / 60, minute: m % 60, second: 0, of: Date()) ?? Date()
+        }, set: { d in
+            let c = Calendar.current.dateComponents([.hour, .minute], from: d)
+            model.power[keyPath: key] = (c.hour ?? 0) * 60 + (c.minute ?? 0)
+        })
+    }
     var body: some View {
         Form {
             Section {
@@ -638,6 +663,25 @@ private struct PerformanceTab: View {
                 }
             } header: {
                 Text("Throughput")
+            }
+            Section {
+                Toggle("Index on battery power", isOn: Binding(get: { model.power.indexOnBattery },
+                                                               set: { model.power.indexOnBattery = $0 }))
+                    .toggleStyle(.switch)
+                Toggle("Index only at set hours", isOn: Binding(get: { model.power.hoursEnabled },
+                                                                set: { model.power.hoursEnabled = $0 }))
+                    .toggleStyle(.switch)
+                if model.power.hoursEnabled {
+                    HStack {
+                        DatePicker("From", selection: hourBinding(\.hoursStart), displayedComponents: .hourAndMinute)
+                        DatePicker("to", selection: hourBinding(\.hoursEnd), displayedComponents: .hourAndMinute)
+                    }
+                }
+            } header: {
+                Text("When to index")
+            } footer: {
+                Text("Low Power Mode and a hot Mac pause indexing too. New and changed files are always indexed right away.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section {
                 // What Omni is using first, then the room it may use on top of it.

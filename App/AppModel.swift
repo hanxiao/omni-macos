@@ -3892,6 +3892,35 @@ final class AppModel {
     /// MLX spends the difference evicting and re-allocating: the weights alone are most of a 6 GB
     /// budget whose buffer cache is a quarter of it, so nearly every step misses.
     private var indexingPausedForOCR = false
+
+    /// Power and schedule (PowerPolicy): while held, the big work waits - a full pass and a folder's
+    /// first index - and resumes on its own when the hold lifts. The watcher's few-file updates go on.
+    let power = PowerPolicy()
+    private(set) var powerHold: PowerHold?
+    private var indexingPausedForPower = false
+
+    /// The hold, when big work is actually waiting on it - what Settings says instead of "Up to date".
+    var powerWaiting: PowerHold? {
+        guard let powerHold, indexingPausedForPower || !pendingCatchUpRoots.isEmpty || indexState == .paused else { return nil }
+        return powerHold
+    }
+
+    private func powerChanged(_ hold: PowerHold?) {
+        powerHold = hold
+        if hold != nil {
+            // Stand down the way an OCR run does: a pause keeps every file already embedded.
+            if isIndexing || !activeRoots.isEmpty {
+                indexingPausedForPower = true
+                pauseIndexing()
+            }
+        } else {
+            if indexingPausedForPower {
+                indexingPausedForPower = false
+                startIndexing()
+            }
+            catchUpPendingRoots()
+        }
+    }
     private var ocrHoldsMemory = false
     enum OCRHolder: Hashable { case session, served }
     private var ocrResidentHolders: Set<OCRHolder> = []
@@ -4288,6 +4317,8 @@ final class AppModel {
         applyMemoryLimit()
         startMemoryLogIfRequested()
         watchMemoryPressure()
+        power.onChange = { [weak self] hold in self?.powerChanged(hold) }
+        power.start()
         watchActivationForDeniedRoots()
         // A model/db switch tears the old engine down: stop any in-flight label-cache build on
         // it (buildCache checks cancellation per batch) and drop the stale re-tag queue (it
@@ -5534,7 +5565,7 @@ final class AppModel {
         }
         // indexState != .paused: indexing is paused as a whole, and a Photos change arriving then
         // started a catch-up anyway. Resume's pass drains the queue.
-        guard !indexWritesBlocked, !isPaperRunning, !indexObsolete, !ocrRunActive,
+        guard !indexWritesBlocked, !isPaperRunning, !indexObsolete, !ocrRunActive, powerHold == nil,
               indexState != .indexing, indexState != .paused, activeRoots.isEmpty,
               !fsReconcileInFlight,
               let indexer, let store, !(pendingCatchUpRoots.isEmpty && pendingCatchUpPhotos.isEmpty) else { return }
@@ -6769,6 +6800,7 @@ final class AppModel {
     func startIndexing() {
         // An OCR run owns the GPU while it lasts; see beginOCRRun. endOCRRun kicks this again.
         guard !ocrRunActive else { indexingPausedForOCR = true; return }
+        guard powerHold == nil else { indexingPausedForPower = true; return }
         guard !indexWritesBlocked, let indexer, let store, indexState != .indexing else { return }
         // !isPaperRunning: same reason as catchUpPendingRoots - the suite owns the engine and the
         // levers for the duration. REMEMBERED, not dropped: a Reindex/Update/Resume that arrives
