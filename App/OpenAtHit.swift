@@ -1,5 +1,6 @@
 import AppKit
 import PDFKit
+import Quartz
 import OmniKit
 
 /// OPEN A RESULT WHERE IT MATCHED (issue #26), with the two places-in-a-document the system's own
@@ -34,6 +35,9 @@ enum OpenAtHit {
             send(url, searchText: nil, line: line)
             return
         }
+        // A RECORDING AT ITS MOMENT: the start of the segment that matched, in the player that opens
+        // the file anyway, when that player can be told where to start. Anything else opens as before.
+        if let t = ChunkPreview.seconds(fromTimeLocator: locator), t >= 1, Moment.open(url, at: t) { return }
         PhotoActions.open(path)
     }
 
@@ -200,3 +204,110 @@ enum OpenAtHit {
         return nil
     }
 }
+
+/// A media hit's moment, in the two places that can be told one.
+///
+/// THE PLAYER. QuickTime Player is asked over Apple events to open the file and set its current
+/// time; IINA takes the time in its URL scheme. Other players get the file as before. The Apple
+/// event goes through `osascript` in a child process, not NSAppleScript: the first time, macOS asks
+/// whether Omni may control QuickTime Player, and an in-process script would hold the main thread
+/// until that is answered. Refused or failed, the file opens plainly. (DigUp ships the same two
+/// paths; its notes measured QuickTime and IINA honouring them, 2026-10-08.)
+///
+/// QUICK LOOK. Its panel takes a display state - "CurrentPage" for a PDF, "CurrentTime" for a movie
+/// - only once the preview is up: set within ~0.1 s it is ignored, from ~0.6 s it holds (DigUp's
+/// measurement, re-checked here). So it is set at 0.6 s and again at 1.2 s for a slow file; the
+/// value is absolute, so the second set changes nothing when the first took.
+enum Moment {
+    static let quickTime = "com.apple.QuickTimePlayerX"
+    static let iina = "com.colliderli.iina"
+
+    /// The app that opens `url` by default, by bundle id.
+    static func player(for url: URL) -> String? {
+        NSWorkspace.shared.urlForApplication(toOpen: url).flatMap { Bundle(url: $0)?.bundleIdentifier }
+    }
+
+    /// Whether opening `url` can start at a moment: its default app is one that can be told.
+    static func canSeek(_ url: URL) -> Bool { [quickTime, iina].contains(player(for: url)) }
+
+    /// Open `url` at `seconds` in its default player. False when that player cannot be told a
+    /// moment, so the caller opens it the ordinary way.
+    @MainActor static func open(_ url: URL, at seconds: Double) -> Bool {
+        switch player(for: url) {
+        case iina:
+            var c = URLComponents(string: "iina://open")
+            c?.queryItems = [URLQueryItem(name: "url", value: url.absoluteString),
+                             URLQueryItem(name: "mpv_start", value: String(format: "%.1f", seconds))]
+            guard let link = c?.url else { return false }
+            NSWorkspace.shared.open(link)
+            return true
+        case quickTime:
+            openInQuickTime(url, at: seconds)
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func openInQuickTime(_ url: URL, at seconds: Double) {
+        // Whole milliseconds as an integer argument: a decimal point would depend on the locale.
+        let script = """
+            on run argv
+                set theFile to POSIX file (item 1 of argv)
+                set theTime to (item 2 of argv as integer) / 1000
+                tell application "QuickTime Player"
+                    activate
+                    set theDocument to open theFile
+                    set current time of theDocument to theTime
+                    play theDocument
+                    return current time of theDocument
+                end tell
+            end run
+            """
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", script, url.path, String(Int(seconds * 1000))]
+        let err = Pipe()
+        p.standardError = err
+        p.standardOutput = Pipe()
+        p.terminationHandler = { proc in
+            let failed = proc.terminationStatus != 0
+            let message = failed ? (String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? "") : ""
+            DispatchQueue.main.async {
+                omniPerfLog("moment quicktime at=\(Int(seconds)) ok=\(!failed) \(message.trimmingCharacters(in: .whitespacesAndNewlines))")
+                // Not allowed to control it (-1743), no answer to the question (-1712), anything else:
+                // the plain open. A file that did open only comes forward.
+                if failed { NSWorkspace.shared.open(url) }
+            }
+        }
+        do { try p.run() } catch { NSWorkspace.shared.open(url) }
+    }
+
+    /// Quick Look's display state for a hit: a page after the first, or a moment past the start.
+    static func quickLookState(path: String, locator: String) -> [String: Any]? {
+        if (path as NSString).pathExtension.lowercased() == "pdf",
+           let page = ChunkPreview.pageIndex(fromLocator: locator), page > 0 { return ["CurrentPage": page] }
+        if let t = ChunkPreview.seconds(fromTimeLocator: locator), t >= 1 { return ["CurrentTime": t] }
+        return nil
+    }
+
+    @MainActor private static var generation = 0
+
+    /// After Quick Look opens `url` for a hit, move it to the hit's page or moment.
+    @MainActor static func applyToQuickLook(_ url: URL, locator: String) {
+        generation += 1
+        let mine = generation
+        guard let state = quickLookState(path: url.path, locator: locator) else { return }
+        for delay in [0.6, 1.2] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                guard mine == generation, QLPreviewPanel.sharedPreviewPanelExists() else { return }
+                let panel = QLPreviewPanel.shared()!
+                guard panel.isVisible, panel.currentPreviewItem?.previewItemURL?.standardizedFileURL.path
+                        == url.standardizedFileURL.path else { return }
+                panel.displayState = state
+                omniPerfLog("moment quicklook \(url.lastPathComponent) state=\(state) visible=\(panel.isVisible)")
+            }
+        }
+    }
+}
+

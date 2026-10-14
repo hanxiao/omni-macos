@@ -40,6 +40,10 @@ targets:
       path: App/Omni.entitlements
       properties:
         com.apple.security.personal-information.photos-library: true
+        # Opening a recording at the moment that matched tells QuickTime Player where to start, over
+        # Apple events (OpenAtHit, Moment); macOS asks the user once. Hardened runtime refuses the
+        # event without this.
+        com.apple.security.automation.apple-events: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.hanxiao.omni

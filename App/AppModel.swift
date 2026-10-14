@@ -684,7 +684,13 @@ final class AppModel {
     /// real file), which is why this is not just a `previewURL` write.
     func showPreview(path: String) {
         if RemotePath.isRemote(path) { previewRemote(path); return }
-        if !PhotoLibrary.isPhotoPath(path) { showPreview(URL(fileURLWithPath: path)); return }
+        if !PhotoLibrary.isPhotoPath(path) {
+            let url = URL(fileURLWithPath: path)
+            showPreview(url)
+            // At the page or moment that matched, once the panel has the file (Moment).
+            if let h = searchHit(for: path) { Moment.applyToQuickLook(url, locator: h.locator) }
+            return
+        }
         Task { @MainActor in
             guard let url = await PhotoActions.materialized(path) else { return }
             showPreview(url)
