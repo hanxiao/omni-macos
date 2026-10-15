@@ -246,6 +246,7 @@ enum PerfScript {
                 "time": Date().timeIntervalSince1970, "query": model.query, "box": model.rawQuery,
                 "results": groups,
                 "selection": model.selection ?? "",
+                "locators": model.rawResults.prefix(10).map { "\(($0.path as NSString).lastPathComponent)|\($0.locator)" },
                 "browseFolder": model.browserListingForPerf.folder,
                 "browse": model.browserListingForPerf.paths,
                 "clipboardOff": model.showsClipboardOff,

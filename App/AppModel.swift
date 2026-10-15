@@ -421,9 +421,12 @@ final class AppModel {
                 if let p = selection { showPreview(path: p) } else { previewURL = nil }
             }
             refreshSelectionOrdered()
-            // A PDF hit's open-at-page phrase, worked out before the open asks for it.
-            if let p = selection, p != oldValue, let h = searchHit(for: p) {
-                OpenAtHit.prefetch(p, locator: h.locator, snippet: h.snippet)
+            // A PDF hit's page (PDFPagePick), then its open-at-page phrase, worked out before the
+            // open asks for them.
+            if let p = selection, p != oldValue, searchHit(for: p) != nil {
+                pickPage(for: p) { [weak self] in
+                    if let h = self?.searchHit(for: p) { OpenAtHit.prefetch(p, locator: h.locator, snippet: h.snippet) }
+                }
             }
         }
     }
@@ -436,10 +439,38 @@ final class AppModel {
     func openResult(_ path: String) {
         if RemotePath.isRemote(path) { openRemote(path); return }
         CloudStatus.watchDownload(path)
-        if let h = searchHit(for: path) {
-            OpenAtHit.open(path, locator: h.locator, snippet: h.snippet)
+        if searchHit(for: path) != nil {
+            pickPage(for: path) { [weak self] in
+                guard let h = self?.searchHit(for: path) else { return }
+                OpenAtHit.open(path, locator: h.locator, snippet: h.snippet)
+            }
         } else {
             PhotoActions.open(path)
+        }
+    }
+
+    /// WHICH PAGE A PDF HIT IS ON, for this query (PDFPagePick): a chunk spread over pages - a whole
+    /// short PDF is one - showed and opened at the page holding most of it, whatever was asked. Picked
+    /// when the row is selected or opened, once a result set; the hit's locator takes the page, so the
+    /// row, Quick Look and the open agree. `then` runs on the main actor when the page is settled.
+    private var pagePicked: Set<String> = []
+    private var pagePickToken = ""
+    private func pickPage(for path: String, then: @escaping @MainActor () -> Void) {
+        guard path.lowercased().hasSuffix(".pdf"), !RemotePath.isRemote(path), let h = searchHit(for: path),
+              h.locator.hasPrefix("Page "), let store, let engine, let qv = lastQueryVector else { then(); return }
+        if pagePickToken != resultsToken { pagePickToken = resultsToken; pagePicked = [] }
+        guard pagePicked.insert(path).inserted else { then(); return }
+        let token = resultsToken
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let page = FileExtractor.isDataless(path) ? nil
+                : PDFPagePick.page(path: path, chunkIndex: h.chunkIndex, locator: h.locator, query: qv, store: store, embedder: engine)
+            await MainActor.run {
+                if let self, let page, self.resultsToken == token,
+                   let i = self.rawResults.firstIndex(where: { $0.path == path }), self.rawResults[i].locator != "Page \(page)" {
+                    self.rawResults[i].locator = "Page \(page)"
+                }
+                then()
+            }
         }
     }
     /// The full multi-selection (result paths). `selection` is the active item within it; the set

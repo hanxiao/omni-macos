@@ -13031,6 +13031,23 @@ public final class VectorStore: @unchecked Sendable {
 
     public func kinds() -> Set<String> { queue.sync { Set(kindFileCounts.keys) } }
 
+    /// Every chunk's locator in one file, by chunk index: one indexed SELECT (PDFPagePick).
+    public func chunkLocators(path: String) -> [Int: String] {
+        queue.sync {
+            guard dbOpen() else { return [:] }
+            var out: [Int: String] = [:]
+            var st: OpaquePointer?
+            if sqlite3_prepare_v2(db, fileDisplaySQL, -1, &st, nil) == SQLITE_OK {
+                bindPath(st, 1, path)
+                while sqlite3_step(st) == SQLITE_ROW {
+                    out[Int(sqlite3_column_int(st, 0))] = sqlite3_column_text(st, 2).map { String(cString: $0) } ?? ""
+                }
+            }
+            sqlite3_finalize(st)
+            return out
+        }
+    }
+
     /// Rank a single file's chunks against the query (for the "which passage matched" UI).
     public func rankChunks(_ query: [Float], path: String, topK: Int = 6) -> [ChunkHit] {
         queue.sync {

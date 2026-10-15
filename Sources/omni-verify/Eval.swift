@@ -589,11 +589,21 @@ enum EvalCommand {
         // The weaker-matches fold (VectorStore.weakFold), as the app applies it to this list.
         var shownTotal = 0, hitsTotal = 0, foldedAnswers = 0, foldedTop10 = 0
         for query in spec.queries where onlyTag == nil || query.tag == onlyTag {
-            let hits: [SearchHit]
+            var hits: [SearchHit]
             if let g = engine.queryVectorGraph(query.q) {
                 hits = store.search(queryGraph: g, filter: SearchFilter(), topK: VectorStore.shippedTopK, textQuery: query.q).hits
             } else {
                 hits = store.search(engine.embedQuery(query.q), filter: SearchFilter(), topK: VectorStore.shippedTopK, textQuery: query.q)
+            }
+            // WHAT OPENING A HIT SHOWS: a PDF hit opens at PDFPagePick's page (the app does the same).
+            if !args.contains("--no-page-pick") {
+                let qv = engine.embedQuery(query.q)
+                for i in hits.indices.prefix(10) where hits[i].path.lowercased().hasSuffix(".pdf") {
+                    if let p = PDFPagePick.page(path: hits[i].path, chunkIndex: hits[i].chunkIndex, locator: hits[i].locator,
+                                                query: qv, store: store, embedder: engine) {
+                        hits[i].locator = "Page \(p)"
+                    }
+                }
             }
             let rank = hits.firstIndex { hit in query.expect.contains { matches(hit, $0, tree: treePath) } }.map { $0 + 1 }
             let fileRank = hits.firstIndex { hit in

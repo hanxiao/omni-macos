@@ -77,9 +77,14 @@ is not worth it); audio is re-embedded by this release's enrichment anyway. Prob
   still "petals, garden". The scoring (patch/global fusion, prior, NMS) is the study's, measured on
   COCO-150; its noise is the next thing to look at, not the vocabulary.
 
-- A PDF short enough to be one chunk has one place, its first page: the eval's five-topic, 1,400-
-  character `pdf-page` file stays at place R@1 0.00 (file R@10 1.00). Cutting page by page fixes it
-  and costs 30% more chunks on real PDFs, more on slide decks (see "PDF page locators").
+- FIXED at open, not at index (2026-10-14): a PDF short enough to be one chunk had one place. Now
+  PDFPagePick embeds the pages the hit's chunk can be on (previous chunk's page to the next one's;
+  the whole document for a one-chunk PDF, at most 24) and opens at the one closest to the query;
+  the app picks it when the row is selected or opened, so the row's Match, Quick Look and the open
+  agree. Nothing stored, search unchanged. Eval, Nano, same index: `pdf-page` place R@1 0.00 ->
+  0.25, MRR 0.125 -> 0.442 (two of the three that moved are held back by the FILE's rank, 6 and
+  10); ALL MRR 0.842 -> 0.852; no other query moved. In the app: "climbing mount fuji" showed the
+  note at Page 1, selected it shows and opens Page 2.
 - FIXED: a covered vector whose blob disagrees with the file after a power loss is written back
   from the blob by both loaders when the debt table records it (the sidecar adopt declined it and
   opened on the old vector); and a quit no longer leaves the scan replica stale at reused positions
