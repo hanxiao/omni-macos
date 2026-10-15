@@ -213,7 +213,7 @@ struct WorkUnit: Sendable {
             units = max(1, ((d ?? 0) / Indexer.mediaSegmentSeconds).rounded(.up))
         case .text, .scan:
             var bytes = Double(max(0, f.size))
-            if Indexer.isLongText(f), !Indexer.streamsText(f, settings: settings) { bytes = Double(FileExtractor.maxTextBytes) }
+            if !Indexer.readsToEnd(f, settings: settings) { bytes = Double(FileExtractor.maxTextBytes) }
             units = bytes / 1_000_000
         }
     }

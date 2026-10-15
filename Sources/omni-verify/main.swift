@@ -3964,6 +3964,38 @@ if args.count >= 2 && args[1] == "concbench2" {
 // Load benchmark: omni-verify loadbench [N] [dim]
 // Times VectorStore(dbURL) reopening an existing N-row index (loadIntoMemory) - the store load that
 // bootstrap now overlaps with the engine load (opt 2A), i.e. the wall-clock 2A removes from launch.
+// When every file becomes searchable: omni-verify coverage <model> <tree> <db dir>
+if args.count >= 5 && args[1] == "coverage" {
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]), keepAudio: true)
+    let tree = URL(fileURLWithPath: args[3]), dbDir = URL(fileURLWithPath: args[4])
+    try? FileManager.default.removeItem(at: dbDir)
+    try FileManager.default.createDirectory(at: dbDir, withIntermediateDirectories: true)
+    let store = try VectorStore(dbURL: dbDir.appendingPathComponent("index.sqlite"))
+    let total = (FileManager.default.enumerator(atPath: tree.path)?.allObjects as? [String] ?? [])
+        .filter { !$0.hasPrefix(".") && !$0.contains("/.") }.filter { p in
+            var d: ObjCBool = false
+            return FileManager.default.fileExists(atPath: tree.appendingPathComponent(p).path, isDirectory: &d) && !d.boolValue
+        }.count
+    let indexer = Indexer(store: store, embedder: engine)
+    let t0 = Date()
+    final class Marks: @unchecked Sendable { var at: [Int: Double] = [:] }
+    let marks = Marks()
+    let last: IndexProgress = await withCheckedContinuation { cont in
+        DispatchQueue.global().async {
+            indexer.index(roots: [tree], settings: IndexSettings()) { p in
+                let t = -t0.timeIntervalSinceNow
+                for f in [50, 90, 100] where marks.at[f] == nil && p.embedded * 100 >= total * f { marks.at[f] = t }
+                if p.done { cont.resume(returning: p) }
+            }
+        }
+    }
+    let end = -t0.timeIntervalSinceNow
+    store.close()
+    print(String(format: "coverage files=%d embedded=%d: 50%% at %.1fs, 90%% at %.1fs, 100%% at %.1fs, pass %.1fs",
+                 total, last.embedded, marks.at[50] ?? -1, marks.at[90] ?? -1, marks.at[100] ?? -1, end))
+    exit(0)
+}
+
 // How long a real index takes to open: omni-verify opentime <index.sqlite>
 if args.count >= 3 && args[1] == "opentime" {
     let t = Date()

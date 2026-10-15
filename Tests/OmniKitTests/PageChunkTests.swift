@@ -80,4 +80,62 @@ final class PageChunkTests: XCTestCase {
         XCTAssertEqual(after.map(\.chunkKey), now.map(\.chunkKey))
         XCTAssertEqual(indexer.textsEmbedded.value, embeddedBefore, "relocation embedded text")
     }
+
+    /// A text PDF with more than a first window of text TAKES TURNS by pages: searchable after its
+    /// first pages, whole after its last, every page still found at its own page number.
+    func testALongPDFTakesTurnsAndKeepsItsPages() throws {
+        var r = FileManager.default.temporaryDirectory.appendingPathComponent("pdfturn-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: r, withIntermediateDirectories: true)
+        if let rp = realpath(r.path, nil) { r = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+        let root = r
+        let db = root.deletingLastPathComponent().appendingPathComponent("pdfturn-db-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: db, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root); try? FileManager.default.removeItem(at: db) }
+        let words = ["harbor", "engine", "anchor", "compass", "lantern", "rigging", "ballast", "keel"]
+        let pages = (0 ..< 40).map { k -> String in
+            var s = "marker\(k)zz "
+            var i = k
+            while s.count < 3000 { s += words[i % words.count] + "\(k) "; i += 3 }
+            return s
+        }
+        let file = root.appendingPathComponent("log.pdf")
+        pdf(pages, at: file)
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let embedder = EnrichmentTests.Fake()
+        var indexer = Indexer(store: store, embedder: embedder)
+        let first = expectation(description: "pass 1")
+        indexer.index(roots: [root], settings: IndexSettings()) { p in
+            if p.embedded >= 1 { indexer.cancel(.pause) }
+            if p.done { first.fulfill() }
+        }
+        wait(for: [first], timeout: 120)
+        let partial = try XCTUnwrap(store.storedChunks(path: file.path))
+        XCTAssertFalse(partial.isEmpty, "the first turn was not stored")
+        XCTAssertEqual(indexer.streams.count, 1, "no cursor to resume from")
+        indexer = Indexer(store: store, embedder: embedder)   // a new launch
+        let second = expectation(description: "pass 2")
+        indexer.index(roots: [root], settings: IndexSettings()) { p in if p.done { second.fulfill() } }
+        wait(for: [second], timeout: 120)
+        XCTAssertEqual(indexer.streams.count, 0)
+        let chunks = try XCTUnwrap(store.storedChunks(path: file.path)).sorted { $0.chunkIndex < $1.chunkIndex }
+        XCTAssertGreaterThan(chunks.count, partial.count)
+        XCTAssertEqual(chunks.map(\.chunkIndex), Array(0 ..< chunks.count), "chunk numbers have a gap or a repeat")
+        XCTAssertEqual(chunks.first?.locator, "Page 1")
+        // Pages in order, from the first to the last: the turns cover the file, numbered from page 1.
+        let pagesAt = chunks.compactMap { Int($0.locator.dropFirst(5)) }
+        XCTAssertEqual(pagesAt.count, chunks.count, "a chunk without a page: \(chunks.map(\.locator))")
+        XCTAssertEqual(pagesAt, pagesAt.sorted(), "pages out of order across turns")
+        XCTAssertGreaterThanOrEqual(pagesAt.last ?? 0, 39, "the last pages were not indexed")
+        // Where a page's marker opens a chunk (a page that begins a turn always does), that chunk
+        // is at that page: the second turn's numbers are the file's, not the turn's.
+        var seen = 0
+        for k in 0 ..< 40 {
+            for c in chunks where c.snippet.hasPrefix("marker\(k)zz") {
+                XCTAssertEqual(c.locator, "Page \(k + 1)"); seen += 1
+            }
+        }
+        XCTAssertGreaterThanOrEqual(seen, 2, "no page opened a chunk past the first: the boundary is untested")
+        XCTAssertNotNil(store.contentKeys(paths: [file.path])[file.path], "the finished PDF's content key was not recorded")
+    }
 }

@@ -132,7 +132,7 @@ final class MediaTurnTests: XCTestCase {
             if p.done { first.fulfill() }
         }
         wait(for: [first], timeout: 300)
-        XCTAssertEqual(try XCTUnwrap(store.storedChunks(path: long.path)).count, Indexer.audioWindowsPerTurn, "the first turn was not stored")
+        XCTAssertEqual(try XCTUnwrap(store.storedChunks(path: long.path)).count, 1, "the first turn (one minute) was not stored")
         XCTAssertEqual(indexer.streams.count, 1, "no cursor to resume from")
         XCTAssertNil(store.contentKeys(paths: [long.path])[long.path], "a part-read recording's key was recorded")
         let afterFirst = embedder.audioCalls
@@ -141,7 +141,7 @@ final class MediaTurnTests: XCTestCase {
         indexer.index(roots: [root], settings: IndexSettings(enabledKinds: [.audio])) { p in if p.done { second.fulfill() } }
         wait(for: [second], timeout: 300)
         XCTAssertEqual(try XCTUnwrap(store.storedChunks(path: long.path)).count, 25)
-        XCTAssertEqual(embedder.audioCalls - afterFirst, 5, "the resumed pass embedded the first turn again")
+        XCTAssertEqual(embedder.audioCalls - afterFirst, 24, "the resumed pass embedded the first turn again")
         XCTAssertEqual(indexer.streams.count, 0)
     }
 }

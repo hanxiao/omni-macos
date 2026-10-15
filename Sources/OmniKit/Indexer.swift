@@ -167,7 +167,10 @@ final class DecodedItem: @unchecked Sendable {
                    duplicate([IndexedChunk]),    // content-dedup hit: rows ready to store, no embed needed
                    // A plain-text file over FileExtractor.maxTextBytes: nothing decoded here; the embed
                    // stage reads, embeds and STORES it a window at a time (storeStreamedText).
-                   textStream }
+                   textStream,
+                   // A text PDF with more than a first window of text: its pages are read a turn at
+                   // a time (pdfTextTurn), so nothing of its text is held between turns.
+                   pdfTextTurns(pageCount: Int) }
     let file: CrawledFile
     let kind: String
     let payload: Payload
@@ -1343,6 +1346,7 @@ public final class Indexer: @unchecked Sendable {
         /// One turn of a long file: a 2 MB text window, or a turn of a recording, video or scan.
         func step(_ item: DecodedItem, _ c: inout StreamCursors.Cursor) -> StreamStep {
             if case .textStream = item.payload { return streamWindow(item, cursor: &c, settings: settings) }
+            if case .pdfTextTurns(let n) = item.payload { return pdfTextTurn(item, cursor: &c, pageCount: n, settings: settings) }
             guard let plan = mediaPlan(item) else { return .failed }
             return mediaTurn(item, cursor: &c, plan: plan, settings: settings)
         }
@@ -1596,7 +1600,7 @@ public final class Indexer: @unchecked Sendable {
                         if textWork[path] != nil { scanPagesOf[path] = chunks.count }
                         costs.addTime(.scan, seconds: dt, units: Double(chunks.count), files: 1)
                         storeChunks(path, chunks)   // scanned PDF (streamed) / image pages (batched)
-                    case .textStream:
+                    case .textStream, .pdfTextTurns:
                         _ = handleStream(item)
                     default:
                         p.skipped += 1
@@ -1762,6 +1766,10 @@ public final class Indexer: @unchecked Sendable {
                 costs.addTime(.text, seconds: dt, units: Double(textsEmbedded.value - before.texts), files: 1)
                 costs.addChunks(sort, chunks: c.written - before.written, scanPages: 0, mb: mb)
                 if let r = rootOf(item.file.path) { workDone[r, default: WorkLeft()].add(WorkUnit(kind: .text, sort: sort, units: mb)) }
+            } else if case .pdfTextTurns = item.payload, let turn = share(item, before.unit, c.unit ?? before.unit) {
+                // Text, priced as text: by the chunks that reached the model.
+                costs.addTime(.text, seconds: dt, units: Double(textsEmbedded.value - before.texts), files: 1)
+                if let r = rootOf(item.file.path) { workDone[r, default: WorkLeft()].add(turn.done) }
             } else if let turn = share(item, before.unit, c.unit ?? before.unit) {
                 costs.addTime(turn.kind, seconds: dt, units: turn.units, files: 0)
                 if let r = rootOf(item.file.path) { workDone[r, default: WorkLeft()].add(turn.done) }
@@ -1976,6 +1984,14 @@ public final class Indexer: @unchecked Sendable {
 
     // MARK: - Long text files, streamed
 
+    /// HIGH RECALL FIRST (Han, 2026-10-14). A file's first turn is the least that makes it
+    /// searchable - 64 KB of text, one video segment, one minute of audio, one group of scanned
+    /// pages - and its later turns are full size, so the work is the same and only its order
+    /// changes. Measured on 12 long text files queued ahead of 600 notes (omni-verify coverage, five
+    /// interleaved pairs on a shared machine): every file searchable at 6.3 s, not 77 s (medians);
+    /// the pass 151 vs 176 s, and 130.0 vs 129.9 s in the quietest pair.
+    static let firstWindowBytes = 65_536
+
     /// A plain-text file past FileExtractor.maxTextBytes. Below it nothing changes - the file is
     /// read whole and chunked exactly as before.
     static func isLongText(_ file: CrawledFile) -> Bool {
@@ -1988,9 +2004,23 @@ public final class Indexer: @unchecked Sendable {
     /// 1,311 files, 94% of it .log, .jsonl and .json: agent runs, caches, model weights.
     public static let dataTextExtensions: Set<String> = ["log", "json", "jsonl", "ndjson"]
 
-    /// A long text file that is read to the end (storeStreamedText) rather than cut at 2 MB.
+    /// Read to its end: everything but a long log or data file while the setting keeps the cut.
+    static func readsToEnd(_ file: CrawledFile, settings: IndexSettings) -> Bool {
+        !isLongText(file) || settings.readLongDataFiles || !dataTextExtensions.contains(file.ext.lowercased())
+    }
+
+    /// How far a text file is read: its end, or the 2 MB cut.
+    static func readLimit(_ file: CrawledFile, settings: IndexSettings) -> Int {
+        readsToEnd(file, settings: settings) ? file.size : Swift.min(file.size, FileExtractor.maxTextBytes)
+    }
+
+    /// TAKES TURNS: a plain-text file past the first window, read a window at a time with the rest
+    /// sent to the end of the queue (as far as `readLimit`). With a small first window that is most
+    /// text files, and every one is searchable after its first turn; past the first, windows are
+    /// full size, so the work is the same and only its order changes.
     static func streamsText(_ file: CrawledFile, settings: IndexSettings) -> Bool {
-        isLongText(file) && (settings.readLongDataFiles || !dataTextExtensions.contains(file.ext.lowercased()))
+        !file.isPhoto && FileExtractor.textExtensions.contains(file.ext.lowercased())
+            && file.size > Swift.min(firstWindowBytes, FileExtractor.maxTextBytes)
     }
 
     /// The long-text policy the index was last brought in line with, written by the app once a
@@ -2040,6 +2070,8 @@ public final class Indexer: @unchecked Sendable {
             return total > Self.audioWindowsPerTurn ? (total, Self.audioWindowsPerTurn) : nil
         case .pdfScan(let pageCount, _):
             return pageCount > Self.scanPagesPerTurn ? (pageCount, Self.scanPagesPerTurn) : nil
+        case .pdfTextTurns(let pageCount):
+            return (pageCount, pageCount)   // turns sized by text, not pages (pdfTextTurn)
         default:
             return nil
         }
@@ -2055,7 +2087,11 @@ public final class Indexer: @unchecked Sendable {
               let mod = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970,
               abs(mod - f.modified) < 0.001, (attrs[.size] as? Int) == f.size else { return .failed }
         let start = c.unit ?? 0
-        let range = start ..< min(plan.total, start + plan.perTurn)
+        // The first turn is the least that makes the file searchable - one segment, one minute,
+        // one group of pages (firstWindowBytes); the rest come at full size.
+        let turn: Int
+        if start == 0, case .pdfScan = item.payload { turn = scanPageGroup } else { turn = start == 0 ? 1 : plan.perTurn }
+        let range = start ..< min(plan.total, start + turn)
         var chunks: [IndexedChunk]
         switch item.payload {
         case .videoSegments(let duration, let maxFrames, let maxDimension):
@@ -2153,10 +2189,12 @@ public final class Indexer: @unchecked Sendable {
             guard let handle = try? FileHandle(forReadingFrom: file.url) else { return }
             defer { try? handle.close() }
             var undecoded = Data(), carry = "", written = 0, offset: UInt64 = 0
+            let limit = UInt64(Self.readLimit(file, settings: settings))
             while true {
-                let data = (try? handle.read(upToCount: FileExtractor.maxTextBytes)) ?? Data()
+                let window = UInt64(offset == 0 ? Self.firstWindowBytes : FileExtractor.maxTextBytes)
+                let data = offset >= limit ? Data() : ((try? handle.read(upToCount: Int(Swift.min(window, limit - offset)))) ?? Data())
                 offset += UInt64(data.count)
-                let eof = data.isEmpty || offset >= UInt64(file.size)
+                let eof = data.isEmpty || offset >= limit
                 undecoded.append(data)
                 let (decoded, rest) = Self.decodeTextWindow(undecoded, final: eof)
                 undecoded = rest
@@ -2405,6 +2443,18 @@ public final class Indexer: @unchecked Sendable {
             return true
         case FileKind.image.rawValue:
             guard settings.screenText, Self.isScreenshot(c.path) else { return true }   // not a screenshot: nothing to add
+            // A COPY OF A SCREENSHOT whose text is already in: its rows, taken over as content dedup
+            // takes them, not Vision again over the same pixels (the lane adds the original's text
+            // after its picture is stored, so a copy deduplicated in between has none yet).
+            for other in store.pathsForContentDigests([digest])[digest] ?? [] where other != c.path {
+                guard let rows = store.storedChunks(path: other), rows.contains(where: { $0.kind == FileKind.text.rawValue })
+                else { continue }
+                return write(rows.map { r in
+                    IndexedChunk(path: c.path, modified: c.modified, size: c.size, kind: r.kind, chunkIndex: r.chunkIndex,
+                                 snippet: r.snippet, embedding: r.embedding, width: r.width, height: r.height,
+                                 duration: r.duration, locator: r.locator, chunkKey: r.chunkKey)
+                })
+            }
             guard let pieces = readScreenText(file, settings: settings) else { return false }
             return pieces.isEmpty || addScreenText(file, digest: digest, pieces: pieces, settings: settings)
         case FileKind.text.rawValue:
@@ -2463,8 +2513,10 @@ public final class Indexer: @unchecked Sendable {
               let mod = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970,
               abs(mod - file.modified) < 0.001, (attrs[.size] as? Int) == file.size else { return .failed }
         try? handle.seek(toOffset: c.offset)
-        let data = (try? handle.read(upToCount: FileExtractor.maxTextBytes)) ?? Data()
-        let eof = data.isEmpty || c.offset + UInt64(data.count) >= UInt64(file.size)
+        let limit = UInt64(Self.readLimit(file, settings: settings))
+        let window = UInt64(c.offset == 0 ? Self.firstWindowBytes : FileExtractor.maxTextBytes)
+        let data = c.offset >= limit ? Data() : ((try? handle.read(upToCount: Int(Swift.min(window, limit - c.offset)))) ?? Data())
+        let eof = data.isEmpty || c.offset + UInt64(data.count) >= limit
         var undecoded = c.undecoded
         undecoded.append(data)
         let (decoded, rest) = Self.decodeTextWindow(undecoded, final: eof)
@@ -2476,38 +2528,79 @@ public final class Indexer: @unchecked Sendable {
             guard lineBase > 0, piece.locator.hasPrefix("Line "), let n = Int(piece.locator.dropFirst(5)) else { return piece }
             return TextPiece(text: piece.text, locator: "Line \(n + lineBase)")
         }
-        if !kept.isEmpty {
-            recordIdentifiers(kept, contentKey: item.contentKey, firstChunk: c.written, replace: c.written == 0)
-            let keyed = kept.map { (text: $0.text, key: chunkKey($0.text, settings: settings)) }
-            var groups: [[(text: String, key: String)]] = []
-            var i = 0
-            while i < keyed.count { groups.append(Array(keyed[i ..< min(i + textBatchSize, keyed.count)])); i += textBatchSize }
-            let vecs = embedGroupsReusing(groups, width: textBatchSize).flatMap { $0 }
-            if isCancelled { return .failed }
-            guard vecs.count == kept.count, vecs.allSatisfy({ !$0.isEmpty && Self.isFinite($0) }) else {
-                Self.log.error("stream window embed failed \(file.path, privacy: .public)")
-                return .failed
-            }
-            let chunks = kept.enumerated().map { j, piece in
-                IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: item.kind,
-                             chunkIndex: c.written + j, snippet: snippet(piece.text), embedding: vecs[j],
-                             locator: piece.locator, chunkKey: keyed[j].key)
-            }
-            do {
-                try Self.writeWaitingOutLocks { try store.replaceMany([(file.path, chunks)], keepExisting: c.written > 0) }
-            } catch {
-                Self.log.error("stream window store failed \(file.path, privacy: .public): \(String(describing: error), privacy: .public)")
-                return .failed
-            }
-            c.written += chunks.count
-        } else if eof && c.written == 0 {
-            store.deletePaths([file.path])   // nothing indexable after all
-        }
+        guard storeTurn(item, kept, cursor: &c, last: eof, settings: settings) else { return .failed }
         c.offset += UInt64(data.count)
         c.undecoded = rest
         c.carry = carry
         c.lineBase += text.prefix(text.count - carry.count).reduce(0) { $1.isNewline ? $0 + 1 : $0 }
         return eof ? .done : .more
+    }
+
+    /// One turn's text pieces of a file that takes turns, stored after what earlier turns stored:
+    /// identifiers, embedding (stored vectors reused by chunk key), one write, the cursor advanced.
+    /// The text window and the PDF page turn both end here.
+    func storeTurn(_ item: DecodedItem, _ kept: [TextPiece], cursor c: inout StreamCursors.Cursor, last: Bool,
+                   settings: IndexSettings) -> Bool {
+        let file = item.file
+        guard !kept.isEmpty else {
+            if last && c.written == 0 { store.deletePaths([file.path]) }   // nothing indexable after all
+            return true
+        }
+        recordIdentifiers(kept, contentKey: item.contentKey, firstChunk: c.written, replace: c.written == 0)
+        let keyed = kept.map { (text: $0.text, key: chunkKey($0.text, settings: settings)) }
+        var groups: [[(text: String, key: String)]] = []
+        var i = 0
+        while i < keyed.count { groups.append(Array(keyed[i ..< min(i + textBatchSize, keyed.count)])); i += textBatchSize }
+        let vecs = embedGroupsReusing(groups, width: textBatchSize).flatMap { $0 }
+        if isCancelled { return false }
+        guard vecs.count == kept.count, vecs.allSatisfy({ !$0.isEmpty && Self.isFinite($0) }) else {
+            Self.log.error("stream window embed failed \(file.path, privacy: .public)")
+            return false
+        }
+        let chunks = kept.enumerated().map { j, piece in
+            IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: item.kind,
+                         chunkIndex: c.written + j, snippet: snippet(piece.text), embedding: vecs[j],
+                         locator: piece.locator, chunkKey: keyed[j].key)
+        }
+        do {
+            try Self.writeWaitingOutLocks { try store.replaceMany([(file.path, chunks)], keepExisting: c.written > 0) }
+        } catch {
+            Self.log.error("stream window store failed \(file.path, privacy: .public): \(String(describing: error), privacy: .public)")
+            return false
+        }
+        c.written += chunks.count
+        return true
+    }
+
+    /// One turn of a text PDF: its next pages, as many as the window holds (firstWindowBytes on the
+    /// first turn, a full window after), chunked with page locators counted from the file's first
+    /// page, and stored through storeTurn. A turn ends on a page boundary, so no chunk spans two.
+    func pdfTextTurn(_ item: DecodedItem, cursor c: inout StreamCursors.Cursor, pageCount: Int,
+                     settings: IndexSettings) -> StreamStep {
+        let file = item.file
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
+              let mod = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970,
+              abs(mod - file.modified) < 0.001, (attrs[.size] as? Int) == file.size,
+              let doc = PDFDocument(url: file.url), doc.pageCount == pageCount else { return .failed }
+        let start = c.unit ?? 0
+        let budget = start == 0 ? Self.firstWindowBytes : FileExtractor.maxTextBytes
+        var text = "", starts: [Int] = [], bytes = 0, page = start
+        while page < pageCount, page == start || bytes < budget {
+            let s = autoreleasepool { doc.page(at: page)?.string ?? "" }
+            starts.append(text.count)
+            text += s
+            if !s.hasSuffix("\n") { text += "\n" }
+            bytes += s.utf8.count
+            page += 1
+        }
+        let pieces = text.isEmpty ? [] : chunk(text, settings: settings, origin: .paged(starts)).map { p -> TextPiece in
+            guard start > 0, p.locator.hasPrefix("Page "), let n = Int(p.locator.dropFirst(5)) else { return p }
+            return TextPiece(text: p.text, locator: "Page \(n + start)")
+        }
+        let last = page >= pageCount
+        guard storeTurn(item, pieces, cursor: &c, last: last, settings: settings) else { return .failed }
+        c.unit = page
+        return last ? .done : .more
     }
 
     /// STREAM A LONG TEXT FILE TO THE END. It used to be read to FileExtractor.maxTextBytes (2 MB)
@@ -2544,10 +2637,14 @@ public final class Indexer: @unchecked Sendable {
         var carry = ""
         var lineBase = 0
         var total = 0
+        let limit = UInt64(Self.readLimit(item.file, settings: settings))
+        var offset: UInt64 = 0
         while true {
             if isCancelled { return false }
-            let data = (try? handle.read(upToCount: FileExtractor.maxTextBytes)) ?? Data()
-            let eof = data.isEmpty
+            let window = UInt64(offset == 0 ? Self.firstWindowBytes : FileExtractor.maxTextBytes)
+            let data = offset >= limit ? Data() : ((try? handle.read(upToCount: Int(Swift.min(window, limit - offset)))) ?? Data())
+            offset += UInt64(data.count)
+            let eof = data.isEmpty || offset >= limit
             undecoded.append(data)
             let (decoded, rest) = Self.decodeTextWindow(undecoded, final: eof)
             undecoded = rest
@@ -2985,6 +3082,14 @@ public final class Indexer: @unchecked Sendable {
                 // branch would delete the file it just wrote. Whole, so any window-at-a-time
                 // cursor for it is done with: a pass must not resume it and append again.
                 if self.storeStreamedText(item, settings: settings) { self.streams.finish(item.file.path) }
+            case .pdfTextTurns(let pageCount):
+                // A changed PDF from the watcher: its turns back to back, as a changed long text
+                // file is re-streamed whole here; stored vectors are reused by chunk key.
+                var c = StreamCursors.Cursor(modified: item.file.modified, size: item.file.size, offset: 0, undecoded: Data(),
+                                             carry: "", lineBase: 0, written: 0, unit: 0)
+                var step = StreamStep.more
+                while case .more = step, !self.isCancelled { step = self.pdfTextTurn(item, cursor: &c, pageCount: pageCount, settings: settings) }
+                if case .done = step { Self.recordFinishedKey(item, store: self.store); self.streams.finish(item.file.path) }
             default:
                 acceptCompleted(path, self.withExtras(item, self.embed(item), settings: settings))
             }
@@ -3073,7 +3178,8 @@ public final class Indexer: @unchecked Sendable {
                         if let d = Self.testReadDelay?(file.path) { Thread.sleep(forTimeInterval: d) }
                         let item = self.isCancelled
                             ? DecodedItem(file: file, abandoned: true)
-                            : self.decode(file, settings: settings)
+                            : self.decode(file, settings: settings,
+                                          turns: known[file.path] == nil || self.streams.inProgress(file.path))
                         cond.lock()
                         ready.started[i] = nil
                         let late = ready.gaveUp.remove(i) != nil
@@ -3187,16 +3293,19 @@ public final class Indexer: @unchecked Sendable {
     /// it, hand me its bytes) is behind `ContentSource`; everything below - thresholds, dedup,
     /// payload shape, HQ crops - is policy, and lives here exactly once so a new channel cannot
     /// quietly acquire its own version of it. That is precisely how issue #13 happened.
-    private func decode(_ file: CrawledFile, settings: IndexSettings) -> DecodedItem {
+    /// `turns`: a long text PDF may take turns - on its first index, or resuming one. An indexed
+    /// PDF that changed is read in one go, so every unchanged chunk's vector is reused before any
+    /// row is replaced (turns replace a file's rows at the first).
+    private func decode(_ file: CrawledFile, settings: IndexSettings, turns: Bool = false) -> DecodedItem {
         // Asked BEFORE anything reads the file: the probe's header read is already a download.
         let evict = settings.evictDownloaded && !settings.skipDataless
             && FileContentSource.claims(file) && FileExtractor.isDataless(file.path)
-        let item = decodeContent(file, settings: settings)
+        let item = decodeContent(file, settings: settings, turns: turns)
         if evict { item.evictWhenDone = file.url }
         return item
     }
 
-    private func decodeContent(_ file: CrawledFile, settings: IndexSettings) -> DecodedItem {
+    private func decodeContent(_ file: CrawledFile, settings: IndexSettings, turns: Bool = false) -> DecodedItem {
         let source = ContentSources.source(for: file)
 
         // Nil probe = produce nothing for this item right now: it is gone, or its content could
@@ -3279,6 +3388,12 @@ public final class Indexer: @unchecked Sendable {
             return DecodedItem(file: file, kind: kind, payload: .text(pieces), contentKey: contentKey)
         case .pagedText(let text, let pageStarts):
             if settings.minTextChars > 0, text.count < settings.minTextChars { return DecodedItem(file: file) }
+            if turns, pageStarts.count > 1, text.utf8.count > Self.firstWindowBytes {
+                // Takes turns by pages, like long text: searchable after its first pages.
+                let item = DecodedItem(file: file, kind: kind, payload: .pdfTextTurns(pageCount: pageStarts.count), contentKey: contentKey)
+                item.enrichable = true
+                return item
+            }
             let pieces = chunk(text, settings: settings, origin: .paged(pageStarts))
             recordIdentifiers(pieces, contentKey: contentKey)
             let item = DecodedItem(file: file, kind: kind, payload: .text(pieces), contentKey: contentKey)
@@ -3327,7 +3442,7 @@ public final class Indexer: @unchecked Sendable {
         // Text that keeps the 2 MB cut hashes its first 2 MB, as it always did - its old keys stay
         // valid, and an appended-to 900 MB log is not re-hashed end to end on every change.
         let cut = category == .text && FileExtractor.textExtensions.contains(ext)
-            && !streamsText(file, settings: settings)
+            && !readsToEnd(file, settings: settings)
         guard let digest = sha256(file.url, cap: cut ? FileExtractor.maxTextBytes : Int.max) else { return nil }
         let fp: String
         switch category {
@@ -3403,8 +3518,8 @@ public final class Indexer: @unchecked Sendable {
             return []
         case .duplicate(let chunks):
             return chunks   // content-dedup hit: source rows already rewritten for this file
-        case .textStream:
-            return []       // stored by storeStreamedText, which every consumer calls instead
+        case .textStream, .pdfTextTurns:
+            return []       // stored a turn at a time (handleStream), which every consumer calls instead
         case .text(let pieces):
             var out: [IndexedChunk] = []
             var i = 0

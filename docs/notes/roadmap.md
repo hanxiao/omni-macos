@@ -162,3 +162,20 @@ old 82.2 / 84.3 s; text read on the decode stage 102 s; a lane that read AND emb
 job waited on the GPU behind the audio batches, 157 ms a screenshot); a lane that only reads, with
 the consumer adding what is read in batches, 90.3 / 93.2 s (+9-10%). Its image phase is the old
 build's (34.3 vs 33.7 s); what is left is new content: the soundtracks and one-minute audio windows.
+
+### High recall first: every long file's first turn is small (Han, 2026-10-14)
+
+Turns now start with the least that makes a file searchable: 64 KB of text, one video segment, one
+minute of audio, one group of scanned pages; later turns are full size, so the work is the same and
+only its order changes. Text past 64 KB takes turns (not only past 2 MB; long logs and data files
+still stop at the 2 MB cut unless the setting is on), and a text PDF with more than a first window
+of text takes turns by pages (pdfTextTurn, through the same storeTurn as a text window). An indexed
+file that changed keeps the one-pass path, which reuses every unchanged chunk's vector.
+
+`omni-verify coverage`: when every file of a tree is searchable, and the pass. 12 long text files
+(3-4 MB) queued ahead of 600 notes, five interleaved pairs on a shared machine: searchable 77 s ->
+6.3 s (medians), the pass 176 -> 151 s (quietest pair 129.9 vs 130.0 s). With 40 mid-size files
+(100 KB - 1.5 MB) added, the committed indexer against this one, three pairs: 160.2 / 158.8 /
+164.5 s -> 14.7 / 13.6 / 18.0 s; the pass 217.0 / 216.1 / 250.8 vs 215.5 / 239.6 / 246.6 s (the
+second pair ran beside an Xcode build). Not yet: converted documents (docx and the like) are read
+in one go; they would need their converted text in a scratch file to take turns.
