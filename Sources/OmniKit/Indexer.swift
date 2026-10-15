@@ -200,6 +200,16 @@ final class DecodedItem: @unchecked Sendable {
     /// text file or a scanned PDF is read again by the embed stage, long after decode returned, and
     /// an early eviction would download it a second time.
     var evictWhenDone: URL?
+    /// A converted document that takes turns (.textStream): its converted text, written once to a
+    /// scratch file beside the index, which the turns read in place of the file (Indexer.turnText).
+    var streamSource: URL?
+    var streamSourceBytes = 0
+    /// MB of the FILE a turn's bytes of its text stand for: the same for a text file; a converted
+    /// document's work is priced by the document's size, not by its text's.
+    func fileMB(_ textBytes: Int64) -> Double {
+        guard streamSource != nil, streamSourceBytes > 0 else { return Double(textBytes) / 1_000_000 }
+        return Double(file.size) * Double(textBytes) / Double(streamSourceBytes) / 1_000_000
+    }
     deinit { if let url = evictWhenDone { CloudEviction.evict(url) } }
     init(file: CrawledFile, kind: String = "", payload: Payload = .empty, unchanged: Bool = false, abandoned: Bool = false,
          meta: (width: Int, height: Int, duration: Double) = (0, 0, 0), contentKey: String? = nil) {
@@ -1042,6 +1052,7 @@ public final class Indexer: @unchecked Sendable {
         // Per file on the consumer, so no lock: the long files part-way at the pass's start (a file
         // that starts one in this pass was work already). Usually empty.
         let streamingAtStart = streams.paths
+        sweepTurnTexts()
         let quarantineRef = quarantine
         let isWorkSendable: @Sendable (CrawledFile) -> Bool = { f in
             if let k = known[f.path], k.modified == f.modified, k.size == f.size,
@@ -1368,6 +1379,7 @@ public final class Indexer: @unchecked Sendable {
                 continuations.append((item, c))
             case .done:
                 streams.finish(path)
+                if let s = item.streamSource { try? FileManager.default.removeItem(at: s) }
                 guard !first else { return }
                 Self.recordFinishedKey(item, store: store)
                 if item.enrichable, let ck = item.contentKey {
@@ -1376,7 +1388,10 @@ public final class Indexer: @unchecked Sendable {
             case .failed:
                 // Cancelled: the cursor stays, and the next pass resumes there. Anything else (the
                 // file changed, a write failed): start over next time, as a changed file.
-                if !isCancelled { streams.finish(path) }
+                if !isCancelled {
+                    streams.finish(path)
+                    if let s = item.streamSource { try? FileManager.default.removeItem(at: s) }
+                }
             }
         }
         /// LONG FILES TAKE TURNS: a turn now, the rest to the end of the queue. False: not a long
@@ -1393,7 +1408,7 @@ public final class Indexer: @unchecked Sendable {
             // book - goes through the whole-file stream, which reuses every stored window's
             // vectors; splitting it would lose that. Window-at-a-time is for a first index and
             // for a file already part-way.
-            if text, resume == nil, known[f.path] != nil {
+            if text, resume == nil, known[f.path] != nil, item.streamSource == nil {
                 streams.finish(f.path)   // a cursor left by an older version
                 if storeStreamedText(item, settings: settings) { p.embedded += 1 } else if !isCancelled { p.failed += 1 }
                 return true
@@ -1407,7 +1422,8 @@ public final class Indexer: @unchecked Sendable {
             // What is left of it is not done yet: its later turns are credited as they run.
             if case .more = outcome {
                 if text, let r = rootOf(f.path) {
-                    let rest = Double(max(0, Int64(f.size) - Int64(c.offset))) / 1_000_000
+                    let total = item.streamSource != nil ? Int64(item.streamSourceBytes) : Int64(f.size)
+                    let rest = item.fileMB(max(0, total - Int64(c.offset)))
                     workDone[r, default: WorkLeft()].add(WorkUnit(kind: .text, sort: IndexCosts.sort(ext: f.ext.lowercased()), units: rest), sign: -1)
                 } else if !text, let w = inflight[f.path], let turn = share(item, startUnit, c.unit ?? 0) {
                     inflight[f.path] = (w.root, turn.done)
@@ -1762,7 +1778,7 @@ public final class Indexer: @unchecked Sendable {
             // The turn's time and work, each in its own units.
             let dt = CFAbsoluteTimeGetCurrent() - t0
             if case .textStream = item.payload {
-                let mb = Double(c.offset - before.offset) / 1_000_000, sort = IndexCosts.sort(ext: item.file.ext.lowercased())
+                let mb = item.fileMB(Int64(c.offset - before.offset)), sort = IndexCosts.sort(ext: item.file.ext.lowercased())
                 costs.addTime(.text, seconds: dt, units: Double(textsEmbedded.value - before.texts), files: 1)
                 costs.addChunks(sort, chunks: c.written - before.written, scanPages: 0, mb: mb)
                 if let r = rootOf(item.file.path) { workDone[r, default: WorkLeft()].add(WorkUnit(kind: .text, sort: sort, units: mb)) }
@@ -2018,6 +2034,43 @@ public final class Indexer: @unchecked Sendable {
     /// sent to the end of the queue (as far as `readLimit`). With a small first window that is most
     /// text files, and every one is searchable after its first turn; past the first, windows are
     /// full size, so the work is the same and only its order changes.
+    /// Where a converted document's pieces wait between its turns: one file per version of the
+    /// document (path, date, size), in `turns/` beside the index. Deleted when the file is done or
+    /// starts over; any left by a killed session go at the next launch (sweepTurnTexts).
+    func turnText(_ file: CrawledFile) -> URL? {
+        guard !file.isPhoto else { return nil }
+        return Self.turnTextURL(dir: turnsDir, path: file.path, modified: file.modified, size: file.size)
+    }
+
+    var turnsDir: URL { store.dbURL.deletingLastPathComponent().appendingPathComponent("turns", isDirectory: true) }
+
+    static func turnTextURL(dir: URL, path: String, modified: Double, size: Int) -> URL {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        for b in "\(path)\u{0}\(modified)\u{0}\(size)".utf8 { h = (h ^ UInt64(b)) &* 0x0000_0100_0000_01b3 }
+        return dir.appendingPathComponent(String(h, radix: 16) + ".txt")
+    }
+
+    /// The pieces, one JSON string a line; the bytes written, or nil.
+    static func writeTurnPieces(_ pieces: [TextPiece], to url: URL) -> Int? {
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let enc = JSONEncoder()
+        var data = Data()
+        for p in pieces {
+            guard let line = try? enc.encode(p.text) else { return nil }
+            data.append(line); data.append(0x0A)
+        }
+        return (try? data.write(to: url, options: .atomic)) != nil ? data.count : nil
+    }
+
+    /// Scratch texts no cursor needs: a killed session's, or a version that changed.
+    func sweepTurnTexts() {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: turnsDir.path) else { return }
+        let live = Set(streams.all.map { Self.turnTextURL(dir: turnsDir, path: $0.path, modified: $0.cursor.modified,
+                                                           size: $0.cursor.size).lastPathComponent })
+        for n in names where !live.contains(n) { try? fm.removeItem(at: turnsDir.appendingPathComponent(n)) }
+    }
+
     static func streamsText(_ file: CrawledFile, settings: IndexSettings) -> Bool {
         !file.isPhoto && FileExtractor.textExtensions.contains(file.ext.lowercased())
             && file.size > Swift.min(firstWindowBytes, FileExtractor.maxTextBytes)
@@ -2505,6 +2558,7 @@ public final class Indexer: @unchecked Sendable {
     /// first window replacing the file's rows, the rest appending. Every row carries the file's
     /// real modified time and size; what marks it unfinished is the cursor, not the rows.
     func streamWindow(_ item: DecodedItem, cursor c: inout StreamCursors.Cursor, settings: IndexSettings) -> StreamStep {
+        if item.streamSource != nil { return pieceTurn(item, cursor: &c, settings: settings) }
         let file = item.file
         guard let handle = try? FileHandle(forReadingFrom: file.url) else { return .failed }
         defer { try? handle.close() }
@@ -2534,6 +2588,40 @@ public final class Indexer: @unchecked Sendable {
         c.carry = carry
         c.lineBase += text.prefix(text.count - carry.count).reduce(0) { $1.isNewline ? $0 + 1 : $0 }
         return eof ? .done : .more
+    }
+
+    /// One turn of a converted document: its next pieces from the scratch file, as many as the window
+    /// holds. The pieces were cut at decode, on the concurrent stage, exactly as the one-pass path
+    /// cuts the document (cutting each window again on this thread cost 0.5 s of a 31 s pass of ten
+    /// long documents), so the chunks are the one-pass chunks by construction. One JSON string a line.
+    func pieceTurn(_ item: DecodedItem, cursor c: inout StreamCursors.Cursor, settings: IndexSettings) -> StreamStep {
+        let file = item.file
+        guard let src = item.streamSource, let handle = try? FileHandle(forReadingFrom: src) else { return .failed }
+        defer { try? handle.close() }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
+              let mod = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970,
+              abs(mod - file.modified) < 0.001, (attrs[.size] as? Int) == file.size else { return .failed }
+        try? handle.seek(toOffset: c.offset)
+        let budget = c.offset == 0 ? Self.firstWindowBytes : FileExtractor.maxTextBytes
+        var data = Data(), eof = false
+        // At least one whole line, however long; then up to the budget.
+        while !eof, data.count < budget || !data.contains(0x0A) {
+            let more = (try? handle.read(upToCount: Swift.max(budget - data.count, 65_536))) ?? Data()
+            if more.isEmpty { eof = true } else { data.append(more) }
+        }
+        var pieces: [TextPiece] = [], used = 0
+        let decoder = JSONDecoder()
+        while let nl = data[(data.startIndex + used)...].firstIndex(of: 0x0A) {
+            let line = data[(data.startIndex + used) ..< nl]
+            guard let text = try? decoder.decode(String.self, from: line) else { return .failed }
+            pieces.append(TextPiece(text: text, locator: ""))
+            used = nl - data.startIndex + 1
+            if used >= budget { break }
+        }
+        let last = UInt64(used) + c.offset >= UInt64(item.streamSourceBytes)
+        guard storeTurn(item, pieces, cursor: &c, last: last, settings: settings) else { return .failed }
+        c.offset += UInt64(used)
+        return last ? .done : .more
     }
 
     /// One turn's text pieces of a file that takes turns, stored after what earlier turns stored:
@@ -3374,6 +3462,15 @@ public final class Indexer: @unchecked Sendable {
             return item
         }
 
+        // A converted document part-way through its turns: the text is already converted.
+        if turns, category == .text, FileExtractor.officeExtensions.contains(file.ext.lowercased()),
+           let scratch = turnText(file), FileManager.default.fileExists(atPath: scratch.path) {
+            let item = DecodedItem(file: file, kind: kind, payload: .textStream, meta: meta, contentKey: contentKey)
+            item.streamSource = scratch
+            item.streamSourceBytes = (try? FileManager.default.attributesOfItem(atPath: scratch.path)[.size] as? Int) ?? 0
+            return item
+        }
+
         switch source.content(file, kind: category, settings: settings) {
         case .empty:
             return DecodedItem(file: file)
@@ -3383,7 +3480,18 @@ public final class Indexer: @unchecked Sendable {
             // office doc's converted string are meaningless to the user.
             let ext = file.ext.lowercased()
             let origin: TextOrigin = FileExtractor.textExtensions.contains(ext) ? .plain : .opaque
+            // A CONVERTED DOCUMENT TAKES TURNS LIKE A LONG TEXT FILE: its first window now, the rest
+            // at the back of the queue. Converting is all or nothing (NSAttributedString reads the
+            // whole document), so its pieces - cut here, as one pass cuts them - are written once to
+            // a scratch file, and each turn reads its share (pieceTurn); the file goes when it is done.
             let pieces = chunk(text, settings: settings, origin: origin)
+            if turns, case .opaque = origin, text.utf8.count > Self.firstWindowBytes, pieces.count > 1,
+               let scratch = turnText(file), let bytes = Self.writeTurnPieces(pieces, to: scratch) {
+                let item = DecodedItem(file: file, kind: kind, payload: .textStream, meta: meta, contentKey: contentKey)
+                item.streamSource = scratch
+                item.streamSourceBytes = bytes
+                return item
+            }
             recordIdentifiers(pieces, contentKey: contentKey)
             return DecodedItem(file: file, kind: kind, payload: .text(pieces), contentKey: contentKey)
         case .pagedText(let text, let pageStarts):

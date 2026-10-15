@@ -177,5 +177,16 @@ file that changed keeps the one-pass path, which reuses every unchanged chunk's 
 6.3 s (medians), the pass 176 -> 151 s (quietest pair 129.9 vs 130.0 s). With 40 mid-size files
 (100 KB - 1.5 MB) added, the committed indexer against this one, three pairs: 160.2 / 158.8 /
 164.5 s -> 14.7 / 13.6 / 18.0 s; the pass 217.0 / 216.1 / 250.8 vs 215.5 / 239.6 / 246.6 s (the
-second pair ran beside an Xcode build). Not yet: converted documents (docx and the like) are read
-in one go; they would need their converted text in a scratch file to take turns.
+second pair ran beside an Xcode build).
+
+Converted documents (docx, doc, rtf, pages, odt, webarchive) take turns too. NSAttributedString
+converts the whole document, so decode cuts it there - on the concurrent stage, exactly as the
+one-pass path does - and writes the pieces, one JSON string a line, to `turns/` beside the index;
+each turn reads its share (pieceTurn) through the same storeTurn, the file goes when the document is
+done, and a launch sweeps any no cursor needs. The chunks are the one-pass chunks by construction
+(PageChunkTests compares chunk keys). 10 docx of 0.3-2 MB of text ahead of 600 notes, Nano,
+interleaved, six pairs: every file searchable 31.0-32.5 s -> 5.0-5.1 s; the pass 31.1-31.3 s ->
+31.4-31.6 s. A first version wrote the text and cut each window again on the consumer thread:
+31.7 s (cutting off the concurrent stage); length-sorting a turn's batches changed nothing and was
+dropped. What is left, ~0.35 s, is the small first turn's batches (4.7-5.4 ms a chunk against 4.6
+in a full turn) and a write per turn: the price of a first turn, as for long text.

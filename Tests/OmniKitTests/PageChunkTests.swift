@@ -138,4 +138,63 @@ final class PageChunkTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(seen, 2, "no page opened a chunk past the first: the boundary is untested")
         XCTAssertNotNil(store.contentKeys(paths: [file.path])[file.path], "the finished PDF's content key was not recorded")
     }
+
+    /// A CONVERTED DOCUMENT TAKES TURNS: an RTF with more than a first window of text is searchable
+    /// after its first window and whole after its last, its converted text read from a scratch file
+    /// that is gone when it is done - and the chunks are exactly the ones the one-pass path makes.
+    func testALongDocumentTakesTurnsAndChunksAsOnePass() throws {
+        var r = FileManager.default.temporaryDirectory.appendingPathComponent("docturn-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: r, withIntermediateDirectories: true)
+        if let rp = realpath(r.path, nil) { r = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+        let root = r
+        let db = root.deletingLastPathComponent().appendingPathComponent("docturn-db-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: db, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root); try? FileManager.default.removeItem(at: db) }
+        let words = ["harbor", "engine", "anchor", "compass", "lantern", "rigging", "ballast", "keel", "mast", "tide"]
+        var paras: [String] = []
+        for k in 0 ..< 400 {
+            var s = "Section \(k): "
+            var i = k
+            while s.count < 600 { s += words[i % words.count] + "\(k % 37) "; i += 7 }
+            paras.append(s + ".")
+        }
+        let file = root.appendingPathComponent("report.rtf")
+        try ("{\\rtf1\\ansi " + paras.map { $0 + "\\par\n" }.joined() + "}").write(to: file, atomically: true, encoding: .utf8)
+        guard case .text(let whole) = try FileExtractor.extract(file) else { return XCTFail("the RTF did not convert") }
+        let attrs = try FileManager.default.attributesOfItem(atPath: file.path)
+        let crawled = CrawledFile(url: file, modified: try XCTUnwrap(attrs[.modificationDate] as? Date).timeIntervalSince1970,
+                                  size: try XCTUnwrap(attrs[.size] as? Int))
+        XCTAssertGreaterThan(whole.utf8.count, 3 * Indexer.firstWindowBytes, "the document is too short to take turns")
+
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let embedder = EnrichmentTests.Fake()
+        var indexer = Indexer(store: store, embedder: embedder)
+        let expected = indexer.chunk(whole, settings: IndexSettings(), origin: .opaque)
+            .map { indexer.chunkKey($0.text, settings: IndexSettings()) }
+        let first = expectation(description: "pass 1")
+        indexer.index(roots: [root], settings: IndexSettings()) { p in
+            if p.embedded >= 1 { indexer.cancel(.pause) }
+            if p.done { first.fulfill() }
+        }
+        wait(for: [first], timeout: 120)
+        let partial = try XCTUnwrap(store.storedChunks(path: file.path))
+        XCTAssertFalse(partial.isEmpty, "the first turn was not stored")
+        XCTAssertLessThan(partial.count, expected.count, "the document was indexed in one turn")
+        XCTAssertEqual(indexer.streams.count, 1, "no cursor to resume from")
+        let scratch = try XCTUnwrap(indexer.turnText(crawled))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: scratch.path), "the converted text was not kept for the next turn")
+
+        indexer = Indexer(store: store, embedder: embedder)   // a new launch
+        let second = expectation(description: "pass 2")
+        indexer.index(roots: [root], settings: IndexSettings()) { p in if p.done { second.fulfill() } }
+        wait(for: [second], timeout: 120)
+        XCTAssertEqual(indexer.streams.count, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: scratch.path), "the scratch text outlived the document's turns")
+        let chunks = try XCTUnwrap(store.storedChunks(path: file.path)).sorted { $0.chunkIndex < $1.chunkIndex }
+        XCTAssertEqual(chunks.map(\.chunkIndex), Array(0 ..< chunks.count), "chunk numbers have a gap or a repeat")
+        XCTAssertEqual(chunks.map(\.chunkKey), expected, "the turns cut the document differently from one pass")
+        XCTAssertTrue(chunks.allSatisfy { $0.locator.isEmpty }, "a converted document's offsets map to nothing: no locator")
+        XCTAssertNotNil(store.contentKeys(paths: [file.path])[file.path], "the finished document's content key was not recorded")
+    }
 }

@@ -55,6 +55,9 @@ public final class StreamCursors: @unchecked Sendable {
     /// The paths in progress right now, for a pass to test against without taking the lock per file.
     public var paths: Set<String> { lock.withLock { Set(cursors.keys) } }
 
+    /// Every cursor, with its path.
+    public var all: [(path: String, cursor: Cursor)] { lock.withLock { cursors.map { ($0.key, $0.value) } } }
+
     public func set(_ path: String, _ c: Cursor) { lock.withLock { cursors[path] = c; save() } }
 
     public func finish(_ path: String) {
