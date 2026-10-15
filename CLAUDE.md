@@ -120,6 +120,10 @@ codebase were already measured there, and many were rejected.
   model we already run (https://hanxiao.io/tencent-elastic-search-ai-2026/#1).
 - EVERY UI CHANGE IS SHOWN TO HAN and follows macOS Tahoe, Liquid Glass and native macOS design.
   UI text and hints are plain: no mannered prose.
+- DEDUP IS PART OF THE DESIGN; NEVER DISABLE IT (Han, 2026-10-14). Content dedup and chunk reuse
+  (`contentDedup`, `globalChunkReuse`, `vectorsForContentKeys`) stay on in every shipped path, and a
+  new path goes through them rather than around them. A test may switch something off only as a
+  negative control, restored at once and named as such.
 
 ## Rules that keep biting
 

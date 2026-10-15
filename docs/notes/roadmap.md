@@ -201,3 +201,20 @@ query ("yellow flower", rank 5 vs 4) differs as much between two rebuilds of the
 queries), so that is build-to-build variation, not the rule. A query of dates or readings alone
 ("2026-03-01", "500ml") now puts the files holding them first. The sidecar's recipe is 3, so every
 index rebuilds it once from its text (the backfill: no model).
+
+### Long logs: novelty sampling built, measured, and dropped (Han, 2026-10-14)
+
+Tried as the replacement for the 2 MB cut on long logs and data files and its setting: every text
+file read to its end, each later window embedded only when 2 of 16 evenly spaced samples came no
+closer than cosine 0.90 to what the file already held (else the new samples plus the most novel one
+kept, carrying the window's identifiers). Calibrated on the first 8 MB of real files, every chunk
+embedded for the truth: a web crawl, an embedding log, a blog database and a tokenizer vocabulary
+kept 100%; a compile database 35%, with 98.5% of its chunks within 0.90 of a kept one (4 of 16: 3%,
+92.6%). Then on real agent-run files, whole, Nano: a 120 MB pi.log kept 59% of its chunks (233 s),
+a 106 MB events.jsonl 76% (273 s), a 191 MB session .jsonl 74% (561 s). At that rate the 15.5 GB of
+long-file text past 2 MB on the real index would roughly double the index for about 8 h of one-time
+GPU - what the cut exists to prevent. Han: back to the 2 MB cut and the setting. Two things found on
+the way that any later attempt needs: compare a re-streamed file against what THIS version has kept,
+not its old rows (against the old rows every unchanged window read as a repeat and was dropped:
+24 of 1,731 chunks kept), and an always-read-to-the-end log is re-hashed whole on every change.
+Not tried: novelty against the whole index rather than the file, and a per-file budget.
