@@ -80,10 +80,10 @@ is not worth it); audio is re-embedded by this release's enrichment anyway. Prob
 - A PDF short enough to be one chunk has one place, its first page: the eval's five-topic, 1,400-
   character `pdf-page` file stays at place R@1 0.00 (file R@10 1.00). Cutting page by page fixes it
   and costs 30% more chunks on real PDFs, more on slide decks (see "PDF page locators").
-- A covered vector whose blob DISAGREES with the file - what a power loss inside a reuse's stamp
-  window would leave - makes the open refuse the index ("The vector file could not be read").
-  Pre-existing, separate from the reuse debt below; the debt table would let the open tell this
-  case apart and write the blob back, not done.
+- FIXED: a covered vector whose blob disagrees with the file after a power loss is written back
+  from the blob by both loaders when the debt table records it (the sidecar adopt declined it and
+  opened on the old vector); and a quit no longer leaves the scan replica stale at reused positions
+  (index.md, "Reuse debt").
 
 ### PDF page locators (2026-10-14)
 

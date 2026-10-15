@@ -2651,6 +2651,8 @@ public final class VectorStore: @unchecked Sendable {
         // The covered positions a reuse has written and no sync has made durable yet: what
         // `unsyncedReuse` holds in memory, kept where a kill cannot take it (settleInheritedReuseLocked).
         exec("CREATE TABLE IF NOT EXISTS vec_reuse_debt(slot INTEGER PRIMARY KEY);")
+        // The positions the scan replica on disk no longer describes (quantPatchedOnDisk).
+        exec("CREATE TABLE IF NOT EXISTS quant_patched(slot INTEGER PRIMARY KEY);")
         mutationGen = Int64(scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='mutation_gen'"))
         // Legacy layout -> interned, before a single query runs against it. Verified against the
         // original inside its own transaction, so a failure leaves the old table in place and the
@@ -4094,7 +4096,7 @@ public final class VectorStore: @unchecked Sendable {
             kindCode = []; kindID = [:]; idKind = []; resetTombstonesLocked(); invalidateBase()
             resetPathAllowCachesLocked()   // idPath is gone, so the tag-free table is gone with it
             fileRowLo = []; fileRowHi = []; rowWindowCovered = 0   // same reason: release, not removeAll
-            try? FileManager.default.removeItem(at: quantReplicaURL); lastPersistedBaseRows = -1   // replica is of wiped rows
+            dropQuantReplicaLocked()   // replica is of wiped rows
             removeRowSidecarFiles()   // sidecar caches the wiped rows; releaseAll() above dropped the mapping
             resetCoverageLocked()     // no file, so nothing is covered: coverage restarts at 0
             resetAggregatesLocked()
@@ -8249,6 +8251,56 @@ public final class VectorStore: @unchecked Sendable {
         dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".quant")
     }
     private var lastPersistedBaseRows = -1          // baseRows covered by the on-disk replica (-1 = none)
+
+    /// THE REPLICA'S STALE ROWS, KEPT WHERE A QUIT CANNOT TAKE THEM. A reuse rewrites a position
+    /// the replica on disk holds codes for, and the session corrects that row per query from
+    /// `patchedSlots`, which is resident. close() would delete the replica - but the app quits with
+    /// `_exit` and never calls it, so the next launch adopted codes for the files that used to be
+    /// there (its checksum samples ~512 rows): in the test, 33 of 40 reused files could not be
+    /// found by their own vectors. Deleting the replica at the first reuse instead would cost the
+    /// next launch the base rebuild (~minutes on a base M chip at 4M rows). So each such position
+    /// is recorded in `quant_patched`, in the transaction that rewrites it, and the adoption hands
+    /// the list back to `patchedSlots`. The table describes the file on disk, so it is emptied only
+    /// when that file is replaced or deleted. Empty unless a replica exists and a write landed in it.
+    private var quantPatchedOnDisk = false
+
+    private func notePatchedOnDiskLocked(_ p: Int32) {
+        guard lastPersistedBaseRows > 0, Int(p) < lastPersistedBaseRows else { return }
+        exec("INSERT OR IGNORE INTO quant_patched(slot) VALUES(\(p));")
+        quantPatchedOnDisk = true
+    }
+
+    private func clearQuantPatchedLocked() {
+        guard quantPatchedOnDisk || scalarQuery("SELECT COUNT(*) FROM quant_patched") > 0 else { return }
+        exec("DELETE FROM quant_patched;")
+        quantPatchedOnDisk = false
+    }
+
+    /// The replica file is gone, so nothing on disk is stale.
+    private func dropQuantReplicaLocked() {
+        try? FileManager.default.removeItem(at: quantReplicaURL)
+        lastPersistedBaseRows = -1
+        clearQuantPatchedLocked()
+    }
+
+    /// About to write a fresh replica. If the one on disk has recorded stale rows it is deleted
+    /// FIRST: a write cut off by the exit then leaves no replica (rebuilt, correct), never the old
+    /// file with its record already gone.
+    private func replaceQuantReplicaLocked() {
+        if quantPatchedOnDisk { dropQuantReplicaLocked() }
+    }
+
+    /// At adoption: the rows the replica no longer describes go back to `patchedSlots`, which
+    /// scores them from the vectors on every search until the next fold.
+    private func inheritQuantPatchedLocked(rows: Int) {
+        guard scalarQuery("SELECT COUNT(*) FROM quant_patched") > 0 else { return }
+        var st: OpaquePointer?
+        if sqlite3_prepare_v2(db, "SELECT slot FROM quant_patched WHERE slot < \(rows);", -1, &st, nil) == SQLITE_OK {
+            while sqlite3_step(st) == SQLITE_ROW { patchedSlots.append(Int32(sqlite3_column_int64(st, 0))) }
+        }
+        sqlite3_finalize(st)
+        quantPatchedOnDisk = true
+    }
     private var replicaLaunchPersistScheduled = false
     /// Serializes replica FILE writes (the close-path sync write vs the post-fold async write).
     /// Never takes `queue`, so queue -> persistIO.sync cannot deadlock.
@@ -8337,9 +8389,14 @@ public final class VectorStore: @unchecked Sendable {
     /// rewrite the file mid-session: a launch adopts the persisted prefix and scores the tail as
     /// delta, then folds it incrementally.
     private func quantReplicaChangedLocked() {
-        guard Self.quantPersistEnabled, quantBase != nil || bitBase != nil, !replicaLaunchPersistScheduled else { return }
+        // A fold that took in the rows the replica no longer describes is worth a fresh file
+        // whenever it happens, not once a process: it empties `quant_patched`, which every launch
+        // otherwise hands back to `patchedSlots` to be scored exactly on every search.
+        let staleFolded = quantPatchedOnDisk && patchedSlots.isEmpty
+        guard Self.quantPersistEnabled, quantBase != nil || bitBase != nil,
+              !replicaLaunchPersistScheduled || staleFolded else { return }
         replicaLaunchPersistScheduled = true
-        guard baseRows != lastPersistedBaseRows else { return }   // adopted replica already covers this
+        guard baseRows != lastPersistedBaseRows || staleFolded else { return }   // adopted replica already covers this
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10) { [weak self] in
             guard let self else { return }
             self.queue.sync {
@@ -8363,6 +8420,7 @@ public final class VectorStore: @unchecked Sendable {
             biShape: nil, biDType: nil, biBytes: nil, biSum: nil,
             checksum: String(prefixChecksumLocked(rows: baseRows), radix: 16),
             rotate: true)   // the sign tier always rotates; see its note
+        replaceQuantReplicaLocked()
         lastPersistedBaseRows = baseRows
         let url = quantReplicaURL
         let tmp = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp")
@@ -8395,8 +8453,7 @@ public final class VectorStore: @unchecked Sendable {
         // adoption checksum samples ~512 rows out of millions, so it would usually not notice.
         // Leaving an OLDER replica behind is the same lie, so the file goes.
         if !patchedSlots.isEmpty {
-            try? FileManager.default.removeItem(at: quantReplicaURL)
-            lastPersistedBaseRows = -1
+            dropQuantReplicaLocked()
             return
         }
         // The 1-bit tier persists through the SAME file and header: its packed codes ride the `wq`
@@ -8404,12 +8461,12 @@ public final class VectorStore: @unchecked Sendable {
         // bits mismatch and rebuilds, which is the existing width-change path - so an upgrade or a
         // downgrade costs a background replica rebuild and never a reindex.
         if quantBits == 1, let bb = bitBase, baseRows > 0, dim > 0, Self.quantPersistEnabled,
-           baseRows != lastPersistedBaseRows, flat16.count >= baseRows * dim {
+           baseRows != lastPersistedBaseRows || quantPatchedOnDisk, flat16.count >= baseRows * dim {
             persistBitReplicaLocked(bb, sync: sync)
             return
         }
         guard Self.quantPersistEnabled, let qb = quantBase, baseRows > 0, dim > 0,
-              baseRows != lastPersistedBaseRows, flat16.count >= baseRows * dim else { return }
+              baseRows != lastPersistedBaseRows || quantPatchedOnDisk, flat16.count >= baseRows * dim else { return }
         guard let wqTag = Self.dtypeTag(qb.wq.dtype), let scTag = Self.dtypeTag(qb.scales.dtype) else { return }
         var biTag: String? = nil
         if let bi = qb.biases {
@@ -8426,6 +8483,7 @@ public final class VectorStore: @unchecked Sendable {
             biShape: qb.biases?.shape, biDType: biTag, biBytes: biData?.count, biSum: biData.map { Self.blobChecksum($0) },
             checksum: String(prefixChecksumLocked(rows: baseRows), radix: 16),
             rotate: false)
+        replaceQuantReplicaLocked()
         lastPersistedBaseRows = baseRows
         let url = quantReplicaURL
         let tmp = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp")
@@ -8463,8 +8521,8 @@ public final class VectorStore: @unchecked Sendable {
         // strand an in-flight .tmp mid-write. It is garbage by construction (never renamed); GBs of
         // it must not accumulate in Application Support.
         try? FileManager.default.removeItem(at: url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp"))
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        func reject() { try? FileManager.default.removeItem(at: url) }
+        guard FileManager.default.fileExists(atPath: url.path) else { clearQuantPatchedLocked(); return }
+        func reject() { try? FileManager.default.removeItem(at: url); clearQuantPatchedLocked() }
         let n = slotCount
         guard n > 0, dim > 0, dim % Self.quantGroup == 0 else { reject(); return }
         let bits = Self.quantBitsFor(baseBytes: n * dim * MemoryLayout<UInt16>.size, rowCount: n)
@@ -8530,6 +8588,7 @@ public final class VectorStore: @unchecked Sendable {
             baseRows = header.rows; baseOccCount = occCountCoveringSlotsLocked(baseRows)
             baseDirty = false
             lastPersistedBaseRows = header.rows
+            inheritQuantPatchedLocked(rows: header.rows)
             if Self.searchTiming { print("[search] ADOPT 1-bit replica rows=\(header.rows)") }
             if header.bits != bits { scheduleWidthUpgradeLocked() }
             return
@@ -8555,6 +8614,7 @@ public final class VectorStore: @unchecked Sendable {
         baseRows = header.rows; baseOccCount = occCountCoveringSlotsLocked(baseRows)
         baseDirty = false
         lastPersistedBaseRows = header.rows
+        inheritQuantPatchedLocked(rows: header.rows)
         if Self.searchTiming {
             print("[search] ADOPT quant replica rows=\(header.rows) of \(n) bits=\(header.bits)"
                   + (header.bits == bits ? "" : " (prefers \(bits) - upgrade deferred to idle)"))
@@ -8904,6 +8964,7 @@ public final class VectorStore: @unchecked Sendable {
         // different bytes now, and those bytes are not durable until the next msync - so the new
         // row keeps its pending blob, and the coverage stamp drops it once the file is synced.
         if p < baseRows { patchedSlots.append(Int32(p)) }
+        notePatchedOnDiskLocked(Int32(p))
         if p < coveredRows {
             // And durably which one is owed, in the same transaction: a kill takes the set above
             // with it, and this is how the next open finds it (settleInheritedReuseLocked).
@@ -9544,15 +9605,22 @@ public final class VectorStore: @unchecked Sendable {
     private func findInheritedReuseLocked() {
         guard flat16.isPersistent, coveredRows > 0, dim > 0,
               scalarQuery("SELECT COUNT(*) FROM vec_reuse_debt") > 0 else { return }
-        adoptReuseDebtsLocked(where: "c.slot >= 0 AND c.slot IN (SELECT slot FROM vec_reuse_debt)")
+        adoptReuseDebtsLocked(where: "c.slot >= 0 AND c.slot IN (SELECT slot FROM vec_reuse_debt)", recorded: true)
     }
 
     /// Covered positions whose row still has its blob, under `filter` on the chunk row `c`: each
     /// recorded as an unsettled reuse when the file holds the blob's bytes. If ANY blob disagrees
     /// with the file, none is recorded: that blob may be the only right copy (the file stale after
     /// a power loss), and the settle that follows drops every covered blob it finds.
+    ///
+    /// `recorded`: every position under `filter` is in `vec_reuse_debt`, so a disagreement IS
+    /// explained - a reuse whose bytes a power loss took before any sync - and the blob is written
+    /// back into the file, as loadBySlotLocked does. It used to decline here, and the settle then
+    /// emptied the debt table: the index opened on the position's OLD vector, and the blob stayed
+    /// beside it with nothing left to say why, so a later by-slot open refused the index. The
+    /// adopt's sample check only catches it when one of its ~32 rows is that position.
     @discardableResult
-    private func adoptReuseDebtsLocked(where filter: String, scanPending: Bool = false) -> Bool {
+    private func adoptReuseDebtsLocked(where filter: String, scanPending: Bool = false, recorded: Bool = false) -> Bool {
         let unit = splitBuilt ? "chunk" : "chunks"
         var stmt: OpaquePointer?
         defer { sqlite3_finalize(stmt) }
@@ -9569,7 +9637,14 @@ public final class VectorStore: @unchecked Sendable {
                 guard (pos + 1) * d <= buf.count else { return false }
                 return memcmp(buf.baseAddress! + pos * d, blob, bytes) == 0
             }
-            guard agrees else { return false }
+            if !agrees {
+                guard recorded, (pos + 1) * d <= flat16.count else { return false }
+                flat16.withUnsafeMutableBufferPointer { buf in
+                    let src = blob.assumingMemoryBound(to: UInt16.self)
+                    for j in 0 ..< d { buf[pos * d + j] = src[j] }
+                }
+                omniPerfLog("store wrote back position \(pos) from its blob (a reuse the disk lost)")
+            }
             agreed.append(Int32(pos))
         }
         for p in agreed where unsyncedReuse.insert(p).inserted { exec("INSERT OR IGNORE INTO vec_reuse_debt(slot) VALUES(\(p));") }
@@ -11435,13 +11510,15 @@ public final class VectorStore: @unchecked Sendable {
         if !slotsOutOfOrder {
             exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.slotsOutOfOrderKey)', '1');")
         }
+        // In the transaction, for the moment between the commit and the replica's delete below.
+        for pr in pairs { notePatchedOnDiskLocked(pr.dst) }
         bumpGenLocked()
         guard execChecked("COMMIT;") else { rollbackTxnLocked(); return -1 }
         laps.lap("sql")
         slotsOutOfOrder = true
         // The on-disk scan replica describes the destinations' old bytes, and its adoption check
         // samples too few rows to notice: it goes, and the next quiet moment writes a fresh one.
-        if lastPersistedBaseRows != -1 { try? FileManager.default.removeItem(at: quantReplicaURL); lastPersistedBaseRows = -1 }
+        if lastPersistedBaseRows != -1 { dropQuantReplicaLocked() }
         // MEMORY, IN PLACE. Each row of a moved content takes the new slot; the CSR files it under
         // the new slot (rowsOfSlotLocked skips it under the old one), and the orphan cache moves the
         // live count across and re-reads both slots at the next search.

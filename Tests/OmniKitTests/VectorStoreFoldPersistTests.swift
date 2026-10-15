@@ -416,6 +416,57 @@ final class VectorStoreFoldPersistTests: XCTestCase {
         }
     }
 
+    /// A KILLED SESSION THAT REUSED BASE POSITIONS. The replica on disk was written before the
+    /// reuses; close() would have deleted it (a patched base describes bytes the file no longer
+    /// holds) but a kill never gets there, and the adoption checksum samples ~512 rows, so the
+    /// next launch adopted codes for the deleted files at the reused positions. Every reused file
+    /// must still be found by its own vector.
+    func testAReplicaOlderThanAKilledSessionsReusesIsNotAdopted() throws {
+        let savedBits = VectorStore.scanBitsOverride
+        let savedFree = VectorStore.freeListEnabled
+        VectorStore.scanBitsOverride = 3
+        VectorStore.freeListEnabled = true
+        defer { VectorStore.scanBitsOverride = savedBits; VectorStore.freeListEnabled = savedFree }
+        try withCap(quantCap) {
+            let url = tempDB()
+            let dim = 64
+            var rng = Rng(s: 11)
+            var reused: [(String, [Float])] = []
+            do {
+                let store = try VectorStore(dbURL: url)
+                var batch: [(path: String, chunks: [IndexedChunk])] = []
+                for i in 0 ..< 4000 {
+                    let p = "/seed/f\(i).txt"
+                    batch.append((p, [chunk(p, 0, randUnit(dim, &rng))]))
+                }
+                try store.replaceMany(batch)
+                _ = store.search(randUnit(dim, &rng), topK: 10)
+                // The file answers for these positions, as on any settled index: the next opens
+                // keep every row where it is (without it they renumber, and the checksum sees that).
+                store.advanceCoverageForTest()
+                store.close()   // the replica, for these 4000 rows
+            }
+            XCTAssertTrue(FileManager.default.fileExists(atPath: quantURL(url).path), "no replica was written (the case never runs)")
+            do {
+                let store = try VectorStore(dbURL: url)
+                // OFF the adoption checksum's sample stride (4000 / 512 = every 7th row), as a
+                // handful of reuses in millions of rows nearly always is.
+                for i in 0 ..< 40 { store.deletePath("/seed/f\(i * 91 + 3).txt") }
+                for i in 0 ..< 40 {
+                    let p = "/reused/f\(i).txt"
+                    let v = randUnit(dim, &rng)
+                    reused.append((p, v))
+                    try store.replace(path: p, chunks: [chunk(p, 0, v)])
+                }
+                // No close(): killed.
+            }
+            let store = try VectorStore(dbURL: url); defer { store.close() }
+            var found = 0
+            for (p, v) in reused where store.search(v, topK: 3).first?.path == p { found += 1 }
+            XCTAssertEqual(found, reused.count, "reused files not found by their own vectors after the kill")
+        }
+    }
+
     func testStaleReplicaRejectedAfterStructuralChange() throws {
         try withCap(quantCap) {
             let url = tempDB()

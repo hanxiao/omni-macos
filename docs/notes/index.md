@@ -1553,3 +1553,27 @@ older build's debt settled at coverage completion; each fails with its fix remov
 index the upgrade damaged, an earlier form of this fix (the sweep) settled the 3 through the app and
 it audited clean after a SIGKILL; the damage did not recur in 13 further attempts, so the final form
 is proven by the tests, not by that index.
+
+Two more, found by checking that each kill test ran the path it names (2026-10-14):
+
+- THE SIDECAR ADOPT DECLINED A POWER-LOST REUSE. The power-loss test for the sidecar path used 60
+  rows, so the adoption's spot check (~32 evenly spaced rows) landed on the lost position, rejected
+  the sidecar, and the by-slot loader - which writes the blob back - ran instead. At 400 rows the
+  sidecar is adopted, and its own handling was wrong: a recorded debt whose blob disagreed made it
+  decline, the settle then emptied `vec_reuse_debt`, and the index opened on the position's OLD
+  vector (the test's query returned `/a/f196.txt`; audit "coverage covers 400 rows but 399 have no
+  blob"), with nothing left to explain the blob to a later by-slot open, which would refuse the
+  index. A recorded position is now written back there too. The test asserts which loader ran.
+- A QUIT LEFT THE SCAN REPLICA STALE AT EVERY REUSED POSITION. close() deletes the replica when the
+  base was patched, but the app quits with `_exit` and never calls it; the adoption checksum samples
+  ~512 rows, so the next launch adopted codes for the files that used to be at reused positions.
+  4,000 rows, a replica, 40 reuses off the checksum's stride, a kill: 7 of 40 reused files found by
+  their own vectors. Deleting the replica at the first reuse would cost every launch after an edit
+  the base rebuild, so `quant_patched` records each such position in the transaction that writes
+  it (only while a replica exists and covers it), and the adoption hands the list back to
+  `patchedSlots`, which scores those rows exactly until the next fold; a fold that took them in
+  writes a fresh replica, and the table is emptied only when the file is replaced or deleted (the
+  old file goes first when it has records, so an exit mid-write leaves none, never a stale one):
+  40 of 40. mutbench `--crud update`, HEAD vs this, interleaved: open 6.3/6.5 and 4.9/4.9 s, op
+  12.13/12.45 and 8.37/8.49 s, browse 0.4-0.5 ms, audit clean; sampled mid-op the table held 2,254
+  positions (the positive control), and the clean close emptied it.

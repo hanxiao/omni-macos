@@ -410,7 +410,13 @@ final class FreeListTests: XCTestCase {
         XCTAssertThrowsError(try powerLoss(stampSidecar: false, forgetDebt: true))
     }
 
+    /// The sidecar case uses 400 files so the lost position (3) is off the adoption's spot check
+    /// (~32 evenly spaced rows), as it nearly always is on a real index: with 60 the check landed on
+    /// it, rejected the sidecar, and the by-slot loader ran instead - the adopt path's own handling
+    /// was never exercised, and it was wrong (it declined, emptied the debt table, and opened on the
+    /// lost bytes).
     private func powerLoss(stampSidecar: Bool, forgetDebt: Bool = false) throws {
+        let files = stampSidecar ? 400 : 60
         VectorStore.quantBaseOverride = VectorStore.scanBits
         let url = tempDB()
         let vecs = URL(fileURLWithPath: url.path + ".vecs")
@@ -419,7 +425,7 @@ final class FreeListTests: XCTestCase {
         var before = Data()
         do {
             let store = try VectorStore(dbURL: url)
-            for i in 0 ..< 60 { try store.replace(path: "/a/f\(i).txt", chunks: [chunk("/a/f\(i).txt", i)]) }
+            for i in 0 ..< files { try store.replace(path: "/a/f\(i).txt", chunks: [chunk("/a/f\(i).txt", i)]) }
             _ = store.search(vec(1), topK: 3)
             store.advanceCoverageForTest()
             store.deletePath("/a/f3.txt")
@@ -448,6 +454,7 @@ final class FreeListTests: XCTestCase {
         try h.close()
 
         let store = try VectorStore(dbURL: url); defer { store.close() }
+        XCTAssertEqual(store.adoptedRowSidecar, stampSidecar, "the open took the other loader: the case under test never ran")
         XCTAssertEqual(store.search(vec(903), topK: 3).first?.path, "/reused.txt", "the reused file reads the lost bytes")
         XCTAssertNil(store.coverageAudit())
         XCTAssertEqual(pendingCount(url), 0, "the blob was not written back and settled")
