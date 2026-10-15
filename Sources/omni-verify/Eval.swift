@@ -562,7 +562,9 @@ enum EvalCommand {
         }
         let store = try VectorStore(dbURL: indexDir.appendingPathComponent("index.sqlite"))
         defer { store.close() }
-        if !FileManager.default.fileExists(atPath: doneMark.path) {
+        // A cached index whose identifier sidecar was dropped (a new token recipe) is brought back
+        // the way the app brings it back: a pass, whose end reads the identifiers again.
+        if !FileManager.default.fileExists(atPath: doneMark.path) || !store.idIndex.backfilled {
             let indexer = Indexer(store: store, embedder: engine)
             let t0 = Date()
             let last: IndexProgress = await withCheckedContinuation { cont in

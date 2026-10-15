@@ -239,3 +239,13 @@ image's top category scores highest, fused alone), on COCO-150's 80 categories t
 Nano: P@1 0.773-0.800, mAP 0.644-0.659 at weights 0.5-1.3, against the shipped max over all 5
 crops at 0.833-0.840 and 0.690-0.692 (base 0.773, 0.644). Focusing on one region drops what the
 other crops find; the shipped fusion stays.
+
+### Eval baselines, end of 2026-10-14 (125 queries)
+
+ALL MRR Nano 0.852, Small 0.904 (this morning 0.843 / 0.888): kind from the query vector, the
+soundtrack, identifiers without shape exceptions, PDF page pick. Weakest tags now, Nano / Small MRR:
+soundtrack 0.430 / 0.778, pdf-page 0.442 / 0.525 (the one-chunk note's FILE ranks 2-10: its vector
+blends five topics - cutting such PDFs per page is the disk trade already declined), audio 0.624 /
+0.740, image-ml 0.631 / 0.691. The eval now runs a pass over a cached index whose identifier
+sidecar was dropped (a new recipe), as the app does at launch: the shipped backfill brought Small's
+`exact` back from 0.36 to 1.00 on an index built under recipe 2.
