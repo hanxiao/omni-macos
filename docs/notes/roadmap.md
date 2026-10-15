@@ -272,4 +272,4 @@ means words from the speech: on-device transcription (Speech framework), indexed
 audio at its moments, as screenshot text is. Checked on this Mac (read-only, nothing downloaded): of
 12 eval languages only en-US and zh-CN recognise on-device; the other ten need an asset download or
 Apple's servers (audio leaves the Mac), and Speech Recognition is its own privacy permission (not yet
-determined here) - a new prompt for every user. Not built: Han's call.
+determined here) - a new prompt for every user. Han, 2026-10-15: leave audio as it is.
