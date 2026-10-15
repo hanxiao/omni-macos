@@ -273,3 +273,15 @@ audio at its moments, as screenshot text is. Checked on this Mac (read-only, not
 12 eval languages only en-US and zh-CN recognise on-device; the other ten need an asset download or
 Apple's servers (audio leaves the Mac), and Speech Recognition is its own privacy permission (not yet
 determined here) - a new prompt for every user. Han, 2026-10-15: leave audio as it is.
+
+### The session against its start, on the benchmark (2026-10-15)
+
+`omni-verify bench <nano> --scale 0.05`, 5feff5c (this session's start) against HEAD, alternated, two
+full runs each: 14/14 cases ok in all four; wall 139.9 / 139.7 s against 138.7 / 172.2 s, the 172 s
+run one the benchmark's own clock probe marked throttled in two cases (88% and 324% slower than its
+own fastest). Of 1,003 metrics, the differences that held across both runs were search speed-ups
+(search while space is reclaimed -52%, filtered query p50 -21%, the text index's fresh chunks per
+second +3-9%) and two that looked like slow-downs: recall's 3-bit x4 arm and search under folder
+writes. Neither held. The folder writes: 1.34 ms against 2.90 ms in the unthrottled runs. Recall
+alone (`--only recall`), five alternated pairs: noisy for both builds in the first two, then equal on
+every arm (b1m1 4.21-4.36 against 4.22-4.28 ms, b3m4 6.01-6.17 against 6.04-6.10 ms).
