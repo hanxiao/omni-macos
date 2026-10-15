@@ -1291,3 +1291,19 @@ Relevance, Match, Excerpt, Tags and Folder, with Name at least 180 pt. A header 
 results (name, kind, folder, date modified, relevance) and a second click reverses it; the toolbar's
 Sort menu sets the same order. The passages disclosure is the row's leading triangle, where Finder
 draws one; an opened stack's copies are indented one icon width. The grid is unchanged.
+
+The header cost +25 ms of main thread a search, and is now free. Measured in isolated instances on
+one settled index, 15 x two searches in list view each, main-thread CPU per search (perf script),
+arms interleaved: the build before columns 61-63 / 69-73 ms ("dog on the beach" / "invoice total"
+p50), columns 84-89 / 97-99, grid equal in both (80 / 82-91). Switching parts off one at a time
+put all of it on the header in its bar: without the Excerpt column, the folder tooltip, the rows'
+width report, the header's own width measurement or its context menu, nothing changed; an
+`.equatable()` header changed nothing; an empty bar, a bar holding one Text, or the header as a
+plain sibling (no edge effect) each removed it. The safe-area bar sizes its content again whenever
+the scroll view under it is replaced, which is every search (a new result set is a new scroll
+view), and sizing the header's flexible columns there is the cost; the profile showed it as
+window layout, with the toolbar laid out again (`NSToolbarView layout` 142 -> 309 ms over 30
+searches). The bar now holds a clear spacer of the header's measured height with the header as an
+overlay on it (`ColumnHeaderBar`): 58-65 / 67-74 ms over three reps, the pre-columns figure.
+Screenshots of the search list and the folder browser are identical pixel for pixel before and
+after, apart from the text cursor.

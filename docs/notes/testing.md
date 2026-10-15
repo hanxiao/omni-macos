@@ -467,6 +467,33 @@ day later the same tour measured ZERO blocks over 250 ms (see "UI tests").
   them `NSToolbarView layout` (the toolbar's items change with the result state), and CoreText.
   Taken down 19% on 2026-10-02: see "A RESULT SET COSTS 19% LESS" under the speed review.
 
+## Chaos A/B for the search columns (2026-10-14)
+
+The same seed (4242) against the build before the columns and the build with them, the renamed
+copy each time, 600 s, twice and in both orders: 207/209 and 219/222 actions, 0 failures, 0
+crashes in all four; stalls over 250 ms 22/22 (median 377/415 ms) and 11/13 (502/504 ms), every one
+CPU-bound in both arms; footprint p50 4.8/4.5 GB and 5.0/4.7 GB with the same 20-21 GB transient
+peaks. Footprint a chaos run reads is the workload's, not the build's: on one settled index with a
+fixed script the columns build sat at 2.45 GB idle against 3.04 GB (three reps each, peak 2.8 vs
+3.4 GB). The +25 ms a search the columns did cost was found by the perf script, not by chaos
+(ui.md, "Search results in columns").
+
+What had to change in the suite to get there:
+- TEST DATA ON THE INTERNAL DISK. A renamed, ad-hoc-signed copy reading `-omni.dbDir` on
+  /Volumes/han2tb raised the removable-volume privacy prompt, and the app's main thread sat in
+  `open()` under `AppModel.loadIgnore()` for the whole run (stuck-0.txt), so one arm ran 8 actions.
+  Corpus, base index and reserve now live in the session scratch directory.
+- MENUS READ FROM ONE SNAPSHOT. A menu that closed between two live queries failed the whole run
+  ("Failed to get matching snapshot ... Descendants matching type Menu"), which
+  `continueAfterFailure` does not survive. `menuItemTitles` takes `snapshot()` once (main actor)
+  and a menu that throws is a closed one.
+- THE HEADER'S TITLES ARE VALUES. A header title is a `Text`; accessibility carries its words as
+  the value, not the label, so the header step matched nothing for two runs.
+- LIST STEPS GET TO THE LIST. `resultHeader` and `passages` are top-level surfaces (weights 3 and
+  2) and `inResultList` takes them there the way a user would (out of the OCR workspace, as List,
+  a search, "Show N weaker matches" when the matches sit under the floor); without it they ran 2
+  times in 17 and tested the grid.
+
 ## The benchmark (2026-10-08, Settings > Performance > Benchmark this Mac)
 - ONE benchmark. It replaced two: the public "Run benchmark" (a downloaded 300-file dataset, one
   indexing pass, files/s and tokens/s) and the hidden "Paper" suite (Option-click, about 1.9 h of

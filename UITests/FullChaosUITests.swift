@@ -162,6 +162,65 @@ final class FullChaosUITests: XCTestCase {
         settle(0.4)
     }
 
+    private func headerCells() -> [XCUIElement] {
+        let titles = "{'Name', 'Relevance', 'Match', 'Excerpt', 'Tags', 'Folder', 'Kind', 'Date Modified'}"
+        // A header title is a Text: accessibility carries its words as the VALUE, not the label.
+        return window.staticTexts.matching(NSPredicate(format: "value IN \(titles) OR label IN \(titles)"))
+            .allElementsBoundByIndex.filter { $0.exists && $0.isHittable }
+    }
+
+    /// What `find` returns in the search results' list, getting there the way a user would when it
+    /// is not on screen: as List, then a search. Without this the steps that need the list mostly
+    /// ran where it was not (the grid, a browse, an empty box) and tested nothing.
+    private func inResultList(_ find: () -> [XCUIElement]) -> [XCUIElement]? {
+        let first = find()
+        if !first.isEmpty { return first }
+        // Out of the OCR workspace first: the toolbar keeps a search field there, so a query typed
+        // in it searches but shows nothing.
+        let toggle = window.descendants(matching: .any)["ocr.toggle"]
+        let inOCR = toggle.exists && (toggle.isSelected || window.staticTexts["Choose a document  ⌘O"].exists)
+        if inOCR, toggle.isHittable { toggle.click(); settle(1.5) }
+        guard window.searchFields.firstMatch.exists else { return nil }
+        app.typeKey("2", modifierFlags: .command)
+        focusSearch()
+        app.typeKey("a", modifierFlags: .command)
+        app.typeText(pick(queries) + "\r")
+        settle(2)
+        // Results below the score floor sit behind "Show N weaker matches".
+        let weaker = window.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Show ' AND label ENDSWITH ' weaker matches'")).firstMatch
+        if find().isEmpty, weaker.exists, weaker.isHittable { weaker.click(); settle(1) }
+        let again = find()
+        return again.isEmpty ? nil : again
+    }
+
+    /// The search list's column header: a title, which sorts the results, or the header's menu,
+    /// which turns a column on or off (the list view only; nothing to find in the grid).
+    private func resultHeader() {
+        guard let hittable = inResultList({ self.headerCells() }) else { note("no result header"); return }
+        let cell = pick(hittable)
+        if rng.int(3) == 0 {
+            note("result header menu \((cell.value as? String) ?? cell.label)")
+            cell.rightClick(); settle(0.5)
+            chooseFromOpenMenu()
+        } else {
+            note("result header sort \((cell.value as? String) ?? cell.label)")
+            cell.click()
+        }
+        settle(0.5)
+    }
+
+    /// A row's passages disclosure (multi-chunk files only).
+    private func passages() {
+        let disclosures = {
+            self.window.buttons.matching(NSPredicate(format: "label IN {'Show matching passages', 'Hide matching passages'}"))
+                .allElementsBoundByIndex.filter { $0.exists && $0.isHittable }
+        }
+        guard let tri = inResultList(disclosures) else { note("no passages disclosure"); return }
+        note("passages disclosure")
+        pick(tri).click()
+        settle(0.6)
+    }
+
     private func resultActions() {
         note("result actions")
         switch rng.int(8) {
@@ -192,20 +251,36 @@ final class FullChaosUITests: XCTestCase {
     private func openMenu() -> XCUIElement? {
         // Bound to the element, not the index: a menu that closes mid-scan moves every index after
         // it, and a query re-resolved by index then fails the run instead of reading as closed.
-        for m in app.menus.allElementsBoundByAccessibilityElement.reversed() where m.exists {
-            let first = m.children(matching: .menuItem).firstMatch
-            if first.exists, !first.frame.isEmpty { return m }
+        // THROUGH SNAPSHOTS: a live query on a menu that closed between two calls fails the whole
+        // run ("Failed to get matching snapshot", which continueAfterFailure does not survive);
+        // `snapshot()` throws instead, and a thrown menu is a closed one.
+        for m in app.menus.allElementsBoundByAccessibilityElement.reversed() where menuItemTitles(m) != nil {
+            return m
         }
         return nil
     }
 
+    /// The titles an open menu offers that `allowed` would pass, read from ONE snapshot; nil when
+    /// the menu is closed or went away. (A test runs on the main thread; `snapshot()` is isolated
+    /// to it, and its result is not Sendable, so it is read where it is taken.)
+    private func menuItemTitles(_ menu: XCUIElement) -> [String]? {
+        let denied = Self.denied
+        return MainActor.assumeIsolated { () -> [String]? in
+            guard let snap = try? menu.snapshot() else { return nil }
+            let items = snap.children.filter { $0.elementType == .menuItem }
+            guard let first = items.first, !first.frame.isEmpty else { return nil }
+            return items.filter { e in
+                guard e.isEnabled, !e.title.isEmpty, !e.frame.isEmpty else { return false }
+                let words = [e.identifier, e.title, e.label].map { $0.lowercased() }
+                return !e.identifier.hasPrefix("_XCUI") && e.title != "Open"
+                    && !words.contains { w in denied.contains { w.contains($0) } }
+            }.map { $0.title }
+        }
+    }
+
     private func chooseFromOpenMenu(_ menu: XCUIElement? = nil) {
-        guard let open = menu ?? openMenu(), open.exists else { app.typeKey(.escape, modifierFlags: []); return }
-        let items = open.children(matching: .menuItem).allElementsBoundByIndex
-            .filter { $0.exists && $0.isEnabled && !$0.title.isEmpty }
-        let safe = items.filter(allowed)
-        if let m = safe.isEmpty ? nil : pick(safe), rng.int(3) != 0, !m.frame.isEmpty {
-            let title = m.title
+        guard let open = menu ?? openMenu(), let titles = menuItemTitles(open) else { app.typeKey(.escape, modifierFlags: []); return }
+        if let title = titles.isEmpty ? nil : pick(titles), rng.int(3) != 0 {
             // Looked up again by title at the click: a menu that re-lays out while open replaces
             // its items, and clicking the stale one fails the whole run.
             let target = open.menuItems.matching(NSPredicate(format: "title == %@", title)).firstMatch
@@ -661,7 +736,7 @@ final class FullChaosUITests: XCTestCase {
             (4, "resultActions", resultActions), (2, "viewMode", viewMode), (3, "scroll", scroll),
             (3, "sidebar", sidebar), (3, "browse", browse), (3, "toolbar", toolbar),
             (2, "menuBar", menuBar), (2, "ocr", ocr), (1, "settings", settings),
-            (4, "clipboard", clipboard),
+            (4, "clipboard", clipboard), (3, "resultHeader", resultHeader), (2, "passages", passages),
         ]
         let total = actions.reduce(0) { $0 + $1.0 }
         while Date() < deadline {

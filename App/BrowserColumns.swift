@@ -325,7 +325,7 @@ extension View {
     /// the plain stack: it has no edge effect to earn.
     @ViewBuilder func columnHeader<H: View>(@ViewBuilder _ header: () -> H) -> some View {
         if #available(macOS 26.0, *) {
-            safeAreaBar(edge: .top, spacing: 0) { VStack(spacing: 0) { header(); Divider() } }
+            modifier(ColumnHeaderBar(header: header()))
         } else {
             VStack(spacing: 0) { header(); Divider(); self }
         }
@@ -335,6 +335,33 @@ extension View {
     func reportsCellsMaxX(_ x: Binding<CGFloat>) -> some View {
         onGeometryChange(for: CGFloat.self, of: { $0.frame(in: .global).maxX }) { v in
             if abs(v - x.wrappedValue) > 0.5 { x.wrappedValue = v }
+        }
+    }
+}
+
+/// The column header in its safe-area bar, DRAWN OVER A FIXED-HEIGHT SPACER rather than given to
+/// the bar as its content. The bar sizes what it is given, and it does so again every time the
+/// scroll view under it is replaced - each search, since a new result set is a new scroll view.
+/// Sizing the header's flexible columns there cost +25 ms of main thread a search (list view,
+/// p50 63 -> 89 ms; grid 80 = 80); a spacer is free to size, and the header, an overlay, is laid
+/// out once at the width it is given: 63 ms, the list before the header existed. The height is the
+/// header's own, measured, so nothing is assumed about its font.
+@available(macOS 26.0, *)
+private struct ColumnHeaderBar<H: View>: ViewModifier {
+    let header: H
+    @State private var height: CGFloat = 23
+    func body(content: Content) -> some View {
+        content.safeAreaBar(edge: .top, spacing: 0) {
+            VStack(spacing: 0) {
+                Color.clear.frame(height: height)
+                    .overlay(alignment: .top) {
+                        header.fixedSize(horizontal: false, vertical: true)
+                            .onGeometryChange(for: CGFloat.self, of: { $0.size.height }) { h in
+                                if abs(h - height) > 0.25 { height = h }
+                            }
+                    }
+                Divider()
+            }
         }
     }
 }

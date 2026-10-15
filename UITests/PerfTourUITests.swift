@@ -95,9 +95,12 @@ final class PerfTourUITests: XCTestCase {
         let queries = env["OMNI_PERF_QUERIES"].map { $0.split(separator: "|").map(String.init) }
             ?? ["dog on the beach", "invoice total amount", "neural network training loss",
                 "sunset over mountains", "readme installation"]
-        let folders = env["OMNI_PERF_BROWSE"].map { $0.split(separator: ":").map(String.init) }
-            ?? corpus.map { [$0 + "/Downloads", $0 + "/Documents", $0 + "/Documents/dashboard/node_modules"] }
-            ?? []
+        // Split in three: as one `??` chain the type checker gave up on it (Xcode 26.6).
+        let corpusFolders: [String] = corpus.map { c -> [String] in
+            [c + "/Downloads", c + "/Documents", c + "/Documents/dashboard/node_modules"]
+        } ?? []
+        let browse: [String]? = env["OMNI_PERF_BROWSE"].map { $0.split(separator: ":").map(String.init) }
+        let folders: [String] = browse ?? corpusFolders
         app.launchArguments = roots + extra + [
             "-omni.dbDir", db,
             "-omni.ephemeralUIState", "YES",
