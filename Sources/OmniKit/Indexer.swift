@@ -2518,6 +2518,19 @@ public final class Indexer: @unchecked Sendable {
                   case .pagedText(let text, let starts) = ContentSources.source(for: file).content(file, kind: .text, settings: settings),
                   let stored = store.storedChunks(path: c.path)?.sorted(by: { $0.chunkIndex < $1.chunkIndex }) else { return true }
             let pieces = chunk(text, settings: settings, origin: .paged(starts))
+            // A SHORT PDF STORED AS ONE CHUNK, which today's cut makes one per page (chunk()): its
+            // pages are embedded and replace that chunk - only when the stored one is exactly the old
+            // cut of this same text. A few chunks a file, and 49 such files in 1,613 real PDFs.
+            if stored.count == 1, pieces.count > 1, stored[0].chunkKey == chunkKey(text, settings: settings) {
+                let keyed = pieces.map { (text: $0.text, key: chunkKey($0.text, settings: settings)) }
+                let vecs = embedGroupsReusing([keyed], width: textBatchSize).flatMap { $0 }
+                guard !isCancelled, vecs.count == pieces.count, vecs.allSatisfy({ !$0.isEmpty && Self.isFinite($0) }) else { return false }
+                recordIdentifiers(pieces, digest: digest)
+                return write(pieces.enumerated().map { j, piece in
+                    IndexedChunk(path: c.path, modified: c.modified, size: c.size, kind: FileKind.text.rawValue, chunkIndex: j,
+                                 snippet: snippet(piece.text), embedding: vecs[j], locator: piece.locator, chunkKey: keyed[j].key)
+                })
+            }
             guard pieces.count == stored.count,
                   zip(pieces, stored).allSatisfy({ chunkKey($0.text, settings: settings) == $1.chunkKey }) else { return true }
             guard zip(pieces, stored).contains(where: { $0.locator != $1.locator }) else { return true }
@@ -2681,7 +2694,7 @@ public final class Indexer: @unchecked Sendable {
             bytes += s.utf8.count
             page += 1
         }
-        let pieces = text.isEmpty ? [] : chunk(text, settings: settings, origin: .paged(starts)).map { p -> TextPiece in
+        let pieces = text.isEmpty ? [] : chunk(text, settings: settings, origin: .paged(starts), wholeDocument: false).map { p -> TextPiece in
             guard start > 0, p.locator.hasPrefix("Page "), let n = Int(p.locator.dropFirst(5)) else { return p }
             return TextPiece(text: p.text, locator: "Page \(n + start)")
         }
@@ -3879,7 +3892,10 @@ public final class Indexer: @unchecked Sendable {
         return isCancelled ? [] : out
     }
 
-    func chunk(_ text: String, settings: IndexSettings, origin: TextOrigin, filterOpaque: Bool = true) -> [TextPiece] {   // internal for tests
+    /// `wholeDocument`: false for one turn of a long PDF, which is never cut by page (that is for a
+    /// whole short document only; turns cut as one pass would).
+    func chunk(_ text: String, settings: IndexSettings, origin: TextOrigin, filterOpaque: Bool = true,
+               wholeDocument: Bool = true) -> [TextPiece] {   // internal for tests
         let limit = max(200, settings.maxCharsPerChunk)   // user-set; floor keeps chunks meaningful
         let totalCount = text.count
         // A single chunk still HAS a position - the top of the file - and an empty string made
@@ -3889,6 +3905,20 @@ public final class Indexer: @unchecked Sendable {
         // same thing on every text hit. `.opaque` still returns nothing, because for a converted
         // office document an offset genuinely maps to nothing the reader can see.
         if totalCount <= limit {
+            // A SHORT PDF OF SEVERAL PAGES IS CUT BY PAGE. One vector for a whole five-topic note
+            // blends its topics, so the note ranked 2-10 for a question about one of its pages and
+            // opened at the page holding most of it. Only for text that fits one chunk: a longer
+            // PDF is cut as before (cutting every PDF by page was 30% more chunks; this is ~0.5%:
+            // 50 chunks over 1,613 real PDFs, 49 of them short and multi-page).
+            if wholeDocument, case .paged(let starts) = origin, starts.count > 1 {
+                var pages: [TextPiece] = []
+                let idx = starts.map { text.index(text.startIndex, offsetBy: Swift.min($0, totalCount)) } + [text.endIndex]
+                for n in 0 ..< starts.count where idx[n] < idx[n + 1] {
+                    let page = String(text[idx[n] ..< idx[n + 1]])
+                    if !page.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { pages.append(TextPiece(text: page, locator: "Page \(n + 1)")) }
+                }
+                if pages.count > 1 { return pages }
+            }
             let first: String
             switch origin {
             case .plain: first = "Line 1"

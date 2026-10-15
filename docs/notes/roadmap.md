@@ -249,3 +249,15 @@ blends five topics - cutting such PDFs per page is the disk trade already declin
 0.740, image-ml 0.631 / 0.691. The eval now runs a pass over a cached index whose identifier
 sidecar was dropped (a new recipe), as the app does at launch: the shipped backfill brought Small's
 `exact` back from 0.36 to 1.00 on an index built under recipe 2.
+
+### Short PDFs cut by page (2026-10-15)
+
+The one-chunk note's FILE ranked 2-10 for a question about one of its pages: one vector blended
+five topics. Cutting every PDF by page was declined at 30% more chunks; cutting only a PDF whose
+whole text fits one chunk and spans 2+ non-empty pages (Indexer.chunk, `wholeDocument`) is 50 chunks
+over 1,613 real PDFs in Documents, Downloads and Desktop (49 such files, ~0.5% of the PDF chunks).
+Eval on fresh indexes: `pdf-page` MRR Nano 0.442 -> 1.000, Small 0.525 -> 1.000; ALL Nano 0.852 ->
+0.870, Small 0.904 -> 0.920; otherwise only +-1-rank build variation. A long PDF's turns are never
+cut by page. An index that holds such a PDF as one chunk gets its pages from the enrichment (not yet
+released, so it is the same one pass every user takes; its recipe gains `p1`), only when the stored
+chunk is exactly the old cut of the same text. PDFPagePick still serves long PDFs' multi-page chunks.

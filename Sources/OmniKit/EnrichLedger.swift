@@ -18,7 +18,8 @@ public final class EnrichLedger: @unchecked Sendable {
     /// the files are done again: with a feature turned off, "done" means done without it, and a
     /// ledger kept across turning it on would never add it.
     public static func recipe(_ settings: IndexSettings) -> String {
-        "t\(settings.screenText ? 1 : 0)|s\(settings.soundtrack ? 1 : 0)|w\(OmniAudioPreprocess.segmentMelFrames)"
+        // p1: a short multi-page PDF is cut by page (Indexer.chunk), and a one-chunk one is redone.
+        "t\(settings.screenText ? 1 : 0)|s\(settings.soundtrack ? 1 : 0)|w\(OmniAudioPreprocess.segmentMelFrames)|p1"
     }
 
     private var recipe = ""

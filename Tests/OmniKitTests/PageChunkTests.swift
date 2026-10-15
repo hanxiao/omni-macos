@@ -81,6 +81,50 @@ final class PageChunkTests: XCTestCase {
         XCTAssertEqual(indexer.textsEmbedded.value, embeddedBefore, "relocation embedded text")
     }
 
+    /// A SHORT PDF OF SEVERAL PAGES IS CUT BY PAGE - each page its chunk, at its page - and an index
+    /// that holds one as a single chunk (the cut before) gets its pages from the enrichment.
+    func testAShortPDFIsCutByPageAndAnOlderOneIsRedone() throws {
+        var r = FileManager.default.temporaryDirectory.appendingPathComponent("short-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: r, withIntermediateDirectories: true)
+        if let rp = realpath(r.path, nil) { r = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+        let root = r
+        let db = root.deletingLastPathComponent().appendingPathComponent("short-db-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: db, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root); try? FileManager.default.removeItem(at: db) }
+        let topics = ["revenue grew in the third quarter", "we climbed mount fuji at dawn", "plant tomato seedlings after frost",
+                      "open guitar chords for beginners", "the boat engine needs new oil"]
+        let file = root.appendingPathComponent("notes.pdf")
+        pdf(topics.map { t in (0 ..< 5).map { _ in t }.joined(separator: " ") }, at: file)
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let indexer = Indexer(store: store, embedder: EnrichmentTests.Fake())
+        let done = expectation(description: "pass")
+        indexer.index(roots: [root], settings: IndexSettings()) { p in if p.done { done.fulfill() } }
+        wait(for: [done], timeout: 120)
+        let pages = try XCTUnwrap(store.storedChunks(path: file.path)).sorted { $0.chunkIndex < $1.chunkIndex }
+        XCTAssertEqual(pages.map(\.locator), (1 ... 5).map { "Page \($0)" }, "a short multi-page PDF was not cut by page")
+
+        // The cut before: the whole text one chunk, at the page holding most of it.
+        let whole = pages.map(\.snippet).joined()   // snippets are the page texts here (short pages)
+        XCTAssertFalse(whole.isEmpty)
+        var old = pages[0]
+        old.locator = "Page 1"
+        guard case .pagedText(let text, _) = ContentSources.source(for: CrawledFile(path: file.path, modified: old.modified, size: old.size))
+            .content(CrawledFile(path: file.path, modified: old.modified, size: old.size), kind: .text, settings: IndexSettings()) else {
+            return XCTFail("no paged text")
+        }
+        old.chunkKey = indexer.chunkKey(text, settings: IndexSettings())
+        old.snippet = String(text.prefix(220))
+        try store.replaceMany([(file.path, [old])])
+        XCTAssertEqual(store.chunkCount(path: file.path), 1)
+        let f = try XCTUnwrap(store.storedFiles(paths: [file.path])[file.path])
+        let d = try XCTUnwrap(store.contentDigests(paths: [file.path])[file.path])
+        XCTAssertTrue(indexer.enrichOne((file.path, f.kind, f.modified, f.size, 0), digest: d, settings: IndexSettings()))
+        let redone = try XCTUnwrap(store.storedChunks(path: file.path)).sorted { $0.chunkIndex < $1.chunkIndex }
+        XCTAssertEqual(redone.map(\.locator), pages.map(\.locator), "the enrichment left the old one-chunk cut")
+        XCTAssertEqual(redone.map(\.chunkKey), pages.map(\.chunkKey))
+    }
+
     /// A text PDF with more than a first window of text TAKES TURNS by pages: searchable after its
     /// first pages, whole after its last, every page still found at its own page number.
     func testALongPDFTakesTurnsAndKeepsItsPages() throws {
