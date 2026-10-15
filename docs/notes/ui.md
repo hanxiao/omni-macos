@@ -1281,7 +1281,9 @@ metadata line of kind, size, position, folder and date). It now draws as the fol
 one line, the shared `BrowserHeader` as a safe-area bar, `ColumnSlot` geometry and `BrowserMetrics`,
 so a search and a folder are one kind of list. What is about the search comes first, right after
 Name (Han: not pushed to the end): Relevance; Match, why it matched and where (Han's P2 item 16 -
-"Frame at 4:00", "Speech at 4:00", "Words in the image", "Page 100", "Line 1", "Scanned page 3",
+"Frame at 4:00", "Video" for a video up to 4 minutes, which is embedded whole and so has no moment
+(it said "Frame", which read as one particular frame; Han, 2026-10-15), "Speech at 4:00", "Words in
+the image", "Page 100", "Line 1", "Scanned page 3",
 "File name", "Contains INV-2041"; `SearchHit.matchReason`, with `SearchHit.via` from the store for
 the name and identifier cases); Excerpt, the passage or a screenshot's read words; Tags, a picture's
 or a frame's (Han: tags are not "Match"). Then the file's facts: Folder, Kind, Dimensions,

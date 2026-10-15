@@ -1333,7 +1333,9 @@ extension SearchHit {
         }
         let at = locator.isEmpty ? "" : " at \(locator)"
         switch kind {
-        case FileKind.video.rawValue: return "Frame" + at
+        // A video of one segment (up to 4 minutes) is embedded whole, so its match has no moment:
+        // "Video", not "Frame", which read as one particular frame. Longer ones match a segment.
+        case FileKind.video.rawValue: return locator.isEmpty ? "Video" : "Frame" + at
         case FileKind.audio.rawValue: return (fileKind == FileKind.video.rawValue ? "Speech" : "Audio") + at
         case FileKind.image.rawValue: return locator.isEmpty ? "Picture" : locator
         case FileKind.scan.rawValue: return locator.isEmpty ? "Scanned page" : "Scanned " + locator.lowercased()
