@@ -103,12 +103,11 @@ final class PageChunkTests: XCTestCase {
         let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
         defer { store.close() }
         let embedder = EnrichmentTests.Fake()
-        var indexer = Indexer(store: store, embedder: embedder)
+        let pausing = PausingEmbedder(inner: embedder, store: store, path: file.path)   // in the second turn
+        var indexer = Indexer(store: store, embedder: pausing)
+        pausing.indexer = indexer
         let first = expectation(description: "pass 1")
-        indexer.index(roots: [root], settings: IndexSettings()) { p in
-            if p.embedded >= 1 { indexer.cancel(.pause) }
-            if p.done { first.fulfill() }
-        }
+        indexer.index(roots: [root], settings: IndexSettings()) { p in if p.done { first.fulfill() } }
         wait(for: [first], timeout: 120)
         let partial = try XCTUnwrap(store.storedChunks(path: file.path))
         XCTAssertFalse(partial.isEmpty, "the first turn was not stored")
@@ -161,20 +160,20 @@ final class PageChunkTests: XCTestCase {
         let file = root.appendingPathComponent("report.rtf")
         try ("{\\rtf1\\ansi " + paras.map { $0 + "\\par\n" }.joined() + "}").write(to: file, atomically: true, encoding: .utf8)
         guard case .text(let whole) = try FileExtractor.extract(file) else { return XCTFail("the RTF did not convert") }
-        let attrs = try FileManager.default.attributesOfItem(atPath: file.path)
-        let crawled = CrawledFile(url: file, modified: try XCTUnwrap(attrs[.modificationDate] as? Date).timeIntervalSince1970,
-                                  size: try XCTUnwrap(attrs[.size] as? Int))
         XCTAssertGreaterThan(whole.utf8.count, 3 * Indexer.firstWindowBytes, "the document is too short to take turns")
 
         let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
         defer { store.close() }
         let embedder = EnrichmentTests.Fake()
-        var indexer = Indexer(store: store, embedder: embedder)
+        // PAUSED IN THE SECOND TURN, not from the progress callback: that arrives when it arrives,
+        // and a short document could finish every turn first (2 runs in 6 failed that way).
+        let pausing = PausingEmbedder(inner: embedder, store: store, path: file.path)
+        var indexer = Indexer(store: store, embedder: pausing)
+        pausing.indexer = indexer
         let expected = indexer.chunk(whole, settings: IndexSettings(), origin: .opaque)
             .map { indexer.chunkKey($0.text, settings: IndexSettings()) }
         let first = expectation(description: "pass 1")
         indexer.index(roots: [root], settings: IndexSettings()) { p in
-            if p.embedded >= 1 { indexer.cancel(.pause) }
             if p.done { first.fulfill() }
         }
         wait(for: [first], timeout: 120)
@@ -182,19 +181,44 @@ final class PageChunkTests: XCTestCase {
         XCTAssertFalse(partial.isEmpty, "the first turn was not stored")
         XCTAssertLessThan(partial.count, expected.count, "the document was indexed in one turn")
         XCTAssertEqual(indexer.streams.count, 1, "no cursor to resume from")
-        let scratch = try XCTUnwrap(indexer.turnText(crawled))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: scratch.path), "the converted text was not kept for the next turn")
+        // Found by listing, not by rebuilding its name: the indexer names it from the crawler's
+        // modification date, whose fractional digits this test's own stat need not reproduce.
+        func scratchFiles() -> [String] { (try? FileManager.default.contentsOfDirectory(atPath: indexer.turnsDir.path)) ?? [] }
+        XCTAssertEqual(scratchFiles().count, 1, "the converted text was not kept for the next turn")
 
         indexer = Indexer(store: store, embedder: embedder)   // a new launch
         let second = expectation(description: "pass 2")
         indexer.index(roots: [root], settings: IndexSettings()) { p in if p.done { second.fulfill() } }
         wait(for: [second], timeout: 120)
         XCTAssertEqual(indexer.streams.count, 0)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: scratch.path), "the scratch text outlived the document's turns")
+        XCTAssertEqual(scratchFiles(), [], "the scratch text outlived the document's turns")
         let chunks = try XCTUnwrap(store.storedChunks(path: file.path)).sorted { $0.chunkIndex < $1.chunkIndex }
         XCTAssertEqual(chunks.map(\.chunkIndex), Array(0 ..< chunks.count), "chunk numbers have a gap or a repeat")
         XCTAssertEqual(chunks.map(\.chunkKey), expected, "the turns cut the document differently from one pass")
         XCTAssertTrue(chunks.allSatisfy { $0.locator.isEmpty }, "a converted document's offsets map to nothing: no locator")
         XCTAssertNotNil(store.contentKeys(paths: [file.path])[file.path], "the finished document's content key was not recorded")
+    }
+
+    /// Pauses the indexer the moment it is asked to embed while `path` already has chunks stored:
+    /// inside a long file's second turn, every time.
+    final class PausingEmbedder: Embedder, @unchecked Sendable {
+        let inner: any Embedder
+        let store: VectorStore
+        let path: String
+        weak var indexer: Indexer?
+        private var paused = false
+        init(inner: any Embedder, store: VectorStore, path: String) { self.inner = inner; self.store = store; self.path = path }
+        var dim: Int { inner.dim }
+        func embedText(_ text: String, as type: OmniInputType) -> [Float] { inner.embedText(text, as: type) }
+        func embedTextBatch(_ texts: [String], as type: OmniInputType) -> [[Float]] {
+            if !paused, store.chunkCount(path: path) > 0 { paused = true; indexer?.cancel(.pause) }
+            return inner.embedTextBatch(texts, as: type)
+        }
+        func embedImage(_ image: CGImage) -> [Float]? { inner.embedImage(image) }
+        func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? { inner.embedImages(raws) }
+        func embedVideoFrames(_ frames: [CGImage]) -> [Float]? { inner.embedVideoFrames(frames) }
+        func embedAudio(_ url: URL) -> [Float]? { inner.embedAudio(url) }
+        func embedAudioMel(_ mel: [Float], frames: Int) -> [Float]? { inner.embedAudioMel(mel, frames: frames) }
+        func embedAudioMelBatch(_ mels: [[Float]], frames: [Int]) -> [[Float]]? { inner.embedAudioMelBatch(mels, frames: frames) }
     }
 }
