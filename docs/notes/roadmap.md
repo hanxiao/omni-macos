@@ -261,3 +261,15 @@ Eval on fresh indexes: `pdf-page` MRR Nano 0.442 -> 1.000, Small 0.525 -> 1.000;
 cut by page. An index that holds such a PDF as one chunk gets its pages from the enrichment (not yet
 released, so it is the same one pass every user takes; its recipe gains `p1`), only when the stored
 chunk is exactly the old cut of the same text. PDFPagePick still serves long PDFs' multi-page chunks.
+
+### Spoken content: what is left, and what closing it would take (2026-10-15)
+
+The weakest tags are spoken (Nano / Small MRR: soundtrack 0.430 / 0.778, audio 0.624 / 0.740). The
+misses are a text document on a nearby topic outranking the recording that says the words ("chocolate
+cake recipe explained out loud": the .md first, the .m4a second); the audio embedding's distance to a
+text query is the gap, and per-kind score normalisation was already measured and rejected. Closing it
+means words from the speech: on-device transcription (Speech framework), indexed as text beside the
+audio at its moments, as screenshot text is. Checked on this Mac (read-only, nothing downloaded): of
+12 eval languages only en-US and zh-CN recognise on-device; the other ten need an asset download or
+Apple's servers (audio leaves the Mac), and Speech Recognition is its own privacy permission (not yet
+determined here) - a new prompt for every user. Not built: Han's call.
