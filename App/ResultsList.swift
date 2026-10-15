@@ -146,6 +146,12 @@ struct ResultsList<Footer: View>: View {
                                       columns: columns.visible)
                                 .equatable()
                                 .reportsCellsMaxX($rowCellsMaxX)
+                                // LEADING, WHATEVER THE COLUMNS ADD UP TO. A row wider than the list
+                                // was centred, so the overflow went half under the floating sidebar:
+                                // the disclosure triangles sat against its edge (1,036pt of default
+                                // columns in a 1,280pt window's 988pt list). Now the extra goes off
+                                // the trailing edge, as a too-narrow Finder list does.
+                                .frame(maxWidth: .infinity, alignment: .leading)
                                 // Rows drag files OUT of the app from their icon and name (see
                                 // FileDrag). Never back in: an in-app drag was easy to misclick onto
                                 // the search drop target, so inside Omni the drag offers nothing.

@@ -1307,3 +1307,19 @@ searches). The bar now holds a clear spacer of the header's measured height with
 overlay on it (`ColumnHeaderBar`): 58-65 / 67-74 ms over three reps, the pre-columns figure.
 Screenshots of the search list and the folder browser are identical pixel for pixel before and
 after, apart from the text cursor.
+
+
+## Search rows against the sidebar (Han, 2026-10-15)
+
+"This is too close to the left drawer", against Finder: the search list's rows began 2pt past the
+floating sidebar's edge, disclosure triangles against it, 23pt left of the folder browser's rows. Not
+a safe-area matter - the scroll view's frame starts at the pane edge (260) like the browser's list -
+but an OVERFLOW: the default columns are 1,036pt (Name 180 + lead 38, Relevance 85, Match 181, Excerpt
+160, Tags 197, Folder 177, trail 18) and a 1,280pt window's list has 988, so the row was wider than
+the list and centred, 24pt under the sidebar and 24pt past the right edge (the header with it).
+Rows and the shared header are now anchored leading (`frame(maxWidth: .infinity, alignment: .leading)`),
+so extra width leaves by the trailing edge as in a too-narrow Finder list, and Excerpt's least width
+is 0: the flexible column gives way first, and the default columns fit 1,280pt again. Measured at
+1280x800: stripe 252 -> 276, icon 270 -> 294, name 291 -> 314 - the folder browser's 294 and 314.
+A first try padded by the scroll view's leading safe-area inset and overshot: that inset reads 260,
+the whole width to the window's edge, not the part the sidebar covers.

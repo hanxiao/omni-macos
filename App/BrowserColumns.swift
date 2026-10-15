@@ -70,7 +70,8 @@ enum BrowserColumn: String, CaseIterable, Identifiable, Sendable {
         case .tags:         return 197
         case .folder:       return 177
         case .match:        return 181
-        case .excerpt:      return 160   // the least it gets: it shares the free width with Name
+        case .excerpt:      return 0     // the least it gets: it shares the free width with Name, and
+                                         // gives it all up before a row runs past the list
         case .dimensions:   return 101
         case .duration:     return 81
         case .relevance:    return 85
@@ -269,6 +270,9 @@ struct BrowserHeader<Menu: View>: View {
         // divides the header from the ROWS, not from the toolbar.
         .contentShape(.rect)
         .contextMenu { menu() }
+        // Leading, like the rows under it (ResultsList): columns wider than the pane run off the
+        // trailing edge instead of being centred half under the sidebar.
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     /// The trailing padding, MEASURED from the rows rather than assumed. A visible scroller (the
