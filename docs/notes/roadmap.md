@@ -218,3 +218,15 @@ the way that any later attempt needs: compare a re-streamed file against what TH
 not its old rows (against the old rows every unchanged window read as a repeat and was dropped:
 24 of 1,731 chunks kept), and an always-read-to-the-end log is re-hashed whole on every change.
 Not tried: novelty against the whole index rather than the file, and a per-file budget.
+
+### Tag phrases from the top words: measured, not shipped (Han, 2026-10-14)
+
+The talk's B--ngram read as phrases: per image the top 8 words by the shipped score, 2-word phrases
+of them and 3-word ones of the top 4 (80), encoded as passages and scored by the same function with
+a prior from the same neutral seed images; a phrase that beats every word in it replaces them.
+Nano, the 14 user pictures and COCO-150 (439 category instances; a category inside a phrase counts):
+words 1/14 and 37; with phrases 2/14 and 40; with a 0.02 margin 2/14 and 36; with 0.05, 1/14 and 37.
+And what it adds reads as noise: the penguin "eagle pigeon", the eagle "squir hawk", a truck
+"freight tractor", flowers "bouquet bloss" - two words' meanings together overlap a picture more
+than either alone, so beating the words is no test of a phrase. Probe deleted; the other reading,
+re-running the vocabulary on the region where a tag fired, is not tried.
