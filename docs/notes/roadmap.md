@@ -228,5 +228,9 @@ Nano, the 14 user pictures and COCO-150 (439 category instances; a category insi
 words 1/14 and 37; with phrases 2/14 and 40; with a 0.02 margin 2/14 and 36; with 0.05, 1/14 and 37.
 And what it adds reads as noise: the penguin "eagle pigeon", the eagle "squir hawk", a truck
 "freight tractor", flowers "bouquet bloss" - two words' meanings together overlap a picture more
-than either alone, so beating the words is no test of a phrase. Probe deleted; the other reading,
-re-running the vocabulary on the region where a tag fired, is not tried.
+than either alone, so beating the words is no test of a phrase. Probe deleted. The other reading,
+re-running the vocabulary on the region where the top tag fired (the crop of the 5 where the
+image's top category scores highest, fused alone), on COCO-150's 80 categories through tageval,
+Nano: P@1 0.773-0.800, mAP 0.644-0.659 at weights 0.5-1.3, against the shipped max over all 5
+crops at 0.833-0.840 and 0.690-0.692 (base 0.773, 0.644). Focusing on one region drops what the
+other crops find; the shipped fusion stays.
