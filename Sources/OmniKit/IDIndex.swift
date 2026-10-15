@@ -25,7 +25,7 @@ import SQLite3
 public final class IDIndex: @unchecked Sendable {
     /// Version of the token recipe (IDTokens) and of this layout. A different one drops the
     /// tables; the backfill refills them from the files.
-    static let recipe = 2
+    static let recipe = 3   // 3: dates, readings and sizes count (IDTokens)
     static let chunkBits = 20
 
     private let url: URL

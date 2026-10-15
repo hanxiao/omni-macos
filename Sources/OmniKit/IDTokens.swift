@@ -2,8 +2,7 @@ import Foundation
 
 /// Identifier-shaped tokens: order numbers, booking codes, ticket IDs, serials, long numbers -
 /// what a person types to find one exact file and what an embedding cannot hold ("INV-2041",
-/// "K7Q2LM", "OPS-0417", "4815162342"). Readings, dates, sizes and decimals are not identifiers:
-/// "21.4C", "101.3kPa", "2026-03-01", "1280x720", "4e-06".
+/// "K7Q2LM", "OPS-0417", "4815162342", "2026-03-01", "500ml").
 ///
 /// One pass over the UTF-8 bytes, no regex: this runs over every text the indexer reads. A token
 /// is a run of ASCII letters, digits, '-', '_' and '#'; anything else ends it - so a path or a
@@ -47,30 +46,18 @@ public enum IDTokens {
 
     /// 4 to 40 bytes with a digit, and a letter too (not a reading, a date, a size or a number in
     /// scientific notation), or seven digits (not a year, a range or a short number).
+    /// 4 to 40 bytes with a digit, and a letter too or seven digits (not a year, a range or a short
+    /// number). NO EXCEPTIONS BY SHAPE (Han, 2026-10-14: no hand-written rules): dates, readings,
+    /// sizes and scientific notation used to be cut out ("2026-03-01", "500ml", "1280x720", "4e-06")
+    /// by a parser of their forms. Counted as identifiers they cost 17% more postings on real
+    /// Desktop and Downloads text (348,851 -> 408,094 file-token pairs, ~0.7% -> 0.8% of the text)
+    /// and move no query on the eval (exact 1.00, MRR 0.843, both), and a search for a date or a
+    /// reading now finds the files that hold it exactly.
     static func isIdentifier(bytes t: ArraySlice<UInt8>) -> Bool {
         let n = t.count
         guard n >= 4, n <= 40 else { return false }
         var digits = 0, letters = 0
         for c in t { if isDigit(c) { digits += 1 } else if isLetter(c) { letters += 1 } }
-        guard digits > 0 else { return false }
-        let a = Array(t)
-        var i = 0
-        while i < n, isDigit(a[i]) { i += 1 }
-        let lead = i
-        // A date, with or without an hour after T ("2026-03-01", "2026-03-01T00").
-        if n >= 10, lead == 4, a[4] == 45, isDigit(a[5]), isDigit(a[6]), a[7] == 45, isDigit(a[8]), isDigit(a[9]) {
-            if n == 10 { return false }
-            if a[10] == 116 || a[10] == 84, a[11...].allSatisfy(isDigit) { return false }
-        }
-        guard letters > 0 else { return digits >= 7 }
-        // A reading: digits, then one to four letters and nothing else ("3kPa", "500ml", "16kWp").
-        if lead > 0, n - lead <= 4, a[lead...].allSatisfy(isLetter) { return false }
-        // A size or scientific notation: digits, x or e, an optional sign, digits ("1280x720", "28e-06").
-        if lead > 0, lead < n, a[lead] == 120 || a[lead] == 88 || a[lead] == 101 || a[lead] == 69 {
-            var j = lead + 1
-            if j < n, a[j] == 45 || a[j] == 43 { j += 1 }
-            if j < n, a[j...].allSatisfy(isDigit) { return false }
-        }
-        return true
+        return digits > 0 && (letters > 0 || digits >= 7)
     }
 }

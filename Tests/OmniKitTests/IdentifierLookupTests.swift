@@ -4,13 +4,17 @@ import CoreGraphics
 
 final class IdentifierLookupTests: XCTestCase {
     func testWhatCountsAsAnIdentifier() {
-        for t in ["INV-2041", "K7Q2LM", "OPS-0417", "4815162342", "114-3328-9912", "YN20260815", "M-417", "kv24", "JTMRFREV0HD123456"] {
+        // No exceptions by shape: a date, a reading or a size is found exactly like an order number.
+        for t in ["INV-2041", "K7Q2LM", "OPS-0417", "4815162342", "114-3328-9912", "YN20260815", "M-417", "kv24", "JTMRFREV0HD123456",
+                  "2026-03-01", "500ml", "1280x720", "4e-06"] {
             XCTAssertTrue(IDTokens.isIdentifier(t), t)
         }
-        for t in ["21.4C", "101.3kPa", "2026-03-01", "2026-03-01T00:00:00Z", "v1.2.3", "1280x720", "4e-06", "110-115", "2026", "hello", "abc"] {
+        // Not a token at all (a '.' or ':' inside), too short, or too few digits with no letter.
+        for t in ["21.4C", "101.3kPa", "2026-03-01T00:00:00Z", "v1.2.3", "110-115", "2026", "hello", "abc"] {
             XCTAssertFalse(IDTokens.isIdentifier(t), t)
         }
-        XCTAssertEqual(IDTokens.tokens(in: "Invoice INV-2041, see ref/ref_layer0.py and 4.28e-06."), ["inv-2041", "ref_layer0"])
+        XCTAssertEqual(IDTokens.tokens(in: "Invoice INV-2041, see ref/ref_layer0.py and 4.28e-06."), ["inv-2041", "ref_layer0", "28e-06"])
+        XCTAssertEqual(IDTokens.tokens(in: "Meeting on 2026-03-01: bring 500ml."), ["2026-03-01", "500ml"])
     }
 
     final class Fixed: Embedder, @unchecked Sendable {
