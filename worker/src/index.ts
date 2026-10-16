@@ -26,11 +26,16 @@ export interface Env {
 // on a cold page cache, and v7 (0.15.12) the rest of the store's cold files and the memory gate
 // that skipped search under writes on a 16 GB Mac, v8 (0.15.13) the same-store shaping, memory and
 // recall-at-scale rows and the fixes that let 16 GB Macs finish, v9 (0.15.14) runs that throttled
-// when the display slept, the app's headroom instead of a fixed cap, and file-backed exact stores.
+// when the display slept, the app's headroom instead of a fixed cap, and file-backed exact stores,
+// v10 measures beside whatever the Mac is doing and records it (Conditions rows: other processes'
+// CPU and GPU, the slowest clock, swap read), runs every case a Mac's RAM can hold, takes the app's
+// whole query path, and adds time-to-searchable and sharing-the-GPU rows. Until a v10 run arrives
+// the table is built from v9, so the page is never empty across the switch.
 const DATASET_VERSION = "profiling-v2";
 const HISTORY_DATASETS = ["profiling-v1", "profiling-v2"];
-const BENCH_DATASET = "bench-v9";
-const BENCH_DATASETS = ["bench-v4", "bench-v5", "bench-v6", "bench-v7", "bench-v8", BENCH_DATASET];
+const BENCH_DATASET = "bench-v10";
+const BENCH_PREVIOUS = "bench-v9";
+const BENCH_DATASETS = ["bench-v4", "bench-v5", "bench-v6", "bench-v7", "bench-v8", BENCH_PREVIOUS, BENCH_DATASET];
 const ACCEPTED_DATASETS = new Set([...HISTORY_DATASETS, ...BENCH_DATASETS]);
 const MAX_BODY_BYTES = 8 * 1024; // 8KB
 const RATE_LIMIT_PER_HOUR = 20;
@@ -42,7 +47,9 @@ const SECONDS_MAX = 86_400;
 const BYTES_MAX = 1e15; // ~1PB, generous upper bound to reject absurd values
 const TABLE_ROWS_MAX = 64;
 const TABLE_TEXT_MAX = 80;
-const TABLE_CELLS = new Set(["p50", "p95", "p99", "max", "value", "op"]);
+// cpu/gpu/clk/swp: a Conditions row's other-process CPU and GPU (%), slowest clock (% below the
+// run's fastest) and swap read back (MB).
+const TABLE_CELLS = new Set(["p50", "p95", "p99", "max", "value", "op", "cpu", "gpu", "clk", "swp"]);
 const CELL_ABS_MAX = 1e9;
 
 // ---------------------------------------------------------------------------
@@ -522,7 +529,7 @@ interface BenchRunRow {
  * order of the newest run's table, then any row only older runs had. Machines are ordered by text
  * indexing throughput, fastest first.
  */
-async function benchAggregate(env: Env) {
+async function benchRuns(env: Env, dataset: string): Promise<BenchRunRow[]> {
   const { results } = await env.DB.prepare(
     `SELECT dataset_ver, chip, model, release_year, mem_bytes, vram_bytes, cpu_cores, app_version,
             macos_version, bench_table
@@ -530,11 +537,20 @@ async function benchAggregate(env: Env) {
       WHERE dataset_ver = ? AND bench_table IS NOT NULL
       ORDER BY created_at DESC`
   )
-    .bind(BENCH_DATASET)
+    .bind(dataset)
     .all<BenchRunRow>();
-  const runs = results ?? [];
+  return results ?? [];
+}
 
-  const rows: { g: string; t: string; u: string; kind: "latency" | "value" }[] = [];
+async function benchAggregate(env: Env) {
+  let dataset = BENCH_DATASET;
+  let runs = await benchRuns(env, dataset);
+  if (runs.length === 0) {
+    dataset = BENCH_PREVIOUS;
+    runs = await benchRuns(env, dataset);
+  }
+
+  const rows: { g: string; t: string; u: string; kind: "latency" | "value" | "conditions" }[] = [];
   const rowSeen = new Set<string>();
   type Machine = { meta: BenchRunRow[]; cells: Map<string, Map<string, number[]>> };
   const machines = new Map<string, Machine>();
@@ -554,7 +570,8 @@ async function benchAggregate(env: Env) {
       const id = row.g + "/" + row.t;
       if (!rowSeen.has(id)) {
         rowSeen.add(id);
-        rows.push({ g: row.g, t: row.t, u: row.u, kind: "value" in row.c ? "value" : "latency" });
+        const kind = row.g === "Conditions" ? "conditions" : "value" in row.c ? "value" : "latency";
+        rows.push({ g: row.g, t: row.t, u: row.u, kind });
       }
       let cell = m.cells.get(id);
       if (!cell) m.cells.set(id, (cell = new Map()));
@@ -595,7 +612,7 @@ async function benchAggregate(env: Env) {
 
   const versions = uniq(runs.map((r) => r.app_version)).sort((a, b) => cmpVersion(b, a));
   return {
-    datasetVersion: BENCH_DATASET,
+    datasetVersion: dataset,
     runs: runs.length,
     latestVersion: versions[0] ?? null,
     rows,

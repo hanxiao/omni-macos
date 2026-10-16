@@ -349,6 +349,7 @@
       box-shadow: inset 0 0 0 1px var(--line), 0 10px 30px -8px var(--glass-shade);
     }
     #bench-tip .t { font-weight: 600; margin-bottom: 2px; }
+    #bench-tip .cond { margin-top: 4px; color: var(--text-3); font-size: 11.5px; }
 
     /* FAQ */
     .faq-content { margin-top: 44px; }
@@ -787,19 +788,43 @@ curl http://127.0.0.1:51234/v1/search -d '{"query": "invoice from february", "to
         return a >= 1000 ? Math.round(v).toLocaleString("en-US") : a >= 100 ? v.toFixed(0) : a >= 10 ? v.toFixed(1) : v.toFixed(2);
       }
       if (row.kind === "value") return esc(n(c.value));
+      if (row.kind === "conditions") {
+        return esc(n(c.cpu)) + ' <span class="mx">/ ' + esc(n(c.gpu)) + "</span>";
+      }
       if (row.g === "Search under load" && typeof c.max === "number") {
         return esc(n(c.p50)) + ' <span class="mx">/ ' + esc(n(c.max)) + "</span>";
       }
       return esc(n(c.p50));
     }
 
+    // What else the Mac was doing while a group's rows were measured (its Conditions row).
+    function conditionsLine(m, group) {
+      var k = m.cells ? m.cells["Conditions/" + group] : null;
+      if (!k) return "";
+      var bits = [];
+      if (typeof k.cpu === "number") bits.push("other apps' CPU " + esc(k.cpu.toFixed(1)) + "%");
+      if (typeof k.gpu === "number") bits.push("GPU " + esc(k.gpu.toFixed(1)) + "%");
+      if (typeof k.clk === "number" && k.clk > 0.5) bits.push("clock up to " + esc(k.clk.toFixed(0)) + "% slower");
+      if (typeof k.swp === "number" && k.swp >= 1) bits.push(esc(k.swp.toFixed(0)) + " MB read back from swap");
+      return bits.length ? '<div class="cond">measured beside ' + bits.join(", ") + "</div>" : "";
+    }
+
     function cellTip(row, m, c) {
       var head = "<div class=\"t\">" + esc(row.t) + " \u00B7 " + esc(shortChip(m.chip)) + "</div>";
-      if (row.kind === "value") return head + "<div><strong>" + esc(String(c.value)) + "</strong> " + esc(row.u) + "</div>";
+      if (row.kind === "conditions") {
+        var lines = [];
+        if (typeof c.cpu === "number") lines.push("other apps' CPU <strong>" + esc(c.cpu.toFixed(1)) + "%</strong> of all cores");
+        if (typeof c.gpu === "number") lines.push("other apps' GPU <strong>" + esc(c.gpu.toFixed(1)) + "%</strong> of its time");
+        if (typeof c.clk === "number") lines.push("clock at most <strong>" + esc(c.clk.toFixed(1)) + "%</strong> below the run's fastest");
+        if (typeof c.swp === "number") lines.push("<strong>" + esc(c.swp.toFixed(0)) + " MB</strong> read back from swap");
+        return head + "<div>" + lines.join("</div><div>") + "</div><div class=\"cond\">median over the cases behind these rows</div>";
+      }
+      var cond = conditionsLine(m, row.g);
+      if (row.kind === "value") return head + "<div><strong>" + esc(String(c.value)) + "</strong> " + esc(row.u) + "</div>" + cond;
       var parts = ["p50", "p95", "p99", "max"].filter(function (k) { return typeof c[k] === "number"; })
         .map(function (k) { return k + " <strong>" + esc(String(c[k])) + "</strong>"; });
       var op = typeof c.op === "number" ? "<div>the change itself took " + esc(c.op.toFixed(1)) + " s</div>" : "";
-      return head + "<div>" + parts.join(" \u00B7 ") + " ms</div>" + op;
+      return head + "<div>" + parts.join(" \u00B7 ") + " ms</div>" + op + cond;
     }
 
     function renderTable(data, holder) {
@@ -836,7 +861,7 @@ curl http://127.0.0.1:51234/v1/search -d '{"query": "invoice from february", "to
           var c = m.cells ? m.cells[row.g + "/" + row.t] : null;
           return c && typeof c.max === "number";
         });
-        var unit = worst ? "ms, median / worst" : row.u;
+        var unit = worst ? "ms, median / worst" : row.kind === "conditions" ? "other apps, % CPU / GPU" : row.u;
         body += "<tr><td>" + esc(row.t) + '<span class="unit">' + esc(unit) + "</span></td>" +
           machines.map(function (m) {
             var c = m.cells ? m.cells[row.g + "/" + row.t] : null;
@@ -848,7 +873,8 @@ curl http://127.0.0.1:51234/v1/search -d '{"query": "invoice from february", "to
       holder.innerHTML =
         '<div class="bench-panel"><div class="bench-table-wrap"><table class="bench-table">' + head +
         "<tbody>" + body + "</tbody></table></div></div>" +
-        '<p class="bench-note">Medians over each Mac&rsquo;s runs. Search under load: a search every 50&nbsp;ms during one bulk change to a 946,568-row index.</p>';
+        '<p class="bench-note">Medians over each Mac&rsquo;s runs. Search under load: a search every 50&nbsp;ms during one bulk change to a 946,568-row index. ' +
+        'Each Mac measures beside whatever else it is running; Conditions gives the other apps&rsquo; share of the CPU and GPU behind each group of rows.</p>';
       wireTips(holder, "td.v", null);
     }
 
