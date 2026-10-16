@@ -2384,6 +2384,9 @@ public final class VectorStore: @unchecked Sendable {
         self.dbURL = dbURL
         self.interactiveLane = ReadLane(dbURL: dbURL, label: "omni.vectorstore.read")
         self.aggregateLane = ReadLane(dbURL: dbURL, label: "omni.vectorstore.read.agg")
+        self.lexical = LexicalIndex(indexURL: dbURL)
+        self.idIndex = IDIndex(indexURL: dbURL)
+        self.enrichLedger = EnrichLedger(indexURL: dbURL)
         let gate = WriteGate()
         self.writeGate = gate
         self.warmer = PageWarmer(dbURL: dbURL)
@@ -4491,11 +4494,17 @@ public final class VectorStore: @unchecked Sendable {
     // unretrievable by their own name at any k. This sidecar restores that one capability without
     // touching the vector path: it is built from paths already in the store, queried on its own
     // connection off this queue, and fused only when the query looks like a name.
-    private lazy var lexical = LexicalIndex(indexURL: dbURL)
+    //
+    // The three sidecars are BUILT IN INIT, NOT `lazy` (as the read lanes are, interactiveLane): the
+    // decode workers record identifiers and ledger entries concurrently, and on a fresh store the
+    // first two each built an IDIndex - one assignment won and the other was freed under the thread
+    // still using it (EXC_BAD_ACCESS in IDIndex.deinit from recordIdentifiers, omni-verify bench on a
+    // new store, 2026-10-16). Building one costs a URL; each opens its file on first use.
+    private let lexical: LexicalIndex
     /// Identifiers inside files, for exact lookup (IDIndex). The indexer records; search reads.
-    public private(set) lazy var idIndex = IDIndex(indexURL: dbURL)
+    public let idIndex: IDIndex
     /// Which contents have their screenshot text, soundtrack and audio windows (EnrichLedger).
-    public private(set) lazy var enrichLedger = EnrichLedger(indexURL: dbURL)
+    public let enrichLedger: EnrichLedger
 
     /// Distinct indexed paths. Used to build the filename index; runs on the queue like any read.
     /// FROM MEMORY, not SQLite. This is the filename index's input, built right after launch; as a

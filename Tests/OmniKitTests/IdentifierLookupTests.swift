@@ -17,6 +17,23 @@ final class IdentifierLookupTests: XCTestCase {
         XCTAssertEqual(IDTokens.tokens(in: "Meeting on 2026-03-01: bring 500ml."), ["2026-03-01", "500ml"])
     }
 
+    /// The sidecars are built with the store, not lazily: the decode workers record identifiers
+    /// concurrently, and a lazy first use from two threads built two indexes and freed one under the
+    /// thread still using it (EXC_BAD_ACCESS in IDIndex.deinit, a fresh store's first pass).
+    func testSidecarsTakeConcurrentFirstUse() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("ids-race-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = try VectorStore(dbURL: dir.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        DispatchQueue.concurrentPerform(iterations: 64) { i in
+            store.idIndex.record(contentKey: StoreSchema.contentDigestHex("race-\(i)"), chunks: [["inv-\(1000 + i)"]])
+            _ = store.enrichLedger
+        }
+        store.idIndex.flush()
+        XCTAssertEqual(store.idIndex.lookup(["inv-1007"]).first?.contentKey, StoreSchema.contentDigestHex("race-7"))
+    }
+
     final class Fixed: Embedder, @unchecked Sendable {
         let dim = 8
         private func v(_ s: String) -> [Float] {
