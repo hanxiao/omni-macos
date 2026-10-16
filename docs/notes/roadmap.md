@@ -304,6 +304,7 @@ group = the queries the step serves (shipped / removed), all = 125 queries with 
 | filename fusion | - | - | 0.870 | - | 0.916 (the near tie) |
 | page pick at open | - | - | 0.870 | - | 0.916 (the near tie) |
 | all of the above | all (125) | - | 0.762 | - | 0.795 |
+| all of the above, page pick kept on (the paper's row) | all (125) | - | 0.773 | - | 0.812 |
 
 Shipped: Nano 0.870 (R@1 0.82), Small 0.920 (R@1 0.89). Filename fusion and page pick move nothing
 here: the eval's name queries are found by meaning, and its short PDFs are cut by page (page pick
