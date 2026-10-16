@@ -3967,6 +3967,10 @@ if args.count >= 2 && args[1] == "concbench2" {
 // When every file becomes searchable: omni-verify coverage <model> <tree> <db dir>
 if args.count >= 5 && args[1] == "coverage" {
     let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]), keepAudio: true)
+    // The app's memory setting (1 GB of headroom over what is resident), so a long media pass here
+    // holds the memory the app would; without it MLX's buffer cache passed 65 GB within a minute of
+    // media on this Mac (2026-10-16).
+    omniSetMemoryHeadroom(1_000_000_000, residentBytes: MLX.Memory.activeMemory)
     let tree = URL(fileURLWithPath: args[3]), dbDir = URL(fileURLWithPath: args[4])
     try? FileManager.default.removeItem(at: dbDir)
     try FileManager.default.createDirectory(at: dbDir, withIntermediateDirectories: true)

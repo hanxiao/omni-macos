@@ -152,8 +152,8 @@ public enum OmniAudioPreprocess {
     // MARK: - Decode
 
     /// Sequential decoder: any audio file -> 16 kHz mono Float32 PCM, one bounded segment
-    /// (`segmentSeconds`) at a time. Reads the file's native float32 processing format in <= 60 s slices
-    /// into ONE reusable buffer, downmixes each slice to mono, and linearly resamples per
+    /// (`segmentSeconds`) at a time. Reads the file's native float32 processing format `readFrames`
+    /// at a time into ONE reusable buffer, downmixes each slice to mono, and linearly resamples per
     /// segment. Never sizes a buffer by the file's length: the old whole-file
     /// `AVAudioPCMBuffer(frameCapacity: file.length)` made AudioToolbox compute
     /// `frames x bytesPerFrame` in 32 bits, which throws an uncatchable C++ exception past
@@ -165,31 +165,54 @@ public enum OmniAudioPreprocess {
     /// to the old path. Single-consumer; calls must be sequenced (the indexer's prefetch
     /// queue does this, mirroring the scanned-PDF reader).
     public final class AudioSegmentReader: @unchecked Sendable {
-        private let file: AVAudioFile
-        private let slice: AVAudioPCMBuffer
+        private var file: AVAudioFile?
+        private var slice: AVAudioPCMBuffer?
         private let channelCount: Int
         private let nativeRate: Double
         private let nativeSegmentFrames: Int   // native frames per segment
         private var done = false
+        /// Segments in the file (the last may be short). Kept past `close()`: a parked long file's
+        /// plan reads it every turn.
+        public let segmentCount: Int
 
-        public init?(url: URL) {
+        /// FRAMES PER READ CALL. One large request can send AudioToolbox's AAC decoder into a read
+        /// that never returns while its realtime-safe allocator grows without bound: the silent
+        /// AAC track of an iPhone screen recording (6-byte packets) read 60 s at a time held one
+        /// `ExtAudioFileRead` at 100% CPU for hours and left 31 GB in the
+        /// `caulk::realtime_safe_resource` zone (Omni 0.17.0, which first read videos'
+        /// soundtracks; 2026-10-16). On that file one request of 1,000,000 frames decodes and one
+        /// of 1,032,233 never returns; 65,536 decodes the whole file in 8 ms. Sequential reads
+        /// concatenate to exactly the bytes one larger read returns, so segments are unchanged,
+        /// and the buffer is 0.5 MB for stereo where 60 s was 21 MB.
+        static let readFrames: AVAudioFrameCount = 65_536
+
+        /// `readFrames` other than the default exists for the test that proves the segments do not
+        /// depend on it.
+        public convenience init?(url: URL) { self.init(url: url, readFrames: Self.readFrames) }
+
+        init?(url: URL, readFrames: AVAudioFrameCount) {
             guard let f = try? AVAudioFile(forReading: url) else { return nil }
             let fmt = f.processingFormat
-            guard fmt.sampleRate > 0, fmt.channelCount > 0, f.length > 0 else { return nil }
-            // <= 60 s of native audio per read, additionally capped in frames so an exotic
-            // high-rate/many-channel format stays far from any 32-bit byte limit.
-            let sliceFrames = AVAudioFrameCount(Swift.min(60.0 * fmt.sampleRate, 8_000_000))
-            guard sliceFrames > 0, let b = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: sliceFrames) else { return nil }
+            guard fmt.sampleRate > 0, fmt.channelCount > 0, f.length > 0, readFrames > 0 else { return nil }
+            guard let b = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: readFrames) else { return nil }
             file = f
             slice = b
             channelCount = Int(fmt.channelCount)
             nativeRate = fmt.sampleRate
             nativeSegmentFrames = Int(OmniAudioPreprocess.segmentSeconds * fmt.sampleRate)
+            segmentCount = Int((Double(f.length) / Double(nativeSegmentFrames)).rounded(.up))
+        }
+
+        /// Let go of the file and its buffer. A long file waiting for its next turn holds no open
+        /// decoder (the turn reopens it); later calls read nothing.
+        public func close() {
+            file = nil; slice = nil; pending = nil; done = true
         }
 
         /// The next segment as 16 kHz mono samples; nil at end of file.
         public func nextSegment() -> [Float]? {
             if done { return nil }
+            guard let file, let slice else { done = true; return nil }
             var mono: [Float] = []
             mono.reserveCapacity(Swift.min(nativeSegmentFrames, 4_000_000))
             while mono.count < nativeSegmentFrames {
@@ -230,12 +253,10 @@ public enum OmniAudioPreprocess {
         /// in this process or after a restart.
         public func seek(toSegment k: Int) {
             pending = nil
+            guard let file else { done = true; return }
             file.framePosition = AVAudioFramePosition(k) * AVAudioFramePosition(nativeSegmentFrames)
             done = file.framePosition >= file.length
         }
-
-        /// Segments in the file (the last may be short).
-        public var segmentCount: Int { Int((Double(file.length) / Double(nativeSegmentFrames)).rounded(.up)) }
 
         /// Hand a segment back so the next `nextMelSegment()` returns it again. The indexer's
         /// decode stage peeks one segment ahead to tell single-segment files (the common case,

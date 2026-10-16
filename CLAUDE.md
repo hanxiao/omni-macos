@@ -160,6 +160,9 @@ codebase were already measured there, and many were rejected.
   clones inconsistent. /Volumes/han2tb/bench-index is the standing one.
 - @Observable NOTIFIES ON EVERY WRITE, EQUAL OR NOT. Guard writes, store derived Bools, and keep
   high-rate state out of anything the toolbar, menu bar or a row body reads (ui.md, testing.md).
+- AUDIOTOOLBOX IS READ IN SMALL CALLS. One `AVAudioFile.read` of 60 s on a silent screen-recording
+  soundtrack never returned and grew a realtime-safe allocator to 31 GB (0.17.0, index.md "The
+  soundtrack read that never returned"). Every read goes through `AudioSegmentReader.readFrames`.
 - EVERY COPY OMNI MAKES goes through `OmniPasteboard` (the clipboard history must never record it).
 - A FLAG NOTHING CAN TURN OFF IS DELETED, and a settled A/B arm is retired with its numbers recorded
   in the notes. Do not leave experiments in the shipped path.
@@ -189,7 +192,7 @@ codebase were already measured there, and many were rejected.
   resident memory, launch, write path, Photos reconcile, multi-folder scope, ignore policy grammar
   and defaults, renames, Recents, clipboard history, the 2026-10-02 speed review and media NaN,
   search while long files stream, the heavy CRUD review, file-backed exact stores, iCloud
-  index-then-evict (issue #29).
+  index-then-evict (issue #29), the 0.17.0 soundtrack read that never returned.
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
   and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names.

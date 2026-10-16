@@ -173,7 +173,7 @@ final class DecodedItem: @unchecked Sendable {
                    pdfTextTurns(pageCount: Int) }
     let file: CrawledFile
     let kind: String
-    let payload: Payload
+    private(set) var payload: Payload
     let unchanged: Bool   // already indexed and not modified - not a "skip", just nothing to do
     let abandoned: Bool   // produced after a pause/cancel - not consumed, not counted (re-indexed on resume)
     // Display metadata (image pixel size / media duration) captured DURING decode, where the file
@@ -195,6 +195,16 @@ final class DecodedItem: @unchecked Sendable {
     /// records it once stored, unless an extra failed.
     var enrichable = false
     var enrichFailed = false
+    /// Waiting for its next turn: drop what only the first turn reads. The soundtrack reader a
+    /// long video opened at decode is never read (its last turn opens one), and a long recording's
+    /// payload reader and first mel are read only by its first turn (later turns seek their own).
+    func parkForNextTurn() {
+        soundtrack = nil
+        if case .audioSegments(_, _, let reader) = payload {
+            reader.close()
+            payload = .audioSegments(mel: [], frames: 0, reader: reader)
+        }
+    }
     /// A file this item's decode downloaded, to be handed back to the cloud (IndexSettings
     /// .evictDownloaded). ON RELEASE, because that is the one point every payload agrees on: a long
     /// text file or a scanned PDF is read again by the embed stage, long after decode returned, and
@@ -1376,6 +1386,11 @@ public final class Indexer: @unchecked Sendable {
             switch outcome {
             case .more:
                 streams.set(path, c)
+                // PARKED LIGHT. A later turn reopens what it reads (mediaTurn), so nothing open waits
+                // in the queue: in 0.17.0 every long video kept its decode-time soundtrack reader and
+                // every long recording its first reader and first minute of mel until the pass's end -
+                // an open decoder and a 60 s read buffer each (21 MB for stereo 44.1 kHz).
+                item.parkForNextTurn()
                 continuations.append((item, c))
             case .done:
                 streams.finish(path)
@@ -1416,7 +1431,7 @@ public final class Indexer: @unchecked Sendable {
             var c = resume ?? StreamCursors.Cursor(modified: f.modified, size: f.size, offset: 0, undecoded: Data(),
                                                    carry: "", lineBase: 0, written: 0, unit: text ? nil : 0)
             let startUnit = c.unit ?? 0
-            let outcome = step(item, &c)
+            let outcome = autoreleasepool { step(item, &c) }   // a pool per turn, as per consumed item
             settle(item, c, outcome, first: resume == nil)
             if case .failed = outcome { if !isCancelled { p.failed += 1 } } else if resume == nil { p.embedded += 1 }
             // What is left of it is not done yet: its later turns are credited as they run.
@@ -1773,7 +1788,7 @@ public final class Indexer: @unchecked Sendable {
             p.currentPath = item.file.path
             let t0 = CFAbsoluteTimeGetCurrent()
             let before = (offset: c.offset, written: c.written, unit: c.unit ?? 0, texts: textsEmbedded.value)
-            let outcome = step(item, &c)
+            let outcome = autoreleasepool { step(item, &c) }   // a pool per turn, as per consumed item
             settle(item, c, outcome, first: false)
             // The turn's time and work, each in its own units.
             let dt = CFAbsoluteTimeGetCurrent() - t0
@@ -2152,8 +2167,9 @@ public final class Indexer: @unchecked Sendable {
                                         maxDimension: maxDimension, width: item.meta.width, height: item.meta.height,
                                         segments: range)
         case .audioSegments(let mel, let frames, let decodeReader):
-            // The first turn reads on from the decode stage's reader; a later one opens its own.
-            guard let reader = start == 0 ? decodeReader : OmniAudioPreprocess.AudioSegmentReader(url: f.url) else { return .failed }
+            // The first turn reads on from the decode stage's reader; a later one, or an item already
+            // parked (parkForNextTurn: no first mel left), opens its own.
+            guard let reader = start == 0 && !mel.isEmpty ? decodeReader : OmniAudioPreprocess.AudioSegmentReader(url: f.url) else { return .failed }
             chunks = embedStreamedAudio(file: f, kind: item.kind, firstMel: mel, firstFrames: frames, reader: reader,
                                         duration: item.meta.duration, segments: range)
         case .pdfScan(let pageCount, let maxDimension):
@@ -2228,7 +2244,9 @@ public final class Indexer: @unchecked Sendable {
             onFile(todo[0].file.path)
             DispatchQueue.concurrentPerform(iterations: todo.count) { i in
                 guard !self.isCancelled else { return }
-                self.readIdentifiers(todo[i].file, contentKey: todo[i].key, settings: settings)
+                // A pool per file: PDFKit and attributed-string reads hand back autoreleased objects,
+                // and a worker of concurrentPerform drains only when the whole call returns.
+                autoreleasepool { self.readIdentifiers(todo[i].file, contentKey: todo[i].key, settings: settings) }
             }
             read += todo.count
         }
@@ -2358,7 +2376,9 @@ public final class Indexer: @unchecked Sendable {
                     group.leave()
                     return
                 }
-                let pieces = read?(job)
+                // A pool per screenshot: the lane is one block for as long as jobs keep coming, and
+                // Vision and ImageIO objects are autoreleased.
+                let pieces = autoreleasepool { read?(job) }
                 lock.withLock { reads.append(Read(job: job, pieces: pieces)) }
             }
         }
@@ -2456,7 +2476,9 @@ public final class Indexer: @unchecked Sendable {
                 if isCancelled { return enriched }
                 guard let d = digests[c.path], !done.contains(EnrichLedger.key(digest: d, path: c.path)) else { continue }
                 onFile(c.path)
-                if enrichOne(c, digest: d, settings: settings) {
+                // A pool per file: Vision, AVFoundation and PDFKit objects are autoreleased, and the
+                // whole enrichment runs inside one call of index() that drains only when it returns.
+                if autoreleasepool(invoking: { enrichOne(c, digest: d, settings: settings) }) {
                     ledger.record([EnrichLedger.key(digest: d, path: c.path)])
                     enriched += 1
                 }
@@ -3344,7 +3366,9 @@ public final class Indexer: @unchecked Sendable {
                 Self.log.error("read stalled \(Int(self.stallLimit), privacy: .public)s, quarantined: \(f.path, privacy: .private)")
             }
             if item.abandoned { continue }   // paused: don't consume/count files left unprocessed
-            consume(item)
+            // A pool per item: the consumer is one long call for the whole pass, and what decoding
+            // and embedding autorelease (AVFoundation, Vision, CGImage) would otherwise wait for its end.
+            autoreleasepool { consume(item) }
             // NOT FOR A LONG FILE STILL BEING READ: content dedup would hand its PARTIAL rows to
             // any copy of it - and to itself on the next pass, which then never resumed. Its key
             // is recorded when its last window is stored (recordFinishedKey).
@@ -3799,7 +3823,7 @@ public final class Indexer: @unchecked Sendable {
         var exhausted = false
         var seg = segments?.lowerBound ?? 0
         let end = segments?.upperBound ?? Int.max
-        if seg > 0 {   // a later turn: from its segment, read here
+        if seg > 0 || (firstMel.isEmpty && firstFrames == 0) {   // a later turn, or no first segment handed in: read here
             reader.seek(toSegment: seg)
             current = reader.nextMelSegment()
         }

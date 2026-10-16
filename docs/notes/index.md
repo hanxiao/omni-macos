@@ -1577,3 +1577,35 @@ Two more, found by checking that each kill test ran the path it names (2026-10-1
   40 of 40. mutbench `--crud update`, HEAD vs this, interleaved: open 6.3/6.5 and 4.9/4.9 s, op
   12.13/12.45 and 8.37/8.49 s, browse 0.4-0.5 ms, audit clean; sampled mid-op the table held 2,254
   positions (the positive control), and the clean close emptied it.
+
+## The soundtrack read that never returned (0.17.0, 2026-10-16)
+
+Han's Omni 0.17.0 reached ~54 GB on one Mac. On this one, `vmmap` of the installed app: footprint
+37.2 GB, of it 31.2 GB in `caulk::realtime_safe_resource` (292,745 regions, nothing live), with one
+thread at 100% CPU in enrichMedia -> extraChunks -> `AVAudioFile.read` and the zone still growing.
+0.17.0 is the first version to read videos' soundtracks, so every video's audio track now goes
+through AudioToolbox.
+
+- THE TRIGGER IS ONE LARGE READ OF ONE KIND OF TRACK. The file was an iPhone screen recording whose
+  AAC track is silence: 1,010 packets of at most 6 bytes, 23.4 s. `AudioSegmentReader` asked for up
+  to 60 s per `read(into:frameCount:)`. One request of 1,000,000 frames decodes it; one of
+  1,032,233 (the length minus one) or more never returns, and the zone grows 4.3 GB in 6 s, 6.4 GB
+  in 15 s, inside `ACSpanningInputBuffer::checkRelocateClientPacketDescriptions` ->
+  `rt_allocate`. 65,536 frames per call decode it in 8 ms; so do 4,096 and 441,000. Shortened
+  passthrough copies (0.2, 1 and 3 s) and a 25 s silent AAC written by AVAudioFile do not hang at
+  any size: it is this track's layout, not silence or packet size alone. AVAssetReader reads it in
+  76 ms. A per-file scan of the 598-file real-media set with 0.17.0's reader grew the zone to ~33 GB.
+- FIX: `readFrames = 65_536` per call. Sequential reads return the bytes one larger read returns;
+  AudioReadBoundTests compares every segment of a 70 s stereo file read at 2,646,000 and at 65,536
+  frames, and they are equal. Decoding 5.8 h of real audio (6 files), interleaved twice: 5.36 / 5.44
+  s at 60 s per call, 5.36 / 5.39 s at 65,536. The buffer is 0.5 MB for stereo where it was 21 MB.
+- Found by review on the way, not separately measured: a long file waiting for its next turn kept
+  its decode-time readers (a video's soundtrack reader is never read by a later turn, which opens
+  its own; a recording's first reader and first minute of mel are read only by the first turn).
+  `parkForNextTurn` drops them. The consumer, each turn, each enrichment candidate, each screen-text
+  job and each identifier-backfill file now run in their own autorelease pool: each of those loops
+  lived inside one long call that drained only at its end.
+- PROOF ON REAL MEDIA. The same 598 files (`omni-verify coverage`, which now applies the app's 1 GB
+  headroom - without it MLX's buffer cache alone passed 65 GB within a minute): 556 embedded, pass
+  413 s, footprint 3.3-5.0 GB throughout, the realtime-safe zone 48 KB at every sample; both screen
+  recordings that hung indexed with frames and soundtrack.
