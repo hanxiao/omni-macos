@@ -2199,6 +2199,9 @@ public final class Indexer: @unchecked Sendable {
         return best
     }
     nonisolated(unsafe) static var pageByPage = ProcessInfo.processInfo.environment["OMNI_PAGE_CHUNKS"] == "1"   // A/B, settled below
+    /// A short multi-page PDF cut by page (`chunk`); off only in the labeled eval's leave-one-out arm
+    /// (`omni-verify eval --no-pdf-pages`).
+    nonisolated(unsafe) public static var shortPDFByPage = true
 
     /// A window after the first needs this many mel frames (one second) to be embedded.
     static let minTailMelFrames = 100
@@ -3910,7 +3913,7 @@ public final class Indexer: @unchecked Sendable {
             // opened at the page holding most of it. Only for text that fits one chunk: a longer
             // PDF is cut as before (cutting every PDF by page was 30% more chunks; this is ~0.5%:
             // 50 chunks over 1,613 real PDFs, 49 of them short and multi-page).
-            if wholeDocument, case .paged(let starts) = origin, starts.count > 1 {
+            if wholeDocument, Self.shortPDFByPage, case .paged(let starts) = origin, starts.count > 1 {
                 var pages: [TextPiece] = []
                 let idx = starts.map { text.index(text.startIndex, offsetBy: Swift.min($0, totalCount)) } + [text.endIndex]
                 for n in 0 ..< starts.count where idx[n] < idx[n + 1] {

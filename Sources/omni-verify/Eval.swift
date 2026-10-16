@@ -526,7 +526,10 @@ enum EvalCommand {
     // MARK: - Evaluate
 
     static func evaluate(_ args: [String]) async throws {
-        guard args.count >= 4 else { throw Failure("usage: omni-verify eval <modelDir> <dir> [--json out] [--rebuild] [--tag t]") }
+        guard args.count >= 4 else {
+            throw Failure("usage: omni-verify eval <modelDir> <dir> [--json out] [--rebuild] [--tag t] [--no-screen-text] "
+                          + "[--no-soundtrack] [--no-pdf-pages] [--no-page-pick] [--no-kind-lift] [--no-name-fusion] [--no-id-lookup]")
+        }
         let modelDir = URL(fileURLWithPath: (args[2] as NSString).expandingTildeInPath)
         let bed = URL(fileURLWithPath: (args[3] as NSString).expandingTildeInPath, isDirectory: true)
         func opt(_ k: String) -> String? { args.firstIndex(of: k).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
@@ -537,11 +540,17 @@ enum EvalCommand {
         let treePath = URL(fileURLWithPath: String(cString: realpath(tree.path, nil))).path
 
         let engine = try await OmniEngine(modelDir: modelDir)
-        // A/B of the indexing features: --no-screen-text, --no-soundtrack, each its own index.
+        // A/B of the indexing features: --no-screen-text, --no-soundtrack, --no-pdf-pages, each its
+        // own index. The ranking steps after the scan are switched off on the same index.
         var settings = IndexSettings()
         if args.contains("--no-screen-text") { settings.screenText = false }
         if args.contains("--no-soundtrack") { settings.soundtrack = false }
+        if args.contains("--no-pdf-pages") { Indexer.shortPDFByPage = false }
+        if args.contains("--no-kind-lift") { VectorStore.kindLift = false }
+        if args.contains("--no-name-fusion") { VectorStore.nameFusion = false }
+        if args.contains("--no-id-lookup") { VectorStore.identifierLookup = false }
         let arm = (settings.screenText ? "" : "-nst") + (settings.soundtrack ? "" : "-nsd")
+            + (Indexer.shortPDFByPage ? "" : "-npp")
         let indexDir = bed.appendingPathComponent("index-\(modelDir.lastPathComponent)-\(engine.dim)-\(treeHash.prefix(8))\(arm)", isDirectory: true)
         let doneMark = indexDir.appendingPathComponent("built")
         if args.contains("--rebuild") { try? FileManager.default.removeItem(at: indexDir) }

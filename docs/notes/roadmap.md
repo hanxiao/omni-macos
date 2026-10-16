@@ -285,3 +285,27 @@ second +3-9%) and two that looked like slow-downs: recall's 3-bit x4 arm and sea
 writes. Neither held. The folder writes: 1.34 ms against 2.90 ms in the unthrottled runs. Recall
 alone (`--only recall`), five alternated pairs: noisy for both builds in the first two, then equal on
 every arm (b1m1 4.21-4.36 against 4.22-4.28 ms, b3m4 6.01-6.17 against 6.04-6.10 ms).
+
+### Leave-one-out on the eval, for the paper (2026-10-16, 0.17.0 ranking)
+
+`omni-verify eval ... --no-id-lookup | --no-kind-lift | --no-name-fusion | --no-page-pick` on one
+index; `--no-screen-text | --no-soundtrack | --no-pdf-pages` each on its own. Every arm scored on a
+reopened index (a `--rebuild` arm scores its in-process state, where one Small audio query sits on
+a near tie and flips by a rank: Small full 0.916 fresh, 0.920 reopened). MRR at the right place,
+group = the queries the step serves (shipped / removed), all = 125 queries with the step removed:
+
+| removed | group (n) | Nano group | Nano all | Small group | Small all |
+|---|---|---|---|---|---|
+| identifier lookup | exact + shot-exact (15) | 1.000 / 0.581 | 0.820 | 1.000 / 0.605 | 0.872 |
+| kind lift | image + image-ml + audio (32) | 0.669 / 0.572 | 0.856 | 0.782 / 0.700 | 0.901 |
+| screenshot text | screenshot + shot-exact (13) | 1.000 / 0.833 | 0.856 | 1.000 / 0.897 | 0.909 |
+| soundtrack | soundtrack (3) | 0.430 / 0.000 | 0.861 | 0.778 / 0.007 | 0.893 |
+| short-PDF page cut | pdf-page (4) | 1.000 / 0.442 | 0.852 | 1.000 / 0.525 | 0.904 |
+| filename fusion | - | - | 0.870 | - | 0.916 (the near tie) |
+| page pick at open | - | - | 0.870 | - | 0.916 (the near tie) |
+| all of the above | all (125) | - | 0.762 | - | 0.795 |
+
+Shipped: Nano 0.870 (R@1 0.82), Small 0.920 (R@1 0.89). Filename fusion and page pick move nothing
+here: the eval's name queries are found by meaning, and its short PDFs are cut by page (page pick
+serves long PDFs' multi-page chunks). Fold: Nano 4.4 of 120 shown, answers folded at ranks 9 and 44;
+Small 5.2 shown, none folded.

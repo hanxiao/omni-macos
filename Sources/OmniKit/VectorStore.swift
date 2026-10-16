@@ -6211,10 +6211,10 @@ public final class VectorStore: @unchecked Sendable {
             return (fuseLexical(dense: r.hits, text: explicit, filter: filter, topK: topK, explicit: true, denseQuery: r.query), r.query)
         }
         guard let text = textQuery else { return r }
-        let kinded = fuseKinds(r.hits, filter: filter, topK: topK, query: r.query)
-        let named = LexicalIndex.shouldFuse(text)
+        let kinded = Self.kindLift ? fuseKinds(r.hits, filter: filter, topK: topK, query: r.query) : r.hits
+        let named = Self.nameFusion && LexicalIndex.shouldFuse(text)
             ? fuseLexical(dense: kinded, text: text, filter: filter, topK: topK, explicit: false, denseQuery: r.query) : kinded
-        return (fuseIdentifiers(named, text: text, filter: filter, topK: topK, denseQuery: r.query), r.query)
+        return (Self.identifierLookup ? fuseIdentifiers(named, text: text, filter: filter, topK: topK, denseQuery: r.query) : named, r.query)
     }
 
     private func searchGraphDense(queryGraph: MLXArray, filter: SearchFilter = SearchFilter(), topK: Int = 40) -> (hits: [SearchHit], query: [Float]) {
@@ -6301,10 +6301,10 @@ public final class VectorStore: @unchecked Sendable {
             return fuseLexical(dense: dense, text: explicit, filter: filter, topK: topK, explicit: true, denseQuery: query)
         }
         guard let text = textQuery else { return dense }
-        let kinded = fuseKinds(dense, filter: filter, topK: topK, query: query)
-        let named = LexicalIndex.shouldFuse(text)
+        let kinded = Self.kindLift ? fuseKinds(dense, filter: filter, topK: topK, query: query) : dense
+        let named = Self.nameFusion && LexicalIndex.shouldFuse(text)
             ? fuseLexical(dense: kinded, text: text, filter: filter, topK: topK, explicit: false, denseQuery: query) : kinded
-        return fuseIdentifiers(named, text: text, filter: filter, topK: topK, denseQuery: query)
+        return Self.identifierLookup ? fuseIdentifiers(named, text: text, filter: filter, topK: topK, denseQuery: query) : named
     }
 
     /// Each kind's centroid in this index: the axis of its cone. Sampled (at most 65,536 rows a
@@ -8646,6 +8646,11 @@ public final class VectorStore: @unchecked Sendable {
     nonisolated(unsafe) static var gemvSlice = ProcessInfo.processInfo.environment["OMNI_GEMV_SLICE"] != "0"
     /// Shrink the page cache for the duration of VACUUM (OMNI_VACUUM_CACHE=0 disables, for A/B).
     nonisolated(unsafe) public static var vacuumSmallCache = ProcessInfo.processInfo.environment["OMNI_VACUUM_CACHE"] != "0"
+    /// The ranking steps after the dense scan, each switched off alone by the labeled eval's
+    /// leave-one-out arms (`omni-verify eval --no-kind-lift | --no-name-fusion | --no-id-lookup`).
+    nonisolated(unsafe) public static var kindLift = true
+    nonisolated(unsafe) public static var nameFusion = true
+    nonisolated(unsafe) public static var identifierLookup = true
     /// Fold the delta after writes go quiet (OMNI_IDLE_FOLD=0 disables, for A/B).
     nonisolated(unsafe) static var idleFold = ProcessInfo.processInfo.environment["OMNI_IDLE_FOLD"] != "0"
     private var rowSidecarURL: URL { dbURL.deletingLastPathComponent().appendingPathComponent(dbURL.lastPathComponent + ".rows") }
