@@ -6,7 +6,9 @@ public struct BenchRow: Sendable, Codable, Equatable, Identifiable {
     public let task: String
     public let unit: String
     /// `p50`, `p95`, `p99`, `max` for a latency; `value` for a rate or a share; `op` for the seconds
-    /// the write under a search row took. A missing key is a cell the run did not produce.
+    /// the write under a search row took. A Conditions row carries `cpu` and `gpu` (other processes'
+    /// share, median over the group's cases), `clk` (the slowest clock, % below the run's fastest)
+    /// and `swp` (MB read back from swap). A missing key is a cell the run did not produce.
     public let cells: [String: Double]
     public var id: String { group + "/" + task }
 }
@@ -15,7 +17,8 @@ public struct BenchRow: Sendable, Codable, Equatable, Identifiable {
 /// upload carries. The table is a view over the metrics: every cell names the metric it came from,
 /// so nothing here is measured or computed beyond picking one value.
 public enum BenchTable {
-    public static let groups = ["Indexing", "Queries", "Search under load", "Memory", "Mechanisms"]
+    public static let groups = ["Indexing", "Queries", "Search under load", "Sharing the GPU", "Memory", "Mechanisms",
+                                "Conditions"]
     public static let latencyColumns = ["p50", "p95", "p99", "max"]
 
     private struct Spec {
@@ -43,11 +46,15 @@ public enum BenchTable {
         latency("Indexing", "Index one image", .index_image, "tags_on.index_image"),
         latency("Indexing", "Save one edit", .save_edit, "reuse_on.save"),
         value("Indexing", "Write vectors in bulk", "rows/s", .store_build, "write"),
+        value("Indexing", "Every file searchable", "s", .coverage, "all_searchable"),
+        value("Indexing", "Whole pass, same files", "s", .coverage, "pass"),
 
         latency("Queries", "Filename query", .queries, "filename_query"),
         latency("Queries", "Text query", .queries, "text_query"),
         latency("Queries", "Text query, encode", .queries, "text_encode"),
         latency("Queries", "Text query, search", .queries, "text_scan"),
+        latency("Queries", "Identifier query", .queries, "identifier_query"),
+        latency("Queries", "Query leaning toward images, search", .queries, "leaning_scan"),
         latency("Queries", "Filtered query", .queries, "filtered_query"),
         latency("Queries", "Find similar", .queries, "find_similar"),
         latency("Queries", "Image query", .queries, "image_query"),
@@ -62,6 +69,13 @@ public enum BenchTable {
         latency("Search under load", "While removing a kind", .search_under_writes, "kind.search", op: "kind.op"),
         latency("Search under load", "While reclaiming space", .search_under_writes, "reclaim.search", op: "reclaim.op"),
 
+        latency("Sharing the GPU", "GPU app frame, alone", .gpu_app, "alone.frame"),
+        latency("Sharing the GPU", "GPU app frame, Omni indexing", .gpu_app, "indexing.frame"),
+        latency("Sharing the GPU", "GPU app frame, Omni searching", .gpu_app, "searching.frame"),
+        value("Sharing the GPU", "GPU app frames missed, Omni indexing", "%", .gpu_app, "indexing.missed"),
+        latency("Sharing the GPU", "Search, GPU app running", .gpu_app, "searching.search"),
+        value("Sharing the GPU", "Indexing throughput lost, GPU app running", "%", .gpu_app, "index_cost"),
+
         value("Memory", "Peak process memory, indexing every kind while searching", "MB", .memory_trace, "index.peak"),
         value("Memory", "Peak process memory, deleting and compacting", "MB", .memory_trace, "compact.peak"),
         value("Memory", "At rest, model and index loaded", "MB", .memory_trace, "idle.peak"),
@@ -75,8 +89,8 @@ public enum BenchTable {
 
     public static func rows(_ result: PaperSuiteResult) -> [BenchRow] {
         var out: [BenchRow] = []
-        // Only cases that produced numbers at the run's own clock. A throttled case keeps its metrics
-        // in the report for diagnosis; in the table (and so in the upload) it would read as a slow Mac.
+        // Every case that produced numbers. None is dropped for what the machine was doing: that is
+        // in the Conditions rows, next to the numbers it was measured under.
         let cases = result.cases.filter { $0.status.producedNumbers }
         func metric(_ c: PaperCaseID, _ key: String, _ unit: PaperUnit? = nil) -> PaperMetric? {
             cases.first { $0.id == c.rawValue }?.metrics.first { $0.key == key && (unit == nil || $0.unit == unit) }
@@ -115,6 +129,38 @@ public enum BenchTable {
             out.append(BenchRow(group: "Queries", task: "One-bit funnel search, 500k rows", unit: "ms",
                                 cells: ["p50": m.value]))
         }
+        out += conditionRows(cases)
+        // Grouped in the table's order, stable within a group: the derived rows above join their
+        // group instead of opening a second one at the end (the site breaks groups on every change).
+        let rank = Dictionary(uniqueKeysWithValues: groups.enumerated().map { ($1, $0) })
+        return out.enumerated().sorted { a, b in
+            let ra = rank[a.element.group] ?? groups.count, rb = rank[b.element.group] ?? groups.count
+            return ra != rb ? ra < rb : a.offset < b.offset
+        }.map(\.element)
+    }
+
+    /// What the machine was doing while each group's rows were measured, and over the whole run:
+    /// other processes' CPU and GPU (median over the group's cases), the slowest the clock ran
+    /// against the run's fastest, and what was read back from swap.
+    static func conditionRows(_ cases: [PaperCaseResult]) -> [BenchRow] {
+        var byGroup: [String: Set<String>] = [:]
+        for s in specs { byGroup[s.group, default: []].insert(s.caseID.rawValue) }
+        byGroup["Mechanisms", default: []].insert(PaperCaseID.scan_ladder.rawValue)
+        byGroup["Queries", default: []].insert(PaperCaseID.recall.rawValue)
+        func row(_ task: String, _ ids: Set<String>?) -> BenchRow? {
+            let picked = cases.filter { ids == nil || ids!.contains($0.id) }
+            guard !picked.isEmpty else { return nil }
+            let c = PaperRunConditions(picked)
+            var cells: [String: Double] = [:]
+            if let v = c.backgroundCPUMedian { cells["cpu"] = v }
+            if let v = c.backgroundGPUMedian { cells["gpu"] = v }
+            if let v = c.clockSlowdownMax { cells["clk"] = v }
+            if let v = c.swapInTotalMB { cells["swp"] = v }
+            return cells.isEmpty ? nil : BenchRow(group: "Conditions", task: task, unit: "%", cells: cells)
+        }
+        var out: [BenchRow] = []
+        for g in groups where g != "Conditions" { if let r = row(g, byGroup[g]) { out.append(r) } }
+        if let r = row("Whole run", nil) { out.append(r) }
         return out
     }
 
@@ -146,7 +192,10 @@ public enum BenchTable {
             lines.append(group)
             for r in g {
                 let task = r.task.padding(toLength: taskWidth, withPad: " ", startingAt: 0)
-                if r.cells["value"] != nil {
+                if r.group == "Conditions" {
+                    lines.append("  \(task)other CPU \(fmt(r.cells["cpu"]))%  other GPU \(fmt(r.cells["gpu"]))%  "
+                                 + "clock slowest \(fmt(r.cells["clk"]))% below fastest  swap read \(fmt(r.cells["swp"])) MB")
+                } else if r.cells["value"] != nil {
                     lines.append("  \(task)\(fmt(r.cells["value"])) \(r.unit)")
                 } else {
                     var cols = latencyColumns.map { "\($0) \(fmt(r.cells[$0]))" }.joined(separator: "  ") + " \(r.unit)"

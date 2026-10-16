@@ -62,7 +62,8 @@ public final class PaperFS: Sendable {
     /// run; leaving them until the final cleanup would need the peak of all of them at once on disk.
     /// Every file a store keeps beside its database.
     static let storeSuffixes = ["", "-wal", "-shm", ".rows", ".vecs", ".quant", ".hits", ".vecdump",
-                                ".lex", ".lex-wal", ".lex-shm", ".names", ".names-wal", ".names-shm"]
+                                ".lex", ".lex-wal", ".lex-shm", ".names", ".names-wal", ".names-shm",
+                                ".ids", ".ids-wal", ".ids-shm"]
 
     public func discard(_ store: VectorStore, named name: String) {
         store.close()

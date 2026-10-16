@@ -249,12 +249,11 @@ public enum PaperCasesStore {
         for target in orderedUnique(ladder.map { ($0 / chunksPerFile) * chunksPerFile }) {
             try ctx.checkCancel()
             guard ctx.shouldContinue else { out.truncated = true; break }
-            // Per-rung gate on top of the runner's whole-case one. The runner sizes its gate on the
-            // LARGEST rung, so without this an 8 GB machine would lose the 125k row it can measure
-            // comfortably along with the 500k row it cannot.
+            // Per-rung capacity rule on top of the runner's whole-case one, which sizes the SMALLEST
+            // rung: each rung runs where this Mac's physical memory holds it (PaperCaseCatalog.fits),
+            // whatever is open beside the run.
             let peakMB = PaperCaseCatalog.storePeakMB(rows: target, quantized: true)
-            let freeMB = SystemProbe.snapshot().memFreeMB
-            if freeMB > 0, peakMB > freeMB - PaperCaseCatalog.memoryReserveMB {
+            if !PaperCaseCatalog.fits(peakMB: peakMB, memoryBytes: ctx.memoryBytes) {
                 skippedMemory.append(target)
                 continue
             }
@@ -274,50 +273,70 @@ public enum PaperCasesStore {
                 break
             }
 
+            // COUNTERBALANCED, A B B A in half-size blocks (bench-v10): whatever else the Mac does during
+            // the rung (a burst from another app, a clock ramp) falls on both arms alike instead of on
+            // whichever ran second. Through v9 the arms ran back to back and one M3 Ultra rung read
+            // 1.07x between 0.53x and 0.47x. The base is rebuilt only when the arm changes.
             var rungOK = true
-            for arm in arms {
+            var times: [String: [Double]] = [:], bits: [String: Int] = [:], resident: [String: Double] = [:]
+            let blocks = arms.count == 2 ? [arms[0], arms[1], arms[1], arms[0]] : arms
+            let perBlock = arms.count == 2 ? Swift.max(1, queries / 2) : queries
+            var current: String?
+            for (b, arm) in blocks.enumerated() {
                 try ctx.checkCancel()
                 guard ctx.shouldContinue else { out.truncated = true; rungOK = false; break }
-                let r = try ctx.withArm(arm) { () -> (times: [Double], bits: Int, residentMB: Double) in
-                    // Invalidate first, THEN read the baseline: the rebuild releases the previous
-                    // arm's resident matrix, so measuring across both would net one against the other
-                    // and report a negative size for the smaller representation.
-                    // The arm's lever set already holds quantBaseOverride at arm.bits (see the spec
-                    // in PaperCaseCatalog); this only drops the previous arm's resident matrix so
-                    // the warm-up search below rebuilds it under that override.
-                    store.invalidateBaseForBenchmark()
-                    MLX.Memory.clearCache()
-                    let before = MLX.Memory.activeMemory
-                    // Warm-up: the first search is what performs the rebuild, and timing it would put
-                    // a one-off base construction into a per-query latency column.
-                    for w in 0 ..< 3 {
-                        _ = store.search(PaperVectors.query(900 + w, dim: dim),
-                                         filter: SearchFilter(), topK: searchTopK)
+                let rebuild = arm != current
+                let r = try ctx.withArm(arm) { () -> (times: [Double], bits: Int, residentMB: Double?) in
+                    var residentMB: Double?
+                    if rebuild {
+                        // Invalidate first, THEN read the baseline: the rebuild releases the previous
+                        // arm's resident matrix, so measuring across both would net one against the
+                        // other and report a negative size for the smaller representation. The arm's
+                        // lever set already holds quantBaseOverride at its bits (PaperCaseCatalog).
+                        store.invalidateBaseForBenchmark()
+                        MLX.Memory.clearCache()
+                        let before = MLX.Memory.activeMemory
+                        // Warm-up: the first search performs the rebuild, and timing it would put a
+                        // one-off base construction into a per-query latency column.
+                        for w in 0 ..< 3 {
+                            _ = store.search(PaperVectors.query(900 + w, dim: dim),
+                                             filter: SearchFilter(), topK: searchTopK)
+                        }
+                        MLX.Memory.clearCache()
+                        residentMB = Double(MLX.Memory.activeMemory - before) / 1_048_576
                     }
-                    MLX.Memory.clearCache()
-                    let resident = Double(MLX.Memory.activeMemory - before) / 1_048_576
-                    ctx.progress("rung \(target) - \(arm) - \(queries) queries")
-                    let t = try timedQueries(store, count: queries, dim: dim, queryBase: 0, ctx: ctx,
+                    ctx.progress("rung \(target) - \(arm) - block \(b + 1) of \(blocks.count)")
+                    // The same queries for both arms: an arm's first block asks the first half, its
+                    // second block the second half.
+                    let seen = blocks[..<b].filter { $0 == arm }.count
+                    let t = try timedQueries(store, count: perBlock, dim: dim, queryBase: seen * perBlock, ctx: ctx,
                                              dumpHits: false, label: "\(target) \(arm)")
-                    return (t.milliseconds, store.baseModeBits, resident)
+                    return (t.milliseconds, store.baseModeBits, residentMB)
                 }
+                current = arm
                 guard !r.times.isEmpty else { out.truncated = true; rungOK = false; break }
                 out.ran(arm)
-                out.add("n\(target).\(arm)_p50", r.times, unit: .milliseconds, arm: arm)
+                times[arm, default: []] += r.times
+                bits[arm] = r.bits
+                if let m = r.residentMB, resident[arm] == nil { resident[arm] = m }
+                if r.times.count < perBlock { out.truncated = true }
+            }
+            for arm in arms {
+                guard let ts = times[arm], !ts.isEmpty else { continue }
+                out.add("n\(target).\(arm)_p50", ts, unit: .milliseconds, arm: arm)
                 out.add(PaperMetric.derived("n\(target).\(arm)_p95",
-                                            value: percentile(r.times.sorted(), 0.95), unit: .milliseconds,
+                                            value: percentile(ts.sorted(), 0.95), unit: .milliseconds,
                                             from: ["n\(target).\(arm)_p50"], arm: arm,
                                             note: "95th percentile of the same per-query sample"))
-                if r.residentMB > 0 {
+                if let m = resident[arm], m > 0 {
                     out.add(PaperMetric.derived("n\(target).\(arm)_base_resident",
-                                                value: r.residentMB, unit: .megabytes, from: [], arm: arm,
+                                                value: m, unit: .megabytes, from: [], arm: arm,
                                                 note: "MLX active-memory delta across the base rebuild, "
                                                     + "buffer cache dropped on both sides"))
                 }
                 // Proof the forcing took. Without it a row could carry an arm label the store never
                 // adopted, which is the one failure this whole case is arranged to prevent.
-                out.add(PaperFact("n\(target).\(arm)_base_bits", r.bits, arm: arm))
-                if r.times.count < queries { out.truncated = true }
+                if let b = bits[arm] { out.add(PaperFact("n\(target).\(arm)_base_bits", b, arm: arm)) }
             }
 
             // One ratio per funnel arm against the exact scan, so the crossover can be read for the
@@ -344,11 +363,11 @@ public enum PaperCasesStore {
                                 skippedMemory.isEmpty ? .text("none") : .ints(skippedMemory))
         out.extraParameters.set("top_k", .int(searchTopK))
         if completed.isEmpty, !skippedMemory.isEmpty {
-            throw PaperMemoryShort("every size needs more memory than is available: "
+            throw PaperMemoryShort("every size needs more memory than this Mac holds: "
                                    + skippedMemory.map(String.init).joined(separator: ","))
         }
         if !skippedMemory.isEmpty {
-            out.note = "rungs skipped for free memory: " + skippedMemory.map(String.init).joined(separator: ",")
+            out.note = "rungs larger than this Mac's memory holds: " + skippedMemory.map(String.init).joined(separator: ",")
         }
         return out
     }
@@ -606,8 +625,7 @@ public enum PaperCasesStore {
             try ctx.checkCancel()
             guard ctx.shouldContinue else { out.truncated = true; break }
             let peakMB = PaperCaseCatalog.measuredPeakMB(rows: target, bytesPerRow: PaperCaseCatalog.storeBuildBytesPerRow)
-            let freeMB = SystemProbe.snapshot().memFreeMB
-            if freeMB > 0, peakMB > freeMB - PaperCaseCatalog.memoryReserveMB { skipped.append(target); continue }
+            if !PaperCaseCatalog.fits(peakMB: peakMB, memoryBytes: ctx.memoryBytes) { skipped.append(target); continue }
             // The reference first, then the store: the vectors are a function of their index, so the
             // answer is the same either way, and its slabs no longer sit on top of the store's peak.
             guard let reference = try exactReference(rows: target, dim: dim, queries: queryCount, ctx: ctx),
@@ -650,7 +668,7 @@ public enum PaperCasesStore {
             MLX.Memory.clearCache()
         }
         if measured.isEmpty, !skipped.isEmpty {
-            throw PaperMemoryShort("every size needs more memory than is available: "
+            throw PaperMemoryShort("every size needs more memory than this Mac holds: "
                                    + skipped.map(String.init).joined(separator: ","))
         }
         out.extraParameters.set("ladder_measured", .ints(measured))

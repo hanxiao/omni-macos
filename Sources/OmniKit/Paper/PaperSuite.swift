@@ -20,10 +20,12 @@ import MLX
 //    unit of work, which is stamped in the result rather than left to the reader.
 //  - It never runs over. A case gets a budget and the suite gets a cap; on exhaustion the case
 //    records `timeout` or `skipped:budget` and keeps whatever aggregates it had.
-//  - It cannot wedge a small machine. Before each case its arithmetic peak is compared against the
-//    memory actually free, and a case that does not fit records `skipped:memory`. Swap is sampled
-//    at every boundary and a large delta aborts the whole run, because every number after that
-//    point would be a paging measurement.
+//  - It never waits for a quiet machine (Han, 2026-10-16). Omni runs beside whatever its owner is
+//    doing, so that is where it is measured: no idle gap between cases, no gate on free memory,
+//    swap or heat, no case dropped for a slow clock. What the machine was doing is RECORDED per case
+//    (other processes' CPU and GPU, swap reads, pressure, thermal state, power, the clock) and
+//    travels with the numbers. A case leaves a machine only when its measured peak cannot fit that
+//    machine's physical memory, a property of the Mac and not of the moment.
 //  - Levers move only between cases and arms, only from this thread, and are always restored.
 
 /// What a case body returns. The runner adds identity, status, timing and environment; the body
@@ -104,13 +106,6 @@ public struct PaperRunConfig: Sendable {
     /// 1.0 makes the run a smoke run and the export says so.
     public var scale: Double
     public var maxWallSeconds: Double
-    /// Identical on every machine so case k never inherits case k-1's thermal state.
-    public var interCaseGapSeconds: Double
-    public var armSettleSeconds: Double
-    /// MB read back from swap since the run began that abort it (Risk 1).
-    public var swapAbortMB: Double
-    /// A case may claim the memory actually free less this (PaperCaseCatalog.memoryReserveMB).
-    public var memoryReserveMB: Double
     /// The memory headroom the run applies, exactly as the shipped app applies the user's setting:
     /// MLX's limit is what is resident plus the working floor plus this, and it follows the open
     /// stores' GPU bases as they grow (AppModel.applyMemoryLimit, followIndexMemory). nil leaves
@@ -120,32 +115,21 @@ public struct PaperRunConfig: Sendable {
     public var restoreMemoryCap: (@Sendable () -> Void)?
     /// Worst case to acknowledge a cancel: one gemv, or one file's embed.
     public var cancelLatencyBoundSeconds: Double
-    /// Probe the clock before the first case and after every case, and record a case that ran
-    /// slower than the start as `throttled` (PaperCasesCompute.clockProbeMilliseconds).
+    /// Probe the clock before the first case and after every case, and record how much slower than
+    /// the fastest probe so far each case left the machine (PaperCasesCompute.clockProbeMilliseconds).
     public var clockCheck: Bool
-    /// How much slower than the start's probe a case's closing probe may read before the case is
-    /// `throttled`. Clean runs drift 0-4% start to end (bench-v8, five Macs); a slept display read
-    /// 46-49% slower.
-    public var clockSlowdownLimitPercent: Double
 
     public init(runId: String = UUID().uuidString,
                 scale: Double = 1.0,
                 maxWallSeconds: Double = PaperCaseCatalog.maxWallSeconds,
-                interCaseGapSeconds: Double = 3.0,
-                armSettleSeconds: Double = 0.25,
-                swapAbortMB: Double = 512,
-                memoryReserveMB: Double = PaperCaseCatalog.memoryReserveMB,
                 pinHeadroomBytes: Int? = nil,
                 restoreMemoryCap: (@Sendable () -> Void)? = nil,
                 cancelLatencyBoundSeconds: Double = 3.0,
-                clockCheck: Bool = true,
-                clockSlowdownLimitPercent: Double = 20) {
+                clockCheck: Bool = true) {
         self.runId = runId; self.scale = scale; self.maxWallSeconds = maxWallSeconds
-        self.interCaseGapSeconds = interCaseGapSeconds; self.armSettleSeconds = armSettleSeconds
-        self.swapAbortMB = swapAbortMB; self.memoryReserveMB = memoryReserveMB
         self.pinHeadroomBytes = pinHeadroomBytes; self.restoreMemoryCap = restoreMemoryCap
         self.cancelLatencyBoundSeconds = cancelLatencyBoundSeconds
-        self.clockCheck = clockCheck; self.clockSlowdownLimitPercent = clockSlowdownLimitPercent
+        self.clockCheck = clockCheck
     }
 }
 
@@ -172,6 +156,8 @@ public struct PaperContext: Sendable {
     let levers: PaperLeverController
     let cancelled: @Sendable () -> Bool
     let relay: PaperProgressRelay
+    /// What other processes did while each arm ran, summed over every scope the arm opened.
+    let armLog: PaperArmConditions
 
     public var isCancelled: Bool { cancelled() }
     public var isExpired: Bool { Date() >= deadline }
@@ -192,6 +178,8 @@ public struct PaperContext: Sendable {
         guard let arm = spec.arm(id) else {
             preconditionFailure("case \(spec.id.rawValue) has no arm '\(id)'")
         }
+        let begin = SystemProbe.loadSample()
+        defer { armLog.add(id, from: begin, to: SystemProbe.loadSample()) }
         return try levers.withArm(arm.id, arm.levers, body)
     }
 }
@@ -230,6 +218,56 @@ final class PaperProgressRelay: @unchecked Sendable {
     }
 }
 
+/// Other processes' CPU and GPU over each arm's scopes, so a comparison between two arms can be read
+/// against what else ran during each: a burst that fell on one arm shows here, next to its numbers.
+final class PaperArmConditions: @unchecked Sendable {
+    private struct Sum { var wall = 0.0, busy = 0.0, total = 0.0, own = 0.0, othersGPUNs = 0.0, gpuReadable = true }
+    private let lock = NSLock()
+    private var sums: [String: Sum] = [:]
+    private var order: [String] = []
+
+    func add(_ arm: String, from a: SystemProbe.LoadSample, to b: SystemProbe.LoadSample) {
+        var busy = 0.0, total = 0.0
+        if a.ticks.count == 4, b.ticks.count == 4 {
+            for i in 0 ..< 4 {
+                let d = Double(b.ticks[i] &- a.ticks[i])
+                total += d
+                if i != 2 { busy += d }          // CPU_STATE_IDLE is 2
+            }
+        }
+        let split = SystemProbe.gpuTimeSplit(from: a.gpu, to: b.gpu)
+        lock.withLock {
+            if sums[arm] == nil { order.append(arm) }
+            var s = sums[arm] ?? Sum()
+            s.wall += Swift.max(0, b.wall - a.wall)
+            s.busy += busy; s.total += total
+            s.own += Swift.max(0, b.ownCPUSeconds - a.ownCPUSeconds)
+            s.othersGPUNs += Double(split.othersNs)
+            s.gpuReadable = s.gpuReadable && !a.gpu.isEmpty && !b.gpu.isEmpty
+            sums[arm] = s
+        }
+    }
+
+    /// `arm.<id>.other_cpu_pct` and `arm.<id>.other_gpu_pct`, per arm in the order they first ran.
+    func facts() -> [PaperFact] {
+        let logical = Double(Swift.max(1, ProcessInfo.processInfo.activeProcessorCount))
+        return lock.withLock {
+            order.flatMap { arm -> [PaperFact] in
+                guard let s = sums[arm], s.wall > 0 else { return [] }
+                var out: [PaperFact] = []
+                if s.total > 0 {
+                    let other = Swift.max(0, 100 * s.busy / s.total - 100 * (s.own / s.wall) / logical)
+                    out.append(PaperFact("arm.\(arm).other_cpu_pct", String(format: "%.1f", other), arm: arm))
+                }
+                if s.gpuReadable {
+                    out.append(PaperFact("arm.\(arm).other_gpu_pct", String(format: "%.1f", 100 * s.othersGPUNs / (s.wall * 1e9)), arm: arm))
+                }
+                return out
+            }
+        }
+    }
+}
+
 public enum PaperSuite {
 
     /// Run the suite to completion, to cancellation or to abort, and ALWAYS return a result.
@@ -261,7 +299,7 @@ public enum PaperSuite {
 
         let relay = PaperProgressRelay(caseCount: plan.count, sink: onProgress)
         let shared = PaperShared()
-        let levers = PaperLeverController(settleSeconds: config.armSettleSeconds)
+        let levers = PaperLeverController()
         defer { levers.restore() }
         levers.pin(.suiteWide)
 
@@ -284,16 +322,15 @@ public enum PaperSuite {
             }
         }
 
-        // The clock every case is held to: the FASTEST probe of the run so far, first taken here
+        // The clock each case is compared with: the FASTEST probe of the run so far, first taken here
         // after the cap is pinned. Not the first probe alone: it can land on cold clocks (0.669 ms
-        // against 0.475-0.594 for the rest of one run), and a baseline that slow hides a throttle
-        // of the same size. A machine that slows down later (display sleep, App Nap, heat) is
-        // caught case by case.
+        // against 0.475-0.594 for the rest of one run). How much slower a case left the machine
+        // (display sleep, App Nap, heat, someone else's GPU work) is recorded with it.
         var clockBase = config.clockCheck ? PaperCasesCompute.clockProbeMilliseconds() : nil
 
         let startedAt = Date()
         let begin = SystemProbe.snapshot()
-        var maxThermalRank = thermalRank(begin.thermal)
+        var maxThermalRank = PaperRunConditions.thermalRank(begin.thermal)
         var maxBusy = -1.0
         var busyProcs = SystemProbe.processesOver20Percent()
 
@@ -301,7 +338,6 @@ public enum PaperSuite {
         var canaryFirst: PaperCaseResult?
         var canaryLast: PaperCaseResult?
         var status: PaperSuiteStatus = .complete
-        var aborted = false
         var completedWeight = 0.0
 
         for (index, step) in plan.enumerated() {
@@ -310,14 +346,12 @@ public enum PaperSuite {
             relay.beginCase(index: index + 1, id: spec.id.rawValue, title: spec.title,
                             fraction: totalWeight > 0 ? completedWeight / totalWeight : 0)
 
-            // Order of the gates matters: cancel beats abort beats budget beats capability beats
+            // Order of the gates matters: cancel beats budget beats capability beats the machine's
             // memory, so the recorded reason is the FIRST thing that made the case impossible.
             var precheck: (PaperCaseStatus, String)?
             if isCancelled() {
                 precheck = (.cancelled, "cancelled before the case started")
                 status = .cancelled
-            } else if aborted {
-                precheck = (.skippedAborted, "suite aborted before the case started")
             } else if step.repetition != .last, elapsed + closingReserve + spec.budgetSeconds > config.maxWallSeconds {
                 precheck = (.skippedBudget, String(format: "global cap reached at %.0f s", elapsed))
             } else if spec.requiresVisionTower, !engine.supportsImages {
@@ -327,18 +361,15 @@ public enum PaperSuite {
             }
 
             if precheck == nil {
-                // The gap is what makes case k independent of case k-1: drop the buffer cache
-                // first, then idle a fixed 3 s (identical on every machine), then reset the peak so
-                // the case's own high-water mark is measured against a settled baseline.
-                if index > 0 {
-                    MLX.Memory.clearCache()   // GPU.clearCache is the deprecated spelling
-                    idle(config.interCaseGapSeconds, isCancelled: isCancelled)
-                }
+                // No idle gap: the next case starts at once, on whatever the machine is doing. The
+                // buffer cache is dropped and the peak reset so the case's own high-water mark is its
+                // own.
+                if index > 0 { MLX.Memory.clearCache() }   // GPU.clearCache is the deprecated spelling
                 MLX.GPU.resetPeakMemory()
-                if isCancelled() {
-                    precheck = (.cancelled, "cancelled during the inter-case gap")
-                    status = .cancelled
-                } else if let block = memoryBlock(spec, reserve: config.memoryReserveMB) {
+                // The run's own state, reset rather than waited out: no typing window carried over
+                // from a case that simulated keystrokes.
+                engine.endInteractive()
+                if let block = capacityBlock(spec, memoryBytes: memoryBytes) {
                     precheck = (.skippedMemory, block)
                 }
             }
@@ -356,14 +387,15 @@ public enum PaperSuite {
                 let envBegin = SystemProbe.snapshot()
                 relay.environment(thermal: envBegin.thermal,
                                   swapDeltaMB: max(0, envBegin.swapUsedMB - begin.swapUsedMB))
+                let armLog = PaperArmConditions()
                 let ctx = PaperContext(spec: spec, params: spec.params, engine: engine, fs: fs,
                                        shared: shared,
                                        scale: config.scale, capClass: capClass,
                                        memoryBytes: memoryBytes, repetition: step.repetition,
                                        deadline: Date().addingTimeInterval(spec.budgetSeconds),
-                                       levers: levers, cancelled: isCancelled, relay: relay)
+                                       levers: levers, cancelled: isCancelled, relay: relay, armLog: armLog)
                 let t0 = Date()
-                let peak = FootprintPeak(from: envBegin.footprintMB)
+                let peak = CaseSampler(from: envBegin.footprintMB)
                 var output = PaperCaseOutput()
                 var caseStatus = PaperCaseStatus.ok
                 var note: String?
@@ -383,6 +415,7 @@ public enum PaperSuite {
                     note = "\(error)"
                 }
                 let seconds = Date().timeIntervalSince(t0)
+                output.facts += armLog.facts()
                 if caseStatus == .ok {
                     if isCancelled() {
                         caseStatus = .cancelled
@@ -402,34 +435,30 @@ public enum PaperSuite {
                     note = output.note ?? "the case returned no measurements"
                 }
 
-                // The closing probe. A case that produced numbers at a slower clock than the run
-                // has shown it can do is not reported as measured: one retry after a pause separates a
-                // momentary dip from a machine that has changed clock domain.
+                // The case's own GPU work, finished: a kernel it queued must not land on the closing
+                // probe and read as a slow machine. This waits for this process's queue only.
+                Stream.defaultStream(.gpu).synchronize()
+                // The conditions end where the case's work ends, before the closing probe, whose own
+                // GPU work would otherwise count as the case's.
+                let envEnd = SystemProbe.snapshot()
+                let sampled = peak.stop()
+
+                // The closing probe: how much slower than its fastest the machine ran after this case.
+                // Recorded with the case, never a reason to drop it.
+                var slowdown: Double?
                 if let base = clockBase, base > 0, caseStatus.producedNumbers, step.repetition == .only {
-                    var probe = PaperCasesCompute.clockProbeMilliseconds()
-                    if 100 * (probe - base) / base > config.clockSlowdownLimitPercent {
-                        idle(5, isCancelled: isCancelled)
-                        probe = PaperCasesCompute.clockProbeMilliseconds()
-                    }
-                    let slowdown = 100 * (probe - base) / base
+                    let probe = PaperCasesCompute.clockProbeMilliseconds()
+                    slowdown = 100 * (probe - base) / base
                     output.facts.append(PaperFact("clock_probe_ms", String(format: "%.3f", probe)))
                     output.facts.append(PaperFact("clock_probe_best_ms", String(format: "%.3f", base)))
-                    if slowdown > config.clockSlowdownLimitPercent {
-                        caseStatus = .throttled
-                        note = String(format: "the machine ran %.0f%% slower after this case than its fastest earlier "
-                                      + "in the run (clock probe %.2f ms against %.2f ms); its numbers are kept in the "
-                                      + "report and left out of the table", slowdown, probe, base)
-                    } else {
-                        clockBase = min(base, probe)
-                    }
+                    clockBase = min(base, probe)
                 }
 
-                let envEnd = SystemProbe.snapshot()
-                let peakDelta = peak.stop()
                 let swapIn = envEnd.swapInMB.flatMap { e in envBegin.swapInMB.map { e - $0 } }
                 let busy = SystemProbe.busy(from: envBegin, to: envEnd)
+                let logical = Double(max(1, ProcessInfo.processInfo.activeProcessorCount))
                 maxBusy = max(maxBusy, busy.systemBusyPct)
-                maxThermalRank = max(maxThermalRank, thermalRank(envEnd.thermal))
+                maxThermalRank = max(maxThermalRank, PaperRunConditions.thermalRank(sampled.thermalWorst))
                 result = PaperCaseResult(
                     id: spec.id.rawValue, title: spec.title, deliverable: spec.deliverable,
                     status: caseStatus, note: note ?? output.note, arms: output.arms,
@@ -438,24 +467,21 @@ public enum PaperSuite {
                     budgetSeconds: spec.budgetSeconds, truncated: output.truncated,
                     environment: PaperCaseEnvironment(
                         thermalBegin: envBegin.thermal, thermalEnd: envEnd.thermal,
+                        thermalWorst: sampled.thermalWorst,
                         memFreeBeginMB: envBegin.memFreeMB,
                         swapDeltaMB: envEnd.swapUsedMB - envBegin.swapUsedMB,
                         footprintDeltaMB: envEnd.footprintMB - envBegin.footprintMB,
-                        footprintPeakDeltaMB: peakDelta, swapInMB: swapIn,
+                        footprintPeakDeltaMB: sampled.footprintPeakDeltaMB, swapInMB: swapIn,
+                        pressureWorst: sampled.pressureWorst,
                         mlxPeakMB: envEnd.mlxPeakMB,
                         systemBusyPercent: busy.systemBusyPct, ownCPUCores: busy.ownCores,
-                        contended: busy.contended))
-
-                // Paging is the wedge detector: past the limit every later number would be a paging
-                // measurement, so the run stops rather than filling a table with them. It counts
-                // pages READ BACK from swap. It used to count swap USED, which grows whenever the
-                // kernel parks the owner's idle apps to make room - what a 16 GB Mac does as soon as
-                // the model loads - and stopped a 16 GB M4 after five cases (bench-v7) with nothing
-                // of the benchmark's own ever paged out.
-                if let now = envEnd.swapInMB, let start = begin.swapInMB, now - start > config.swapAbortMB {
-                    aborted = true
-                    status = .abortedSwap
-                }
+                        backgroundCPUPercent: busy.systemBusyPct < 0 ? -1
+                            : max(0, busy.systemBusyPct - 100 * busy.ownCores / logical),
+                        backgroundGPUPercent: sampled.othersGPUPercent,
+                        ownGPUPercent: sampled.ownGPUPercent,
+                        gpuUtilizationPercent: sampled.gpuUtilizationMean,
+                        clockSlowdownPercent: slowdown,
+                        powerSource: envBegin.powerSource, lowPowerMode: envBegin.lowPowerMode))
             }
 
             completedWeight += spec.budgetSeconds
@@ -476,7 +502,7 @@ public enum PaperSuite {
 
         let end = SystemProbe.snapshot()
         let endedAt = Date()
-        maxThermalRank = max(maxThermalRank, thermalRank(end.thermal))
+        maxThermalRank = max(maxThermalRank, PaperRunConditions.thermalRank(end.thermal))
         busyProcs = max(busyProcs, SystemProbe.processesOver20Percent())
         // One rule for the whole run rather than a status assignment at every gate: anything short
         // of twelve ok cases is a partial run, whatever made it short.
@@ -488,7 +514,7 @@ public enum PaperSuite {
             pinnedCapBytes: config.pinHeadroomBytes != nil ? OmniMemoryBudget.capBytes : originalCap,
             startedAtUTC: startedAt, endedAtUTC: endedAt,
             wallSeconds: endedAt.timeIntervalSince(startedAt), status: status, cases: results,
-            begin: begin, end: end, maxThermal: thermalName(maxThermalRank),
+            begin: begin, end: end, maxThermal: PaperRunConditions.thermalName(maxThermalRank),
             maxSystemBusyPercent: maxBusy,
             swapDeltaMB: (begin.swapUsedMB >= 0 && end.swapUsedMB >= 0) ? end.swapUsedMB - begin.swapUsedMB : -1,
             processesOver20Percent: busyProcs, thermalDriftPercent: drift,
@@ -497,30 +523,70 @@ public enum PaperSuite {
 
     // MARK: - Gates and helpers
 
-    /// The highest phys_footprint a case reaches, sampled every 50 ms on its own thread, over the
-    /// footprint it started from. The case's end-to-end delta hides a transient it freed before
-    /// returning, and the transient is what the memory gate has to admit.
-    final class FootprintPeak: @unchecked Sendable {
+    /// What the machine did while one case ran, sampled on its own thread: phys_footprint every
+    /// 50 ms (the case's high-water mark), and every 250 ms the GPU's utilization, the thermal state
+    /// and the memory pressure. GPU time per process is read at both ends and split into this
+    /// process and everyone else.
+    final class CaseSampler: @unchecked Sendable {
+        struct Sampled {
+            var footprintPeakDeltaMB: Double
+            var thermalWorst: String
+            var pressureWorst: Int
+            var gpuUtilizationMean: Double?
+            var ownGPUPercent: Double?
+            var othersGPUPercent: Double?
+        }
         private let lock = NSLock()
         private var high: Double
         private var running = true
         private let base: Double
         private let done = DispatchSemaphore(value: 0)
+        private var thermalRank = 0
+        private var pressure = -1
+        private var utilization: [Double] = []
+        private let gpuBegin: [UInt64: (pid: Int32, ns: UInt64)]
+        private let t0 = Date()
+
         init(from base: Double) {
             self.base = base; high = base
+            gpuBegin = SystemProbe.gpuClientTimes()
             Thread.detachNewThread { [self] in
+                var tick = 0
                 while lock.withLock({ running }) {
                     let now = Double(SystemProbe.footprintBytes()) / 1_048_576
                     lock.withLock { high = Swift.max(high, now) }
+                    if tick % 5 == 0 {
+                        let rank = PaperRunConditions.thermalRank(SystemProbe.thermalName(ProcessInfo.processInfo.thermalState))
+                        let level = SystemProbe.sysctlInt("kern.memorystatus_vm_pressure_level") ?? -1
+                        let util = SystemProbe.gpuUtilizationPercent()
+                        lock.withLock {
+                            thermalRank = Swift.max(thermalRank, rank)
+                            pressure = Swift.max(pressure, level)
+                            if let util { utilization.append(util) }
+                        }
+                    }
+                    tick += 1
                     Thread.sleep(forTimeInterval: 0.05)
                 }
                 done.signal()
             }
         }
-        func stop() -> Double {
+
+        func stop() -> Sampled {
             lock.withLock { running = false }
             done.wait()
-            return lock.withLock { high } - base
+            let wallNs = Swift.max(1, -t0.timeIntervalSinceNow * 1e9)
+            let gpuEnd = SystemProbe.gpuClientTimes()
+            let readable = !gpuBegin.isEmpty && !gpuEnd.isEmpty
+            let split = SystemProbe.gpuTimeSplit(from: gpuBegin, to: gpuEnd)
+            return lock.withLock {
+                Sampled(footprintPeakDeltaMB: high - base,
+                        thermalWorst: PaperRunConditions.thermalName(thermalRank),
+                        pressureWorst: pressure,
+                        gpuUtilizationMean: utilization.isEmpty ? nil : utilization.reduce(0, +) / Double(utilization.count),
+                        ownGPUPercent: readable ? 100 * Double(split.ownNs) / wallNs : nil,
+                        othersGPUPercent: readable ? 100 * Double(split.othersNs) / wallNs : nil)
+            }
         }
     }
 
@@ -569,26 +635,13 @@ public enum PaperSuite {
         }
     }
 
-    /// A case may claim the memory actually free less `reserve`. The peak is arithmetic or measured,
-    /// never guessed; a case without one (its peak is the model's activations, which the harness does
-    /// not size) is never blocked, because guessing a number here would be worse than not gating.
-    private static func memoryBlock(_ spec: PaperCaseSpec, reserve: Double) -> String? {
-        guard let peak = spec.arithmeticPeakMB else { return nil }
-        let free = SystemProbe.snapshot().memFreeMB
-        guard free > 0 else { return nil }          // probe failed; do not block on an unknown
-        guard peak > free - reserve else { return nil }
-        return String(format: "needs %.0f MB, only %.0f MB free (%.0f kept in reserve)", peak, free, reserve)
-    }
-
-    /// The fixed idle gap, polled so a cancel is acknowledged inside it rather than after it.
-    private static func idle(_ seconds: Double, isCancelled: @Sendable () -> Bool) {
-        let slice = 0.1
-        var slept = 0.0
-        while slept < seconds {
-            if isCancelled() { return }
-            Thread.sleep(forTimeInterval: min(slice, seconds - slept))
-            slept += slice
-        }
+    /// A case runs on a Mac whose physical memory can hold its measured peak
+    /// (PaperCaseCatalog.fits). Free memory, swap and pressure are recorded, never consulted: what the
+    /// owner happens to have open is a condition of the measurement, not a reason to skip it. A case
+    /// without a peak (its peak is the model's activations) always runs.
+    private static func capacityBlock(_ spec: PaperCaseSpec, memoryBytes: Int) -> String? {
+        guard let peak = spec.arithmeticPeakMB, !PaperCaseCatalog.fits(peakMB: peak, memoryBytes: memoryBytes) else { return nil }
+        return PaperCaseCatalog.capacityNote(peakMB: peak, memoryBytes: memoryBytes)
     }
 
     /// Fold the canary's two invocations into one result. Every metric keeps its runs and gains a
@@ -620,30 +673,17 @@ public enum PaperSuite {
         }
         if var envA = first.environment, let envB = last.environment {
             envA.thermalEnd = envB.thermalEnd
+            envA.thermalWorst = PaperRunConditions.thermalName(max(PaperRunConditions.thermalRank(envA.thermalWorst),
+                                                                   PaperRunConditions.thermalRank(envB.thermalWorst)))
+            envA.pressureWorst = max(envA.pressureWorst, envB.pressureWorst)
             envA.swapDeltaMB += envB.swapDeltaMB
+            if let b = envB.swapInMB { envA.swapInMB = (envA.swapInMB ?? 0) + b }
             envA.mlxPeakMB = max(envA.mlxPeakMB, envB.mlxPeakMB)
             envA.systemBusyPercent = max(envA.systemBusyPercent, envB.systemBusyPercent)
-            envA.contended = envA.contended || envB.contended
+            envA.backgroundCPUPercent = max(envA.backgroundCPUPercent, envB.backgroundCPUPercent)
+            if let b = envB.backgroundGPUPercent { envA.backgroundGPUPercent = max(envA.backgroundGPUPercent ?? 0, b) }
             merged.environment = envA
         }
         return merged
-    }
-
-    private static func thermalRank(_ name: String) -> Int {
-        switch name {
-        case "nominal": 0
-        case "fair": 1
-        case "serious": 2
-        case "critical": 3
-        default: 0
-        }
-    }
-    private static func thermalName(_ rank: Int) -> String {
-        switch rank {
-        case 1: "fair"
-        case 2: "serious"
-        case 3: "critical"
-        default: "nominal"
-        }
     }
 }

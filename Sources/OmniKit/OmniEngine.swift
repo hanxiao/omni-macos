@@ -745,6 +745,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// so the search preempts after one short forward instead of waiting behind a full in-flight
     /// indexing flush. Cheap (one lock + Date); safe to call on every keystroke.
     public func noteInteractive() { markQuery() }
+    /// End the activity window now, as if the user had stopped typing a window ago. The benchmark
+    /// ends a phase of simulated typing with this, so the phase after it does not start with the
+    /// indexer in its typing mode (an indexing phase that followed one read 27% slower than one
+    /// that did not, bench-v10).
+    public func endInteractive() { queryStampLock.withLock { _lastQueryAt = .distantPast } }
     private static let queryActiveWindow: TimeInterval =
         (ProcessInfo.processInfo.environment["OMNI_QUERY_ACTIVE_WINDOW"].flatMap { Double($0) }) ?? 2.0
     /// True if an interactive query ran within the active window (default 2s). Off by env

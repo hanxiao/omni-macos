@@ -60,6 +60,31 @@ public enum PaperVectors {
     /// Query `q`'s vector: the same construction at a disjoint index (see the header note).
     public static func query(_ q: Int, dim: Int = dim) -> [Float] { vec(queryIndexBase + q, dim: dim) }
 
+    // MARK: - The image cone (bench-v10)
+
+    /// A real encoder puts each modality in a narrow cone of its own (the modality gap), and the
+    /// app's modality lift reads a query's lean from those cones. On isotropic vectors every kind's
+    /// centroid is noise and no query ever leans, so the large store's image rows are their seeded
+    /// vector pulled toward one fixed axis. Every other row, and every other case, stays isotropic.
+    static let imageAxisIndex = 1 << 33
+
+    /// An image row of the large store: cosine about 0.6 with the image axis.
+    public static func imageRow(_ i: Int, dim: Int = dim) -> [Float] { lean(vec(i, dim: dim), weight: 0.6, dim: dim) }
+
+    /// A query that leans toward images (cosine about 0.9 with the image axis), as a description of
+    /// something seen does: the modality lift takes it to the text scale and adds the images' own
+    /// best hits from a second, restricted scan.
+    public static func leaningQuery(_ q: Int, dim: Int = dim) -> [Float] { lean(query(q, dim: dim), weight: 0.9, dim: dim) }
+
+    private static func lean(_ noise: [Float], weight w: Float, dim: Int) -> [Float] {
+        let axis = vec(imageAxisIndex, dim: dim)
+        let r = (1 - w * w).squareRoot()
+        var v = (0 ..< dim).map { w * axis[$0] + r * noise[$0] }
+        let n = v.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot()
+        if n > 0 { for k in 0 ..< dim { v[k] /= n } }
+        return v
+    }
+
     /// A whole query set. Deterministic and independent of the store, so the same `q` asks the same
     /// question of every arm and of every machine.
     public static func queries(_ n: Int, dim: Int = dim) -> [[Float]] {

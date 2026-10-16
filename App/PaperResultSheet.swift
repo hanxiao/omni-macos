@@ -188,20 +188,6 @@ struct PaperResultSheet: View {
         for c in r.cases where c.status != .ok {
             w.append("\(c.id) \(c.status.rawValue)" + (c.note.map { ": " + $0 } ?? ""))
         }
-        if r.thermalDriftExceeded, let drift = r.thermalDriftPercent {
-            w.append(String(format: "Thermal drift %.1f%% exceeds +-8%%: the machine changed clock domain mid-suite.", drift))
-        }
-        if r.maxThermal == "serious" || r.maxThermal == "critical" {
-            w.append("Thermal state reached '\(r.maxThermal)': the machine throttled during the run.")
-        }
-        if !r.contendedCases.isEmpty {
-            w.append("Contended (another process used more than a fifth of the machine): "
-                     + r.contendedCases.joined(separator: ", "))
-        }
-        if !r.pagedCases.isEmpty {
-            w.append(String(format: "Paged (more than %.0f MB read back from swap while it ran): ", PaperSuiteResult.pagedThresholdMB)
-                     + r.pagedCases.joined(separator: ", "))
-        }
         return w
     }
 

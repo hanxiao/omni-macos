@@ -207,10 +207,9 @@ public struct PaperLevers: Sendable, Equatable {
 
 /// Owns every mutation of the levers for the duration of a run.
 public final class PaperLeverController: @unchecked Sendable {
-    /// Settle gap after a lever moves, before the arm's work starts. The suite is serial so nothing
-    /// should be in flight, but MLX evaluates lazily and the store folds on its own timers; a short
-    /// fence costs a quarter second per arm and removes a whole class of "the previous arm's work
-    /// finished under the new lever" doubt.
+    /// Pause after a lever moves, before the arm's work starts. Zero: the benchmark does not wait for
+    /// the machine to settle (Han, 2026-10-16). The suite is serial, so nothing of its own is in flight
+    /// when an arm opens; anything else running is a condition the case records.
     public let settleSeconds: TimeInterval
 
     private let owner: Thread
@@ -218,7 +217,7 @@ public final class PaperLeverController: @unchecked Sendable {
     private var pinned: PaperLevers
     private var activeArmName: String?
 
-    public init(settleSeconds: TimeInterval = 0.25) {
+    public init(settleSeconds: TimeInterval = 0) {
         self.settleSeconds = settleSeconds
         self.owner = Thread.current
         self.original = PaperLevers.capture()

@@ -8,10 +8,9 @@ import OmniKit
 // Mirrors runProfiling()'s structure (AppModel.swift) - guard, pause, defer-restore, detached work,
 // publish progress - and adds the three things a 25-minute run needs that a 30-second one does not:
 //
-//  1. A refusal list. A run that started on a hot laptop, on battery in low-power mode, with the
-//     serving port open, or with the wrong model variant loaded produces numbers that look like a
-//     design difference and are not one. Each refusal names its own reason, because "cannot run" on
-//     somebody else's Mac is unactionable.
+//  1. No refusal for what the Mac is doing. A busy, hot, low-memory or battery-powered Mac is one
+//     Omni runs on, so the run measures there and records those conditions with every case; only
+//     what makes the run impossible (no scratch disk) stops it, and says so.
 //  2. Live per-case progress. The suite publishes which case, how far through the budget weight,
 //     and the machine's condition; the sheet must never look hung.
 //  3. A report that survives a cancel. The suite always returns a result, this always renders and
@@ -220,41 +219,16 @@ extension AppModel {
 
     // MARK: - Preflight
 
-    /// Every condition that makes a run not worth starting, checked BEFORE anything is paused,
-    /// pinned or created. Returns false having already told the operator which one it was.
+    /// What makes a run impossible, checked BEFORE anything is paused, pinned or created. Returns
+    /// false having already told the operator which one it was.
     private func paperPreflightPasses() -> Bool {
         // The paper's reference checkpoint is Nano (Table 1). A mixed-variant table is worthless,
         // and Nano is also the only variant that leaves headroom at 8 GB. Never switched here:
         // switchVariant reloads the engine and can mark the real index obsolete.
 
-        let snap = SystemProbe.snapshot()
-        // The same refusal run_bench.sh already makes, for the same reason: a contended measurement
-        // has been wrong by up to 1.8x in this project's own records. PER CORE, not the script's
-        // absolute 2.0: macOS counts every runnable AND uninterruptible thread, so an idle machine
-        // reads roughly 0.1 per core (measured on a 32-core M3 Ultra at 97% idle CPU: 1.6 to 3.5),
-        // and the absolute limit refused 14 of 16 attempts there. The limit keeps a 3x margin over
-        // that measured idle ceiling and never drops below the script's own value.
-        let loadLimit = max(2.0, 0.35 * Double(ProcessInfo.processInfo.activeProcessorCount))
-        guard snap.loadAvg1m <= loadLimit else {
-            paperAlert("The Mac is too busy",
-                       String(format: "One-minute load average is %.1f (limit %.1f). "
-                              + "Quit busy apps, then try again.",
-                              snap.loadAvg1m, loadLimit))
-            return false
-        }
-        guard snap.thermal != "serious", snap.thermal != "critical" else {
-            paperAlert("The Mac is too hot",
-                       "Thermal state is '\(snap.thermal)'. The Mac is throttling, so results would be "
-                       + "unreliable. Let it cool down, then try again.")
-            return false
-        }
-        // Hard refuse: on battery AND in Low Power Mode is a different machine, not a slower one.
-        guard !(snap.powerSource == "battery" && snap.lowPowerMode) else {
-            paperAlert("Plug in, or turn off Low Power Mode",
-                       "Low Power Mode on battery slows the chip, so results would not be comparable "
-                       + "with other Macs.")
-            return false
-        }
+        // NO REFUSAL FOR WHAT THE MAC IS DOING (Han, 2026-10-16). A busy, hot, low-memory or
+        // battery-powered Mac is a Mac Omni runs on, so the run starts and records those conditions
+        // with every case (PaperSuite). Only what makes the run impossible stops it here.
         // The run writes several stores plus a VACUUM transient into $TMPDIR.
         let freeBytes = SystemProbe.statics().diskFreeBytes ?? Int.max
         guard freeBytes >= 6_000_000_000 else {
@@ -262,36 +236,6 @@ extension AppModel {
                        String(format: "The run needs about 6 GB of scratch space and there is %.1f GB free.",
                               Double(freeBytes) / 1_000_000_000))
             return false
-        }
-        // Memory, asked up front rather than discovered case by case. A case that does not fit in the
-        // memory available now is skipped, along with every case that uses what it builds; a 16 GB
-        // M2 with its usual apps open missed the shared store by 61 MB and lost a third of the table
-        // to that (bench-v8). Asking first lets the owner quit an app instead of running twice.
-        let freeMB = snap.memFreeMB
-        let specs = PaperCaseCatalog.specs(memoryBytes: Int(ProcessInfo.processInfo.physicalMemory))
-        let reserve = PaperCaseCatalog.memoryReserveMB
-        let blocked = specs.filter { ($0.arithmeticPeakMB ?? 0) > freeMB - reserve }
-        if freeMB > 0, let worst = blocked.compactMap(\.arithmeticPeakMB).max() {
-            let a = NSAlert()
-            a.messageText = "Quit other apps first"
-            a.informativeText = String(format: "%d of %d measurements need %.1f GB of free memory, and %.1f GB "
-                + "is free now. Quit other apps and try again, or run anyway and skip those measurements "
-                + "and the ones that depend on them.",
-                blocked.count, specs.count, (worst + reserve) / 1024, freeMB / 1024)
-            a.addButton(withTitle: "Cancel")
-            a.addButton(withTitle: "Run anyway")
-            if a.runModal() != .alertSecondButtonReturn { return false }
-        }
-        // Battery alone: allowed, confirmed, and stamped in the export as env.begin.power_source so
-        // the row can be discarded later if it looks off.
-        if snap.powerSource == "battery" {
-            let a = NSAlert()
-            a.messageText = "Running on battery"
-            a.informativeText = "Apple silicon runs slower on battery. Plug in for results comparable with "
-                + "other Macs. The run takes \(BenchmarkDuration.minutesLabel)."
-            a.addButton(withTitle: "Run anyway")
-            a.addButton(withTitle: "Cancel")
-            if a.runModal() != .alertFirstButtonReturn { return false }
         }
         return true
     }
@@ -340,10 +284,9 @@ private func renderPaperOutcome(result: PaperSuiteResult, engine: OmniEngine, fs
     return PaperRunOutcome(report: report, text: text, savedTxtURL: saved?.txt)
 }
 
-/// How long a full run takes; shown in Settings and in the battery prompt. bench-v9 measured 11.4
-/// minutes in the app on the M3 Ultra (2026-10-09); the bench-v8 reports less the four cases v9 runs
-/// only once (recall at scale, delete cost, compaction, tail rows) give 10-11 on the M4 Pro and
-/// the M4. The 16 GB Macs skipped cases under v8 that v9 runs, hence the upper end.
+/// How long a full run takes; shown in Settings and in the battery prompt. bench-v10 measured 13.9
+/// minutes in the app on the M3 Ultra (2026-10-16); v9 measured 11.4 there and 10-11 on the M4 Pro
+/// and the M4. No other Mac has run v10 yet, so the upper end is v9's.
 enum BenchmarkDuration {
     static let minutesLabel = "10 to 20 minutes, depending on the Mac"
 }

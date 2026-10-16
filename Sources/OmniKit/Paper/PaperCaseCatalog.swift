@@ -46,8 +46,8 @@ public enum PaperCapClass: String, Sendable, Codable {
 }
 
 public enum PaperCaseID: String, Sendable, Codable, CaseIterable {
-    case canary, index_text, index_image, save_edit, store_build, queries
-    case search_while_indexing, search_under_writes, memory_trace
+    case canary, index_text, coverage, index_image, save_edit, store_build, queries
+    case search_while_indexing, search_under_writes, gpu_app, memory_trace
     case tail_rows, attention, prune_fold, scan_ladder, recall, recall_scale, select, compaction, delete_cost
 }
 
@@ -117,8 +117,15 @@ public enum PaperCaseCatalog {
     /// keeps the display awake, probes the clock after every case and reports a slowed case as
     /// throttled; a case that measured nothing is never "ok". Cases whose numbers are the same on
     /// every Mac (tail rows, recall at scale, compaction, deletion cost) run only when named.
-    public static let suiteId = "bench-v9"
-    public static let schema = 4
+    /// v10 measures beside whatever the machine is doing (Han, 2026-10-16): no idle gaps, no gate on
+    /// free memory, swap or heat, no throttled exclusion; every case records the other processes'
+    /// CPU and GPU, swap reads, pressure, thermal state, power and clock, and a case leaves a Mac only
+    /// when its measured peak cannot fit that Mac's physical memory. Queries take the app's whole
+    /// path (modality lift, filename and identifier lookup), with an identifier row and a row for a
+    /// query that leans toward images; new cases time when every file is searchable against the
+    /// whole pass, and what Omni and another GPU app do to each other.
+    public static let suiteId = "bench-v10"
+    public static let schema = 5
 
     /// Global wall-clock cap, derived rather than fixed.
     ///
@@ -131,7 +138,7 @@ public enum PaperCaseCatalog {
         let all = specs(memoryBytes: 64 << 30)
         let budgets = all.reduce(0) { $0 + $1.budgetSeconds }
         let closing = all.first { $0.runsAtBothEnds }?.budgetSeconds ?? 0
-        let gaps = Double(all.count + 1) * 6          // inter-case settle, generously
+        let gaps = Double(all.count + 1) * 6          // clock probes and store opens between cases, generously
         return budgets + closing + gaps + 600         // plus corpus generation and slack
     }
 
@@ -145,11 +152,21 @@ public enum PaperCaseCatalog {
     static let tier32GiB = 31.5
     static func gibibytes(_ bytes: Int) -> Double { Double(bytes) / 1_073_741_824 }
 
-    /// What a case may claim: the memory the kernel can hand out without compressing or swapping
-    /// anything (SystemProbe.memFreeMB), less this. Was 60% of free memory, which on a 16 GB M2 left
-    /// 3.4 GB of a measured 5.7 GB unusable and skipped the store every query and write row needs.
-    /// Pages read back from swap stop the run (PaperRunConfig.swapAbortMB) if a gate is ever wrong.
-    public static let memoryReserveMB = 1_024.0
+    /// THE CAPACITY RULE. A case (or a ladder rung) runs on a Mac whose physical memory is at least
+    /// twice its measured peak, and on every such Mac whatever else is open. Free memory decided this
+    /// through bench-v9, and a 16 GB M2 with its owner's apps open skipped the store every query and
+    /// write row needs (11 of 36 cells): a fact about that afternoon, not about the Mac. Half of
+    /// physical memory leaves the model, the system and the owner's apps the other half; what they
+    /// actually take is recorded per case (swap reads, pressure).
+    static let capacityFraction = 0.5
+
+    public static func fits(peakMB: Double, memoryBytes: Int) -> Bool {
+        peakMB <= Double(memoryBytes) / 1_048_576 * capacityFraction
+    }
+
+    static func capacityNote(peakMB: Double, memoryBytes: Int) -> String {
+        String(format: "needs %.0f MB, more than half of this Mac's %.0f GB", peakMB, gibibytes(memoryBytes))
+    }
 
     /// MEASURED peaks for the cases that build or copy the million-row store, as bytes per row:
     /// phys_footprint sampled every 50 ms over the footprint the case began with (release build, the
@@ -216,9 +233,9 @@ public enum PaperCaseCatalog {
     public static func specs(memoryBytes: Int, scale: Double = 1.0) -> [PaperCaseSpec] {
         // What a user sees first, then what the paper's ablations need: indexing, the store every
         // query and write row runs on, queries, search under load, then the mechanisms.
-        let all = [canary(scale), indexPass(scale), indexImage(scale), saveEdit(scale),
+        let all = [canary(scale), indexPass(scale), coverage(scale), indexImage(scale), saveEdit(scale),
                    storeBuild(scale), queries(scale), searchWhileIndexing(scale),
-                   searchUnderWrites(scale), memoryTrace(scale),
+                   searchUnderWrites(scale), gpuApp(scale), memoryTrace(scale),
                    textLever(scale), sdpa(scale), gate(scale), scan(memoryBytes, scale),
                    recall(memoryBytes, scale), recallScale(scale), select(memoryBytes, scale), compact(scale),
                    deleteCost(memoryBytes, scale)]
@@ -578,14 +595,62 @@ public enum PaperCaseCatalog {
             PaperParameter("text_queries", .int(240), scaling: .scaled(minimum: 20)),
             PaperParameter("warmup_queries", .int(8)),
             PaperParameter("filtered_queries", .int(120), scaling: .scaled(minimum: 10)),
+            PaperParameter("identifier_queries", .int(120), scaling: .scaled(minimum: 10)),
+            PaperParameter("leaning_queries", .int(120), scaling: .scaled(minimum: 10)),
             PaperParameter("media_queries", .int(24), scaling: .scaled(minimum: 4)),
             PaperParameter("top_k", .int(VectorStore.shippedTopK)),
         ]).scaled(by: scale)
         return PaperCaseSpec(
             id: .queries, title: "Queries",
-            deliverable: "Task table, query rows: filename, text (encode and scan), filtered, find similar, media",
-            budgetSeconds: 420,
-            arms: [PaperArm("filename", PaperLeverSet(lexical: true))], params: p, arithmeticPeakMB: nil,
+            deliverable: "Task table, query rows: filename, text (encode and search), identifier, a query leaning toward images, filtered, find similar, media",
+            budgetSeconds: 480,
+            // THE APP'S PATH (v10): the filename and identifier lookups and the modality lift run
+            // after the scan as they do in the app, so the lexical channel is on for every query row.
+            // Through v9 the suite pinned it off and the text row timed the dense scan alone.
+            arms: [PaperArm("app", PaperLeverSet(lexical: true))], params: p, arithmeticPeakMB: nil,
+            requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
+    }
+
+    /// When every file is searchable, against when the pass ends: a few long files queued ahead of
+    /// many short notes, as a new folder with logs and exports in it is. Each long file's first turn
+    /// is small (Indexer.firstWindowBytes) and its rest goes to the end of the queue, so the notes
+    /// behind it do not wait for it.
+    private static func coverage(_ scale: Double) -> PaperCaseSpec {
+        let p = PaperParams([
+            PaperParameter("short_files", .int(240), scaling: .scaled(minimum: 24)),
+            PaperParameter("long_files", .int(4)),
+            PaperParameter("long_bytes", .int(512 * 1024), scaling: .scaled(minimum: 192 * 1024)),
+        ]).scaled(by: scale)
+        return PaperCaseSpec(
+            id: .coverage, title: "Every file searchable",
+            deliverable: "Indexing rows: when every file of a tree with long files is searchable, and the whole pass",
+            budgetSeconds: 300,
+            arms: [], params: p, arithmeticPeakMB: nil,
+            requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
+    }
+
+    /// Omni and another GPU app on one device, the condition the design is for, with the other app
+    /// as an independent variable: a fixed Metal load at 60 frames a second, sized on each Mac to
+    /// a quarter of a frame alone. Phases, interleaved and rotated each round: the app alone, the
+    /// app while Omni indexes, the app while Omni searches as a user types, and Omni indexing alone.
+    private static func gpuApp(_ scale: Double) -> PaperCaseSpec {
+        let p = PaperParams([
+            PaperParameter("frame_hz", .int(60)),
+            PaperParameter("busy_fraction", .double(0.25)),
+            PaperParameter("phase_seconds", .double(8), unit: .seconds, scaling: .scaled(minimum: 2)),
+            PaperParameter("rounds", .int(2), scaling: .scaled(minimum: 1)),
+            PaperParameter("load_files", .int(60), scaling: .scaled(minimum: 8)),
+            PaperParameter("search_interval_ms", .int(100), unit: .milliseconds),
+            PaperParameter("top_k", .int(VectorStore.shippedTopK)),
+        ]).scaled(by: scale)
+        return PaperCaseSpec(
+            id: .gpu_app, title: "Sharing the GPU with another app",
+            deliverable: "A GPU app's frame time alone, while Omni indexes and while it searches; search and indexing beside it",
+            budgetSeconds: 240,
+            // Reuse off, as in search while indexing: the load must reach the encoder every time.
+            arms: [PaperArm("load", PaperLeverSet(chunkCache: false, globalChunkReuse: false))],
+            params: p,
+            arithmeticPeakMB: measuredPeakMB(rows: scaledInt(1_000_000, scale, minimum: 16_000), bytesPerRow: storeCopyBytesPerRow),
             requiresVisionTower: false, runsAtBothEnds: false, driftMetricKey: nil)
     }
 

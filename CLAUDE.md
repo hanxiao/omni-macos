@@ -78,7 +78,7 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (754 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (802 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|
@@ -126,6 +126,14 @@ codebase were already measured there, and many were rejected.
   negative control, restored at once and named as such.
 
 ## Rules that keep biting
+
+- THE BENCHMARK NEVER WAITS FOR A QUIET MACHINE (Han, 2026-10-16). No idle gaps, no "too busy / too
+  hot / low power" refusals, no skip or abort on free memory or swap, no throttled exclusion: Omni
+  runs beside the user's work, so it is measured there. What the machine was doing is RECORDED per
+  case (other processes' CPU and GPU share, swap reads, pressure, thermal state, power, clock speed)
+  and presented with the results. A case leaves a machine only when it cannot fit its physical RAM.
+  Interference is controlled by design (interleaved arms, a co-running GPU load as an independent
+  variable), not by waiting for it to go away.
 
 - NO STORE-QUEUE HOLD THAT GROWS WITH THE INDEX OR WITH THE INPUT. Searches wait on the same serial
   queue as every write, so one long hold is a frozen search box. Bulk writes go through the slicers

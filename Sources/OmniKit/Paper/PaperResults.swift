@@ -309,43 +309,52 @@ public enum PaperCaseStatus: String, Sendable, Codable {
     case skippedBudget = "skipped:budget"
     /// Image cases only: the vision tower is not resident and reloading it would double resident VRAM.
     case skippedTowers = "skipped:towers"
-    /// The case's arithmetic peak did not fit in the memory actually available (Risk 1).
+    /// The case's measured peak does not fit this Mac's physical memory (PaperCaseCatalog.fits).
+    /// A property of the machine, never of what else is running: free memory decides nothing.
     case skippedMemory = "skipped:memory"
-    /// The suite aborted (paging past the limit) before this case started.
-    case skippedAborted = "skipped:aborted"
     /// No body is compiled in for this case on this build. Never a measured zero.
     case skippedUnimplemented = "skipped:unimplemented"
     /// The case needs what an earlier case builds (the shared store) and that case did not build it.
     case skippedDependency = "skipped:dependency"
-    /// The case ran, but the clock probe after it read the machine running slower than its fastest
-    /// earlier in the run (display sleep, App Nap, heat). Its metrics stay in the report for diagnosis and
-    /// never reach the table or the upload.
-    case throttled
 
     public var isSkip: Bool { rawValue.hasPrefix("skipped:") }
     /// Whether the case contributed usable numbers. A timeout did, partially, and says so.
     public var producedNumbers: Bool { self == .ok || self == .timeout }
 }
 
-/// The machine's condition across one case. Sampled at both boundaries; a case whose environment
-/// moved is a case whose number may be a thermal or contention artefact rather than a design
-/// difference, and the sheet warns before the operator sends the file.
+/// The conditions one case measured under. Never a gate: the benchmark runs beside whatever the
+/// owner is doing, as Omni does, and records what that was so it can be read next to the numbers.
 public struct PaperCaseEnvironment: Sendable, Codable {
     public var thermalBegin: String
     public var thermalEnd: String
+    /// The worst thermal state sampled while the case ran (every 250 ms).
+    public var thermalWorst: String
     public var memFreeBeginMB: Double
     public var swapDeltaMB: Double
     public var footprintDeltaMB: Double
     /// Highest phys_footprint while the case ran, over the footprint it started from, sampled every
-    /// 50 ms. What the memory gate's estimates are checked against.
+    /// 50 ms. What the capacity rule's measured peaks are checked against.
     public var footprintPeakDeltaMB: Double?
     /// Pages read back from swap while the case ran, system-wide.
     public var swapInMB: Double?
+    /// The worst memory pressure level sampled (1 normal, 2 warning, 4 critical; -1 unknown).
+    public var pressureWorst: Int
     public var mlxPeakMB: Double
     public var systemBusyPercent: Double
     public var ownCPUCores: Double
-    /// Somebody else used more than a fifth of the machine while this case measured.
-    public var contended: Bool
+    /// Other processes' CPU, as a share of all logical cores, over the case.
+    public var backgroundCPUPercent: Double
+    /// Other processes' GPU time over the case's wall time; nil where the accounting is unreadable.
+    public var backgroundGPUPercent: Double?
+    /// This process's GPU time over the case's wall time.
+    public var ownGPUPercent: Double?
+    /// Mean of the GPU's own utilization, every client together, sampled every 250 ms.
+    public var gpuUtilizationPercent: Double?
+    /// The clock probe after the case against the fastest probe of the run so far: how much slower
+    /// the machine ran (display sleep, App Nap, heat, a busy GPU). Recorded, never excluded.
+    public var clockSlowdownPercent: Double?
+    public var powerSource: String
+    public var lowPowerMode: Bool
 }
 
 /// One case's complete result. Self-contained: id, arm list, parameters, per-run values, aggregate,
@@ -387,9 +396,6 @@ public enum PaperSuiteStatus: String, Sendable, Codable {
     case complete
     case partial
     case cancelled
-    /// More than the limit read back from swap mid-run: every number after that point would be a
-    /// paging measurement, so the suite stops rather than filling a table with them.
-    case abortedSwap = "aborted:swap"
     case failed
 }
 
@@ -413,17 +419,73 @@ public struct PaperSuiteResult: Sendable, Codable {
     public var maxSystemBusyPercent: Double
     public var swapDeltaMB: Double
     public var processesOver20Percent: Int
-    /// Signed percentage change of the thermal canary between the first and last case. Beyond
-    /// +-8% the machine changed clock domain mid-suite and the table is mixed.
+    /// Signed percentage change of the thermal canary between the first and last case: how far the
+    /// machine's speed moved over the run. Recorded with the conditions; nothing is dropped for it.
     public var thermalDriftPercent: Double?
     /// Worst-case latency to acknowledge a cancel: one indivisible unit of work.
     public var cancelLatencyBoundSeconds: Double
 
     public var casesOK: Int { cases.filter { $0.status == .ok }.count }
     public var casesTotal: Int { cases.count }
-    public var thermalDriftExceeded: Bool { abs(thermalDriftPercent ?? 0) > 8 }
-    public var contendedCases: [String] { cases.filter { $0.environment?.contended == true }.map(\.id) }
     /// Cases that waited on swap: more than `pagedThresholdMB` read back from it while they ran.
     public var pagedCases: [String] { cases.filter { ($0.environment?.swapInMB ?? 0) > Self.pagedThresholdMB }.map(\.id) }
     public static let pagedThresholdMB = 64.0
+
+    /// What the machine was doing while the run measured, over every case that produced numbers:
+    /// the median and the largest per-case value of each condition.
+    public var conditions: PaperRunConditions { PaperRunConditions(cases.filter { $0.status.producedNumbers }) }
+}
+
+/// The run's conditions, summarised over its cases. Read next to the table, never used to drop a row.
+public struct PaperRunConditions: Sendable, Codable {
+    public var backgroundCPUMedian: Double?
+    public var backgroundCPUMax: Double?
+    public var backgroundGPUMedian: Double?
+    public var backgroundGPUMax: Double?
+    public var swapInTotalMB: Double?
+    public var clockSlowdownMedian: Double?
+    public var clockSlowdownMax: Double?
+    /// 0 nominal, 1 fair, 2 serious, 3 critical: the worst state any case reached.
+    public var thermalWorstRank: Int
+    /// Share of cases that ran on battery, 0-100.
+    public var batteryPercentOfCases: Double
+    public var lowPowerPercentOfCases: Double
+
+    public init(_ cases: [PaperCaseResult]) {
+        let envs = cases.compactMap(\.environment)
+        func median(_ xs: [Double]) -> Double? {
+            guard !xs.isEmpty else { return nil }
+            let s = xs.sorted(), n = s.count
+            return n % 2 == 1 ? s[n / 2] : (s[n / 2 - 1] + s[n / 2]) / 2
+        }
+        let cpu = envs.map(\.backgroundCPUPercent).filter { $0 >= 0 }
+        let gpu = envs.compactMap(\.backgroundGPUPercent)
+        let clock = envs.compactMap(\.clockSlowdownPercent)
+        backgroundCPUMedian = median(cpu); backgroundCPUMax = cpu.max()
+        backgroundGPUMedian = median(gpu); backgroundGPUMax = gpu.max()
+        let swaps = envs.compactMap(\.swapInMB)
+        swapInTotalMB = swaps.isEmpty ? nil : swaps.reduce(0) { $0 + Swift.max(0, $1) }
+        clockSlowdownMedian = median(clock); clockSlowdownMax = clock.max()
+        thermalWorstRank = envs.map { PaperRunConditions.thermalRank($0.thermalWorst) }.max() ?? 0
+        let n = Double(Swift.max(1, envs.count))
+        batteryPercentOfCases = 100 * Double(envs.filter { $0.powerSource == "battery" }.count) / n
+        lowPowerPercentOfCases = 100 * Double(envs.filter(\.lowPowerMode).count) / n
+    }
+
+    public static func thermalRank(_ name: String) -> Int {
+        switch name {
+        case "fair": 1
+        case "serious": 2
+        case "critical": 3
+        default: 0
+        }
+    }
+    public static func thermalName(_ rank: Int) -> String {
+        switch rank {
+        case 1: "fair"
+        case 2: "serious"
+        case 3: "critical"
+        default: "nominal"
+        }
+    }
 }

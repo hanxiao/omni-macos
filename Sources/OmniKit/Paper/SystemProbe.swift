@@ -10,13 +10,11 @@ import MLX
 // Deliberately NOT part of HardwareProfile: that struct is the wire contract of the /omni/profiling
 // upload and its shape must not move. Everything new lives here.
 //
-// The static facts answer "which machine produced this row". The sampled ones answer the question
-// that actually decides whether a row is usable: was this machine QUIET while it measured. A
-// laptop that thermal-throttled, swapped, or shared its cores with a browser produces numbers that
-// look like a design difference and are not one - measurements.md records three occasions where a
-// contended run was wrong by up to 1.8x. So thermal state, swap, load average and system-wide CPU
-// busy are sampled at every case boundary and stamped, and the dialog warns before the operator
-// sends the file.
+// The static facts answer "which machine produced this row". The sampled ones answer what the
+// machine was doing while it measured: thermal state, power, swap, memory pressure, and how much of
+// the CPU and the GPU other processes used. The benchmark never waits for these to go quiet (Omni
+// runs beside its owner's work, so that is where it is measured); it records them with every case,
+// and the paper and the site show them next to the numbers.
 //
 // PRIVACY: this text gets pasted into a chat. No hostname, no username, no serial, no file paths,
 // and deliberately NO process names - only a COUNT of busy processes.
@@ -141,6 +139,19 @@ public enum SystemProbe {
             ownCPUSeconds: ownCPUSeconds(),
             wallClock: Date().timeIntervalSince1970
         )
+    }
+
+    /// A light reading for an arm's scope: system CPU ticks, this process's CPU seconds, the wall
+    /// clock and every GPU client's time. Differenced like the snapshot's fields.
+    public struct LoadSample: Sendable {
+        let ticks: [UInt64]
+        let ownCPUSeconds: Double
+        let wall: Double
+        let gpu: [UInt64: (pid: Int32, ns: UInt64)]
+    }
+    public static func loadSample() -> LoadSample {
+        LoadSample(ticks: cpuTicks(), ownCPUSeconds: ownCPUSeconds(), wall: Date().timeIntervalSince1970,
+                   gpu: gpuClientTimes())
     }
 
     /// System-wide CPU busy percent between two snapshots, and our own share of it in CORES.
@@ -299,6 +310,87 @@ public enum SystemProbe {
         return out.isEmpty ? nil : out
     }
 
+    /// Cumulative GPU time of every Metal client on the machine, nanoseconds, keyed by the client's
+    /// registry entry id, with the pid that opened it. The same accounting Activity Monitor's GPU
+    /// column reads (AGXDeviceUserClient "AppUsage", "accumulatedGPUTime"); no entitlement or root
+    /// needed. A DIFFERENCE of two readings is GPU time spent between them.
+    public static func gpuClientTimes() -> [UInt64: (pid: Int32, ns: UInt64)] {
+        // The clients hang under the accelerator in the service plane; they are not matchable as
+        // services of their own (IOServiceMatching("AGXDeviceUserClient") finds none), so they are
+        // reached by walking the accelerator's children.
+        var accelerators: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &accelerators) == KERN_SUCCESS else {
+            return [:]
+        }
+        defer { IOObjectRelease(accelerators) }
+        var out: [UInt64: (pid: Int32, ns: UInt64)] = [:]
+        // Each object is released before the iterator advances: a `defer` in the loop body would run
+        // after the reassignment and release the NEXT object before its properties were read.
+        var accelerator = IOIteratorNext(accelerators)
+        while accelerator != 0 {
+            var children: io_iterator_t = 0
+            if IORegistryEntryCreateIterator(accelerator, kIOServicePlane, IOOptionBits(kIORegistryIterateRecursively), &children) == KERN_SUCCESS {
+                var client = IOIteratorNext(children)
+                while client != 0 {
+                    if let usage = IORegistryEntryCreateCFProperty(client, "AppUsage" as CFString, kCFAllocatorDefault, 0)?
+                        .takeRetainedValue() as? [[String: Any]] {
+                        var entry: UInt64 = 0
+                        IORegistryEntryGetRegistryEntryID(client, &entry)
+                        let creator = IORegistryEntryCreateCFProperty(client, "IOUserClientCreator" as CFString, kCFAllocatorDefault, 0)?
+                            .takeRetainedValue() as? String
+                        // "pid 174, WindowServer": only the number is kept, never the name (the export is pasted).
+                        let pid = creator.flatMap { s -> Int32? in
+                            guard s.hasPrefix("pid "), let comma = s.firstIndex(of: ",") else { return nil }
+                            return Int32(s[s.index(s.startIndex, offsetBy: 4) ..< comma])
+                        } ?? -1
+                        let ns = usage.reduce(UInt64(0)) { $0 &+ ((($1["accumulatedGPUTime"] as? NSNumber)?.uint64Value) ?? 0) }
+                        out[entry] = (pid, ns)
+                    }
+                    IOObjectRelease(client)
+                    client = IOIteratorNext(children)
+                }
+                IOObjectRelease(children)
+            }
+            IOObjectRelease(accelerator)
+            accelerator = IOIteratorNext(accelerators)
+        }
+        return out
+    }
+
+    /// GPU time spent between two `gpuClientTimes` readings, split into this process and everyone
+    /// else. A client that appeared in between counts from zero; one that went away is lost, so the
+    /// others' share is a lower bound.
+    public static func gpuTimeSplit(from a: [UInt64: (pid: Int32, ns: UInt64)],
+                                    to b: [UInt64: (pid: Int32, ns: UInt64)]) -> (ownNs: UInt64, othersNs: UInt64) {
+        let me = getpid()
+        var own: UInt64 = 0, others: UInt64 = 0
+        for (entry, now) in b {
+            let before = a[entry]?.ns ?? 0
+            let d = now.ns >= before ? now.ns - before : 0
+            if now.pid == me { own &+= d } else { others &+= d }
+        }
+        return (own, others)
+    }
+
+    /// The GPU's own utilization right now, all clients together ("Device Utilization %" in the
+    /// accelerator's PerformanceStatistics). nil where the driver does not publish it.
+    public static func gpuUtilizationPercent() -> Double? {
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOAccelerator"), &iterator) == KERN_SUCCESS else {
+            return nil
+        }
+        defer { IOObjectRelease(iterator) }
+        var service = IOIteratorNext(iterator)
+        while service != 0 {
+            let stats = IORegistryEntryCreateCFProperty(service, "PerformanceStatistics" as CFString, kCFAllocatorDefault, 0)?
+                .takeRetainedValue() as? [String: Any]
+            IOObjectRelease(service)
+            if let u = (stats?["Device Utilization %"] as? NSNumber)?.doubleValue { return u }
+            service = IOIteratorNext(iterator)
+        }
+        return nil
+    }
+
     /// GPU core count, resolved once. The store reads this to place the bf16/int4 crossover, which
     /// is on the base-build path, so it must not re-walk the IORegistry each time.
     nonisolated(unsafe) private static let cachedGPUCores: Int? = gpuCoreCount()
@@ -314,11 +406,10 @@ public enum SystemProbe {
         defer { IOObjectRelease(iterator) }
         var service = IOIteratorNext(iterator)
         while service != 0 {
-            defer { IOObjectRelease(service) }
-            if let raw = IORegistryEntryCreateCFProperty(service, "gpu-core-count" as CFString, kCFAllocatorDefault, 0),
-               let n = raw.takeRetainedValue() as? Int {
-                return n
-            }
+            let n = IORegistryEntryCreateCFProperty(service, "gpu-core-count" as CFString, kCFAllocatorDefault, 0)?
+                .takeRetainedValue() as? Int
+            IOObjectRelease(service)
+            if let n { return n }
             service = IOIteratorNext(iterator)
         }
         return nil

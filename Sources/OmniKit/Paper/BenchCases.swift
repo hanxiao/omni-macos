@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import MLX
 
 // The cases that measure what a user waits for, on generated inputs only: indexing an image,
@@ -60,11 +61,20 @@ public enum BenchStore {
                 return IndexedChunk(path: p, modified: Double(1_700_000_000 + i + g), size: 4_096,
                                     kind: kind, chunkIndex: j,
                                     snippet: PaperCorpus.filler(characters: 160, stream: UInt64(vectorIndex)),
-                                    embedding: PaperVectors.vec(vectorIndex, dim: dim), chunkKey: key)
+                                    embedding: isImage(i) ? PaperVectors.imageRow(vectorIndex, dim: dim)
+                                                          : PaperVectors.vec(vectorIndex, dim: dim),
+                                    chunkKey: key)
             }
         }
 
         public var totalRows: Int { (0 ..< files).reduce(0) { $0 + rows($1) } }
+
+        /// The identifier text file `i` holds in its first chunk, an invoice number as a person would
+        /// type it. Images hold none.
+        public func identifier(_ i: Int) -> String? { isImage(i) ? nil : "INV-\(i)" }
+        /// The content key the file is recorded under, so the identifier index (keyed by content)
+        /// resolves to the file as it does for an indexed one.
+        public func contentKey(_ i: Int) -> String { "bench-file-\(i)" }
     }
 
     public struct Built: Sendable {
@@ -100,6 +110,8 @@ public enum BenchCases {
         case .memory_trace: traceBody
         case .index_image: imageBody
         case .save_edit: saveBody
+        case .coverage: coverageBody
+        case .gpu_app: gpuAppBody
         default: nil
         }
     }
@@ -143,6 +155,20 @@ public enum BenchCases {
         // bench-v8 store was never settled at all.
         ctx.progress("settling the store")
         let t1 = Date()
+        // Identifiers, as indexing records them: each text file's content key in the dedup table and
+        // its invoice number in the identifier index, keyed by that content. Untimed: the write row is
+        // the vectors, and an indexed file's identifiers are read at decode, off the store's queue.
+        if files == layout.files {
+            for at in stride(from: 0, to: files, by: batch) {
+                let ids = Array(at ..< Swift.min(files, at + batch)).filter { layout.identifier($0) != nil }
+                store.recordContentKeys(ids.map { (layout.path($0), layout.contentKey($0), Double(1_700_000_000 + $0), 4_096) })
+                for i in ids {
+                    store.idIndex.record(contentKey: StoreSchema.contentDigestHex(layout.contentKey(i)),
+                                         chunks: [IDTokens.tokens(in: layout.identifier(i)!)])
+                }
+            }
+            store.idIndex.flush()
+        }
         _ = store.search(PaperVectors.query(0, dim: layout.dim), filter: SearchFilter(), topK: 10)
         store.advanceCoverageToCompletion()
         PaperCasesLiveSupport.stampScanTier(store, into: &out)
@@ -181,6 +207,7 @@ public enum BenchCases {
         let corpus = try PaperCasesCompute.corpus(ctx)
         let p = ctx.params
         let topK = p.int("top_k"), textQueries = p.int("text_queries")
+        let layout = built.layout
         let store = try ctx.fs.store(named: built.name)
         defer { store.close() }
         warm(store, ctx, built.name)
@@ -190,61 +217,113 @@ public enum BenchCases {
         // Ultra) that no user typing into the app would meet.
         let engine = ctx.engine
 
-        let cold = timeMs { _ = store.search(engine.embedQuery(queryTexts[0]), topK: topK, markActive: true) }
-        out.metrics.append(PaperMetric("cold_first_query", runs: [cold], unit: .milliseconds, aggregate: .single))
-        for i in 0 ..< p.int("warmup_queries") {
-            _ = store.search(engine.embedQuery(queryTexts[i % queryTexts.count]), topK: topK, markActive: true)
-        }
-
-        var endToEnd: [Double] = [], encode: [Double] = [], scan: [Double] = []
-        for i in 0 ..< textQueries {
-            try ctx.checkCancel()
-            guard ctx.shouldContinue else { out.truncated = true; break }
-            var v: [Float] = []
-            let e = timeMs { v = engine.embedQuery(queryTexts[i % queryTexts.count]) }
-            let s = timeMs { _ = store.search(v, topK: topK, markActive: true) }
-            encode.append(e); scan.append(s); endToEnd.append(e + s)
-            if i % 25 == 0 { ctx.progress("text query \(i + 1)/\(textQueries)") }
-        }
-        out.metrics += PaperMetric.distribution("text_query", samples: endToEnd, unit: .milliseconds)
-        out.metrics += PaperMetric.distribution("text_encode", samples: encode, unit: .milliseconds)
-        out.metrics += PaperMetric.distribution("text_scan", samples: scan, unit: .milliseconds)
-
-        // Filename queries go through the filename index, which the suite otherwise keeps out of
-        // every timing; this arm turns it on and builds it first.
-        try ctx.withArm("filename") {
-            out.arms.append("filename")
+        // THE APP'S PATH: a typed query carries its text, so after the scan the modality lift reads
+        // the query's lean, the filename lookup runs when the text looks like a name, and the
+        // identifier lookup when it is made of codes (VectorStore.search). The lexical channel is on
+        // for the whole case, as it is in the app.
+        try ctx.withArm("app") {
+            out.arms.append("app")
             let build = timeMs { store.prepareLexicalIndex() }
             out.metrics.append(PaperMetric("filename_index_build", runs: [build], unit: .milliseconds, aggregate: .single))
-            var samples: [Double] = []
+
+            let cold = timeMs {
+                _ = store.search(engine.embedQuery(queryTexts[0]), topK: topK, markActive: true, textQuery: queryTexts[0])
+            }
+            out.metrics.append(PaperMetric("cold_first_query", runs: [cold], unit: .milliseconds, aggregate: .single))
+            for i in 0 ..< p.int("warmup_queries") {
+                let q = queryTexts[i % queryTexts.count]
+                _ = store.search(engine.embedQuery(q), topK: topK, markActive: true, textQuery: q)
+            }
+
+            var endToEnd: [Double] = [], encode: [Double] = [], scan: [Double] = [], pulls: [Double] = []
+            for i in 0 ..< textQueries {
+                try ctx.checkCancel()
+                guard ctx.shouldContinue else { out.truncated = true; break }
+                let q = queryTexts[i % queryTexts.count]
+                var v: [Float] = []
+                let e = timeMs { v = engine.embedQuery(q) }
+                let s = timeMs { _ = store.search(v, topK: topK, markActive: true, textQuery: q) }
+                encode.append(e); scan.append(s); endToEnd.append(e + s)
+                if i < queryTexts.count, let pull = store.kindPulls(v)["image"] { pulls.append(pull) }
+                if i % 25 == 0 { ctx.progress("text query \(i + 1)/\(textQueries)") }
+            }
+            out.metrics += PaperMetric.distribution("text_query", samples: endToEnd, unit: .milliseconds)
+            out.metrics += PaperMetric.distribution("text_encode", samples: encode, unit: .milliseconds)
+            out.metrics += PaperMetric.distribution("text_scan", samples: scan, unit: .milliseconds,
+                                                    note: "the scan and the lookups after it, the query already encoded")
+
+            // Filename queries: an explicit `filename:` scope, the query already encoded.
+            var named: [Double] = []
             for i in 0 ..< textQueries where ctx.shouldContinue {
                 let file = Int(BenchStore.mix(UInt64(i) &+ 77) % UInt64(Swift.max(1, built.files)))
                 var f = SearchFilter(); f.filenameQuery = "f\(file)"
                 let v = engine.embedQuery(queryTexts[i % queryTexts.count])
-                samples.append(timeMs { _ = store.search(v, filter: f, topK: topK, markActive: true) })
+                named.append(timeMs { _ = store.search(v, filter: f, topK: topK, markActive: true) })
             }
-            out.metrics += PaperMetric.distribution("filename_query", samples: samples, unit: .milliseconds,
+            out.metrics += PaperMetric.distribution("filename_query", samples: named, unit: .milliseconds,
+                                                    note: "search alone, the query already encoded")
+
+            // IDENTIFIER QUERIES: an invoice number typed alone, encoded and searched as typed; the
+            // identifier lookup puts the file that holds it first.
+            var ident: [Double] = [], found = 0
+            for i in 0 ..< p.int("identifier_queries") where ctx.shouldContinue {
+                var file = Int(BenchStore.mix(UInt64(i) &+ 4_049) % UInt64(Swift.max(1, built.files)))
+                if layout.identifier(file) == nil { file = (file + 1) % built.files }
+                guard let q = layout.identifier(file) else { continue }
+                var hits: [SearchHit] = []
+                ident.append(timeMs { hits = store.search(engine.embedQuery(q), topK: topK, markActive: true, textQuery: q) })
+                if hits.first?.path == layout.path(file) { found += 1 }
+            }
+            out.metrics += PaperMetric.distribution("identifier_query", samples: ident, unit: .milliseconds,
+                                                    note: "encode and search, an identifier typed alone")
+            out.facts.append(PaperFact("identifier_first_hits", "\(found)/\(ident.count)"))
+
+            // A QUERY THAT LEANS TOWARD IMAGES, as a description of something seen does. Its vector is
+            // drawn toward the store's image cone, so the modality lift takes images to the text scale
+            // and adds their own best hits from a second, restricted scan. Search alone; the first one
+            // builds the restricted scan's mask column and is timed apart.
+            var leaning: [Double] = [], leanPulls: [Double] = []
+            let leaningText = "a photo of a red car at the beach"
+            for i in 0 ..< p.int("leaning_queries") + 1 where ctx.shouldContinue {
+                let v = PaperVectors.leaningQuery(i, dim: layout.dim)
+                let t = timeMs { _ = store.search(v, topK: topK, markActive: true, textQuery: leaningText) }
+                if i == 0 {
+                    out.metrics.append(PaperMetric("leaning_scan_first", runs: [t], unit: .milliseconds, aggregate: .single,
+                                                   note: "builds the image mask column"))
+                } else { leaning.append(t) }
+                if i < 16, let pull = store.kindPulls(v)["image"] { leanPulls.append(pull) }
+            }
+            out.metrics += PaperMetric.distribution("leaning_scan", samples: leaning, unit: .milliseconds,
+                                                    note: "search alone: the scan, the lift and the restricted second scan")
+            // POSITIVE CONTROL: the lean that decides the lift (VectorStore.kindPullBand), for the
+            // leaning queries and for the typed ones. A leaning query past the band's top is lifted in
+            // full and takes the second scan; a typed one stays inside it.
+            func median(_ xs: [Double]) -> String { xs.isEmpty ? "none" : String(format: "%.3f", xs.sorted()[xs.count / 2]) }
+            out.facts.append(PaperFact("leaning_pull_median", median(leanPulls)))
+            out.facts.append(PaperFact("typed_pull_median", median(pulls)))
+            out.facts.append(PaperFact("pull_band_top", String(format: "%.2f", VectorStore.kindPullBand.hi)))
+
+            var filtered: [Double] = []
+            for i in 0 ..< p.int("filtered_queries") where ctx.shouldContinue {
+                var f = SearchFilter(); f.kinds = ["image"]
+                let q = queryTexts[i % queryTexts.count]
+                let v = engine.embedQuery(q)
+                let t = timeMs { _ = store.search(v, filter: f, topK: topK, markActive: true, textQuery: q) }
+                if i == 0 {
+                    out.metrics.append(PaperMetric("filtered_query_first", runs: [t], unit: .milliseconds,
+                                                   aggregate: .single, note: "builds the mask columns"))
+                } else { filtered.append(t) }
+            }
+            out.metrics += PaperMetric.distribution("filtered_query", samples: filtered, unit: .milliseconds,
                                                     note: "search alone, the query already encoded")
         }
 
-        var filtered: [Double] = []
-        for i in 0 ..< p.int("filtered_queries") where ctx.shouldContinue {
-            var f = SearchFilter(); f.kinds = ["image"]
-            let v = engine.embedQuery(queryTexts[i % queryTexts.count])
-            let t = timeMs { _ = store.search(v, filter: f, topK: topK, markActive: true) }
-            if i == 0 {
-                out.metrics.append(PaperMetric("filtered_query_first", runs: [t], unit: .milliseconds,
-                                               aggregate: .single, note: "builds the mask columns"))
-            } else { filtered.append(t) }
-        }
-        out.metrics += PaperMetric.distribution("filtered_query", samples: filtered, unit: .milliseconds,
-                                                note: "search alone, the query already encoded")
-
+        // Find similar and a dropped file carry no text: the app searches their vector alone.
         var similar: [Double] = []
         for i in 0 ..< textQueries where ctx.shouldContinue {
             let file = Int(BenchStore.mix(UInt64(i) &+ 991) % UInt64(Swift.max(1, built.files)))
             similar.append(timeMs {
-                if let v = store.fileVector(built.layout.path(file)) { _ = store.search(v, topK: topK, markActive: true) }
+                if let v = store.fileVector(layout.path(file)) { _ = store.search(v, topK: topK, markActive: true) }
             })
         }
         out.metrics += PaperMetric.distribution("find_similar", samples: similar, unit: .milliseconds,
@@ -652,6 +731,306 @@ public enum BenchCases {
         return out
     }
 
+    // MARK: - Every file searchable
+
+    /// A tree of short notes with a few long files queued ahead of them (the long folder and its
+    /// files are the newest, so the walk takes them first), indexed from empty. The time at which
+    /// every file has its first chunk stored, against the end of the pass.
+    static let coverageBody: PaperCaseBody = { ctx in
+        var out = PaperCaseOutput()
+        let corpus = try PaperCasesCompute.corpus(ctx)
+        let p = ctx.params
+        var root = try ctx.fs.scratch(named: "coverage")
+        if let rp = realpath(root.path, nil) { root = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+        let notes = root.appendingPathComponent("notes", isDirectory: true)
+        let long = root.appendingPathComponent("long", isDirectory: true)
+        let fm = FileManager.default
+        try fm.createDirectory(at: notes, withIntermediateDirectories: true)
+        try fm.createDirectory(at: long, withIntermediateDirectories: true)
+        let shortCount = Swift.min(p.int("short_files"), corpus.spec.textFiles)
+        let older = Date().addingTimeInterval(-86_400), newer = Date()
+        for i in 0 ..< shortCount {
+            let dst = notes.appendingPathComponent("n\(i).md")
+            try fm.copyItem(at: corpus.textFileURL(i), to: dst)
+            try fm.setAttributes([.modificationDate: older], ofItemAtPath: dst.path)
+        }
+        let longCount = p.int("long_files"), longBytes = p.int("long_bytes")
+        for j in 0 ..< longCount {
+            let dst = long.appendingPathComponent("l\(j).md")
+            try PaperCorpus.filler(characters: longBytes, stream: 0xC0FE_0000 &+ UInt64(j)).write(to: dst, atomically: true, encoding: .utf8)
+            try fm.setAttributes([.modificationDate: newer], ofItemAtPath: dst.path)
+        }
+        try fm.setAttributes([.modificationDate: older], ofItemAtPath: notes.path)
+        try fm.setAttributes([.modificationDate: newer], ofItemAtPath: long.path)
+        let total = shortCount + longCount
+
+        let name = "coverage.sqlite"
+        let store = try ctx.fs.store(named: name)
+        defer { ctx.fs.discard(store, named: name) }
+        let indexer = Indexer(store: store, embedder: ctx.engine)
+        final class Marks: @unchecked Sendable {
+            let lock = NSLock(); var all: Double?; var half: Double?; var embedded = 0
+        }
+        let marks = Marks()
+        let t0 = Date()
+        ctx.progress("indexing \(longCount) long files ahead of \(shortCount) notes")
+        indexer.index(roots: [root], settings: .paper, force: false) { prog in
+            let t = -t0.timeIntervalSinceNow
+            marks.lock.withLock {
+                marks.embedded = Swift.max(marks.embedded, prog.embedded)
+                if marks.half == nil, prog.embedded * 2 >= total { marks.half = t }
+                if marks.all == nil, prog.embedded >= total { marks.all = t }
+            }
+        }
+        let pass = -t0.timeIntervalSinceNow
+        let (all, half, embedded) = marks.lock.withLock { (marks.all, marks.half, marks.embedded) }
+        out.facts.append(PaperFact("files", total))
+        out.facts.append(PaperFact("files_searchable", embedded))
+        out.facts.append(PaperFact("long_text_bytes", longCount * longBytes))
+        if let all {
+            out.metrics.append(PaperMetric("all_searchable", runs: [all], unit: .seconds, aggregate: .single,
+                                           note: "every file has its first chunk stored"))
+            out.metrics.append(PaperMetric.derived("searchable_share_of_pass", value: 100 * all / Swift.max(pass, 0.001),
+                                                   unit: .percent, from: ["all_searchable", "pass"]))
+        } else {
+            out.note = "\(embedded) of \(total) files became searchable"
+        }
+        if let half { out.metrics.append(PaperMetric("half_searchable", runs: [half], unit: .seconds, aggregate: .single)) }
+        out.metrics.append(PaperMetric("pass", runs: [pass], unit: .seconds, aggregate: .single,
+                                       note: "the whole pass, every long file read to its end"))
+        return out
+    }
+
+    // MARK: - Sharing the GPU with another app
+
+    /// Another app's GPU work, in this process on its own Metal queue (as a second app's would be,
+    /// beside MLX's): a fixed compute kernel committed once a frame at `hz`, sized on this Mac to
+    /// `busyFraction` of a frame when it runs alone. Each frame's time is from commit to completion,
+    /// what the app waits for; a frame past the period is a missed frame.
+    final class GPUApp: @unchecked Sendable {
+        private let queue: MTLCommandQueue
+        private let pipeline: MTLComputePipelineState
+        private let buffer: MTLBuffer
+        private let threads = 1 << 18
+        private var iterations: UInt32 = 64
+        let period: Double
+        private let lock = NSLock()
+        private var frames: [Double] = []
+        private var running = false
+        private var done = DispatchSemaphore(value: 0)
+
+        static let source = """
+        #include <metal_stdlib>
+        using namespace metal;
+        kernel void spin(device float *b [[buffer(0)]], constant uint &n [[buffer(1)]],
+                         uint id [[thread_position_in_grid]]) {
+            float x = b[id];
+            for (uint i = 0; i < n; i++) { x = fma(x, 0.999f, 0.001f); }
+            b[id] = x;
+        }
+        """
+
+        init?(hz: Int) {
+            guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
+                  let library = try? device.makeLibrary(source: Self.source, options: nil),
+                  let fn = library.makeFunction(name: "spin"),
+                  let pipeline = try? device.makeComputePipelineState(function: fn),
+                  let buffer = device.makeBuffer(length: (1 << 18) * 4, options: .storageModeShared) else { return nil }
+            self.queue = queue; self.pipeline = pipeline; self.buffer = buffer
+            period = 1.0 / Double(hz)
+        }
+
+        /// One frame, committed and waited for: milliseconds from commit to completion.
+        private func frame(_ n: UInt32) -> Double {
+            guard let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { return 0 }
+            var count = n
+            enc.setComputePipelineState(pipeline)
+            enc.setBuffer(buffer, offset: 0, index: 0)
+            enc.setBytes(&count, length: 4, index: 1)
+            let width = pipeline.maxTotalThreadsPerThreadgroup
+            enc.dispatchThreads(MTLSize(width: threads, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: width, height: 1, depth: 1))
+            enc.endEncoding()
+            let t = Date()
+            cb.commit()
+            cb.waitUntilCompleted()
+            return -t.timeIntervalSinceNow * 1000
+        }
+
+        /// Size the frame to `targetMs` on this Mac, alone: double the work until a frame takes the
+        /// target, then bisect, each step the median of five frames.
+        @discardableResult
+        func calibrate(targetMs: Double) -> (iterations: UInt32, ms: Double) {
+            func median(_ n: UInt32) -> Double { (0 ..< 5).map { _ in frame(n) }.sorted()[2] }
+            _ = frame(64)
+            var lo: UInt32 = 1, hi: UInt32 = 64
+            while median(hi) < targetMs, hi < (1 << 24) { lo = hi; hi *= 2 }
+            for _ in 0 ..< 12 where hi - lo > 1 {
+                let mid = lo + (hi - lo) / 2
+                if median(mid) < targetMs { lo = mid } else { hi = mid }
+            }
+            iterations = hi
+            return (hi, median(hi))
+        }
+
+        func start() {
+            lock.withLock { frames = []; running = true }
+            done = DispatchSemaphore(value: 0)
+            let n = iterations, period = period
+            Thread.detachNewThread { [self] in
+                Thread.current.qualityOfService = .userInteractive
+                var next = Date()
+                while lock.withLock({ running }) {
+                    let ms = frame(n)
+                    lock.withLock { frames.append(ms) }
+                    next = next.addingTimeInterval(period)
+                    let wait = next.timeIntervalSinceNow
+                    if wait > 0 { Thread.sleep(forTimeInterval: wait) } else { next = Date() }
+                }
+                done.signal()
+            }
+        }
+
+        func stop() -> [Double] {
+            lock.withLock { running = false }
+            done.wait()
+            return lock.withLock { frames }
+        }
+    }
+
+    static let gpuAppBody: PaperCaseBody = { ctx in
+        var out = PaperCaseOutput()
+        guard let built = ctx.shared.builtStore else { throw PaperDependencyMissing(noStore) }
+        let corpus = try PaperCasesCompute.corpus(ctx)
+        let p = ctx.params
+        guard let app = GPUApp(hz: p.int("frame_hz")) else {
+            out.note = "no Metal device for the other app's load"
+            return out
+        }
+        let target = 1000 * app.period * p.double("busy_fraction")
+        ctx.progress("sizing the other app's frame to \(String(format: "%.1f", target)) ms")
+        let sized = app.calibrate(targetMs: target)
+        out.facts.append(PaperFact("app_iterations", Int(sized.iterations)))
+        out.facts.append(PaperFact("app_frame_alone_calibrated_ms", String(format: "%.2f", sized.ms)))
+        out.facts.append(PaperFact("app_frame_period_ms", String(format: "%.2f", 1000 * app.period)))
+
+        let store = try ctx.fs.store(named: built.name)
+        defer { store.close() }
+        warm(store, ctx, built.name)
+        var loadDir = try ctx.fs.scratch(named: "gpuapp-load")
+        if let rp = realpath(loadDir.path, nil) { loadDir = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+        var load: [String] = []
+        for i in 0 ..< Swift.min(p.int("load_files"), corpus.spec.textFiles) {
+            let dst = loadDir.appendingPathComponent("g\(i).md")
+            try FileManager.default.copyItem(at: corpus.textFileURL(i), to: dst)
+            load.append(dst.path)
+        }
+        let revision = PaperCounter()
+        let seconds = p.double("phase_seconds"), topK = p.int("top_k")
+        let interval = Double(p.int("search_interval_ms")) / 1000
+
+        /// Omni indexing edited files into a store of its own for `seconds`: files finished.
+        func indexFor(_ seconds: Double, round: Int, tag: String) throws -> Int {
+            let name = "gpuapp-\(tag)-\(round).sqlite"
+            let target = try ctx.fs.store(named: name)
+            defer { ctx.fs.discard(target, named: name) }
+            let indexer = Indexer(store: target, embedder: ctx.engine)
+            let stop = PaperFlag(), finished = PaperCounter(), done = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .utility).async {
+                var i = 0
+                while !stop.isOn {
+                    let path = load[i % load.count]
+                    revision.add()
+                    if let h = FileHandle(forWritingAtPath: path) {
+                        h.seekToEndOfFile()
+                        h.write(Data("\nrevision \(revision.value)\n".utf8))
+                        try? h.close()
+                    }
+                    indexer.update(paths: [path], settings: .paper, force: true)
+                    if !stop.isOn { finished.add() }
+                    i += 1
+                }
+                done.signal()
+            }
+            let deadline = Date().addingTimeInterval(seconds)
+            while Date() < deadline, ctx.shouldContinue { Thread.sleep(forTimeInterval: 0.05) }
+            stop.turnOn(); indexer.cancel(); done.wait(); indexer.resetCancelled()
+            return finished.value
+        }
+
+        var frames: [String: [Double]] = [:]
+        var searches: [Double] = []
+        var indexed: [String: (files: Int, seconds: Double)] = [:]
+        let phases = ["alone", "indexing", "searching", "index_alone"]
+        out.arms = ["load"]
+        let rounds = p.int("rounds")
+        try ctx.withArm("load") {
+            rounds: for round in 0 ..< rounds {
+                for k in 0 ..< phases.count {
+                    let phase = phases[(k + round) % phases.count]   // the order rotates each round
+                    try ctx.checkCancel()
+                    guard ctx.shouldContinue else { out.truncated = true; break rounds }
+                    ctx.progress("round \(round + 1)/\(rounds): \(phase)")
+                    switch phase {
+                    case "alone":
+                        app.start()
+                        Thread.sleep(forTimeInterval: seconds)
+                        frames["alone", default: []] += app.stop()
+                    case "indexing":
+                        app.start()
+                        let t = Date()
+                        let files = try indexFor(seconds, round: round, tag: "with")
+                        let elapsed = -t.timeIntervalSinceNow
+                        frames["indexing", default: []] += app.stop()
+                        let prior = indexed["with_app"] ?? (0, 0)
+                        indexed["with_app"] = (prior.files + files, prior.seconds + elapsed)
+                    case "searching":
+                        app.start()
+                        let deadline = Date().addingTimeInterval(seconds)
+                        var k = 0
+                        while Date() < deadline, ctx.shouldContinue {
+                            let q = queryTexts[k % queryTexts.count]
+                            ctx.engine.noteInteractive()
+                            searches.append(timeMs {
+                                _ = store.search(ctx.engine.embedQuery(q), topK: topK, markActive: true, textQuery: q)
+                            })
+                            k += 1
+                            Thread.sleep(forTimeInterval: interval)
+                        }
+                        frames["searching", default: []] += app.stop()
+                        ctx.engine.endInteractive()   // the next phase starts as if the typing had stopped
+                    default:
+                        let t = Date()
+                        let files = try indexFor(seconds, round: round, tag: "alone")
+                        let elapsed = -t.timeIntervalSinceNow
+                        let prior = indexed["alone"] ?? (0, 0)
+                        indexed["alone"] = (prior.files + files, prior.seconds + elapsed)
+                    }
+                }
+            }
+        }
+        let periodMs = 1000 * app.period
+        for phase in ["alone", "indexing", "searching"] {
+            guard let f = frames[phase], !f.isEmpty else { continue }
+            out.metrics += PaperMetric.distribution("\(phase).frame", samples: f, unit: .milliseconds,
+                                                    note: "the other app's frame, commit to completion")
+            out.metrics.append(PaperMetric("\(phase).missed", runs: [100 * Double(f.filter { $0 > periodMs }.count) / Double(f.count)],
+                                           unit: .percent, aggregate: .single, note: "frames longer than the frame period"))
+        }
+        out.metrics += PaperMetric.distribution("searching.search", samples: searches, unit: .milliseconds,
+                                                note: "encode and search, a query every \(p.int("search_interval_ms")) ms, the other app running")
+        for (key, v) in indexed where v.seconds > 0 {
+            out.metrics.append(PaperMetric("index_rate.\(key)", runs: [Double(v.files) / v.seconds], unit: .filesPerSecond,
+                                           aggregate: .single))
+        }
+        if let alone = out.metrics.first(where: { $0.key == "index_rate.alone" })?.value,
+           let with = out.metrics.first(where: { $0.key == "index_rate.with_app" })?.value, alone > 0 {
+            out.metrics.append(PaperMetric.derived("index_cost", value: 100 * (alone - with) / alone, unit: .percent,
+                                                   from: ["index_rate.alone", "index_rate.with_app"]))
+        }
+        return out
+    }
+
     // MARK: - Index one image
 
     static let imageBody: PaperCaseBody = { ctx in
@@ -659,33 +1038,47 @@ public enum BenchCases {
         let corpus = try PaperCasesCompute.corpus(ctx)
         let images = (0 ..< corpus.spec.images).map(corpus.imageURL)
         let rounds = ctx.params.int("rounds")
-        for arm in ["tags_off", "tags_on"] {
-            try ctx.checkCancel()
-            guard ctx.shouldContinue else { out.truncated = true; break }
-            out.arms.append(arm)
-            let name = "image-\(arm).sqlite"
-            let store = try ctx.fs.store(named: name)
-            defer { ctx.fs.discard(store, named: name) }
-            let indexer = Indexer(store: store, embedder: ctx.engine)
-            let savedTagger = ctx.engine.tagger
-            defer { ctx.engine.tagger = savedTagger }
-            ctx.engine.tagger = arm == "tags_on" ? savedTagger : nil
-            if arm == "tags_on", savedTagger == nil { out.facts.append(PaperFact("tags_on_status", "no tagger attached")) }
-            var samples: [Double] = []
-            for r in 0 ..< rounds {
-                for (i, url) in images.enumerated() {
-                    try ctx.checkCancel()
-                    guard ctx.shouldContinue else { out.truncated = true; break }
-                    samples.append(timeMs { indexer.update(paths: [url.path], settings: .paperMedia, force: true) })
-                    if i % 8 == 0 { ctx.progress("\(arm): round \(r + 1), image \(i + 1)/\(images.count)") }
-                }
-            }
-            out.metrics += PaperMetric.distribution("index_image", samples: samples, unit: .milliseconds, arm: arm)
+        let arms = ["tags_off", "tags_on"]
+        let savedTagger = ctx.engine.tagger
+        defer { ctx.engine.tagger = savedTagger }
+        if savedTagger == nil { out.facts.append(PaperFact("tags_on_status", "no tagger attached")) }
+        var stores: [String: VectorStore] = [:], indexers: [String: Indexer] = [:]
+        defer { for arm in arms { if let st = stores[arm] { ctx.fs.discard(st, named: "image-\(arm).sqlite") } } }
+        for arm in arms {
+            let st = try ctx.fs.store(named: "image-\(arm).sqlite")
+            stores[arm] = st
+            indexers[arm] = Indexer(store: st, embedder: ctx.engine)
         }
-        if let off = out.metrics.first(where: { $0.key == "tags_off.index_image.p50" })?.value,
-           let on = out.metrics.first(where: { $0.key == "tags_on.index_image.p50" })?.value, off > 0 {
-            out.metrics.append(PaperMetric.derived("tag_overhead_p50", value: 100 * (on - off) / off, unit: .percent,
-                                                   from: ["tags_off.index_image.p50", "tags_on.index_image.p50"]))
+        // ALTERNATED image by image, the order flipping each image (bench-v10): both arms index the
+        // same image back to back, so what else the Mac does falls on both alike. Through v9 every
+        // tags-off image came before every tags-on one.
+        var samples: [String: [Double]] = [:], paired: [Double] = []
+        rounds: for r in 0 ..< rounds {
+            for (i, url) in images.enumerated() {
+                var pair: [String: Double] = [:]
+                for arm in ((i + r) % 2 == 0 ? arms : arms.reversed()) {
+                    try ctx.checkCancel()
+                    guard ctx.shouldContinue else { out.truncated = true; break rounds }
+                    ctx.engine.tagger = arm == "tags_on" ? savedTagger : nil
+                    let t = ctx.withArm(arm) { timeMs { indexers[arm]!.update(paths: [url.path], settings: .paperMedia, force: true) } }
+                    samples[arm, default: []].append(t)
+                    pair[arm] = t
+                }
+                if let off = pair["tags_off"], let on = pair["tags_on"], off > 0 { paired.append(100 * (on - off) / off) }
+                if i % 8 == 0 { ctx.progress("round \(r + 1), image \(i + 1)/\(images.count)") }
+            }
+        }
+        for arm in arms where !(samples[arm] ?? []).isEmpty {
+            out.arms.append(arm)
+            out.metrics += PaperMetric.distribution("index_image", samples: samples[arm]!, unit: .milliseconds, arm: arm)
+        }
+        // PAIRED: each image's own tags-on time against its tags-off time, the median over images.
+        // Image times fall in two clusters (large and small pictures), and a median of either arm
+        // sits between them: the two arms' medians read 15.2 and 22.8 ms in one run for a cost the
+        // paired median puts at a few percent (bench-v10, M3 Ultra).
+        if !paired.isEmpty {
+            out.metrics.append(PaperMetric("tag_overhead_p50", runs: paired, unit: .percent, aggregate: .median,
+                                           note: "median over images of each image's tags-on time against its tags-off time"))
         }
         return out
     }
@@ -696,38 +1089,47 @@ public enum BenchCases {
         var out = PaperCaseOutput()
         let corpus = try PaperCasesCompute.corpus(ctx)
         let minBytes = ctx.params.int("min_bytes")
-        let picks = (0 ..< corpus.spec.textFiles).filter { PaperCorpus.textFileBytes($0) >= minBytes }
-            .prefix(ctx.params.int("files"))
-        for arm in ["reuse_off", "reuse_on"] {
-            try ctx.checkCancel()
-            guard ctx.shouldContinue else { out.truncated = true; break }
-            out.arms.append(arm)
+        let picks = Array((0 ..< corpus.spec.textFiles).filter { PaperCorpus.textFileBytes($0) >= minBytes }
+            .prefix(ctx.params.int("files")))
+        let arms = ["reuse_off", "reuse_on"]
+        var files: [String: [URL]] = [:], stores: [String: VectorStore] = [:], indexers: [String: Indexer] = [:]
+        defer { for arm in arms { if let st = stores[arm] { ctx.fs.discard(st, named: "save-\(arm).sqlite") } } }
+        // Each arm its own copies and its own store, indexed once under its levers.
+        for arm in arms {
             try ctx.withArm(arm) {
-                // Copies, so the edits never touch the generated corpus.
                 var dir = try ctx.fs.scratch(named: "save-\(arm)")
                 if let rp = realpath(dir.path, nil) { dir = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
-                var files: [URL] = []
+                var copies: [URL] = []
                 for i in picks {
                     let dst = dir.appendingPathComponent("s\(i).md")
                     try FileManager.default.copyItem(at: corpus.textFileURL(i), to: dst)
-                    files.append(dst)
+                    copies.append(dst)
                 }
-                let name = "save-\(arm).sqlite"
-                let store = try ctx.fs.store(named: name)
-                defer { ctx.fs.discard(store, named: name) }
-                let indexer = Indexer(store: store, embedder: ctx.engine)
+                let st = try ctx.fs.store(named: "save-\(arm).sqlite")
+                let indexer = Indexer(store: st, embedder: ctx.engine)
                 indexer.index(roots: [dir], settings: .paper, force: false) { _ in }
-                var samples: [Double] = []
-                for (i, url) in files.enumerated() {
-                    try ctx.checkCancel()
-                    guard ctx.shouldContinue else { out.truncated = true; break }
-                    guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
-                    try (text + "\nappended line for the save measurement\n").write(to: url, atomically: true, encoding: .utf8)
-                    samples.append(timeMs { indexer.update(paths: [url.path], settings: .paper) })
-                    if i % 10 == 0 { ctx.progress("\(arm): save \(i + 1)/\(files.count)") }
-                }
-                out.metrics += PaperMetric.distribution("save", samples: samples, unit: .milliseconds, arm: arm)
+                files[arm] = copies; stores[arm] = st; indexers[arm] = indexer
             }
+        }
+        // ALTERNATED file by file, the order flipping each file (bench-v10): the same edit is saved
+        // under both arms back to back, so a burst from another app falls on both. Through v9 every
+        // reuse-off save came before every reuse-on one.
+        var samples: [String: [Double]] = [:]
+        saves: for k in 0 ..< picks.count {
+            for arm in (k % 2 == 0 ? arms : arms.reversed()) {
+                try ctx.checkCancel()
+                guard ctx.shouldContinue else { out.truncated = true; break saves }
+                let url = files[arm]![k]
+                guard let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+                try (text + "\nappended line for the save measurement\n").write(to: url, atomically: true, encoding: .utf8)
+                let t = ctx.withArm(arm) { timeMs { indexers[arm]!.update(paths: [url.path], settings: .paper) } }
+                samples[arm, default: []].append(t)
+            }
+            if k % 10 == 0 { ctx.progress("save \(k + 1)/\(picks.count)") }
+        }
+        for arm in arms where !(samples[arm] ?? []).isEmpty {
+            out.arms.append(arm)
+            out.metrics += PaperMetric.distribution("save", samples: samples[arm]!, unit: .milliseconds, arm: arm)
         }
         for suffix in ["p50", "p95", "p99"] {
             guard let off = out.metrics.first(where: { $0.key == "reuse_off.save.\(suffix)" })?.value,

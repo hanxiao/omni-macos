@@ -399,7 +399,7 @@ func paperRun(engine: OmniEngine, scale: Double, maxWall: Double, outPath: Strin
     switch result.status {
     case .complete: return 0
     case .partial, .cancelled: return 0     // a partial run is a result, not a failure
-    case .abortedSwap, .failed: return 1
+    case .failed: return 1
     }
 }
 

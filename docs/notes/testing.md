@@ -643,6 +643,33 @@ What had to change in the suite to get there:
     slopes of the row counts). They run with `--only` and the paper quotes them once. Rows that
     read the same everywhere went too: accelerator busy, cap in force, tagging overhead,
     per-file reuse.
+- bench-v10 (0.17.1), after a v9 report from an M2 that could not run the suite, and Han's rule that
+  the benchmark measures beside whatever the Mac is doing (CLAUDE.md, "never waits for a quiet
+  machine"):
+  - NO WAITS, NO GATES. The idle gaps, the throttled exclusion, the swap abort and the free-memory
+    gate are gone. A case leaves a Mac only when its measured peak does not fit half its physical
+    RAM (`PaperCaseCatalog.fits`, BenchCapacityTests); the rest of the machine is RECORDED: per case
+    and per arm, other processes' CPU and GPU share, the slowest clock probe against the run's
+    fastest, swap read back, pressure, thermal state and power. GPU time per process is
+    IOAccelerator's per-client `AppUsage` (the accelerator's AGXDeviceUserClient children:
+    `IOServiceMatching` on the class finds none). The report and the site carry a Conditions group.
+  - ONE CONTROLLED CASE: `gpu_app`, a GPU app (a Metal kernel paced at 60 Hz) as an independent
+    variable - its frame time alone, while Omni indexes and while it searches, and Omni's search and
+    indexing with it running.
+  - NEW ROWS: identifier query, a query leaning toward one modality, every file searchable and the
+    whole pass (coverage), and the sharing-the-GPU group.
+  - WHAT THE FIRST RUNS GOT WRONG, fixed in the harness: the GPU app's indexing cost read -37%
+    because the searching phase before it left the engine in its typing window (the phase after
+    one read 27% slower); the benchmark now ends the window (`OmniEngine.endInteractive`) after
+    every simulated typing phase and at each case. Tagging overhead read 49.7% from a bimodal
+    median of two independent arms; it is now the median of per-image paired differences (-0.36%).
+    The scan ladder's speedups were not monotonic with arms run in a fixed order; they now run in
+    ABBA blocks (0.52 / 0.55 / 0.54 / 0.69 / 0.98 x from 125k to 2M rows, headless).
+  - WHAT IT FOUND IN THE APP: the store's three sidecars were `lazy` and the decode workers' first
+    concurrent use built two IDIndex objects and freed one under the thread using it
+    (EXC_BAD_ACCESS in IDIndex.deinit on a fresh store); they are built in init now.
+  - M3 Ultra: smoke 16/16; two headless full runs 16/16, ~12.5 min each; in the app (isolated,
+    uploads off) 16/16 in 13 min 54 s, other processes' CPU median 21.3% over the run.
 - `--only store_build,search_under_writes` runs a subset (2 min); the report marks it SUBSET RUN.
   With OMNI_SEARCH_TIMING=1 every slice, checkpoint and slow search logs its phases.
 - WHAT IT FOUND ON ITS FIRST FULL RUN: a 1.3-1.8 s stall in the bulk delete (tombstones over budget

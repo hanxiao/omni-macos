@@ -13,8 +13,9 @@ import Foundation
 //     schema, app/model identity, every pin and the corpus hash, and spells out the merge rule in
 //     its own header - a merger that ignores it is choosing to.
 //  3. A partial run got presented as a complete one. So the status of every case is a line, the
-//     skips carry their reason, and a run that is anything short of "every case ok on a quiet
-//     machine" says PARTIAL in its human summary before any number appears.
+//     skips carry their reason, and a run that is anything short of "every case ok" says PARTIAL in
+//     its human summary before any number appears. What the machine was doing is a CONDITIONS
+//     section next to the numbers, not a defect of them.
 //
 // Two structural rules that are cheap here and expensive to retrofit:
 //
@@ -324,8 +325,20 @@ public struct PaperReport: Sendable, Codable {
               ? "unavailable" : Self.f(result.end.swapUsedMB - result.begin.swapUsedMB, 1))
         b.put("env.thermal_drift_pct", result.thermalDriftPercent.map { Self.f($0, 2) } ?? "unavailable")
         b.put("env.thermal_drift_stamped", result.thermalDriftPercent != nil)
-        b.put("env.thermal_drift_exceeded", result.thermalDriftExceeded)
-        b.put("env.contended_cases", result.contendedCases.isEmpty ? "none" : result.contendedCases.joined(separator: ","))
+        // The conditions the run measured under, over every case that produced numbers. Recorded,
+        // never a reason to drop a case (PaperSuite's header).
+        let c = result.conditions
+        func opt(_ v: Double?, _ d: Int) -> String { v.map { Self.f($0, d) } ?? "unavailable" }
+        b.put("env.cond.other_cpu_pct_median", opt(c.backgroundCPUMedian, 1))
+        b.put("env.cond.other_cpu_pct_max", opt(c.backgroundCPUMax, 1))
+        b.put("env.cond.other_gpu_pct_median", opt(c.backgroundGPUMedian, 1))
+        b.put("env.cond.other_gpu_pct_max", opt(c.backgroundGPUMax, 1))
+        b.put("env.cond.swap_in_total_mb", opt(c.swapInTotalMB, 1))
+        b.put("env.cond.clock_slowdown_pct_median", opt(c.clockSlowdownMedian, 1))
+        b.put("env.cond.clock_slowdown_pct_max", opt(c.clockSlowdownMax, 1))
+        b.put("env.cond.thermal_worst", PaperRunConditions.thermalName(c.thermalWorstRank))
+        b.put("env.cond.battery_pct_of_cases", c.batteryPercentOfCases, digits: 0)
+        b.put("env.cond.low_power_pct_of_cases", c.lowPowerPercentOfCases, digits: 0)
     }
 
     private func appendSnapshot(_ b: inout PaperLineBuffer, _ prefix: String, _ s: SystemSnapshot) {
@@ -380,6 +393,10 @@ public struct PaperReport: Sendable, Codable {
             if let e = c.environment {
                 b.put("case.\(c.id).env.thermal_begin", e.thermalBegin)
                 b.put("case.\(c.id).env.thermal_end", e.thermalEnd)
+                b.put("case.\(c.id).env.thermal_worst", e.thermalWorst)
+                b.put("case.\(c.id).env.pressure_worst", e.pressureWorst < 0 ? "unavailable" : String(e.pressureWorst))
+                b.put("case.\(c.id).env.power_source", e.powerSource)
+                b.put("case.\(c.id).env.low_power_mode", e.lowPowerMode)
                 b.put("case.\(c.id).env.mem_free_begin_mb", Self.probe(e.memFreeBeginMB, 1))
                 b.put("case.\(c.id).env.swap_delta_mb", e.swapDeltaMB, digits: 1)
                 b.put("case.\(c.id).env.footprint_delta_mb", e.footprintDeltaMB, digits: 1)
@@ -388,7 +405,11 @@ public struct PaperReport: Sendable, Codable {
                 b.put("case.\(c.id).env.mlx_peak_mb", e.mlxPeakMB, digits: 1)
                 b.put("case.\(c.id).env.system_cpu_busy_pct", Self.probe(e.systemBusyPercent, 1))
                 b.put("case.\(c.id).env.own_cpu_cores", Self.probe(e.ownCPUCores, 2))
-                b.put("case.\(c.id).env.contended", e.contended)
+                b.put("case.\(c.id).env.other_cpu_pct", Self.probe(e.backgroundCPUPercent, 1))
+                b.put("case.\(c.id).env.other_gpu_pct", e.backgroundGPUPercent.map { Self.f($0, 1) } ?? "unavailable")
+                b.put("case.\(c.id).env.own_gpu_pct", e.ownGPUPercent.map { Self.f($0, 1) } ?? "unavailable")
+                b.put("case.\(c.id).env.gpu_utilization_pct", e.gpuUtilizationPercent.map { Self.f($0, 1) } ?? "unavailable")
+                b.put("case.\(c.id).env.clock_slowdown_pct", e.clockSlowdownPercent.map { Self.f($0, 1) } ?? "unavailable")
             }
 
             // Which levers each arm moved. An arm with no levers is a parameter arm (a dtype, an
@@ -508,10 +529,12 @@ public struct PaperReport: Sendable, Codable {
             }
         }
         out.append("#")
+        out += conditionLines()
+        out.append("#")
 
         let warnings = warningLines(duplicates: duplicates)
         if warnings.isEmpty {
-            out.append("# WARNINGS: none. Every case ran ok on a quiet machine.")
+            out.append("# WARNINGS: none. Every case ran ok.")
         } else {
             out.append("# WARNINGS - READ BEFORE CITING ANY NUMBER ABOVE:")
             out += warnings.map { "#   ! " + $0 }
@@ -554,8 +577,32 @@ public struct PaperReport: Sendable, Codable {
         return parts.joined(separator: " | ")
     }
 
+    /// What the machine was doing while each case measured. Read next to the numbers; nothing was
+    /// dropped or waited out for it.
+    private func conditionLines() -> [String] {
+        func v(_ x: Double?, _ suffix: String) -> String { x.map { Self.f($0, 1) + suffix } ?? "-" }
+        var out = ["# CONDITIONS  (other processes' CPU and GPU, clock below the run's fastest, swap read, thermal)"]
+        let c = result.conditions
+        out.append("#   whole run       other CPU median \(v(c.backgroundCPUMedian, "%")) max \(v(c.backgroundCPUMax, "%")) | "
+                   + "other GPU median \(v(c.backgroundGPUMedian, "%")) max \(v(c.backgroundGPUMax, "%")) | "
+                   + "clock slowest \(v(c.clockSlowdownMax, "%")) | swap read \(v(c.swapInTotalMB, " MB")) | "
+                   + "thermal worst \(PaperRunConditions.thermalName(c.thermalWorstRank))"
+                   + (c.batteryPercentOfCases > 0 ? String(format: " | on battery %.0f%% of cases", c.batteryPercentOfCases) : "")
+                   + (c.lowPowerPercentOfCases > 0 ? String(format: " | Low Power Mode %.0f%% of cases", c.lowPowerPercentOfCases) : ""))
+        for r in result.cases {
+            guard let e = r.environment else { continue }
+            out.append("#   " + Self.pad(r.id, 16) + "other CPU " + Self.padLeft(Self.probe(e.backgroundCPUPercent, 1), 5) + "%"
+                       + "  other GPU " + Self.padLeft(e.backgroundGPUPercent.map { Self.f($0, 1) } ?? "-", 5) + "%"
+                       + "  clock " + Self.padLeft(e.clockSlowdownPercent.map { Self.f($0, 1) } ?? "-", 5) + "%"
+                       + "  swap read " + Self.padLeft(e.swapInMB.map { Self.f($0, 0) } ?? "-", 5) + " MB"
+                       + "  " + e.thermalWorst)
+        }
+        return out
+    }
+
     /// Everything that makes a number in this file suspect, in the order a reader should worry
-    /// about it. A partial run has to LOOK partial before any number is read.
+    /// about it. A partial run has to LOOK partial before any number is read. What the machine was
+    /// doing is not here: it is a condition of the measurement (conditionLines), not a defect of it.
     private func warningLines(duplicates: Int) -> [String] {
         var w: [String] = []
         // A subset build measures a few cases on purpose. That has to be visible before any number
@@ -569,10 +616,6 @@ public struct PaperReport: Sendable, Codable {
             w.append("PARTIAL RUN (status \(result.status.rawValue), \(result.casesOK) of \(result.casesTotal) cases ok). "
                      + "Do not present this as a complete suite.")
         }
-        if result.status == .abortedSwap {
-            w.append("ABORTED ON SWAP: the machine read pages back from swap mid-run. Every case after the abort is "
-                     + "missing and the last one measured before it may be a paging measurement.")
-        }
         if result.scale < 1.0 {
             w.append(String(format: "SMOKE RUN at scale %.3f: sizes are reduced, so every rate covers less "
                             + "work than the paper's. Pipeline check only, never a table.", result.scale))
@@ -581,34 +624,8 @@ public struct PaperReport: Sendable, Codable {
             w.append("\(c.id) \(c.status.rawValue)" + (c.note.map { ": " + $0 } ?? ""))
         }
         if result.thermalDriftPercent == nil {
-            w.append("No thermal drift stamp: the closing canary did not run, so nothing bounds a clock "
-                     + "change across the suite.")
-        } else if result.thermalDriftExceeded {
-            w.append(String(format: "Thermal drift %.1f%% exceeds +-8%%: the machine changed clock domain "
-                            + "mid-suite and the cases are not mutually comparable.",
-                            result.thermalDriftPercent ?? 0))
-        }
-        if result.maxThermal == "serious" || result.maxThermal == "critical" {
-            w.append("Thermal state reached '\(result.maxThermal)': the machine throttled during the run.")
-        }
-        if !result.contendedCases.isEmpty {
-            w.append("Contended (another process used more than a fifth of the machine): "
-                     + result.contendedCases.joined(separator: ", "))
-        }
-        if !result.pagedCases.isEmpty {
-            w.append(String(format: "Paged (more than %.0f MB read back from swap while it ran): ", PaperSuiteResult.pagedThresholdMB)
-                     + result.pagedCases.joined(separator: ", "))
-        }
-        if result.end.powerSource == "battery" || result.begin.powerSource == "battery" {
-            w.append("On battery for at least part of the run: Apple silicon clocks differently on battery.")
-        }
-        if result.begin.lowPowerMode || result.end.lowPowerMode {
-            w.append("Low Power Mode was enabled: every number here is a low-power number.")
-        }
-        if result.begin.swapUsedMB >= 0, result.end.swapUsedMB >= 0,
-           result.end.swapUsedMB - result.begin.swapUsedMB > 128 {
-            w.append(String(format: "Swap grew by %.0f MB during the run.",
-                            result.end.swapUsedMB - result.begin.swapUsedMB))
+            w.append("No thermal drift stamp: the closing canary did not run, so the run has no record of how "
+                     + "far the machine's speed moved across it.")
         }
         if corpus == nil {
             w.append("No corpus stamp: nothing that indexed files can be merged with another machine, "
