@@ -2829,7 +2829,7 @@ final class AppModel {
         // the same query, and an @Observable property notifies on every write, equal or not. Each
         // unguarded pass re-rendered the results list and every visible row for nothing.
         var above = rawResults.filter {
-            Self.relevance(Float(Double($0.score) / $0.lift)) >= VectorStore.relevanceFloor(kind: $0.kind, base: minScore)
+            Self.relevance(Float(Double($0.score) / $0.lift)) >= VectorStore.relevanceFloor($0, base: minScore)
         }
         if hiddenByFloor != rawResults.count - above.count { hiddenByFloor = rawResults.count - above.count }
         // WEAKER MATCHES FOLD, on the relevance order the store produced and before any sort, one

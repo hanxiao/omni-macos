@@ -378,7 +378,7 @@ enum MCPAdapter {
         if named?.isEmpty != true, let search = sources?.linkedSearch {
             let floor = filter.minScore ?? EngineServingBackend.minScore
             for a in await search(query, filter, topK, named ?? ["all"], named != nil) {
-                let hits = Array(a.hits.filter { floor <= 0 || Double($0.score) >= VectorStore.relevanceFloor(kind: $0.kind, base: floor) }.prefix(topK))
+                let hits = Array(a.hits.filter { floor <= 0 || Double($0.score) / $0.lift >= VectorStore.relevanceFloor($0, base: floor) }.prefix(topK))
                 if let note = a.note {
                     content.append(diagnostic("On \(a.mac): \(note.hasSuffix(".") ? note : note + ".")"))
                 } else if hits.isEmpty {

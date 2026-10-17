@@ -235,7 +235,7 @@ public enum BenchCases {
                 _ = store.search(engine.embedQuery(q), topK: topK, markActive: true, textQuery: q)
             }
 
-            var endToEnd: [Double] = [], encode: [Double] = [], scan: [Double] = [], pulls: [Double] = []
+            var endToEnd: [Double] = [], encode: [Double] = [], scan: [Double] = []
             for i in 0 ..< textQueries {
                 try ctx.checkCancel()
                 guard ctx.shouldContinue else { out.truncated = true; break }
@@ -244,7 +244,6 @@ public enum BenchCases {
                 let e = timeMs { v = engine.embedQuery(q) }
                 let s = timeMs { _ = store.search(v, topK: topK, markActive: true, textQuery: q) }
                 encode.append(e); scan.append(s); endToEnd.append(e + s)
-                if i < queryTexts.count, let pull = store.kindPulls(v)["image"] { pulls.append(pull) }
                 if i % 25 == 0 { ctx.progress("text query \(i + 1)/\(textQueries)") }
             }
             out.metrics += PaperMetric.distribution("text_query", samples: endToEnd, unit: .milliseconds)
@@ -279,29 +278,25 @@ public enum BenchCases {
             out.facts.append(PaperFact("identifier_first_hits", "\(found)/\(ident.count)"))
 
             // A QUERY THAT LEANS TOWARD IMAGES, as a description of something seen does. Its vector is
-            // drawn toward the store's image cone, so the modality lift takes images to the text scale
-            // and adds their own best hits from a second, restricted scan. Search alone; the first one
-            // builds the restricted scan's mask column and is timed apart.
-            var leaning: [Double] = [], leanPulls: [Double] = []
+            // drawn toward the store's image cone; the scan lifts every media row of a text query to
+            // the text scale (VectorStore.kindScale) in the one pass. Search alone; the first one
+            // builds the per-content lift column and is timed apart.
+            var leaning: [Double] = [], lifted = 0, shown = 0
             let leaningText = "a photo of a red car at the beach"
             for i in 0 ..< p.int("leaning_queries") + 1 where ctx.shouldContinue {
                 let v = PaperVectors.leaningQuery(i, dim: layout.dim)
-                let t = timeMs { _ = store.search(v, topK: topK, markActive: true, textQuery: leaningText) }
+                var hits: [SearchHit] = []
+                let t = timeMs { hits = store.search(v, topK: topK, markActive: true, textQuery: leaningText) }
                 if i == 0 {
                     out.metrics.append(PaperMetric("leaning_scan_first", runs: [t], unit: .milliseconds, aggregate: .single,
-                                                   note: "builds the image mask column"))
+                                                   note: "builds the per-content lift column"))
                 } else { leaning.append(t) }
-                if i < 16, let pull = store.kindPulls(v)["image"] { leanPulls.append(pull) }
+                for h in hits.prefix(10) { shown += 1; if h.lift > 1 { lifted += 1 } }
             }
             out.metrics += PaperMetric.distribution("leaning_scan", samples: leaning, unit: .milliseconds,
-                                                    note: "search alone: the scan, the lift and the restricted second scan")
-            // POSITIVE CONTROL: the lean that decides the lift (VectorStore.kindPullBand), for the
-            // leaning queries and for the typed ones. A leaning query past the band's top is lifted in
-            // full and takes the second scan; a typed one stays inside it.
-            func median(_ xs: [Double]) -> String { xs.isEmpty ? "none" : String(format: "%.3f", xs.sorted()[xs.count / 2]) }
-            out.facts.append(PaperFact("leaning_pull_median", median(leanPulls)))
-            out.facts.append(PaperFact("typed_pull_median", median(pulls)))
-            out.facts.append(PaperFact("pull_band_top", String(format: "%.2f", VectorStore.kindPullBand.hi)))
+                                                    note: "search alone: one scan, media lifted inside it")
+            // POSITIVE CONTROL: the lift fired - media hits in the leaning queries' top ten carry it.
+            out.facts.append(PaperFact("leaning_lifted_top10", "\(lifted)/\(shown)"))
 
             var filtered: [Double] = []
             for i in 0 ..< p.int("filtered_queries") where ctx.shouldContinue {

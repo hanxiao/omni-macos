@@ -376,3 +376,36 @@ each found two causes.
 After both, interleaved, three arms: 0.15.15 0.464-0.498 s, HEAD with the old routing 0.547-0.600,
 HEAD 0.486-0.537. What is left (~1 ms an edit) is 0.17's own per-chunk work: the identifier
 postings, the enrichment ledger, content-key lookups.
+
+### Media on the text scale, in one scan (Han's call, 2026-10-16)
+
+Following "Is there a modality gap": Han chose to calibrate always rather than by the query's lean.
+Every media row of a text query is scored at 1 / its model's scale (`VectorStore.kindScale`: Nano
+0.66, Small 0.77, from COCO) where the scan reduces rows to files, and each candidate selection
+before that (the funnel's top-C on the GPU, the host rerank's heap) ranks on the lifted coarse
+score: one scan, the exact lifted top-K. Gone: the kind centroids, the lean, its band and the
+second scan of a leaning kind. A query that is not text (find similar, an image) is not lifted.
+Each hit carries its model's scale (`SearchHit.scale`), which the fold and every relevance floor
+read; the MCP and REST floors now divide out the lift as the app's always did.
+
+- Prototyped exactly first (each lifted kind's own top-K merged): MRR Nano 0.870 -> 0.909, Small
+  0.916 -> 0.921 (0.615: 0.904 / 0.920). In the scan: Nano 0.900 (R@1 0.85), Small 0.925 (0.88).
+  The scan scores a screenshot by its picture as well as its text (the prototype lifted only the
+  chunk a file was first found by), so "orage et éclairs" now opens a screenshot ahead of the
+  labeled photo (1 -> 2); "토요일 저녁 약속" is the known near tie. By group, shipped -> now:
+  Nano audio 0.624 -> 0.794, soundtrack 0.430 -> 1.000, image 0.725 -> 0.774, image-ml 0.631 ->
+  0.673, doc 0.961 -> 0.918, doc-xl 1.000 -> 0.950; Small image 0.881 -> 0.949, image-ml 0.691 ->
+  0.728, audio 0.684 -> 0.705, soundtrack 0.778 -> 1.000, doc 0.939 -> 0.896. The doc losses are
+  each one rank, to a recording or photo of the same thing (a meeting recording for "what launch
+  date did we decide"). Fold: Nano 4.2 shown, 2 answers folded (1 in the top 10); Small 4.5, none.
+- On a clone of the real index (655,752 files) visual queries return photos where they returned
+  text files naming the words ("sunset over the mountains", "a plate of sushi"); some text queries
+  gain screenshots ("flight booking confirmation": ten images).
+- Speed, the benchmark's query case, the last commit against this, ABBA: leaning query 6.80 / 6.85
+  -> 3.84 / 3.81 ms; text, filename, filtered, identifier and find-similar within 0.1 ms. A first
+  version read the model's width through the store queue after each scan and cost 0.2-0.7 ms on
+  every query (a queue.sync waits behind the maintenance the scan scheduled); the scan now leaves
+  it in a lock. `searchreal` on a fresh bench-index clone: digest 134b9ff183fd2f29 and p50 4.2 ms on
+  both builds (plain, kind and folder queries are not lifted). KindPullTests prove the exact lifted
+  top-K on the GPU and host reducers, the fused path, and that neither funnel cuts the image before
+  the lift (2,600 decoys; with the selection unlifted both tiers return a decoy first).

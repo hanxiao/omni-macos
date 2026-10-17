@@ -5426,7 +5426,7 @@ if args.count >= 4 && args[1] == "latbench" {
     timeIt("per-kind floor over a page", {
         var kept = 0
         for _ in 0 ..< 1000 {
-            kept = page.filter { Double($0.score) >= VectorStore.relevanceFloor(kind: $0.kind, base: 0.60) }.count
+            kept = page.filter { Double($0.score) >= VectorStore.relevanceFloor($0, base: 0.60) }.count
         }
         return kept
     })
@@ -5435,7 +5435,7 @@ if args.count >= 4 && args[1] == "latbench" {
 }
 
 // Per-kind score profile: omni-verify conecheck <dbCopy> [alpha] [k]
-// Re-derives VectorStore.kindScoreScale. Run it after a model change; if one kind's p10, p50 and
+// The profile behind VectorStore.kindScale. Run it after a model change; if one kind's p10, p50 and
 // p90 collapse to one number, that kind's embeddings sit in their own cone and its scores carry no
 // per-file information relative to a text query - which is what makes a per-kind floor necessary.
 if args.count >= 3 && args[1] == "conecheck" {

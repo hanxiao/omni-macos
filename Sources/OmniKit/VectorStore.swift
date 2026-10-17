@@ -66,9 +66,15 @@ public struct SearchHit: Sendable, Equatable {
     /// Total indexed chunks of this FILE (pages/passages), regardless of filters. 1 = single
     /// embedding; > 1 means the UI can offer a per-chunk breakdown (rankChunks).
     public var chunkCount: Int = 1
-    /// What the score was multiplied by to rank it against text (fuseKinds): 1 for none, up to
-    /// 1 / kindScoreScale. Whatever judges a hit on its own kind's scale divides it back out.
+    /// What the score was multiplied by to rank it against text: 1 / `scale` for a media hit of a
+    /// text query (the scan lifts it, see `kindScale`), 1 otherwise. Whatever judges a hit on its
+    /// own kind's scale divides it back out.
     public var lift = 1.0
+    /// The scale this hit's kind scores a text query on, against text's 1, for the model that
+    /// scored it: the store sets it; a hit rebuilt from elsewhere (a linked Mac) takes its kind's
+    /// default.
+    public var modelScale: Double? = nil
+    public var scale: Double { modelScale ?? VectorStore.kindScale(kind) }
     /// How it was found, where the chunk's kind and locator cannot say it: by its file name
     /// (fuseLexical), or by an identifier it contains (fuseIdentifiers). The reason a result list
     /// shows ("File name", "Contains INV-2041", "Frame at 4:00") is read from this and the chunk.
@@ -6017,7 +6023,7 @@ public final class VectorStore: @unchecked Sendable {
     // MARK: - Modality score profile
 
     /// How the score scale differs BY KIND on this index. This is the instrument that produced
-    /// `kindScoreScale` below, and the only way to re-derive it for a different model or corpus.
+    /// `kindScale` below, and the only way to re-derive it for a different model or corpus.
     ///
     /// Method is the bias term of Nearest Neighbor Normalization (Chowdhury et al., arXiv
     /// 2410.24114): each file's typical top score against a bank of reference queries, here the
@@ -6141,20 +6147,26 @@ public final class VectorStore: @unchecked Sendable {
     /// / p90: text 0.260 / 0.333 / 0.425, image 0.155 / 0.179 / 0.216, audio 0.138 / 0.169 / 0.206,
     /// video 0.149 / 0.193 / 0.257, scan 0.165 / 0.196 / 0.258.
     ///
-    /// The correction is a ratio, calibrated from the relevant-score medians measured by
-    /// `omni-verify cutcheck`: text 0.797, media 0.490. On COCO a ratio and a shift rank the same.
-    /// `scan` sits with the image kinds, not with text. A scanned PDF is reached through its page
+    /// The correction is a ratio (on COCO a ratio and a shift rank the same). It was one number,
+    /// 0.615, from the relevant-score medians `omni-verify cutcheck` measured (text 0.797, media
+    /// 0.490); it is now each model's own, below. `scan` sits with the image kinds, not with text. A scanned PDF is reached through its page
     /// images, so its scores are on the vision scale however much text is on the page - the profile
     /// puts it at 0.257 of text where image is 0.244 and audio 0.200. Filing it under text (which
     /// is where it sits in the kind FILTER, since "text" includes scans) would cut scanned PDFs at
     /// a floor their scores cannot reach.
-    public static let kindScoreScale: [String: Double] = [
-        "text": 1.0,
-        "image": 0.615, "audio": 0.615, "video": 0.615, "scan": 0.615,
-    ]
+    ///
+    /// PER MODEL, measured on COCO with `omni-verify gapdump` (a caption's own image over its
+    /// sibling captions, median): Nano 0.66, Small 0.77. The labeled eval, with every media hit
+    /// of a text query lifted by it inside the scan: MRR Nano 0.870 -> 0.909, Small 0.916 -> 0.921
+    /// against the one 0.615 applied by how far a query leaned to a kind's centroid (which did
+    /// not fire on the real index: no visual query of eight leaned past the band).
+    public static func mediaScale(dim: Int?) -> Double { dim == 1024 ? 0.77 : 0.66 }
+    public static func kindScale(_ kind: String, dim: Int? = nil) -> Double {
+        kind == FileKind.text.rawValue ? 1 : mediaScale(dim: dim)
+    }
 
     /// The WEAKER MATCHES of a result list, folded under a button rather than shown: a hit whose
-    /// score, on its kind's scale (`kindScoreScale`), is under `ratio` of the best one's. The first
+    /// score, on its kind's scale (`kindScale`), is under `ratio` of the best one's. The first
     /// hit is never weak. Hits are in relevance order; the answer is per hit, not a prefix - a photo
     /// can stand out on its own scale below documents that do not.
     ///
@@ -6174,7 +6186,7 @@ public final class VectorStore: @unchecked Sendable {
     /// Small 0.832 -> 0.828, spoken answers Nano R@1 0.44 -> 0.22) and is not used.
     public static func weakFold(_ hits: [SearchHit], ratio: Double = 0.6) -> [Bool] {
         guard hits.count > 1 else { return hits.map { _ in false } }
-        func scaled(_ h: SearchHit) -> Double { Double(h.score) / (h.lift * (kindScoreScale[h.kind] ?? 1.0)) }
+        func scaled(_ h: SearchHit) -> Double { Double(h.score) / (h.lift * h.scale) }
         let top = hits.map(scaled).max() ?? 0
         guard top > 0 else { return hits.map { _ in false } }
         return hits.indices.map { $0 > 0 && scaled(hits[$0]) < top * ratio }
@@ -6182,8 +6194,8 @@ public final class VectorStore: @unchecked Sendable {
 
     /// The floor a hit of this kind must clear, given the threshold the user set. `base` is stated
     /// in text-score units, which is what the UI picker and the `score:` qualifier mean.
-    public static func relevanceFloor(kind: String, base: Double) -> Double {
-        base * (kindScoreScale[kind] ?? 1.0)
+    public static func relevanceFloor(_ hit: SearchHit, base: Double) -> Double {
+        base * hit.scale
     }
 
     // MARK: - Search (MLX scan)
@@ -6209,19 +6221,21 @@ public final class VectorStore: @unchecked Sendable {
         // submitting the moment the embed returned and contend with the scan that follows it.
         GPUInteractive.enter(); defer { GPUInteractive.leave() }
         interruptVacuumForSearch()
-        let r = searchGraphDense(queryGraph: queryGraph, filter: filter, topK: topK)
+        let lift = textQuery != nil && Self.kindLift
+        var r = searchGraphDense(queryGraph: queryGraph, filter: filter, topK: topK, liftMedia: lift)
+        r.hits = scaled(r.hits, lifted: lift)
         guard LexicalIndex.enabled else { return r }
         if let explicit = filter.filenameQuery, !explicit.isEmpty {
-            return (fuseLexical(dense: r.hits, text: explicit, filter: filter, topK: topK, explicit: true, denseQuery: r.query), r.query)
+            return (scaled(fuseLexical(dense: r.hits, text: explicit, filter: filter, topK: topK, explicit: true, denseQuery: r.query)), r.query)
         }
         guard let text = textQuery else { return r }
-        let kinded = Self.kindLift ? fuseKinds(r.hits, filter: filter, topK: topK, query: r.query) : r.hits
         let named = Self.nameFusion && LexicalIndex.shouldFuse(text)
-            ? fuseLexical(dense: kinded, text: text, filter: filter, topK: topK, explicit: false, denseQuery: r.query) : kinded
-        return (Self.identifierLookup ? fuseIdentifiers(named, text: text, filter: filter, topK: topK, denseQuery: r.query) : named, r.query)
+            ? fuseLexical(dense: r.hits, text: text, filter: filter, topK: topK, explicit: false, denseQuery: r.query) : r.hits
+        return (scaled(Self.identifierLookup ? fuseIdentifiers(named, text: text, filter: filter, topK: topK, denseQuery: r.query) : named), r.query)
     }
 
-    private func searchGraphDense(queryGraph: MLXArray, filter: SearchFilter = SearchFilter(), topK: Int = 40) -> (hits: [SearchHit], query: [Float]) {
+    private func searchGraphDense(queryGraph: MLXArray, filter: SearchFilter = SearchFilter(), topK: Int = 40,
+                                  liftMedia: Bool = false) -> (hits: [SearchHit], query: [Float]) {
         // Preconditions that read no shared state - resolved off the lock. A filtered query or a
         // disabled GPU reduce skips the lock entirely and takes the classic path. (queryGraph.size == dim
         // is checked INSIDE the lock below, since `dim` is mutable shared state - self-review fix.)
@@ -6271,7 +6285,8 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             return fillSnippetsLocked(reduceTopKGPULocked(
-                baseScore: baseScore, fid: fid, deltaGraph: deltaGraph, topK: topK, filter: filter))
+                baseScore: baseScore, fid: fid, deltaGraph: deltaGraph, topK: topK, filter: filter,
+                lift: liftTableLocked(liftMedia)))
         } : nil
         if needClassic {
             MLX.eval(queryGraph)
@@ -6279,7 +6294,7 @@ public final class VectorStore: @unchecked Sendable {
             // searchDense, not the public search(): that one fuses an explicit `filename:` scope
             // itself, and the caller fuses this result again - on a quantized base (every large
             // index) a filename query was fused twice, its scores clamped to 1 in between.
-            return (searchDense(q, filter: filter, topK: topK), q)
+            return (searchDense(q, filter: filter, topK: topK, liftMedia: liftMedia), q)
         }
         // Evaluated as an ancestor of the scan - this readback is a copy, not a GPU sync.
         let q = queryGraph.asArray(Float.self)
@@ -6297,113 +6312,45 @@ public final class VectorStore: @unchecked Sendable {
                        markActive: Bool = true, textQuery: String? = nil) -> [SearchHit] {
         GPUInteractive.enter(); defer { GPUInteractive.leave() }
         if markActive { interruptVacuumForSearch() }
-        let dense = searchDense(query, filter: filter, topK: topK, markActive: markActive)
+        let lift = textQuery != nil && Self.kindLift
+        let dense = scaled(searchDense(query, filter: filter, topK: topK, markActive: markActive, liftMedia: lift), lifted: lift)
         guard LexicalIndex.enabled else { return dense }
         // Explicit `filename:` beats the heuristic. Otherwise a bare query contributes only if it
         // looks like a name, and then only in proportion to how well it matches.
         if let explicit = filter.filenameQuery, !explicit.isEmpty {
-            return fuseLexical(dense: dense, text: explicit, filter: filter, topK: topK, explicit: true, denseQuery: query)
+            return scaled(fuseLexical(dense: dense, text: explicit, filter: filter, topK: topK, explicit: true, denseQuery: query))
         }
         guard let text = textQuery else { return dense }
-        let kinded = Self.kindLift ? fuseKinds(dense, filter: filter, topK: topK, query: query) : dense
         let named = Self.nameFusion && LexicalIndex.shouldFuse(text)
-            ? fuseLexical(dense: kinded, text: text, filter: filter, topK: topK, explicit: false, denseQuery: query) : kinded
-        return Self.identifierLookup ? fuseIdentifiers(named, text: text, filter: filter, topK: topK, denseQuery: query) : named
+            ? fuseLexical(dense: dense, text: text, filter: filter, topK: topK, explicit: false, denseQuery: query) : dense
+        return scaled(Self.identifierLookup ? fuseIdentifiers(named, text: text, filter: filter, topK: topK, denseQuery: query) : named)
     }
 
-    /// Each kind's centroid in this index: the axis of its cone. Sampled (at most 65,536 rows a
-    /// refresh, ~1-2 ms) and kept for 5 minutes - a cone's axis is the same number for every file in
-    /// it (kindScoreScale's profile), so a sample finds it and it does not move with each write.
-    private var kindAxes: (at: Double, axes: [String: [Float]])?
-    private func kindAxesLocked() -> [String: [Float]] {
-        let now = CFAbsoluteTimeGetCurrent()
-        if let k = kindAxes, now - k.at < 300 { return k.axes }
-        let d = dim, n = rows.count
-        guard d > 0, n > 0 else { return [:] }
-        let step = Swift.max(1, n / 65_536)
-        var sums: [UInt8: [Float]] = [:]
-        flat16.withUnsafeBufferPointer { buf in
-            var i = 0
-            while i < n {
-                defer { i += step }
-                guard !deadRows.contains(Int32(i)) else { continue }
-                let pos = slotOf(i)
-                guard pos >= 0, (pos + 1) * d <= buf.count else { continue }
-                var acc = sums[rows[i].kc] ?? [Float](repeating: 0, count: d)
-                for j in 0 ..< d { acc[j] += Self.fromBF16(buf[pos * d + j]) }
-                sums[rows[i].kc] = acc
-            }
-        }
-        var axes: [String: [Float]] = [:]
-        for (kc, v) in sums {
-            let m = v.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot()
-            if m > 0 { axes[canonicalKind(idKind[Int(kc)])] = v.map { $0 / m } }
-        }
-        kindAxes = (now, axes)
-        return axes
+    /// MEDIA ON THE TEXT SCALE, inside the scan. A text query scores a relevant photo, recording or
+    /// video on a lower scale than a relevant document (`kindScale`), so for a text query every
+    /// media row's score is multiplied by 1 / its scale where the scan reduces rows to files, and
+    /// every candidate selection before that ranks on the lifted coarse score - one scan, the exact
+    /// lifted top-K. It replaced lifting only the hits a first scan kept, by how far the query
+    /// leaned to a kind's centroid, plus a second scan of that kind (roadmap.md, "Is there a
+    /// modality gap"). nil: no lift (not a text query, or the eval's --no-kind-lift).
+    private func liftTableLocked(_ on: Bool) -> [Float]? {
+        let d = dim
+        scanDim.withLock { $0 = d }
+        guard on else { return nil }
+        var t = [Float](repeating: 1, count: 256)
+        for (k, code) in kindID { t[Int(code)] = Float(1 / Self.kindScale(k, dim: dim)) }
+        return t.allSatisfy { $0 == 1 } ? nil : t
     }
 
-    /// How far a query leans toward each media kind's cone, past the text cone's: a query for
-    /// something seen ("black and white striped animal", "黄色的花") leans toward pictures in any
-    /// language; "photo of my vaccination record" leans to text.
-    func kindPulls(_ query: [Float]) -> [String: Double] {
-        let axes = queue.sync { kindAxesLocked() }
-        guard let t = axes["text"], t.count == query.count else { return [:] }
-        func cos(_ a: [Float]) -> Double { Double(zip(a, query).reduce(Float(0)) { $0 + $1.0 * $1.1 }) }
-        let base = cos(t)
-        var out: [String: Double] = [:]
-        for (k, a) in axes where k != "text" && a.count == query.count { out[k] = cos(a) - base }
-        return out
-    }
-
-    /// THE KIND A QUERY ASKS FOR, READ FROM ITS VECTOR. A photo scores a text query on a lower
-    /// scale than a document does (kindScoreScale), so a query for something seen needs its media
-    /// lifted - and the query says so by leaning toward that kind's cone (kindPulls), in any
-    /// language, with or without the word "photo". A kind is lifted by `gain` from 0 at a pull of
-    /// `kindPullBand.lo` to the full text scale at `.hi`; at full gain its own 30 best are brought
-    /// in too, for an index where text fills the first page. This replaced KindWords, which read
-    /// the kind from word lists in ten languages. Eval (125 queries, MRR), lists -> pull:
-    ///
-    ///                 ALL     kind   kind-x  image  image-ml  doc    audio
-    ///     Nano   0.837 -> 0.843  1.00->0.86  1.00  0.64->0.73  0.54->0.63  1.00->0.96  0.52->0.63
-    ///     Small  0.889 -> 0.888  1.00->0.86  1.00  0.84->0.88  0.68->0.69  0.95->0.94  0.63->0.68
-    ///
-    /// Lost: "screenshot of the payment error" (only a list knew "screenshot") and "photo of a
-    /// penguin" (a zoo video above the photo: the eval has 7 video rows, so its video axis is
-    /// zoo animals); a lavender photo now heads "champs de lavande en fleur". Bands swept: (0,
-    /// 0.15) (0.05, 0.2) (0.1, 0.25) (0, 0.1) (-0.05, 0.1) - this one best on both. Axes from the
-    /// model's answer to neutral inputs (the tagger's seed images, silence) scored lower (Nano
-    /// 0.833). Bringing a kind's candidates in at ANY gain put a 20 ms p90 on plain queries (the
-    /// 9.7M-chunk clone); at full gain only, plain p50/p90 4.2/4.5 ms as before and a query
-    /// naming a kind 8.7 -> 4.1 ms.
-    static let kindPullBand = (lo: -0.05, hi: 0.10)
-
-    private func fuseKinds(_ hits: [SearchHit], filter: SearchFilter, topK: Int, query: [Float]) -> [SearchHit] {
-        let band = Self.kindPullBand
-        guard filter.kinds.isEmpty, filter.ext == nil else { return hits }
-        var gain: [String: Double] = [:]
-        for (k, pull) in kindPulls(query) {
-            let g = Swift.min(1, Swift.max(0, (pull - band.lo) / (band.hi - band.lo)))
-            if g > 0 { gain[k] = g }
+    /// The scale every hit of this store's model scores on, and the lift a lifted scan applied.
+    private func scaled(_ hits: [SearchHit], lifted: Bool = false) -> [SearchHit] {
+        let d = scanDim.withLock { $0 }
+        return hits.map { h in
+            var h = h
+            if h.modelScale == nil { h.modelScale = Self.kindScale(h.kind, dim: d) }
+            if lifted, h.kind != FileKind.text.rawValue { h.lift = 1 / h.scale }
+            return h
         }
-        guard !gain.isEmpty else { return hits }
-        var pool = hits
-        let have = Set(hits.map(\.path))
-        for (k, g) in gain where g >= 1 {   // its own candidates only when it leans all the way
-            var narrow = filter
-            narrow.kinds = [k]
-            pool += searchDense(query, filter: narrow, topK: 30, markActive: false).filter { !have.contains($0.path) }
-        }
-        var best: [String: SearchHit] = [:]
-        for var h in pool {
-            if let g = gain[h.kind] {
-                h.lift = 1 / pow(Self.kindScoreScale[h.kind] ?? 1.0, g)
-                h.score = Float(Double(h.score) * h.lift)
-            }
-            if let b = best[h.path], b.score >= h.score { continue }
-            best[h.path] = h
-        }
-        return Array(best.values.sorted { $0.score > $1.score }.prefix(topK))
     }
 
     /// A LOOKUP - a query that is identifiers only ("INV-2041", "K7Q2LM 2026") - puts the files that
@@ -6739,7 +6686,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func searchDense(_ query: [Float], filter: SearchFilter = SearchFilter(), topK: Int = 40,
-                             markActive: Bool = true) -> [SearchHit] {
+                             markActive: Bool = true, liftMedia: Bool = false) -> [SearchHit] {
         let tCall = Self.searchTiming ? Date() : nil
         return queue.sync {
             if let tCall { print(String(format: "[search] lockwait=%.1fms", -tCall.timeIntervalSinceNow * 1000)) }
@@ -6756,6 +6703,7 @@ public final class VectorStore: @unchecked Sendable {
             }
             let quantized = quantBase != nil || bitBase != nil
             quantizedHint.withLock { $0 = quantized }
+            let lift = liftTableLocked(liftMedia)
             let t0 = Self.searchTiming ? Date() : nil
             let qv = MLXArray(query, [dim, 1]).asType(.bfloat16)
             // Full mode: exact bf16 scores. Quant mode: COARSE scores from the quantized replica
@@ -6790,9 +6738,14 @@ public final class VectorStore: @unchecked Sendable {
                     selectScore = MLX.which(slotMask.reshaped(baseScore.shape) .> 0.5,
                                             selectScore, MLXArray(-Float.infinity))
                 }
+                // Candidates are chosen on the LIFTED coarse score, or a photo a text query asks for
+                // could be cut here, before the exact scores ever see it.
+                if let lift, let slotLift = slotLiftGPULocked(lift) {
+                    selectScore = selectScore * slotLift.reshaped(baseScore.shape)
+                }
                 let result = fillSnippetsLocked(searchCandidatesLocked(
                     coarse: selectScore, qv: qv, n: n, candidateCount: C, query: query,
-                    topK: topK, filter: filter))
+                    topK: topK, filter: filter, lift: lift))
                 if let t0 {
                     print(String(format: "[search] n=%d gpu-candidate path total=%.1fms", n, -t0.timeIntervalSinceNow * 1000))
                 }
@@ -6852,7 +6805,7 @@ public final class VectorStore: @unchecked Sendable {
                         }
                     }
                     let result = fillSnippetsLocked(reduceTopKGPULocked(
-                        baseScore: baseScore, fid: fid, deltaGraph: deltaGraph, topK: topK, filter: filter))
+                        baseScore: baseScore, fid: fid, deltaGraph: deltaGraph, topK: topK, filter: filter, lift: lift))
                     if let t0 {
                         print(String(format: "[search] n=%d gpu-reduce path total=%.1fms", n, -t0.timeIntervalSinceNow * 1000))
                     }
@@ -6905,7 +6858,7 @@ public final class VectorStore: @unchecked Sendable {
             // final, so the exact half of the funnel can be priced (recall AND latency) against the
             // funnel and against an exact bf16 scan on a real index. Ship behaviour is unchanged.
             if quantBase != nil || bitBase != nil, Self.quantRerank {
-                scores = rerankLocked(coarse: scores, n: n, query: query, filter: filter, topK: topK)
+                scores = rerankLocked(coarse: scores, n: n, query: query, filter: filter, topK: topK, lift: lift)
             }
             let t1 = Self.searchTiming ? Date() : nil
             let result = fillSnippetsLocked(Self.reduceTopK(scores: scores, fileID: fileID, occSlot: occSlot, fileCount: fileIDCount,
@@ -6913,7 +6866,8 @@ public final class VectorStore: @unchecked Sendable {
                                                             filter: filter, topK: topK,
                                                             kindCode: kindCode, kindID: kindID,
                                                             dead: deadRows,
-                                                            pathFilter: CompiledPathFilter(filter, table: filePaths)))
+                                                            pathFilter: CompiledPathFilter(filter, table: filePaths),
+                                                            lift: lift))
             if let t0, let t1 {
                 print(String(format: "[search] n=%d score(matmul+readout)=%.1fms reduce=%.1fms",
                              n, t1.timeIntervalSince(t0) * 1000, -t1.timeIntervalSinceNow * 1000))
@@ -7092,9 +7046,11 @@ public final class VectorStore: @unchecked Sendable {
     /// plus the (already exact) delta rows. chunkCount comes from the lockstep fileChunkCount, so
     /// nothing here touches all N rows. Filtered queries come here too: the caller has already
     /// masked the base on the GPU, and `offer` re-checks every clause for base and delta rows.
+    /// `lift`: per kind code, what a row's exact score is multiplied by (liftTableLocked); the
+    /// caller already chose the candidates on the lifted coarse score.
     private func searchCandidatesLocked(coarse: MLXArray, qv: MLXArray, n: Int,
                                         candidateCount C: Int, query: [Float], topK: Int,
-                                        filter: SearchFilter = SearchFilter()) -> [SearchHit] {
+                                        filter: SearchFilter = SearchFilter(), lift: [Float]? = nil) -> [SearchHit] {
 
         // Top-C base candidates on the GPU; delta rows are exact and all enter the reduce.
         let tPh = Self.searchTiming ? Date() : nil
@@ -7181,9 +7137,10 @@ public final class VectorStore: @unchecked Sendable {
         let pathFiltered = !filter.folderPrefixes.isEmpty || (filter.ext?.isEmpty == false)
             || filter.tagAllow != nil || filter.tagDeny != nil
         let compiledPath = CompiledPathFilter(filter, table: filePaths)
-        func offer(_ row: Int32, _ score: Float) {
-            guard score.isFinite, !deadRows.contains(row) else { return }
+        func offer(_ row: Int32, _ raw: Float) {
+            guard raw.isFinite, !deadRows.contains(row) else { return }
             if let ka = kindAllowed, Int(row) < kindCode.count, !ka[Int(kindCode[Int(row)])] { return }
+            let score = lift.map { Int(row) < kindCode.count ? raw * $0[Int(kindCode[Int(row)])] : raw } ?? raw
             if pathFiltered, !compiledPath.accepts(Int(rows[Int(row)].fid)) { return }
             if let s = filter.since, metaOf(rows[Int(row)]).modified < s { return }
             if let u = filter.until, metaOf(rows[Int(row)]).modified >= u { return }
@@ -7212,8 +7169,10 @@ public final class VectorStore: @unchecked Sendable {
             sc.sort(by: >)
             gate = sc[topK - 1]
         }
-        // Same expansion for the delta: baseRows + j names the CONTENT, not a row.
-        for (j, sc) in deltaScores.enumerated() where sc >= gate {
+        // Same expansion for the delta: baseRows + j names the CONTENT, not a row. The gate is on
+        // lifted scores, so a raw delta score is held to it at the largest lift it could get.
+        let liftMax = lift?.max() ?? 1
+        for (j, sc) in deltaScores.enumerated() where sc * liftMax >= gate {
             for r in rowsOfSlotLocked(baseRows + j) { offer(r, sc) }
         }
 
@@ -7251,7 +7210,10 @@ public final class VectorStore: @unchecked Sendable {
     /// Delta rows [baseRows, n) were scored exactly by the delta matmul and pass through as-is.
     /// C scales with topK (see candidateCount: at most 4096, doubled on the 1-bit tier); when the
     /// base has <= C rows every row is a candidate and the result is exactly the full bf16 search.
-    private func rerankLocked(coarse: [Float], n: Int, query: [Float], filter: SearchFilter, topK: Int) -> [Float] {
+    /// `lift`: candidates are chosen on the lifted coarse score; the scores returned stay raw (the
+    /// reducer lifts them, once).
+    private func rerankLocked(coarse: [Float], n: Int, query: [Float], filter: SearchFilter, topK: Int,
+                              lift: [Float]? = nil) -> [Float] {
         let C = min(baseRows, Self.candidateCount(topK: topK))
         let kinds = filter.kinds, hasKind = !kinds.isEmpty, since = filter.since, until = filter.until
         // tagAllow/tagDeny are path-based prefilters exactly like folder/ext: they MUST gate
@@ -7299,7 +7261,7 @@ public final class VectorStore: @unchecked Sendable {
                 for i in 0 ..< Swift.min(baseOccCount, Swift.min(rows.count, occSlot.count)) {
                     let sl = slotOf(i)
                     guard sl >= 0, sl < sp.count else { continue }
-                    let sc = sp[sl]
+                    let sc = lift.map { sp[sl] * $0[Int(kc[i])] } ?? sp[sl]
                     if !sc.isFinite { continue }
                     if hScore.count >= C && sc <= hScore[0] { continue }
                     if hasKind && !kindAllowed[Int(kc[i])] { continue }
@@ -7660,6 +7622,23 @@ public final class VectorStore: @unchecked Sendable {
     /// and the scan cannot be finer than that. Post-filtering instead would silently drop a content
     /// whose only in-scope occurrence ranked below the candidate cut, which is the failure the
     /// pre-filtering design exists to avoid.
+    /// Per CONTENT, the lift its kind gets (liftTableLocked), for candidate selection on the slot
+    /// scores. A content has one kind; the scatter takes the max over its occurrences, and a slot
+    /// no base occurrence names gets 1 (not the scatter's 0: 0 times a masked -inf is NaN).
+    /// Cached like the select mask, by the base it was built over.
+    private var slotLiftKey = ""
+    private var slotLiftGPU: MLXArray? = nil
+    private func slotLiftGPULocked(_ lift: [Float]) -> MLXArray? {
+        let key = "\(baseRows)|\(baseOccCount)|\(lift.hashValue)"
+        if key == slotLiftKey, let m = slotLiftGPU { return m }
+        guard let kc = kindCodeGPULocked(), let m = slotMaskFromOccMaskLocked(MLXArray(lift)[kc]) else { return nil }
+        let floored = MLX.maximum(m.reshaped([baseRows]), MLXArray(Float(1)))
+        MLX.eval(floored)
+        slotLiftKey = key
+        slotLiftGPU = floored
+        return floored
+    }
+
     private func slotMaskFromOccMaskLocked(_ occMask: MLXArray) -> MLXArray? {
         guard baseRows > 0, baseOccCount > 0, let oSlot = occSlotGPULocked() else { return nil }
         if baseOccCount == baseRows, occSlotIsIdentityLocked { return occMask }   // nothing shared yet
@@ -7916,7 +7895,7 @@ public final class VectorStore: @unchecked Sendable {
     ///   C) top-K files   = argPartition(bestScore)                    (read back 2*K scalars)
     /// Host work after the matmul is O(K + delta), never O(N).
     private func reduceTopKGPULocked(baseScore: MLXArray, fid: MLXArray, deltaGraph: MLXArray?, topK: Int,
-                                     filter: SearchFilter = SearchFilter()) -> [SearchHit] {
+                                     filter: SearchFilter = SearchFilter(), lift: [Float]? = nil) -> [SearchHit] {
 
         let F = fileIDCount
         let occ = baseOccCount
@@ -7949,6 +7928,9 @@ public final class VectorStore: @unchecked Sendable {
             sClean = MLX.which(mask .> 0.5, sClean, MLXArray(-Float.infinity))
             kindAllowed = allowB
         }
+        // A text query's media rows on the text scale (liftTableLocked), per occurrence, as the
+        // kind mask is; the delta and reused rows below get the same on the host.
+        if let lift, let kc = kindCodeGPULocked() { sClean = sClean * MLXArray(lift)[kc] }
         var bestScore = MLX.full([F], values: MLXArray(-Float.infinity))
         bestScore = bestScore.at[fid].maximum(sClean)
         let rowBest = bestScore[fid]                                          // [occ] each row's file-best
@@ -8005,7 +7987,9 @@ public final class VectorStore: @unchecked Sendable {
         if let reuseGraph {
             let v = reuseGraph.asArray(Float.self)
             reuseScore.reserveCapacity(v.count)
-            for (j, ri) in reuseRows.enumerated() where j < v.count { reuseScore[ri] = v[j] }
+            for (j, ri) in reuseRows.enumerated() where j < v.count {
+                reuseScore[ri] = lift.map { v[j] * $0[Int(kindCode[Int(ri)])] } ?? v[j]
+            }
         }
         let scoresHost = topScores.asArray(Float.self)
         let rowsHost = topRows.asArray(Int32.self)
@@ -8043,7 +8027,7 @@ public final class VectorStore: @unchecked Sendable {
             if sl >= baseRows {
                 let di = sl - baseRows
                 guard di >= 0, di < deltaScores.count else { continue }
-                dot = deltaScores[di]
+                dot = lift.map { deltaScores[di] * $0[Int(kindCode[ri])] } ?? deltaScores[di]
             } else {
                 guard let v = reuseScore[Int32(ri)] else { continue }
                 dot = v
@@ -8084,7 +8068,8 @@ public final class VectorStore: @unchecked Sendable {
     static func reduceTopK(scores: [Float], fileID: [Int32], occSlot: [Int32], fileCount: Int,
                            rows: [Row], tables: RowTables, filter: SearchFilter, topK: Int,
                            kindCode: [UInt8] = [], kindID: [String: UInt8] = [:],
-                           dead: Set<Int32> = [], pathFilter: CompiledPathFilter? = nil) -> [SearchHit] {
+                           dead: Set<Int32> = [], pathFilter: CompiledPathFilter? = nil,
+                           lift: [Float]? = nil) -> [SearchHit] {
         let n = rows.count
         guard n > 0, fileCount > 0, topK > 0, occSlot.count >= n, fileID.count >= n else { return [] }
         let hasDeadRows = !dead.isEmpty
@@ -8114,7 +8099,11 @@ public final class VectorStore: @unchecked Sendable {
         bestScore.withUnsafeMutableBufferPointer { bs in
         bestRow.withUnsafeMutableBufferPointer { br in
         rowCount.withUnsafeMutableBufferPointer { rc in
-            if hasKind || since != nil || until != nil {
+            // A text query's media rows on the text scale (liftTableLocked): the filtered loop, which
+            // reads each row's kind code.
+            let lifting = lift != nil && kindCode.count >= n
+            let liftT = lift ?? []
+            if hasKind || since != nil || until != nil || lifting {
                 kindCode.withUnsafeBufferPointer { kc in
                 kindAllowed.withUnsafeBufferPointer { ka in
                 for i in 0 ..< n {
@@ -8123,7 +8112,7 @@ public final class VectorStore: @unchecked Sendable {
                     rc[f] += 1
                     let sl = Int(os[i])
                     guard sl >= 0, sl < sp.count else { continue }
-                    let dot = sp[sl]
+                    let dot = lifting ? sp[sl] * liftT[Int(kc[i])] : sp[sl]
                     if !dot.isFinite { continue }        // ignore degenerate (NaN/inf) stored vectors
                     if hasKind {
                         if useKindCode { if !ka[Int(kc[i])] { continue } }
@@ -12520,6 +12509,10 @@ public final class VectorStore: @unchecked Sendable {
     /// Whether the base was quantized at the last classic search - read off the lock by
     /// searchGraphDense to skip a fused attempt that cannot succeed.
     private let quantizedHint = OSAllocatedUnfairLock(initialState: false)
+    /// The vector width the last scan ran at, for `scaled` to pick the model's scale without a
+    /// second trip through the store queue (one queue.sync after the scan waits behind whatever
+    /// maintenance the scan scheduled: 0.2-0.7 ms on every query of the bench).
+    private let scanDim = OSAllocatedUnfairLock(initialState: 0)
     private var bitWords: Int { dim / 32 }
     /// Signs for the 1-bit tier's rotation. This tier always rotates, so it always has them.
     private var bitSigns: MLXArray? = nil

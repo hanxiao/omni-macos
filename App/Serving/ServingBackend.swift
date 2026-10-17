@@ -102,7 +102,7 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
         // answer. Per kind, because the score scale is per kind - see VectorStore.relevanceFloor.
         let floor = filter.minScore ?? Self.minScore
         guard floor > 0 else { return hits }
-        return hits.filter { Double($0.score) >= VectorStore.relevanceFloor(kind: $0.kind, base: floor) }
+        return hits.filter { Double($0.score) / $0.lift >= VectorStore.relevanceFloor($0, base: floor) }
     }
 
     /// RECORDED TOO. Ranking passages within named files is a search the user did not type, which
