@@ -428,3 +428,15 @@ HEAD 13.53 / 14.19 / 13.68 s, the GPU busy 98-99% in all. No regression; that ca
 processes using 60% of the CPU. 64 synthetic 45 s clips with soundtracks (one decode worker per
 core, 32 here): 24.5 s, the GPU busy 78%, no read stall and nothing quarantined; frame extraction
 (AVAssetImageGenerator) shows up in the samples as work, not as waiting.
+
+### The default floor (Han, 2026-10-16)
+
+The window's default Relevance was "Only Strong Matches", 0.5 in text units, scaled per kind; MCP
+and REST follow it. Measured through an isolated app (REST, the eval tree, Nano) over the 125
+labeled queries, at the hit of each answer's file in the top 40 (115 have one): the floor hid the
+answer for 27 with the per-model media scale and 21 with the old 0.615, 13 of the 27 at rank 1
+("day trip to see the great buddha" 0.480, "sailing log" 0.461, a lecture's moment and a video's
+soundtrack at 0.271). The weaker-match fold, measured on the same eval, shows 4.2 of 120 hits per
+query and folds 2 answers (1 in the top 10). The default is All now, in the window and for MCP and
+REST; "Only Strong Matches" and `score:` / `min_score` still set a floor. The FAQ and the MCP
+`min_score` description say so.

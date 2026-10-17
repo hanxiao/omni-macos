@@ -57,7 +57,7 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     /// Mirrors the window's Relevance choice, so one floor governs both surfaces. Seeded from
     /// AppModel.defaultMinScore and kept in step by its didSet; an explicit `min_score` in a
     /// request still wins over it.
-    nonisolated(unsafe) static var minScore = 0.5
+    nonisolated(unsafe) static var minScore = 0.0   // AppModel.defaultMinScore (main-actor isolated)
 
     let engine: OmniEngine
     let store: VectorStore

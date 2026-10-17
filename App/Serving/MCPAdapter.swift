@@ -239,7 +239,7 @@ enum MCPAdapter {
                     ],
                     "min_score": [
                         "type": "number",
-                        "description": "Relevance floor, 0 to 1. Defaults to the floor the app's window applies (0.5 unless the user changed it), so weak matches are dropped rather than padding the page - semantic search always returns its nearest neighbours, and most of them are not answers. The floor is scaled per kind (a text query scores a photo on a lower scale than a document), so images are not deleted by a text-shaped cut. Pass 0 for everything.",
+                        "description": "Relevance floor, 0 to 1. Defaults to the floor the app's window applies: none unless the user set one, because a fixed floor also drops right answers that score low; weaker matches are marked instead, as the app folds them. The floor is scaled per kind (a text query scores a photo on a lower scale than a document), so images are not deleted by a text-shaped cut. Pass 0.5 for strong matches only.",
                         "minimum": 0, "maximum": 1
                     ],
                     "macs": [

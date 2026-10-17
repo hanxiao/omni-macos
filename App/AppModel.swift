@@ -336,13 +336,16 @@ final class AppModel {
     /// concurrency" (0.562). No absolute cutoff separates those, because they are not separated on
     /// this axis. Junk needs path and content rules; this control is for a user who wants a
     /// stricter list, which is why it stays, with a picker, off.
-    /// The default relevance floor. "Only strong matches" in the filter menu, against "All" (0).
+    /// The default relevance floor: "All" (0). "Only strong matches" (0.5) in the filter menu is the
+    /// other choice, a per-KIND floor (`VectorStore.relevanceFloor` scales it by the modality's own
+    /// score range), not a flat cosine.
     ///
-    /// A per-KIND floor, not a flat cosine: `VectorStore.relevanceFloor` scales it by the modality's
-    /// own score range, because a text query scores a photo on a different scale than a document
-    /// (measured: image, audio and video sit at 0.615 of the text scale, scans too). A flat 0.50
-    /// would keep documents and delete the media.
-    static let defaultMinScore = 0.5
+    /// OFF BY DEFAULT AGAIN (Han, 2026-10-16). On the labeled eval (Nano, the 115 queries whose
+    /// answer is in the top 40) a 0.5 floor hid the answer for 27, 13 of them at rank 1 - "day trip
+    /// to see the great buddha" at 0.48, a lecture's moment, a video's soundtrack. The weaker-match
+    /// fold, which came after the floor went back to 0.5, keeps the list short instead: 4.2 of 120
+    /// hits shown per query, 2 answers folded (roadmap.md, "The default floor").
+    static let defaultMinScore = 0.0
 
     /// Cosine similarity is -1...1; the UI presents it as a 0...100% relevance, clamping the
     /// (rare, semantically-opposite) negative scores to 0. Filtering uses this same clamped

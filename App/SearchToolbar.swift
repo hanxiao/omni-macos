@@ -507,11 +507,9 @@ struct SearchToolbar: ViewModifier {
             Picker("Date", selection: Binding(get: { model.dateRange }, set: { model.dateRange = $0 })) {
                 ForEach(DateRange.allCases) { Text($0.title).tag($0) }
             }
-            // Two options, on the SCORE. 50% is the floor 0.60 was measured down from: 0.60
-            // returned nothing at all for ordinary queries whose best hit was 0.59, while 0.50
-            // keeps 94.7% of known answers. Scaled per kind on the way through, so it does not
-            // delete the media (see AppModel.defaultMinScore). `score:` in the query language
-            // still sets any other floor.
+            // Two options, on the SCORE; All is the default (see AppModel.defaultMinScore: 50% hid
+            // 27 of 115 known answers on the eval). 50% is the floor 0.60 was measured down from,
+            // scaled per kind on the way through. `score:` in the query language sets any other.
             Picker("Relevance", selection: Binding(get: { model.minScore }, set: { model.minScore = $0 })) {
                 Text("Only Strong Matches").tag(0.5)
                 Text("All").tag(0.0)

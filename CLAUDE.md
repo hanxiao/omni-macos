@@ -78,7 +78,7 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (802 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (806 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|
@@ -89,7 +89,7 @@ codebase were already measured there, and many were rejected.
   <nano model> [--scale 0.05]` runs the same suite headless on generated data. Run the scaled smoke
   first; a full run is minutes on a wide Mac and longer on a small one.
 - Search QUALITY: `omni-verify evalbed /Volumes/han2tb/omni-eval` once, then `omni-verify eval <model>
-  /Volumes/han2tb/omni-eval [--json out] [--tag t]` - 116 labeled queries in 16 tags through the app's
+  /Volumes/han2tb/omni-eval [--json out] [--tag t]` - 125 labeled queries through the app's
   own search, scored at the right place and the right file. Any ranking change is judged here, A/B on
   the same cached index; baselines in docs/notes/roadmap.md.
 - Search digest on the real index (a CLONE, never the live one): `omni-verify searchreal

@@ -80,7 +80,7 @@
         },
         {
           "q": "Why do some searches show \"No results above 50%\"?",
-          "a": "By default only strong matches are shown: a 50% floor, scaled per file type. Click Show N weaker matches, or set Relevance to All in the filter menu.",
+          "a": "Only when Relevance in the filter menu is set to Only Strong Matches: a 50% floor, scaled per file type. Click Show N weaker matches, or set Relevance back to All.",
           "shortcut": ""
         }
       ]

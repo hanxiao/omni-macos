@@ -59,6 +59,13 @@ enum LinkWire {
         var size: Int
         var loc: String
         var chunks: Int
+        /// What the answering Mac multiplied the score by (a media hit of a text query, on the text
+        /// scale) and the scale its kind scores on there, so this Mac's relevance floor and fold read
+        /// the hit as the answering Mac does. Absent from a Mac before 0.17.2 (and for an unlifted
+        /// hit): then 1, and the kind's default scale. Optional, so either side ignores what the other
+        /// does not send.
+        var lift: Double?
+        var scale: Double?
 
         /// Snippets are capped: a row shows a line of one, and a page of 120 long passages would
         /// otherwise be most of the reply.
@@ -68,13 +75,17 @@ enum LinkWire {
             path = s.path; score = s.score; snippet = String(s.snippet.prefix(Self.snippetCap)); kind = s.kind
             chunk = s.chunkIndex; modified = s.modified; w = s.width; h = s.height; dur = s.duration
             size = s.size; loc = s.locator; chunks = s.chunkCount
+            lift = s.lift == 1 ? nil : s.lift; scale = s.modelScale
         }
 
         /// The hit as this Mac shows it: the path becomes the peer's key.
         func hit(peer: String) -> SearchHit {
-            SearchHit.make(path: RemotePath.make(peer: peer, path: path), score: score, snippet: snippet, kind: kind,
-                           chunkIndex: chunk, modified: modified, width: w, height: h, duration: dur, size: size,
-                           locator: loc, chunkCount: chunks)
+            var out = SearchHit.make(path: RemotePath.make(peer: peer, path: path), score: score, snippet: snippet, kind: kind,
+                                     chunkIndex: chunk, modified: modified, width: w, height: h, duration: dur, size: size,
+                                     locator: loc, chunkCount: chunks)
+            out.lift = lift ?? 1
+            out.modelScale = scale
+            return out
         }
     }
 
