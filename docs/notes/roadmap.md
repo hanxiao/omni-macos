@@ -409,3 +409,22 @@ read; the MCP and REST floors now divide out the lift as the app's always did.
   both builds (plain, kind and folder queries are not lifted). KindPullTests prove the exact lifted
   top-K on the GPU and host reducers, the fused path, and that neither funnel cuts the image before
   the lift (2,600 decoys; with the selection unlifted both tiers return a decoy first).
+
+### Fused q/k/v and gate/up projections: measured, not shipped (2026-10-16)
+
+One GEMM over concatenated weights instead of three (q, k, v) and two (gate, up), bf16, MLX 0.31.3.
+Alone, per call with a sync: bit-identical outputs (max |diff| 0); Nano qkv +9.7% at 2,048 rows and
+-7.8% at 8,192, gate/up -7.2 / -2.4%; Small qkv -10.7 / -3.5%, gate/up -3.4 / -1.4%. In the eager
+batched forward (`embbench`, batch 16, eight alternating 6 s pairs beside another GPU job): per-pair
+on/off ratios 0.92-1.71 on Nano and 1.00-1.19 on Small, medians ~1.01; fixture parity unchanged
+(worst cosine 0.99992). About 1% is not worth stored-weight changes and a second path for the
+compiled query graph.
+
+### Image indexing and many videos at once against 0.15.15 (2026-10-16)
+
+bench-v10 in the app read "Index one image" p50 16.18 ms where v9 read 14.53. `omni-verify dedupbench`
+(the same code in both builds) over 600 COCO images, interleaved: 0.15.15 13.59 / 15.50 / 13.68 s,
+HEAD 13.53 / 14.19 / 13.68 s, the GPU busy 98-99% in all. No regression; that case ran beside other
+processes using 60% of the CPU. 64 synthetic 45 s clips with soundtracks (one decode worker per
+core, 32 here): 24.5 s, the GPU busy 78%, no read stall and nothing quarantined; frame extraction
+(AVAssetImageGenerator) shows up in the samples as work, not as waiting.
