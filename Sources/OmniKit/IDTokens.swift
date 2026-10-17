@@ -8,28 +8,39 @@ import Foundation
 /// is a run of ASCII letters, digits, '-', '_' and '#'; anything else ends it - so a path or a
 /// fraction is its parts, and an identifier inside CJK or Arabic text is still found.
 public enum IDTokens {
-    /// Tokens of `text`, lowercased, in order (repeats included).
+    /// Tokens of `text`, lowercased, in order (repeats included). A run of token bytes is judged
+    /// on its first 64 bytes, its joiners trimmed from both ends.
+    ///
+    /// IN PLACE over the contiguous UTF-8 (`withUTF8`, which makes a bridged string native once):
+    /// it runs over every chunk of a file each time the file is saved. Appending each byte to a
+    /// buffer and walking `text.utf8` cost 0.7 ms an edit in the save path (40 edits a round,
+    /// 0.15.15 against 0.17.1, roadmap.md "Save path"); this reads the bytes where they are and
+    /// allocates only for a token it returns. IDTokensTests checks it against the byte-buffer form.
     public static func tokens(in text: String) -> [String] {
-        var out: [String] = []
-        var cur: [UInt8] = []
-        cur.reserveCapacity(48)
-        func flush() {
-            var lo = 0, hi = cur.count
-            while lo < hi, isJoiner(cur[lo]) { lo += 1 }
-            while hi > lo, isJoiner(cur[hi - 1]) { hi -= 1 }
-            if hi - lo >= 4, hi - lo <= 40 {
-                let t = cur[lo ..< hi]
-                if isIdentifier(bytes: t) { out.append(String(decoding: t.map(lower), as: UTF8.self)) }
+        var text = text
+        return text.withUTF8 { buf -> [String] in
+            var out: [String] = []
+            let n = buf.count
+            var i = 0
+            while i < n {
+                guard isTokenByte(buf[i]) else { i += 1; continue }
+                let start = i
+                while i < n, isTokenByte(buf[i]) { i += 1 }
+                var lo = start, hi = Swift.min(i, start + 64)
+                while lo < hi, isJoiner(buf[lo]) { lo += 1 }
+                while hi > lo, isJoiner(buf[hi - 1]) { hi -= 1 }
+                let len = hi - lo
+                guard len >= 4, len <= 40 else { continue }
+                var digits = 0, letters = 0
+                for k in lo ..< hi { let c = buf[k]; if isDigit(c) { digits += 1 } else if isLetter(c) { letters += 1 } }
+                guard digits > 0, letters > 0 || digits >= 7 else { continue }
+                out.append(String(unsafeUninitializedCapacity: len) { dst in
+                    for k in 0 ..< len { dst[k] = lower(buf[lo + k]) }
+                    return len
+                })
             }
-            cur.removeAll(keepingCapacity: true)
+            return out
         }
-        for b in text.utf8 {
-            if isTokenByte(b) {
-                if cur.count < 64 { cur.append(b) }
-            } else if !cur.isEmpty { flush() }
-        }
-        if !cur.isEmpty { flush() }
-        return out
     }
 
     public static func isIdentifier<S: StringProtocol>(_ t: S) -> Bool {

@@ -351,3 +351,28 @@ separate the two.
   0.206, video 0.149 / 0.193 / 0.257, scan 0.165 / 0.196 / 0.258. Where the old figure came from
   is not known (that index is gone); one candidate is the Nano media vectors that were wrapped in
   out-of-range token ids before the special tokens were read from each model's config.
+
+### Save path against 0.15.15 (2026-10-16)
+
+bench-v10 in the app read "Save one edit" p50 9.41 ms where v9 read 7.74 on this Mac. Measured with
+`omni-verify editbench <nano> /Volumes/han2tb/omni-eval/tree 40` (40 appended lines, one update),
+the same command in both builds, interleaved ABBA: HEAD 0.561 / 0.656 / 0.573 / 0.587 s, 0.15.15
+0.448 / 0.508 / 0.473 / 0.458 (+24%). The GPU is busy 15 ms of it; `sample` over 60 rounds of
+each found two causes.
+
+- IDENTIFIERS (0.17.0): every chunk of an edited file is tokenized again. The tokenizer appended
+  each byte to a buffer and walked `text.utf8` (the slow path on a bridged string): 28 ms a round.
+  It now reads the contiguous UTF-8 in place (`withUTF8`) and allocates only what it returns: 7 ms.
+  IDTokensTests checks it against the old form on random text and across the 64-byte cap (the
+  random text never reached the cap; the sweep does - an off-by-one there fails 158 checks).
+- STREAMING ON SAVE (0.17.0): a text file over 64 KB takes turns, so decode hands it to the serial
+  embed stage; the save path passes no `known`, so every file counted as new. In 0.15.15 only files
+  past 2 MB streamed and the rest were read and cut on the concurrent decode stage. The save path
+  now tells the pipeline which paths are indexed, and an indexed file that fits one read is cut on
+  the decode stage - by the stream's own cut (`streamedPieces`), not FileExtractor's, which trims
+  the file's ends and would have changed its last chunk (cosine 0.988 to the streamed one). Every
+  chunk vector and file vector of the 40 files is bit-identical to the streamed path's.
+
+After both, interleaved, three arms: 0.15.15 0.464-0.498 s, HEAD with the old routing 0.547-0.600,
+HEAD 0.486-0.537. What is left (~1 ms an edit) is 0.17's own per-chunk work: the identifier
+postings, the enrichment ledger, content-key lookups.

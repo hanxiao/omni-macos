@@ -2748,6 +2748,22 @@ public final class Indexer: @unchecked Sendable {
     /// keepExisting), each with modified = 0 until the last carries the real mtime. A cancel while
     /// embedding leaves the index as it was; one while writing leaves the file reading as changed,
     /// to be redone next pass - from the rows already written. true when the whole file is stored.
+    /// How the stream cuts a window: the opaque pieces stay in until the window's last piece is
+    /// held back for the next, then go (OpaqueText.filter), and nothing is trimmed.
+    func streamCut(_ text: String, settings: IndexSettings) -> [TextPiece] {
+        chunk(text, settings: settings, origin: .plain, filterOpaque: false)
+    }
+
+    /// A streamed file read in ONE window (it fits one read): the pieces storeStreamedText makes of
+    /// it, for the decode stage. nil: unreadable.
+    func streamedPieces(_ file: CrawledFile, settings: IndexSettings) -> [TextPiece]? {
+        guard let handle = try? FileHandle(forReadingFrom: file.url) else { return nil }
+        defer { try? handle.close() }
+        let data = (try? handle.read(upToCount: Self.readLimit(file, settings: settings))) ?? Data()
+        let text = Self.decodeTextWindow(data, final: true).text
+        return text.isEmpty ? [] : OpaqueText.filter(streamCut(text, settings: settings)) { $0.text }
+    }
+
     func storeStreamedText(_ item: DecodedItem, settings: IndexSettings) -> Bool {
         let file = item.file
         guard let handle = try? FileHandle(forReadingFrom: file.url) else { return false }
@@ -2775,7 +2791,7 @@ public final class Indexer: @unchecked Sendable {
             let (decoded, rest) = Self.decodeTextWindow(undecoded, final: eof)
             undecoded = rest
             let text = carry + decoded
-            var pieces = text.isEmpty ? [] : chunk(text, settings: settings, origin: .plain, filterOpaque: false)
+            var pieces = text.isEmpty ? [] : streamCut(text, settings: settings)
             carry = (!eof && !pieces.isEmpty) ? pieces.removeLast().text : ""
             // Locators are relative to `text`; shift them by the lines already passed, then count
             // this window's committed lines for the next.
@@ -3153,7 +3169,7 @@ public final class Indexer: @unchecked Sendable {
                 off += b.raws.count
             }
         }
-        pipeline(work, force: true, known: .empty, settings: settings) { item in
+        pipeline(work, force: true, known: .empty, indexed: { known[$0] != nil }, settings: settings) { item in
             let path = item.file.path
             switch item.payload {
             case .text(let pieces) where !pieces.isEmpty:
@@ -3254,7 +3270,11 @@ public final class Indexer: @unchecked Sendable {
     /// Bounded concurrent-decode -> serial-consume. `consume` is invoked in file order,
     /// serially, on the calling thread; decode runs on up to `activeProcessorCount`
     /// background cores. At most that many items are outstanding (bounds memory).
+    /// `indexed`: whether the index already holds a path, where `known` is not the answer - the
+    /// save path passes no `known` (it forces every file) but looked its paths up. A file the index
+    /// holds does not take turns: it is read in one go and every unchanged chunk's vector is reused.
     private func pipeline(_ files: [CrawledFile], force: Bool, known: VectorStore.KnownFiles,
+                          indexed: ((String) -> Bool)? = nil,
                           settings: IndexSettings, consume: (DecodedItem) -> Void) {
         if files.isEmpty { return }
         let maxInFlight = max(2, ProcessInfo.processInfo.activeProcessorCount)
@@ -3305,7 +3325,8 @@ public final class Indexer: @unchecked Sendable {
                         let item = self.isCancelled
                             ? DecodedItem(file: file, abandoned: true)
                             : self.decode(file, settings: settings,
-                                          turns: known[file.path] == nil || self.streams.inProgress(file.path))
+                                          turns: !(indexed?(file.path) ?? (known[file.path] != nil))
+                                              || self.streams.inProgress(file.path))
                         cond.lock()
                         ready.started[i] = nil
                         let late = ready.gaveUp.remove(i) != nil
@@ -3421,9 +3442,9 @@ public final class Indexer: @unchecked Sendable {
     /// it, hand me its bytes) is behind `ContentSource`; everything below - thresholds, dedup,
     /// payload shape, HQ crops - is policy, and lives here exactly once so a new channel cannot
     /// quietly acquire its own version of it. That is precisely how issue #13 happened.
-    /// `turns`: a long text PDF may take turns - on its first index, or resuming one. An indexed
-    /// PDF that changed is read in one go, so every unchanged chunk's vector is reused before any
-    /// row is replaced (turns replace a file's rows at the first).
+    /// `turns`: a long text file or PDF may take turns - on its first index, or resuming one. An
+    /// indexed file that changed is read in one go, so every unchanged chunk's vector is reused
+    /// before any row is replaced (turns replace a file's rows at the first).
     private func decode(_ file: CrawledFile, settings: IndexSettings, turns: Bool = false) -> DecodedItem {
         // Asked BEFORE anything reads the file: the probe's header read is already a download.
         let evict = settings.evictDownloaded && !settings.skipDataless
@@ -3480,9 +3501,21 @@ public final class Indexer: @unchecked Sendable {
             }
         }
 
-        // A long plain-text file is streamed by the embed stage, not read here (see storeStreamedText).
+        // A long plain-text file is streamed by the embed stage, not read here (see storeStreamedText)
+        // - when it takes turns (a first index, or resuming one) or is past what one read takes. AN
+        // INDEXED FILE THAT CHANGED and fits one read is read and cut HERE, on the concurrent decode
+        // stage: streamed, a saved edit went whole through the serial embed stage, and every save of
+        // a text file over 64 KB lost the decode stage's parallelism (40 edits: 0.50-0.59 s against
+        // 0.42-0.46 s on 0.15.15, which streamed only past 2 MB). It is cut exactly as the stream
+        // cuts it (streamedPieces) - not through FileExtractor, which trims the file's ends - so its
+        // chunks and keys are the ones its first index made and every unchanged vector is reused.
         if category == .text, Self.streamsText(file, settings: settings) {
-            return DecodedItem(file: file, kind: kind, payload: .textStream, meta: meta, contentKey: contentKey)
+            if turns || file.size > FileExtractor.maxTextBytes {
+                return DecodedItem(file: file, kind: kind, payload: .textStream, meta: meta, contentKey: contentKey)
+            }
+            guard let pieces = streamedPieces(file, settings: settings) else { return DecodedItem(file: file) }
+            recordIdentifiers(pieces, contentKey: contentKey)
+            return DecodedItem(file: file, kind: kind, payload: .text(pieces), meta: meta, contentKey: contentKey)
         }
         if category == .video {
             guard let out = source.video(file, probe: probe, settings: settings) else { return DecodedItem(file: file) }
