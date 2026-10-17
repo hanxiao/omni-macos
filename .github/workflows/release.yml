@@ -227,9 +227,10 @@ jobs:
           fi
           # PURGE ONLY ONCE PAGES HAS PUBLISHED. The push above is not the publish: Pages builds for
           # a minute or more, and a request in that window caches the old page or a 404 for the new
-          # DMG, which a purge sent before it cannot clear. 0.17.3: a check of the download link 20 s
-          # after this step cached a 404 for 4 hours. Origin is read cache-busted until it serves
-          # what was pushed (Pages serves the committed bytes); past 10 minutes it purges anyway.
+          # DMG, which a purge sent before it cannot clear. (0.17.3, with no Cloudflare secrets set
+          # so no purge at all: a check of the link during the Pages build got a 404 that Cloudflare
+          # served for a few minutes.) Origin is read cache-busted until it serves what was pushed
+          # (Pages serves the committed bytes); past 10 minutes it purges anyway.
           if [ -n "$SITE_TOKEN" ]; then
             for i in $(seq 1 60); do
               t=$(date +%s)
