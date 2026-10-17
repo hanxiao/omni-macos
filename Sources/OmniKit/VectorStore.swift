@@ -6130,24 +6130,19 @@ public final class VectorStore: @unchecked Sendable {
 
     /// A relevance threshold is PER KIND, because the score scale is per kind.
     ///
-    /// This is the cone effect (Liang et al., "Mind the Gap", NeurIPS 2022) measured on a real
-    /// index rather than assumed. The NNN bias - each file's typical top score against a bank of
-    /// text queries - comes out like this over 2.68M files:
+    /// Measured, not assumed (roadmap.md, "Is there a modality gap"). Against a text query, an
+    /// UNRELATED image and an unrelated caption score alike (COCO, 2,000 images and 10,000
+    /// captions: 0.120 / 0.107 on Nano, 0.127 / 0.095 on Small), so the modalities share one noise
+    /// floor. A RELEVANT image does not reach a relevant text's score: a caption's own image 0.427
+    /// (Small 0.480) where its sibling captions score 0.648 (0.626). In a pool of both, about 180
+    /// (Small 80) unrelated captions outscore the right image, so one threshold across kinds is
+    /// meaningless: a cut at 0.60 keeps 87.5% of relevant text answers and 10.3% of relevant media.
+    /// The NNN bias per file on the real index (`conecheck`, 655,752 files, 2026-10-16), p10 / p50
+    /// / p90: text 0.260 / 0.333 / 0.425, image 0.155 / 0.179 / 0.216, audio 0.138 / 0.169 / 0.206,
+    /// video 0.149 / 0.193 / 0.257, scan 0.165 / 0.196 / 0.258.
     ///
-    ///     text   n=2,087,334   p10 0.3133  p50 0.7416  p90 0.7445
-    ///     image  n=  571,230   p10 0.1806  p50 0.1806  p90 0.1806
-    ///     audio  n=   12,996   p10 0.1170  p50 0.1483  p90 0.1856
-    ///     video  n=    2,447   p10 0.1241  p50 0.1640  p90 0.2399
-    ///
-    /// Every one of 571,230 images has the SAME bias to four decimal places. Image embeddings sit
-    /// in their own narrow cone, so every image-against-text-query cosine is about the same number;
-    /// there is no per-image information in it at all. A text query therefore scores a photo on a
-    /// different scale than it scores a document, and one threshold across both is meaningless:
-    /// measured, a cut at 0.60 keeps 87.5% of relevant text answers and 10.3% of relevant media.
-    ///
-    /// The scales are proportional, not offset - both modalities are cones from the origin - so the
-    /// correction is a ratio. Calibrated from the relevant-score medians measured by
-    /// `omni-verify cutcheck`: text 0.797, media 0.490.
+    /// The correction is a ratio, calibrated from the relevant-score medians measured by
+    /// `omni-verify cutcheck`: text 0.797, media 0.490. On COCO a ratio and a shift rank the same.
     /// `scan` sits with the image kinds, not with text. A scanned PDF is reached through its page
     /// images, so its scores are on the vision scale however much text is on the page - the profile
     /// puts it at 0.257 of text where image is 0.244 and audio 0.200. Filing it under text (which

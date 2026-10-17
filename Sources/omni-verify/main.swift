@@ -7116,6 +7116,49 @@ if args.count >= 7 && args[1] == "embeddump" {
     exit(0)
 }
 
+// Modality geometry: omni-verify gapdump <modelDir> <pairs.json> <imageDir> <out prefix>
+// <pairs.json> is [{"file": name, "captions": [String]}]. Embeds every image the way the indexer
+// does and every caption twice - as a passage (a document in the index) and as a query - and
+// writes <out>.f32 (rows of float32, L2-normalised by the model) and <out>.json (one {"k", "i",
+// "c"} per row: kind image | passage | query, pair index, caption index). The analysis (centroid
+// distance, paired and random cosines, and the mixed text-and-image pool that ranking faces) reads
+// these; the numbers are in docs/notes/roadmap.md, "Is there a modality gap".
+if args.count >= 6 && args[1] == "gapdump" {
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    guard let pairs = try JSONSerialization.jsonObject(with: Data(contentsOf: URL(fileURLWithPath: args[3]))) as? [[String: Any]] else {
+        print("gapdump: bad pairs file"); exit(1)
+    }
+    var rows: [[String: Any]] = []
+    var flat: [Float] = []
+    func add(_ v: [Float], _ k: String, _ i: Int, _ c: Int) { flat += v; rows.append(["k": k, "i": i, "c": c]) }
+    let t = Date()
+    for start in stride(from: 0, to: pairs.count, by: 16) {
+        let idx = Array(start ..< min(pairs.count, start + 16))
+        var raws: [OmniVisionPreprocess.RawPatches] = []
+        var have: [Int] = []
+        for i in idx {
+            let u = URL(fileURLWithPath: args[4]).appendingPathComponent(pairs[i]["file"] as? String ?? "")
+            guard let src = CGImageSourceCreateWithURL(u as CFURL, nil),
+                  let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { continue }
+            raws.append(OmniVisionPreprocess.preprocessRaw(img)); have.append(i)
+        }
+        if let vecs = engine.embedImages(raws), vecs.count == have.count {
+            for (j, i) in have.enumerated() { add(vecs[j], "image", i, -1) }
+        }
+        var texts: [(Int, Int, String)] = []
+        for i in idx { for (c, cap) in ((pairs[i]["captions"] as? [String]) ?? []).enumerated() { texts.append((i, c, cap)) } }
+        let ps = engine.embedTextBatch(texts.map(\.2), as: .passage)
+        for (j, x) in texts.enumerated() { add(ps[j], "passage", x.0, x.1) }
+        for x in texts { add(engine.embedQuery(x.2), "query", x.0, x.1) }
+        if start % 400 == 0 { print(String(format: "  %d/%d pairs, %.0fs", start, pairs.count, -t.timeIntervalSinceNow)) }
+    }
+    let out = args[5]
+    try flat.withUnsafeBufferPointer { try Data(buffer: $0).write(to: URL(fileURLWithPath: out + ".f32")) }
+    try JSONSerialization.data(withJSONObject: ["dim": engine.dim, "rows": rows]).write(to: URL(fileURLWithPath: out + ".json"))
+    print("GAPDUMP \(rows.count) rows dim \(engine.dim) -> \(out).f32")
+    exit(0)
+}
+
 // Per-process NaN sweep: omni-verify nansweep <modelDir> [imageDir] [reps]
 // Measures THIS process's non-finite embedding rate per modality. The cold-load weight-corruption
 // hypothesis predicts a bimodal distribution ACROSS processes (most runs 0, an occasional run

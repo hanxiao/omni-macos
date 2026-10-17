@@ -310,3 +310,44 @@ Shipped: Nano 0.870 (R@1 0.82), Small 0.920 (R@1 0.89). Filename fusion and page
 here: the eval's name queries are found by meaning, and its short PDFs are cut by page (page pick
 serves long PDFs' multi-page chunks). Fold: Nano 4.4 of 120 shown, answers folded at ranks 9 and 44;
 Small 5.2 shown, none folded.
+
+### Is there a modality gap (Han, 2026-10-16)
+
+Han's question: GELATO (arXiv 2605.08384) passes every modality through the same frozen text
+backbone and its UMAP shows images, audio, video and text interleaved, so why does search treat
+media on its own scale and scan a second time for it? Measured with the app's own embedding paths
+(`omni-verify gapdump`): 2,000 COCO val2017 images (seed 42) and their 10,000 captions, each
+caption embedded as a passage and as a query.
+
+| | Nano | Small | paper Table 3 (Nano / Small) |
+|---|---|---|---|
+| centroid distance, image vs caption | 0.50-0.52 | 0.62-0.67 | 0.54 / 0.71 |
+| paired cosine / random pair / lift | 0.42 / 0.13 / 0.29 | 0.45-0.48 / 0.10-0.14 / 0.34 | 0.35 / 0.40 paired |
+| R@1 image->text / text->image | 46.2 / 32.0 | 72.7 / 57.4 | 36.6 / 27.7, 68.0 / 57.0 (Karpathy) |
+| modality from the nearest centroid (held-out half) | 93.3% | 97.0% | - |
+| unrelated pairs: image-image / passage-passage | 0.36 / 0.15 | 0.51 / 0.14 | - |
+
+The port reproduces the paper's geometry. What the paper shows (no offset between modalities at
+the noise floor) holds: against a query, an UNRELATED image scores 0.120 (Small 0.127) and an
+unrelated caption 0.107 (0.095). What it leaves out, by its own note, is a mixed pool, and that is
+the pool Omni ranks. There the RELEVANT image is on a lower scale than relevant text: a caption's
+own image 0.427 (Small 0.480), its four sibling captions 0.648 (0.626), a ratio of 0.66 (0.77). So
+in a pool of the 2,000 images and the other 9,995 captions, about 182 (Small 80) unrelated captions
+outscore the right image; it ranks 186th (82nd) at the median, its R@10 is 3.0% (10.7%), and the
+top ten are 0.3% (0.9%) images in a pool that is 16.7% images. Scaling image scores by the
+measured ratio: R@10 46.9% (51.9%), median rank 13 (9), the best sibling caption's R@1 49.1 -> 44.1
+(49.5 -> 48.9). A shift instead of a ratio scores the same (45.7%, 52.2%): this data does not
+separate the two.
+
+- So the lift is needed for this model, and so is lifting BEFORE the shortlist is cut: a relevant
+  image's unscaled rank (82-186 of 12k here) is past the first scan's shortlist, which is why
+  fuseKinds scans the leaning kind a second time. One scan with the kind's scale applied inside
+  it gives the same candidates at half the cost (next item).
+- The shipped 0.615 is one number for both models; COCO measures Nano 0.66 and Small 0.77. A
+  per-model scale is a ranking change and is judged on the labeled eval.
+- The kindScoreScale comment's "every one of 571,230 images has the same bias to four decimals"
+  does not hold any more. `conecheck` on a clone of the real index (655,752 files, 2026-10-16):
+  image p10/p50/p90 0.155 / 0.179 / 0.216, text 0.260 / 0.333 / 0.425, audio 0.138 / 0.169 /
+  0.206, video 0.149 / 0.193 / 0.257, scan 0.165 / 0.196 / 0.258. Where the old figure came from
+  is not known (that index is gone); one candidate is the Nano media vectors that were wrapped in
+  out-of-range token ids before the special tokens were read from each model's config.
