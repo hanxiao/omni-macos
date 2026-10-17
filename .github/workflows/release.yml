@@ -199,7 +199,9 @@ jobs:
           # Keep the 2 most recent DMGs (current + previous). The page HTML is at the fixed /omni/
           # URL and can be CF-cached (max-age=14400) briefly after a release; keeping the previous
           # version's DMG means a momentarily-stale page still links a real file instead of 404ing.
-          ( cd /tmp/site/omni && ls -t Omni-*.dmg 2>/dev/null | tail -n +3 | xargs rm -f 2>/dev/null || true )
+          # BY VERSION, not `ls -t`: in a fresh clone every file has the checkout's time, and 0.17.3
+          # kept 0.9.0 and deleted 0.17.2.
+          ( cd /tmp/site/omni && ls Omni-*.dmg 2>/dev/null | sort -V -r | tail -n +3 | xargs rm -f 2>/dev/null || true )
           # Manifest the in-app updater ("Check for Updates") reads to detect new versions.
           printf '{"version":"%s","url":"https://hanxiao.io/omni/Omni-%s.dmg","md5":"%s"}\n' \
             "$VERSION" "$VERSION" "$MD5" > /tmp/site/omni/latest.json
@@ -218,9 +220,25 @@ jobs:
           # 404 cached, and nothing clears it: observed on 0.6.2, where the origin served the file
           # (cache-busted 200) while the plain URL 404'd for everyone.
           DMG_NAME: Omni-${{ steps.ver.outputs.version }}.dmg
+          SITE_TOKEN: ${{ secrets.SITE_TOKEN }}
         run: |
           if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ]; then
             echo "no Cloudflare secrets; skipping purge (page is updated at origin, CF will catch up on TTL)"; exit 0
+          fi
+          # PURGE ONLY ONCE PAGES HAS PUBLISHED. The push above is not the publish: Pages builds for
+          # a minute or more, and a request in that window caches the old page or a 404 for the new
+          # DMG, which a purge sent before it cannot clear. 0.17.3: a check of the download link 20 s
+          # after this step cached a 404 for 4 hours. Origin is read cache-busted until it serves
+          # what was pushed (Pages serves the committed bytes); past 10 minutes it purges anyway.
+          if [ -n "$SITE_TOKEN" ]; then
+            for i in $(seq 1 60); do
+              t=$(date +%s)
+              curl -fsS "https://hanxiao.io/omni/index.html?t=$t" | cmp -s - /tmp/site/omni/index.html \
+                && curl -fsS "https://hanxiao.io/omni/latest.json?t=$t" | cmp -s - /tmp/site/omni/latest.json \
+                && curl -fsSI "https://hanxiao.io/omni/${DMG_NAME}?t=$t" >/dev/null \
+                && { echo "Pages published after ~$(( (i - 1) * 10 )) s"; break; }
+              sleep 10
+            done
           fi
           # Surgical purge of just the /omni URLs (GitHub Pages origin is already updated above).
           # Without this, Cloudflare serves the stale cached HTML/DMG until TTL expiry, making a

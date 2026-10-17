@@ -64,7 +64,18 @@ jobs:
           CF_ZONE_ID: ${{ secrets.CF_ZONE_ID }}
         run: |
           if [ -z "$CF_API_TOKEN" ] || [ -z "$CF_ZONE_ID" ]; then echo "no Cloudflare secrets; CF catches up on TTL"; exit 0; fi
+          # Once Pages serves what was pushed, as release.yml's purge waits (a purge before the
+          # publish cannot clear what a request in between caches).
+          for i in $(seq 1 60); do
+            curl -fsS "https://hanxiao.io/omni/index.html?t=$(date +%s)" | cmp -s - /tmp/site-only/omni/index.html \
+              && { echo "Pages published after ~$(( (i - 1) * 10 )) s"; break; }
+            sleep 10
+          done
+          # The published DMG and manifest too: a 404 cached for the DMG before Pages published it
+          # outlives the release's purge, and this is the way to clear it without another release.
+          VERSION=$(curl -fsS "https://hanxiao.io/omni/latest.json?t=$(date +%s)" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
           FILES=$( { echo "https://hanxiao.io/omni/"; echo "https://hanxiao.io/omni/index.html"; echo "https://hanxiao.io/omni/faq.json"; echo "https://hanxiao.io/omni/llms.txt";
+                     echo "https://hanxiao.io/omni/latest.json"; echo "https://hanxiao.io/omni/Omni-${VERSION}.dmg";
                      for a in site/omni/assets/*; do echo "https://hanxiao.io/omni/assets/$(basename "$a")"; done; } \
                    | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
           # Cloudflare takes at most 30 URLs per purge call.
