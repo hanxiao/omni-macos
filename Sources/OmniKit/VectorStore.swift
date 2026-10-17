@@ -2037,11 +2037,44 @@ public final class VectorStore: @unchecked Sendable {
             if i < idMask.count, !idMask[i] { idMask[i] = true; ids.append(id) }
         }
         guard !ids.isEmpty else { return [] }
-        // OVER THE FILES' OWN ROW WINDOWS, not the whole index. The first version of this walked
-        // every row and asked a Set<Int32> whether it was dead - on a 1M-row index that put saving
-        // one file back to 11.6 ms and made it scale with the INDEX again, undoing the whole point
-        // of tombstoning. provenRowRangesLocked already answers "where can this file's rows be",
-        // and falls back to the full range only when the windows cannot prove containment.
+        return victimRowsLocked(ids, mask: idMask)
+    }
+
+    /// The live rows of the files `under` marks (PathTable.filesUnder), for a folder delete.
+    ///
+    /// THROUGH THE FILES' ROW WINDOWS. This walked every row of the index and, once the slices
+    /// before it had left tombstones, hashed each against them: 370 ms a call on 9.7M rows, to
+    /// find nothing. A removed tree makes one call per directory the watcher reports, and a
+    /// deleted 74k-file tree kept the store queue busy for hours that way (0.17.2).
+    private func folderVictimsLocked(_ under: [Bool]) -> [Int32] {
+        var ids: [Int32] = []
+        for i in 0 ..< Swift.min(under.count, fileChunkCount.count) where under[i] { ids.append(Int32(i)) }
+        return victimRowsLocked(ids, mask: under)
+    }
+
+    /// A folder delete's victims through the row windows and by the walk over every row they
+    /// replaced, with the number of tombstones standing.
+    func folderVictimsForTest(_ folder: String) -> (windowed: [Int32], walked: [Int32], dead: Int) {
+        queue.sync {
+            let under = filePaths.filesUnder(folder, semantics: .bytes)
+            let dead = deadRows
+            let walked = dim == 0 ? [] : (0 ..< rows.count).filter { i in
+                let f = Int(rows[i].fid)
+                return f < under.count && under[f] && !dead.contains(Int32(i))
+            }.map { Int32($0) }
+            return (folderVictimsLocked(under), walked, dead.count)
+        }
+    }
+
+    /// The live rows of the files `mask` marks, `ids` being those files.
+    ///
+    /// OVER THE FILES' OWN ROW WINDOWS, not the whole index. The first version of this walked
+    /// every row and asked a Set<Int32> whether it was dead - on a 1M-row index that put saving
+    /// one file back to 11.6 ms and made it scale with the INDEX again, undoing the whole point
+    /// of tombstoning. provenRowRangesLocked already answers "where can this file's rows be",
+    /// and falls back to the full range only when the windows cannot prove containment.
+    private func victimRowsLocked(_ ids: [Int32], mask idMask: [Bool]) -> [Int32] {
+        guard dim > 0, !ids.isEmpty else { return [] }
         let dead = deadRows
         let hasDead = !dead.isEmpty
         var out: [Int32] = []
@@ -2057,18 +2090,6 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
         }
-        return out
-    }
-
-    /// Predicate form of the above, for the folder/kind removals that do not go by path set.
-    private func victimRowsMatchingLocked(_ predicate: (Row) -> Bool) -> [Int32] {
-        guard dim > 0 else { return [] }
-        // Unavoidably O(rows) - a kind or folder predicate has no per-file index to narrow it - but
-        // the dead check is skipped entirely when nothing is dead, which is the usual case.
-        let dead = deadRows
-        let hasDead = !dead.isEmpty
-        var out: [Int32] = []
-        for i in 0 ..< rows.count where (!hasDead || !dead.contains(Int32(i))) && predicate(rows[i]) { out.append(Int32(i)) }
         return out
     }
 
@@ -3948,7 +3969,7 @@ public final class VectorStore: @unchecked Sendable {
         var laps = Laps()
         let under = filePaths.filesUnder(folder, semantics: .bytes)
         laps.lap("under")
-        let victims = victimRowsMatchingLocked { Int($0.fid) < under.count && under[Int($0.fid)] }
+        let victims = folderVictimsLocked(under)
         laps.lap("victims")
         beginTxnLocked()
         let released = releasedSlotsLocked(victims)
@@ -13944,7 +13965,7 @@ public final class VectorStore: @unchecked Sendable {
         // prior row to remove. Without it, every stored file rebuilt the entire ~dim*rows.count
         // buffer (a multi-GB memmove on a large index), making indexing and reconcile O(N^2).
         // dim > 0 here, so a victim list is the caller's real answer and not the empty one
-        // victimRowsMatchingLocked returns for a store with no vectors.
+        // victimRowsLocked returns for a store with no vectors.
         if let victims {
             guard !victims.isEmpty else { return }
         } else {

@@ -154,6 +154,7 @@ if args[2] == "--crud" {
     //   rename n batch   move n files: their vectors written under a new path, the old deleted
     //   delpaths n batch delete n files, batch per deletePaths (reconcile prune)
     //   delfolder        delete the folder holding the most files (removed source folder)
+    //   delfolders n     n leaf folders under it, one deleteUnderFolder each (a tree rm -rf'd)
     //   delext ext       deleteExtensions([ext])
     //   delkind kind     deleteKinds([kind])
     //   known n          knownFiles(), n times (the indexer's pass start)
@@ -344,6 +345,25 @@ if args[2] == "--crud" {
         }
         th.start(); return th
     }
+    // delfolders: a removed tree as the watcher reports it. rm -rf goes depth first, so a batch
+    // names the deepest directories while their parents are still there, and each is its own
+    // folder delete. The first n leaf directories under the folder holding the most files.
+    var leafRoot = "", leaves: [String] = []
+    if op == "delfolders" {
+        var counts: [String: Int] = [:]
+        for p in all {
+            let parts = p.split(separator: "/", maxSplits: 4)
+            if parts.count >= 4 { counts["/" + parts[0 ..< 4].joined(separator: "/"), default: 0] += 1 }
+        }
+        leafRoot = counts.max { $0.value < $1.value }!.key
+        let dirs = Set(all.lazy.filter { $0.hasPrefix(leafRoot + "/") }.map { ($0 as NSString).deletingLastPathComponent })
+        var inner: Set<String> = [leafRoot]
+        for d in dirs {
+            var q = (d as NSString).deletingLastPathComponent
+            while q.count > leafRoot.count { inner.insert(q); q = (q as NSString).deletingLastPathComponent }
+        }
+        leaves = Array(dirs.subtracting(inner).sorted().prefix(Swift.max(1, n)))
+    }
     let sp = Probe(), bp = Probe()
     let st = prober(sp, every: 50_000) { k in _ = store.search(queries[k % queries.count], filter: SearchFilter(), topK: 10) }
     let bt = prober(bp, every: 250_000) { _ in _ = store.indexedChildrenDetailed(ofFolder: browseFolder) }
@@ -392,6 +412,16 @@ if args[2] == "--crud" {
         let target = args.count > 4 && args[4].hasPrefix("/") ? args[4] : counts.max { $0.value < $1.value }!.key
         detail = "folder \(target) files \(counts[target] ?? -1)"
         store.deleteUnderFolder(target)
+    case "delfolders":
+        var ms: [Double] = []
+        let files0 = store.fileCount
+        for d in leaves {
+            let t = Date(); store.deleteUnderFolder(d); ms.append(-t.timeIntervalSinceNow * 1000)
+        }
+        let total = ms.reduce(0, +)
+        ms.sort()
+        detail = String(format: "under %@: %d folders, %d files  per folder p50 %.1f max %.1f ms  total %.2f s",
+                        leafRoot, leaves.count, files0 - store.fileCount, ms[ms.count / 2], ms.last ?? 0, total / 1000)
     case "delext": store.deleteExtensions([args.count > 4 ? args[4] : "json"])
     case "delkind": store.deleteKinds([args.count > 4 ? args[4] : "image"])
     case "known": for _ in 0 ..< Swift.max(1, n) { _ = store.knownFiles() }

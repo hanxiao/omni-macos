@@ -81,7 +81,7 @@ codebase were already measured there, and many were rejected.
   snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (806 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
-- Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|
+- Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|delfolders|
   delkind|delext|readers|diskuse|stats|idle|settle> [n] [batch]` - one op on a fresh clone of the settled 9.7M-row
   bench index, a search every 50 ms and a browse every 250 ms throughout (index.md, "Heavy CRUD
   review"). Fresh clones are a COLD page cache; that is the case that matters.
@@ -171,6 +171,11 @@ codebase were already measured there, and many were rejected.
 - AUDIOTOOLBOX IS READ IN SMALL CALLS. One `AVAudioFile.read` of 60 s on a silent screen-recording
   soundtrack never returned and grew a realtime-safe allocator to 31 GB (0.17.0, index.md "The
   soundtrack read that never returned"). Every read goes through `AudioSegmentReader.readFrames`.
+- NO BLOCKING WORK STARTED PER EVENT ON THE SWIFT CONCURRENCY POOL. A detached task per watcher
+  callback that waits on the store queue fills the pool (as wide as the Mac has cores: 32 here, 8
+  on a base Air), and then no Task in the app runs: 0.17.2's MCP server took connections and never
+  answered (index.md, "The deleted tree that stopped every Task"). Blocking work goes on a
+  DispatchQueue, one at a time, with what arrives meanwhile merged into the next run.
 - EVERY COPY OMNI MAKES goes through `OmniPasteboard` (the clipboard history must never record it).
 - A FLAG NOTHING CAN TURN OFF IS DELETED, and a settled A/B arm is retired with its numbers recorded
   in the notes. Do not leave experiments in the shipped path.
@@ -200,7 +205,8 @@ codebase were already measured there, and many were rejected.
   resident memory, launch, write path, Photos reconcile, multi-folder scope, ignore policy grammar
   and defaults, renames, Recents, clipboard history, the 2026-10-02 speed review and media NaN,
   search while long files stream, the heavy CRUD review, file-backed exact stores, iCloud
-  index-then-evict (issue #29), the 0.17.0 soundtrack read that never returned.
+  index-then-evict (issue #29), the 0.17.0 soundtrack read that never returned, the 0.17.2
+  deleted tree that stopped every Task.
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
   and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names.

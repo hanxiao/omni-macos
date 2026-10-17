@@ -64,7 +64,7 @@ final class HeavyCrudTests: XCTestCase {
         store.advanceCoverageForTest()
         XCTAssertGreaterThan(store.coveredRowsForTest, 0, "coverage must be active for the peel to run")
 
-        var peeled = 0
+        var peeled = 0, foldersWithVictims = 0
         for step in 0 ..< 300 {
             switch Int.random(in: 0 ..< 12, using: &rng) {
             case 0 ..< 3:   // replace several files at once, some big enough to be peeled first
@@ -107,11 +107,19 @@ final class HeavyCrudTests: XCTestCase {
             XCTAssertEqual(cached, rebuilt, "step \(step): orphan cache")
             let (kept, fresh) = store.slotRowsForTest()
             XCTAssertEqual(kept, fresh, "step \(step): slot -> rows")
+            // A folder delete finds its rows through the files' row windows; the walk over every
+            // row it replaced must agree, with tombstones standing, after reopens and reclaims.
+            for folder in ["/f", "/f/sub", "/f/sub/3.txt", "/f/su", "/g"] {
+                let (windowed, walked, dead) = store.folderVictimsForTest(folder)
+                XCTAssertEqual(windowed.sorted(), walked, "step \(step): victims under \(folder)")
+                if !walked.isEmpty, dead > 0 { foldersWithVictims += 1 }
+            }
             if step % 10 == 0 { XCTAssertNil(store.coverageAudit(), "step \(step)") }
             if cached != rebuilt || kept != fresh { break }
         }
         XCTAssertNil(store.coverageAudit())
         XCTAssertGreaterThan(peeled, 10, "the peel ran \(peeled) times; the test needs it to run")
+        XCTAssertGreaterThan(foldersWithVictims, 100, "victims were compared with tombstones standing \(foldersWithVictims) times")
         store.close()
     }
 

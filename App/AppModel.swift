@@ -6865,23 +6865,47 @@ final class AppModel {
     /// Removing rows needs only the store, so it runs at once. The paths stay queued as well: a
     /// writer that decoded a file before it went may store it again, and the reconcile that drains
     /// the queue removes that row, as it always did.
+    ///
+    /// ONE AT A TIME, OFF THE SWIFT CONCURRENCY POOL. Each watcher callback started its own
+    /// detached task, and a removal blocks on the store queue and the write gate. A deleted 74k-file
+    /// tree reported over many callbacks blocked all 32 of the pool's threads behind the one removal
+    /// that held the queue, so no Task could run anywhere in the app: the MCP server accepted
+    /// connections and never answered `initialize`. Callbacks that arrive while a removal runs
+    /// are queued and taken together by the next one, which also lets classifyVanished fold a
+    /// tree's directories into their topmost.
     private func removeVanishedNow(_ paths: [String]) {
         guard !paths.isEmpty else { return }
+        queuedRemovals.formUnion(paths)
+        startQueuedRemovals()
+    }
+
+    @ObservationIgnored private var queuedRemovals = Set<String>()
+    @ObservationIgnored private var removalRunning = false
+    private static let removalQueue = DispatchQueue(label: "omni.removals", qos: .userInitiated)
+
+    private func startQueuedRemovals() {
+        guard !removalRunning, !queuedRemovals.isEmpty else { return }
         // Held, not dropped: a hold (model swap, purge) or a paper run must see no writer, and
         // the paths' only other way out was the reconcile after the full pass the hold restarts -
         // a minute of hold plus fsWaitLimit. Released at the end of either (flushHeldRemovals).
-        if indexWritesBlocked || isPaperRunning { heldRemovals.formUnion(paths); return }
+        if indexWritesBlocked || isPaperRunning {
+            heldRemovals.formUnion(queuedRemovals); queuedRemovals.removeAll(); return
+        }
         guard let indexer, let store else { return }
+        let paths = Array(queuedRemovals); queuedRemovals.removeAll()
         let rootPaths = watcherRootPaths
         let arriving = arrivingNames.union(reconcilingNames)
-        Task.detached(priority: .userInitiated) {
+        removalRunning = true
+        Self.removalQueue.async {
             let removed = indexer.removeVanished(paths, roots: rootPaths, arriving: arriving)
-            guard removed > 0 else { return }
-            await MainActor.run {
-                guard self.store === store else { return }
-                self.refreshIndexStats(store)
-                self.refreshSearchAfterBackgroundChange()
-                self.reloadBrowserIfTouched(paths)
+            Task { @MainActor in
+                self.removalRunning = false
+                if removed > 0, self.store === store {
+                    self.refreshIndexStats(store)
+                    self.refreshSearchAfterBackgroundChange()
+                    self.reloadBrowserIfTouched(paths)
+                }
+                self.startQueuedRemovals()
             }
         }
     }

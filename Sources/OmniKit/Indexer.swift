@@ -2858,12 +2858,15 @@ public final class Indexer: @unchecked Sendable {
     /// beneath them. A root, or a folder above one, is neither: see update() for why its rows stay.
     ///
     /// TOPMOST ONLY. `rm -rf` reports every file and every directory of the tree, and each gone
-    /// directory with rows became its own deleteUnderFolder - a scan of every row in the index,
+    /// directory with rows became its own deleteUnderFolder - a pass over every file's directory,
     /// a transaction and a checkpoint stat apiece, all on the queue searches wait on. A path
     /// whose ancestor is gone too leaves with that ancestor's folder delete. A root, or a folder
     /// above one, never absorbs its children: its own rows are kept, and the files under it that
     /// are reported gone still go one by one, as they always did.
-    private func classifyVanished(_ gone: Set<String>, known: [String: StoredFile],
+    ///
+    /// `known` is asked about the topmost paths only: a tree's files beneath a gone directory are
+    /// not looked up one by one, on the queue searches wait on, to be dropped here anyway.
+    private func classifyVanished(_ gone: Set<String>, known lookup: (Set<String>) -> [String: StoredFile],
                                   roots: [String]) -> (files: Set<String>, folders: [String]) {
         let protected = { (p: String) in roots.contains { $0 == p || $0.hasPrefix(p + "/") } }
         let absorbing = gone.filter { !protected($0) }
@@ -2875,6 +2878,7 @@ public final class Indexer: @unchecked Sendable {
             }
             return true
         }
+        let known = lookup(topmost)
         var files = Set<String>(), folders: [String] = []
         for path in topmost {
             if known[path] != nil { files.insert(path) }    // deleted / moved away
@@ -2912,7 +2916,7 @@ public final class Indexer: @unchecked Sendable {
             !names.contains(($0 as NSString).lastPathComponent) && Darwin.access($0, F_OK) != 0   // may be back already
         })
         guard !gone.isEmpty else { return 0 }
-        let (files, folders) = classifyVanished(gone, known: store.storedFiles(paths: gone), roots: roots)
+        let (files, folders) = classifyVanished(gone, known: { self.store.storedFiles(paths: $0) }, roots: roots)
         if !files.isEmpty { store.deletePaths(files) }
         for folder in folders { store.deleteUnderFolder(folder) }
         return files.count + folders.count
@@ -3030,7 +3034,7 @@ public final class Indexer: @unchecked Sendable {
         // back (reproduced: rename the parent of a 3-file root, 3 rows -> 0, rename back, all 3
         // re-embedded). The full pass already keeps a missing root's rows (blindRoots); a watcher
         // event must not be the one place that decides otherwise.
-        let (vanishedFiles, vanishedPrefixes) = classifyVanished(deletedTop, known: known, roots: roots)
+        let (vanishedFiles, vanishedPrefixes) = classifyVanished(deletedTop, known: { _ in known }, roots: roots)
         // Resolve which files actually need (re)embedding - stat-level checks only, no decode.
         var work: [CrawledFile] = []
         for crawled in files {

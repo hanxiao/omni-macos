@@ -1609,3 +1609,57 @@ through AudioToolbox.
   headroom - without it MLX's buffer cache alone passed 65 GB within a minute): 556 embedded, pass
   413 s, footprint 3.3-5.0 GB throughout, the realtime-safe zone 48 KB at every sample; both screen
   recordings that hung indexed with frames and soundtrack.
+
+## The deleted tree that stopped every Task (0.17.2, 2026-10-17)
+
+Han's Omni 0.17.2, up 12.5 h: 100% CPU, 13.7 GB, and its MCP endpoint accepted connections and
+never answered `initialize` (an agent waited 20 s). A 74,120-file tree under a root had been
+deleted. `sample` of the installed app:
+
+- THE STORE QUEUE was in Indexer.removeVanished -> deleteUnderFolder -> deleteUnderFolderLocked,
+  3,405 of 3,503 samples on one line: the victim scan, `Hasher._hash` under it. A folder delete
+  runs the folder's files through deleteFilesInSlices and then one transaction "over what is
+  left", and that transaction found its rows by walking EVERY row of the index and hashing each
+  against the tombstones - which the slices just before it had left. About 370 ms per call on
+  9.7M rows, to find nothing.
+- ONE CALL PER DIRECTORY. `rm -rf` goes depth first, so a watcher callback names the deepest
+  directories while their parents are still there; classifyVanished folds a path into an ancestor
+  only when that ancestor is in the same batch, so each leaf directory was its own folder delete.
+- ALL 32 SWIFT CONCURRENCY THREADS were blocked in removeVanished (32 = this Mac's cores: the
+  user-initiated pool was full). AppModel.removeVanishedNow started a detached task per watcher
+  callback, and each blocked on the write gate behind the one that held the queue. HTTPServer
+  runs every request as a Task, so no request could start: the MCP server was alive and could not
+  answer anything. It drained on its own within 40 minutes of the sample.
+
+Fixes:
+- THE LAST TRANSACTION READS THE FOLDER'S FILES' ROW WINDOWS (`folderVictimsLocked`, through the
+  same proven windows deletePaths uses), not every row. The walk it replaced is kept as the
+  reference in `folderVictimsForTest`, and HeavyCrudTests compares the two after every step of its
+  random walk (tombstones standing, reopens, reclaims, peels); handing the windowed form half the
+  folder's ids fails it 386 times.
+- REMOVALS RUN ONE AT A TIME ON THEIR OWN DISPATCH QUEUE (`omni.removals`), never on the
+  concurrency pool. Callbacks that arrive while one runs are merged and taken by the next, which
+  also gives classifyVanished the tree's parents to fold the leaves into.
+- classifyVanished looks up stored state for the topmost paths only; it looked up every gone path
+  in one queue hold, a SQL lookup each, to keep a handful of them.
+
+Measured:
+- `mutbench --crud delfolders 100` (new: 100 leaf folders under the largest folder, one
+  deleteUnderFolder each, as removeVanished ran them), cold clones of the settled bench index
+  (9.7M rows, 2.68M files), interleaved twice. 0.17.2: 373.5 / 383.8 ms a folder (p50), 38.0 /
+  42.6 s for 534 files, searches meanwhile p50 274 / 283 ms with 97 of ~135 over 250 ms. Now:
+  10.2 / 10.2 ms a folder, 4.8 s, searches p50 89 / 108 ms with 1 over 250 ms (a cold clone's
+  vector gather is ~75 ms of every search, deletes or not). The last transaction's laps: files
+  under 3 ms, victims 1 ms.
+- In the app, both builds isolated (`-omni.dbDir` on a clone of the same bench index, a 6,200-file
+  root beside its 9.7M rows), MCP `initialize` every 100 ms while a 1,000-directory, 6,000-file
+  tree is deleted one leaf directory at a time, 20 ms apart (a cleanup loop; 27.6-28.0 s), then
+  `rm -rf` of what is left. Interleaved, two runs each. 0.17.2: `initialize` timed out at 10 s 3
+  times in each run and took over 1 s 7 times; the tree left the index 30.5 / 32.6 s after the
+  last directory went. Now: `initialize` max 2 ms in both (304 / 306 probes); the tree left 1.3 /
+  1.3 s after. Both leave 0 of the tree's files and all 200 kept ones. One `rm -rf` of the whole
+  tree (0.4 s), this build only: gone 2.0 s after, `initialize` max 2 ms.
+- NOT CHANGED: the serving handlers call the store synchronously inside their Tasks, so N
+  requests waiting on a long store hold block N pool threads. With removals off the pool and
+  every bulk write sliced to ~100 ms, a client would need tens of concurrent requests to fill
+  the pool; nothing has been seen to do that.
