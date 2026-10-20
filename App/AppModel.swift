@@ -1816,6 +1816,11 @@ final class AppModel {
         set { filterFolders = newValue.map { [$0] } ?? [] }
     }
     var filterExt: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    /// `-in:` folders and `-ext:` extensions (comma-separated, like `-tag:`): files there never
+    /// appear. Both were parsed and then dropped, so `-in:~/Library` - the FAQ's own example of an
+    /// exclusion - scoped the search TO ~/Library, and `-ext:pdf` meant `ext:pdf`.
+    var filterFoldersExclude: [URL] = [] { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    var filterExtExclude: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     /// Explicit `filename:` intent. Not a filter - it does not exclude anything - but a request for
     /// the filename channel to lead the ranking. Kept beside the filters because it arrives through
     /// the same qualifier grammar.
@@ -2978,6 +2983,7 @@ final class AppModel {
     var filtersActive: Bool {
         !filterKinds.isEmpty || !filterFolders.isEmpty || filterRecents
             || !filterExt.isEmpty || !filterTags.isEmpty || !filterTagsExclude.isEmpty
+            || !filterExtExclude.isEmpty || !filterFoldersExclude.isEmpty
             || dateRange != .any
             || minScore != Self.defaultMinScore
     }
@@ -3706,9 +3712,11 @@ final class AppModel {
         // Built in locals from the defaults and written once each, only where it changed: a reset
         // followed by a re-set wrote every filter twice per keystroke even when nothing moved.
         var kinds: Set<FileKind> = [], ext = "", filename = "", tags = "", tagsExclude = ""
+        var extExclude = "", foldersExclude: [URL] = []
         var date = DateRange.any, score = Self.defaultMinScore, sort = SortOrder.relevance
         func commitFilters(folders: [URL], recents: Bool) {
             assign(\.filterKinds, kinds); assign(\.filterExt, ext); assign(\.filterFolders, folders)
+            assign(\.filterExtExclude, extExclude); assign(\.filterFoldersExclude, foldersExclude)
             assign(\.filterFilename, filename); assign(\.filterRecents, recents)
             assign(\.filterTags, tags); assign(\.filterTagsExclude, tagsExclude)
             assign(\.dateRange, date); assign(\.minScore, score); assign(\.sortOrder, sort)
@@ -3749,11 +3757,22 @@ final class AppModel {
                 } else {
                     tags = tags.isEmpty ? qual.value : tags + "," + qual.value
                 }
-            case "ext": ext = qual.value.hasPrefix(".") ? String(qual.value.dropFirst()) : qual.value
+            case "ext":
+                if qual.negated {
+                    // Accumulates like -tag:, so "-ext:log -ext:tmp" and "-ext:log,tmp" are the same.
+                    let more = qual.value.split(separator: ",").map { Self.bareExtension(String($0)) }.filter { !$0.isEmpty }
+                    let have = extExclude.split(separator: ",").map(String.init)
+                    extExclude = (have + more.filter { !have.contains($0) }).joined(separator: ",")
+                } else {
+                    ext = Self.bareExtension(qual.value)
+                }
             // ACCUMULATES, like `tag:` above and unlike every other qualifier: `in:A in:B` means
             // both folders. Last-one-wins silently dropped A, which is the shape of issue #18.
             case "in":
-                if qual.value.lowercased() == "recents" { recents = true }
+                if qual.negated {
+                    if qual.value.lowercased() != "recents", let url = Self.resolveFolder(qual.value),
+                       !foldersExclude.contains(url) { foldersExclude.append(url) }
+                } else if qual.value.lowercased() == "recents" { recents = true }
                 else if let url = Self.resolveFolder(qual.value), !folders.contains(url) { folders.append(url) }
             case "filename": filename = qual.negated ? "" : qual.value
             case "date": if let d = DateRange(rawValue: qual.value.lowercased()) { date = d }
@@ -3781,7 +3800,7 @@ final class AppModel {
     /// Reset every filter dimension to its default (caller holds the applyingParsedQuery guard).
     private func resetAllFilters() {
         filterKinds = []; filterExt = ""; filterFolders = []; filterFilename = ""; filterRecents = false
-        filterTags = ""; filterTagsExclude = ""
+        filterTags = ""; filterTagsExclude = ""; filterExtExclude = ""; filterFoldersExclude = []
         dateRange = .any; minScore = Self.defaultMinScore; sortOrder = .relevance
     }
 
@@ -3821,9 +3840,11 @@ final class AppModel {
         if !filterTags.isEmpty { parts.append("tag:" + Self.quoteIfNeeded(filterTags)) }
         if !filterTagsExclude.isEmpty { parts.append("-tag:" + Self.quoteIfNeeded(filterTagsExclude)) }
         if !filterExt.isEmpty { parts.append("ext:" + filterExt) }
+        if !filterExtExclude.isEmpty { parts.append("-ext:" + filterExtExclude) }
         if !filterFilename.isEmpty { parts.append("filename:" + Self.quoteIfNeeded(filterFilename)) }
         if filterRecents { parts.append("in:Recents") }
         for f in filterFolders { parts.append("in:" + Self.quoteIfNeeded(f.path)) }
+        for f in filterFoldersExclude { parts.append("-in:" + Self.quoteIfNeeded(f.path)) }
         if dateRange != .any { parts.append("date:" + dateRange.rawValue) }
         if minScore != Self.defaultMinScore { parts.append("score:\(Int((minScore * 100).rounded()))%") }
         if sortOrder != .relevance { parts.append("sort:" + (sortOrder == .name ? "name" : "date")) }
@@ -3937,6 +3958,12 @@ final class AppModel {
         }
     }
 
+    /// "pdf", ".pdf" and "PDF" name the same extension.
+    private static func bareExtension(_ s: String) -> String {
+        let t = s.trimmingCharacters(in: .whitespaces)
+        return t.hasPrefix(".") ? String(t.dropFirst()) : t
+    }
+
     private static func resolveFolder(_ s: String) -> URL? {
         var p = s.trimmingCharacters(in: .whitespaces)
         guard !p.isEmpty else { return nil }
@@ -3950,6 +3977,8 @@ final class AppModel {
         f.folderPrefixes = filterFolders.map(\.path)
         f.recentsLimit = filterRecents ? recentsLimit : nil
         f.ext = filterExt.isEmpty ? nil : filterExt
+        f.excludeExts = filterExtExclude.split(separator: ",").map(String.init).filter { !$0.isEmpty }
+        f.excludeFolders = filterFoldersExclude.map(\.path)
         f.filenameQuery = filterFilename.isEmpty ? nil : filterFilename
         f.since = dateRange.since
         // Terms only; the store resolves them to path sets on its own queue (cached), so no
@@ -6234,6 +6263,7 @@ final class AppModel {
     private func filterSignature() -> String {
         [filterKinds.map(\.rawValue).sorted().joined(separator: ","),
          filterFolder?.path ?? "", filterExt, filterFilename, filterTags, filterTagsExclude,
+         filterExtExclude, filterFoldersExclude.map(\.path).joined(separator: ">"),
          dateRange.rawValue, String(sortOrder.hashValue)].joined(separator: "\u{1}")
     }
 

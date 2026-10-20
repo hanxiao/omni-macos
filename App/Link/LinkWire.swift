@@ -18,6 +18,9 @@ enum LinkWire {
         var tags: [String]?
         var excludeTags: [String]?
         var recents: Int?
+        /// Optional, so a peer from before `-ext:` decodes the request and ignores it; the asking
+        /// side re-applies it to what comes back (see `linkedSearch`).
+        var excludeExts: [String]?
 
         init(_ f: SearchFilter, folders: [String]?) {
             kinds = f.kinds.isEmpty ? nil : f.kinds.sorted()
@@ -29,6 +32,7 @@ enum LinkWire {
             tags = f.tagTerms.isEmpty ? nil : f.tagTerms
             excludeTags = f.tagExcludeTerms.isEmpty ? nil : f.tagExcludeTerms
             recents = f.recentsLimit
+            excludeExts = f.excludeExts.isEmpty ? nil : f.excludeExts
         }
 
         var searchFilter: SearchFilter {
@@ -42,6 +46,7 @@ enum LinkWire {
             f.tagTerms = tags ?? []
             f.tagExcludeTerms = excludeTags ?? []
             f.recentsLimit = recents
+            f.excludeExts = excludeExts ?? []
             return f
         }
     }

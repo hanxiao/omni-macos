@@ -77,7 +77,9 @@ public enum FileExtractor {
         "dockerfile", "gitignore", "env",
     ]
     public static let pdfExtensions: Set<String> = ["pdf"]
-    public static let officeExtensions: Set<String> = ["rtf", "rtfd", "doc", "docx", "odt", "pages", "webarchive"]
+    public static let officeExtensions: Set<String> = ["rtf", "rtfd", "doc", "docx", "odt", "pages", "key", "webarchive"]
+    /// Read by `IWorkText`: NSAttributedString has no importer for them and fails on every file.
+    static let iWorkExtensions: Set<String> = ["pages", "key"]
     public static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "heic", "heif", "webp"]
     public static let videoExtensions: Set<String> = ["mp4", "mov", "m4v", "avi", "mkv", "webm", "mpg", "mpeg", "wmv", "flv", "3gp"]
     public static let audioExtensions: Set<String> = ["mp3", "wav", "m4a", "aac", "flac", "ogg", "oga", "aiff", "aif", "caf", "wma"]
@@ -223,6 +225,10 @@ public enum FileExtractor {
     // MARK: - Office
 
     private static func extractOffice(_ url: URL) -> ExtractedContent {
+        if iWorkExtensions.contains(url.pathExtension.lowercased()) {
+            guard let s = IWorkText.extract(url), !s.isEmpty else { return .empty }
+            return .text(s)
+        }
         #if canImport(AppKit)
         if let attr = try? NSAttributedString(url: url, options: [:], documentAttributes: nil) {
             let s = attr.string.trimmingCharacters(in: .whitespacesAndNewlines)

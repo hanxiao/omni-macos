@@ -45,6 +45,7 @@ extension AppModel {
                                              topK: Self.searchTopK, exclude: excludeHere)
             launchRemote(peer.id, token: token) { [link] in
                 try await link.search(req, peer: peer.id, timeout: Self.remoteSearchTimeout)
+                    .filter { !filter.rejectsByExtension($0.path) }
             }
         }
     }
@@ -180,6 +181,7 @@ extension AppModel {
                     guard shared else { return LinkedSearchAnswer(mac: p.name, hits: [], note: "does not share its files with this Mac") }
                     do {
                         let hits = try await link.search(req, peer: p.id, timeout: Self.servedRemoteTimeout)
+                            .filter { !filter.rejectsByExtension($0.path) }
                         return LinkedSearchAnswer(mac: p.name, hits: hits.map { h in
                             SearchHit.make(path: RemotePath.parse(h.path)?.path ?? h.path, score: h.score, snippet: h.snippet,
                                            kind: h.kind, chunkIndex: h.chunkIndex, modified: h.modified, width: h.width,

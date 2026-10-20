@@ -60,6 +60,28 @@ final class SearchUnderIndexBG: @unchecked Sendable {
 
 let args = CommandLine.arguments
 
+// omni-verify extract <file>... : what the indexer's extractor reads from each file - kind, length,
+// the opening characters. No model. For checking an extractor against real documents, which a
+// fixture cannot stand in for (the iWork reader was written against this machine's own files).
+if args.count >= 3 && args[1] == "extract" {
+    for path in args.dropFirst(2) {
+        let url = URL(fileURLWithPath: path)
+        let t = Date()
+        let content = try? FileExtractor.extract(url)
+        let ms = -t.timeIntervalSinceNow * 1000
+        let text: String
+        switch content {
+        case .text(let s)?: text = s
+        case .pagedText(let s, _)?: text = s
+        case nil: text = "<threw>"
+        default: text = "<\(String(describing: content!).prefix(40))>"
+        }
+        let head = text.prefix(160).replacingOccurrences(of: "\n", with: " / ")
+        print(String(format: "%7.1fms %8d chars  %@\n          %@", ms, text.count, url.lastPathComponent, head))
+    }
+    exit(0)
+}
+
 // Fast deterministic embedder for concurrency stress (no GPU): isolates the FS/store/pipeline/cancel
 // locking from the embed compute, so churnbench can drive a high op rate and surface a real deadlock.
 final class FastEmbedder: Embedder, @unchecked Sendable {
@@ -4635,6 +4657,38 @@ if args.count >= 4 && args[1] == "searchreal" {
     print(String(format: "SEARCHREAL sharing=%@ chunks=%d n=%d p50=%.1fms p90=%.1fms p99=%.1fms digest=%016llx (plain+kind+folder)",
                  true ? "on " : "off", store.count, lat.count,
                  pct(0.5), pct(0.9), pct(0.99), digest))
+    // THE SERVED FILTER, with its own digest so the one above stays comparable across builds: what
+    // MCP, REST and a linked Mac search with - the clipboard history excluded - plus a `-in:` and a
+    // `-ext:` from the box. The first search of each pays the mask build; the rest hit its cache.
+    var served: [(String, SearchFilter)] = []
+    if let home = ProcessInfo.processInfo.environment["HOME"] {
+        var clip = SearchFilter(); clip.excludeFolders = [home + "/Library/Application Support/Omni/Clipboard"]
+        served.append(("served", clip))
+        var notDocs = SearchFilter(); notDocs.excludeFolders = [home + "/Documents"]
+        served.append(("-in:Documents", notDocs))
+    }
+    var notMD = SearchFilter(); notMD.excludeExts = ["md"]
+    served.append(("-ext:md", notMD))
+    for (name, f) in served {
+        var servedDigest: UInt64 = 0xcbf29ce484222325
+        var first: Double = 0
+        var times: [Double] = []
+        for r in 0 ..< max(3, reps / 3) {
+            for (i, q) in qvecs.enumerated() {
+                let t = Date()
+                let hits = store.search(q, filter: f, topK: 10)
+                let ms = -t.timeIntervalSinceNow * 1000
+                if r == 0 && i == 0 { first = ms } else { times.append(ms) }
+                if r == 0 {
+                    for b in "\(name)/q\(i):".utf8 { servedDigest = (servedDigest ^ UInt64(b)) &* 0x100000001b3 }
+                    for h in hits { for b in "\(h.path)\(String(format: "%.5f", h.score))".utf8 { servedDigest = (servedDigest ^ UInt64(b)) &* 0x100000001b3 } }
+                }
+            }
+        }
+        times.sort()
+        print(String(format: "SEARCHREAL %@ first=%.1fms p50=%.1fms p90=%.1fms digest=%016llx", name, first,
+                     times[times.count / 2], times[Swift.min(times.count - 1, times.count * 9 / 10)], servedDigest))
+    }
     // WITH THE QUERY TEXT, as the app searches: the text channels (names, a kind named in words, an
     // identifier lookup) and what each costs on top of the scan. Interleaved, every arm each round.
     var withText: [String: [Double]] = [:]

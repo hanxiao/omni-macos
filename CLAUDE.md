@@ -78,7 +78,7 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (806 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (824 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|delfolders|
@@ -124,6 +124,10 @@ codebase were already measured there, and many were rejected.
   (`contentDedup`, `globalChunkReuse`, `vectorsForContentKeys`) stay on in every shipped path, and a
   new path goes through them rather than around them. A test may switch something off only as a
   negative control, restored at once and named as such.
+- NO THIRD-PARTY OR NEW MODELS, AND LEAN DEPENDENCIES (Han, 2026-10-20). Everything runs on the
+  models Omni already ships (v5 Nano/Small, jina-ocr-v1) and Apple frameworks. A new capability is
+  built from those, not by adding a model or a package; a parser or codec is written in-tree when
+  it is small (the iWork reader, for one) rather than pulled in.
 
 ## Rules that keep biting
 
@@ -206,7 +210,7 @@ codebase were already measured there, and many were rejected.
   and defaults, renames, Recents, clipboard history, the 2026-10-02 speed review and media NaN,
   search while long files stream, the heavy CRUD review, file-backed exact stores, iCloud
   index-then-evict (issue #29), the 0.17.0 soundtrack read that never returned, the 0.17.2
-  deleted tree that stopped every Task.
+  deleted tree that stopped every Task, exclusions, the served mask and iWork text.
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
   and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names.

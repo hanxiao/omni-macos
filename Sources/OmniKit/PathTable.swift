@@ -521,6 +521,10 @@ struct CompiledPathFilter {
     private let extSlow: String?
     private let allow: Set<Int32>?
     private let deny: Set<Int32>?
+    private let excludeFolders: [[UInt8]]
+    private let excludeFolderIDs: Set<Int32>
+    private let excludeExts: [[UInt8]]
+    private let excludeExtsSlow: [String]
     /// False when the filter has no path clause at all, so a caller can skip asking.
     let active: Bool
 
@@ -533,7 +537,13 @@ struct CompiledPathFilter {
         } else { ext = nil; extSlow = nil }
         allow = f.tagAllow.map { Set($0.compactMap { table.id($0) }) }
         deny = f.tagDeny.map { Set($0.compactMap { table.id($0) }) }
+        excludeFolders = f.excludeFolders.map { Array(($0 + "/").utf8) }
+        excludeFolderIDs = Set(f.excludeFolders.compactMap { table.id($0) })
+        let exts = f.excludeExts.filter { !$0.isEmpty }
+        excludeExts = exts.filter { !$0.contains("/") }.map { Array($0.utf8) }
+        excludeExtsSlow = exts.filter { $0.contains("/") }
         active = !folders.isEmpty || ext != nil || extSlow != nil || allow != nil || deny != nil
+            || !excludeFolders.isEmpty || !exts.isEmpty
     }
 
     func accepts(_ i: Int) -> Bool {
@@ -550,6 +560,18 @@ struct CompiledPathFilter {
         }
         if let e = ext, !table.hasExtensionCI(i, e) { return false }
         if let e = extSlow, !SearchFilter.hasExtensionCI(table[i], e) { return false }
+        if !excludeFolders.isEmpty {
+            if excludeFolderIDs.contains(Int32(i)) { return false }
+            let d = Int(table.dirID(i))
+            let under = table.withDirBytes(d) { db in
+                excludeFolders.contains { pb in
+                    db.count >= pb.count && memcmp(db.baseAddress, pb, pb.count) == 0
+                }
+            }
+            if under { return false }
+        }
+        for e in excludeExts where table.hasExtensionCI(i, e) { return false }
+        for e in excludeExtsSlow where SearchFilter.hasExtensionCI(table[i], e) { return false }
         if let a = allow, !a.contains(Int32(i)) { return false }
         if let d = deny, d.contains(Int32(i)) { return false }
         return true

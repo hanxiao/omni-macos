@@ -255,14 +255,41 @@ public struct SearchFilter: Sendable {
     /// Resolved by the store at search entry into the same allow set tag terms use, so every
     /// search route honours it the way it honours `tag:`; nil means no such scope.
     public var recentsLimit: Int? = nil
-    /// Folders whose files never appear: the served surfaces pass the clipboard history here, so an
-    /// agent on the machine cannot search what the user copied. Resolved at search entry into the
-    /// same deny set `-tag:` uses, so every search route honours it.
-    public var excludeFolders: [String] = []
+    /// Folders whose files never appear: `-in:` in the search box, and the clipboard history on the
+    /// served surfaces, so an agent on the machine cannot search what the user copied. A byte-prefix
+    /// clause exactly like `folderPrefixes`, NOT a resolved path set: it used to be resolved into
+    /// the deny set `-tag:` uses, which is a String per excluded file - fine for a clipboard folder
+    /// of a few thousand, a few hundred MB for `-in:~/Library`.
+    public var excludeFolders: [String] = [] {
+        didSet { excludeSlashBytes = excludeFolders.map { Array(($0 + "/").utf8) } }
+    }
+    private(set) var excludeSlashBytes: [[UInt8]] = []
+    /// `-ext:` - extensions (no dot) whose files never appear.
+    public var excludeExts: [String] = []
     /// A clause the store resolves into a path set at search entry.
     var needsPathSets: Bool {
-        !tagTerms.isEmpty || !tagExcludeTerms.isEmpty || recentsLimit != nil || !excludeFolders.isEmpty
+        !tagTerms.isEmpty || !tagExcludeTerms.isEmpty || recentsLimit != nil
     }
+    /// Any clause decided per FILE from its path. The ONE predicate every search route asks before
+    /// building or consulting a per-file mask; four routes each kept their own copy of it, and a
+    /// clause added to one copy and not the others is a filter that silently applies on some routes.
+    var hasPathClause: Bool {
+        !folderPrefixes.isEmpty || (ext?.isEmpty == false) || tagAllow != nil || tagDeny != nil
+            || !excludeFolders.isEmpty || !excludeExts.isEmpty
+    }
+    @inline(__always) func underExcludedFolder(_ path: String) -> Bool {
+        for i in 0 ..< excludeFolders.count
+        where path == excludeFolders[i] || Self.underFolderBytes(path, excludeSlashBytes[i]) {
+            return true
+        }
+        return false
+    }
+    @inline(__always) func hasExcludedExt(_ path: String) -> Bool {
+        excludeExts.contains { Self.hasExtensionCI(path, $0) }
+    }
+    /// For results that did not come through this filter: a linked Mac from before `-ext:`
+    /// ignores the clause, so the asking side drops those files from its answer itself.
+    public func rejectsByExtension(_ path: String) -> Bool { !excludeExts.isEmpty && hasExcludedExt(path) }
     // Resolved by the store at search entry from tagTerms/tagExcludeTerms; per-row checks
     // then cost one Set lookup on the resident canonical path.
     var tagAllow: Set<String>? = nil
@@ -270,8 +297,7 @@ public struct SearchFilter: Sendable {
 
     /// No constraints set - the common plain-query case (enables the GPU candidate fast path).
     var isEmpty: Bool {
-        kinds.isEmpty && folderPrefixes.isEmpty && (ext?.isEmpty ?? true) && since == nil && until == nil
-            && !needsPathSets
+        kinds.isEmpty && !hasPathClause && since == nil && until == nil && !needsPathSets
     }
 
     public init() {}
@@ -288,6 +314,8 @@ public struct SearchFilter: Sendable {
     func acceptsPath(_ path: String) -> Bool {
         if !underAnyFolder(path) { return false }
         if let e = ext, !e.isEmpty, !Self.hasExtensionCI(path, e) { return false }
+        if !excludeFolders.isEmpty, underExcludedFolder(path) { return false }
+        if !excludeExts.isEmpty, hasExcludedExt(path) { return false }
         if let allow = tagAllow, !allow.contains(path) { return false }
         if let deny = tagDeny, deny.contains(path) { return false }
         return true
@@ -297,6 +325,8 @@ public struct SearchFilter: Sendable {
         if !kinds.isEmpty && !kinds.contains(kind) { return false }
         if !underAnyFolder(path) { return false }
         if let e = ext, !e.isEmpty, !Self.hasExtensionCI(path, e) { return false }
+        if !excludeFolders.isEmpty, underExcludedFolder(path) { return false }
+        if !excludeExts.isEmpty, hasExcludedExt(path) { return false }
         if let s = since, modified < s { return false }
         if let u = until, modified >= u { return false }
         if let allow = tagAllow, !allow.contains(path) { return false }
@@ -4418,8 +4448,7 @@ public final class VectorStore: @unchecked Sendable {
             let dead = deadRows
             let hasDead = !dead.isEmpty
             // The path clauses once per FILE; kind and date per row, exactly as `accepts` ordered them.
-            let pathFiltered = !f.folderPrefixes.isEmpty || (f.ext?.isEmpty == false)
-                || f.tagAllow != nil || f.tagDeny != nil
+            let pathFiltered = f.hasPathClause
             let pathOK = pathFiltered ? acceptedFilesLocked(f, count: filePaths.count) : []
             // Kind by CODE, one table lookup a row - not a String hashed into a Set per row.
             var kindOK = [Bool](repeating: f.kinds.isEmpty, count: 256)
@@ -6738,8 +6767,7 @@ public final class VectorStore: @unchecked Sendable {
             // Every filter clause becomes a GPU mask - kind via the kind code, folder/ext/tag via
             // the per-file path table, `since` via the per-file `modified` table - and the query
             // then takes the same candidate selection a plain one does.
-            let pathFilter = !filter.folderPrefixes.isEmpty || (filter.ext?.isEmpty == false)
-                || filter.tagAllow != nil || filter.tagDeny != nil
+            let pathFilter = filter.hasPathClause
             // The mask itself decides whether this path is usable, rather than a separate
             // predicate that could disagree with it. FAILING CLOSED MATTERS: a filter with a
             // clause the mask could not express must fall to the host reducer, because an
@@ -7155,14 +7183,21 @@ public final class VectorStore: @unchecked Sendable {
         }
         // Path filters, per file, for the same reason: the delta was scored on the host and never
         // saw the GPU mask. Bounded work - at most C + delta offers, not a pass over the index.
-        let pathFiltered = !filter.folderPrefixes.isEmpty || (filter.ext?.isEmpty == false)
-            || filter.tagAllow != nil || filter.tagDeny != nil
-        let compiledPath = CompiledPathFilter(filter, table: filePaths)
+        // The GPU selection's own cached table when it has one (one array read a candidate); the
+        // compiled clauses otherwise, built on first use - a tag set is mapped to ids there.
+        let pathFiltered = filter.hasPathClause
+        let hostTable = pathFiltered ? cachedAcceptedFilesLocked(filter) : nil
+        var compiledPath: CompiledPathFilter? = nil
+        func pathAccepts(_ fid: Int) -> Bool {
+            if let t = hostTable, fid < t.count { return t[fid] }
+            if compiledPath == nil { compiledPath = CompiledPathFilter(filter, table: filePaths) }
+            return compiledPath!.accepts(fid)
+        }
         func offer(_ row: Int32, _ raw: Float) {
             guard raw.isFinite, !deadRows.contains(row) else { return }
             if let ka = kindAllowed, Int(row) < kindCode.count, !ka[Int(kindCode[Int(row)])] { return }
             let score = lift.map { Int(row) < kindCode.count ? raw * $0[Int(kindCode[Int(row)])] : raw } ?? raw
-            if pathFiltered, !compiledPath.accepts(Int(rows[Int(row)].fid)) { return }
+            if pathFiltered, !pathAccepts(Int(rows[Int(row)].fid)) { return }
             if let s = filter.since, metaOf(rows[Int(row)]).modified < s { return }
             if let u = filter.until, metaOf(rows[Int(row)]).modified >= u { return }
             let f = fileID[Int(row)]
@@ -7240,8 +7275,7 @@ public final class VectorStore: @unchecked Sendable {
         // tagAllow/tagDeny are path-based prefilters exactly like folder/ext: they MUST gate
         // candidate selection here, or a tag-filtered quant-mode query silently loses every
         // match whose coarse score falls outside the global top-C.
-        let pathFiltered = !filter.folderPrefixes.isEmpty || (filter.ext?.isEmpty == false)
-            || filter.tagAllow != nil || filter.tagDeny != nil
+        let pathFiltered = filter.hasPathClause
         var kindAllowed = [Bool](repeating: false, count: 256)
         if hasKind { for k in kinds { if let id = kindID[k] { kindAllowed[Int(id)] = true } } }
         // Path filters resolved ONCE PER FILE against the path intern table, then read by file id
@@ -7495,6 +7529,14 @@ public final class VectorStore: @unchecked Sendable {
     /// would hash every matched path on every keystroke.
     private var pathAllowKey: String? = nil
     private var pathAllowGPU: MLXArray? = nil
+    /// The host copy of each cached table, for the per-candidate re-check after the GPU selection
+    /// (`searchCandidatesLocked`'s `offer`). That check went through `CompiledPathFilter`, which
+    /// compares directory bytes per candidate - up to 8,192 a search on the 1-bit tier - and the
+    /// served surfaces pay it on EVERY search, because they always exclude the clipboard folder:
+    /// measured +0.15 ms p50 on the 9.7M-row bench index when that exclusion became a byte clause.
+    /// The table already answers the question in one array read. One Bool per file: 2.7 MB at 2.7M.
+    private var pathAllowHost: [Bool]? = nil
+    private var pathAllowPureHost: [Bool]? = nil
     /// The same table for a filter with NO tag component, in a slot that row mutations do NOT
     /// clear.
     ///
@@ -7554,6 +7596,18 @@ public final class VectorStore: @unchecked Sendable {
                 for i in 0 ..< n where ok[i] && !filePaths.hasExtensionCI(i, eb) { ok[i] = false }
             }
         }
+        for folder in f.excludeFolders {
+            let u = filePaths.filesUnder(folder, semantics: .bytes)
+            for i in 0 ..< n where u[i] { ok[i] = false }
+        }
+        for e in f.excludeExts where !e.isEmpty {
+            if e.contains("/") {
+                for i in 0 ..< n where ok[i] && SearchFilter.hasExtensionCI(filePaths[i], e) { ok[i] = false }
+            } else {
+                let eb = Array(e.utf8)
+                for i in 0 ..< n where ok[i] && filePaths.hasExtensionCI(i, eb) { ok[i] = false }
+            }
+        }
         if let allow = f.tagAllow {
             var inAllow = [Bool](repeating: false, count: n)
             for p in allow { if let id = filePaths.id(p), Int(id) < n { inAllow[Int(id)] = true } }
@@ -7590,9 +7644,20 @@ public final class VectorStore: @unchecked Sendable {
                                f.folderPrefixes.isEmpty ? "-" : f.folderPrefixes.joined(separator: ">")))
         }
         guard let key = cacheKey else { return g }
-        if tagFree { pathAllowPureKey = key; pathAllowPureGPU = g }
-        else { pathAllowKey = key; pathAllowGPU = g }
+        if tagFree { pathAllowPureKey = key; pathAllowPureGPU = g; pathAllowPureHost = accepted }
+        else { pathAllowKey = key; pathAllowGPU = g; pathAllowHost = accepted }
         return g
+    }
+
+    /// The cached per-file table for exactly this filter, or nil when none is cached (the caller
+    /// then judges each file itself). Same key, same slot choice as `pathAllowGPULocked`.
+    private func cachedAcceptedFilesLocked(_ f: SearchFilter) -> [Bool]? {
+        let nGlobal = max(1, fileChunkCount.count)
+        guard let key = Self.pathAllowKey(f, nGlobal: nGlobal) else { return nil }
+        if f.tagAllow == nil && f.tagDeny == nil && !f.needsPathSets {
+            return key == pathAllowPureKey ? pathAllowPureHost : nil
+        }
+        return key == pathAllowKey ? pathAllowHost : nil
     }
     /// Identity of the path table `f` produces, or nil when it cannot be identified - which happens
     /// only for resolved tag sets with no terms behind them (see above), and means "do not cache".
@@ -7607,20 +7672,21 @@ public final class VectorStore: @unchecked Sendable {
         // results, and the bug would only appear once a second folder was scoped.
         return "\(f.folderPrefixes.joined(separator: ">"))|\(f.ext ?? "")|\(terms)|\(exTerms)"
             + "|\(f.recentsLimit.map { "recents\($0)" } ?? "")|\(f.excludeFolders.joined(separator: ">"))"
+            + "|\(f.excludeExts.map { $0.lowercased() }.joined(separator: ","))"
             + "|\(f.tagAllow?.count ?? -1)|\(f.tagDeny?.count ?? -1)|\(nGlobal)"
     }
     /// Called on every row mutation (through `invalidateTagFilterCacheLocked`). It deliberately
     /// leaves `pathAllowPure*` alone - see the note on that slot for why a chunk mutation cannot
     /// change a tag-free table.
     func invalidatePathAllowCacheLocked() {
-        pathAllowKey = nil; pathAllowGPU = nil
+        pathAllowKey = nil; pathAllowGPU = nil; pathAllowHost = nil
         selectMaskKey = nil; selectMaskGPU = nil
     }
 
     /// Everything, including the tag-free slot. For the paths that rebuild `idPath` itself.
     func resetPathAllowCachesLocked() {
         invalidatePathAllowCacheLocked()
-        pathAllowPureKey = nil; pathAllowPureGPU = nil
+        pathAllowPureKey = nil; pathAllowPureGPU = nil; pathAllowPureHost = nil
     }
 
     /// The COMBINED per-row keep mask for a filtered query, cached across keystrokes.
@@ -7769,8 +7835,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func onlyKindFiltered(_ f: SearchFilter) -> Bool {
-        f.folderPrefixes.isEmpty && (f.ext?.isEmpty ?? true) && f.since == nil && f.until == nil
-            && !f.needsPathSets
+        !f.hasPathClause && f.since == nil && f.until == nil && !f.needsPathSets
     }
 
     // MARK: - Tag-term filter resolution
@@ -7809,29 +7874,6 @@ public final class VectorStore: @unchecked Sendable {
             out.tagAllow = out.tagAllow.map { $0.intersection(recents) } ?? recents
         }
         if !f.tagExcludeTerms.isEmpty { out.tagDeny = pathsMatchingTagTermsLocked(f.tagExcludeTerms) }
-        if !f.excludeFolders.isEmpty {
-            let key = "\u{1}exclude:" + f.excludeFolders.joined(separator: ">")
-            let under: Set<String>
-            if let cached = tagFilterCache[key] { under = cached }
-            else {
-                under = pathsUnderFoldersLocked(f.excludeFolders)
-                if tagFilterCache.count >= Self.tagFilterCacheCap { tagFilterCache.removeAll(keepingCapacity: true) }
-                tagFilterCache[key] = under
-            }
-            out.tagDeny = out.tagDeny.map { $0.union(under) } ?? under
-        }
-        return out
-    }
-
-    /// Every indexed file at or under any of `folders`, from the resident path table. The folder
-    /// test runs on bytes (`filesUnder`); a String is built only for the files that match, which
-    /// for the clipboard history is a few thousand against millions.
-    private func pathsUnderFoldersLocked(_ folders: [String]) -> Set<String> {
-        var out = Set<String>()
-        for folder in folders {
-            let under = filePaths.filesUnder(folder, semantics: .bytes)
-            for i in under.indices where under[i] { out.insert(filePaths[i]) }
-        }
         return out
     }
 

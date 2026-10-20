@@ -1663,3 +1663,41 @@ Measured:
   requests waiting on a long store hold block N pool threads. With removals off the pool and
   every bulk write sliced to ~100 ms, a client would need tens of concurrent requests to fill
   the pool; nothing has been seen to do that.
+
+## Exclusions, the served mask, and iWork text (2026-10-20)
+
+Three things found by reading the code against the FAQ and against real files, fixed together.
+
+- `-in:` AND `-ext:` WERE PARSED AND DROPPED. `applyParsedQuery` ignored the minus on both, so
+  `-in:~/Library` - the FAQ's own example of an exclusion - scoped the search TO ~/Library, and
+  `-ext:pdf` meant `ext:pdf`. They are path clauses now (`SearchFilter.excludeFolders`,
+  `excludeExts`), byte-prefix and extension tests like `in:`/`ext:`, on every route.
+  `excludeFolders` used to be resolved into the `-tag:` deny set, a String per excluded file: fine
+  for the served surfaces' clipboard folder, a few hundred MB for `-in:~/Library`. Four routes kept
+  their own copy of "is this filter path-filtered"; they ask `hasPathClause` now.
+  `ExclusionFilterTests` covers host, GPU, select-mask and 1-bit routes; its crowding test (5,000
+  excluded near-duplicates of the query) is the one that fails when a route skips the clause in
+  candidate selection - the final per-hit check hides excluded files either way, so the symptom of
+  a missing mask is the ANSWER missing, not an excluded file shown. Negative control run.
+- THE SERVED SEARCH PAID THE CLAUSE PER CANDIDATE. Moving the clipboard exclusion off the path set
+  cost served search +0.15 ms p50 (4.4 -> 4.5-4.6 ms, four interleaved rounds, fresh clones of the
+  9.7M-row bench index): the per-candidate re-check after the GPU selection (`CompiledPathFilter`)
+  compared directory bytes for up to 8,192 candidates, where the old empty deny set cost nothing.
+  The GPU route already builds a per-file table for the filter and caches it; its host copy is now
+  cached beside it (one Bool per file) and the re-check reads it. After: 4.3/4.4/4.4/4.5 ms against
+  4.3/4.4/4.4/4.4 ms, digests identical (`134b9ff183fd2f29` plain, `a5d92396d17c86a6` served).
+  `searchreal` prints the served arms with their own digests now. A new exclusion costs one table
+  build on first use (`-in:Documents` 20-24 ms, `-ext:md` 28-31 ms on the bench index), then
+  4.4-4.5 ms p50 like any search.
+- `.pages` WAS LISTED AND NEVER READ. It went to `NSAttributedString`, which has no iWork importer:
+  "The file isn't in the correct format" for every file, so every Pages document was indexed with
+  no text. `IWorkText` reads the archive: zip directory, stored or DEFLATE entries (Compression),
+  Snappy, and a protobuf walk for the TSWP storage messages (types 2001/2005), body first. No
+  package. `.key` (Keynote) goes the same way. On this Mac: the three real Pages files give 16,257
+  characters each (16,252 in the storages), the one Keynote file 2,332, ~1.5 ms each. The other 27
+  `.key` files here are PEM private keys; they are not archives, extract as empty, and nothing of
+  them reaches the index. `omni-verify extract <file>...` prints what the extractor reads.
+- Photos rows are dated by `modificationDate`, so an old photo edited last week files under last
+  week. The same field drives change detection and near-duplicate stacking, so the fix is a capture
+  date of its own - a column, which goes into the one metadata migration rather than a migration
+  of its own.
