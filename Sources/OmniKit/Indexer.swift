@@ -560,112 +560,274 @@ public final class Indexer: @unchecked Sendable {
     /// and its cutter - says which piece it was. A file changed since it was indexed has no piece
     /// with that key, and the answer is nil, never a passage from another version of the file.
     ///
+    /// FOUND BY ITS OPENING, NOT GUESSED FROM ITS NEIGHBOURHOOD. The stored snippet is the chunk's
+    /// first characters (newlines read as spaces), so where the chunk starts in the file is found
+    /// exactly, and a cut starting there makes the chunk again: a content-defined cut depends on
+    /// where its chunk started and the bytes after, nothing before. What the start does not decide
+    /// is an END where the indexer's text stopped - a PDF turn ends on a page, a long data file at
+    /// its 2 MB cut, every file at its end - so those ends are tried beside the content cut. This
+    /// replaced cutting windows of pages or lines around the locator in the hope that one began on
+    /// a boundary, which on real files lost pages of long PDFs, every chunk inside a long line of an
+    /// agent log (12 of 42 came back) and the last chunk of every text file past 64 KB (the
+    /// extractor trims a file's ends; the stream does not) - index.md, "Passages".
+    ///
     /// Both cutters are tried, content-defined then the grid: an index keeps generation-1 chunks for
-    /// files not edited since the content cutter shipped. A long PDF was indexed in TURNS of pages,
-    /// each cut on its own, so for one the pages around the hit's locator are cut instead of the
-    /// whole document; content-defined boundaries depend only on the bytes around them, so the cut
-    /// agrees with the turn's from its first boundary on, and the key is what makes trying it safe.
+    /// files not edited since the content cutter shipped. The key is what makes every try safe.
     /// A file whose content is not on this Mac (an evicted iCloud file) is not downloaded for this.
-    public func recoverChunkText(path: String, key: String, locator: String, settings: IndexSettings) -> String? {
-        recoverChunkTexts(path: path, keys: [key], locator: locator, settings: settings)[key]
+    public func recoverChunkText(path: String, anchor: ChunkAnchor, settings: IndexSettings) -> String? {
+        recoverChunkTexts(path: path, anchors: [anchor], settings: settings)[anchor.key]
     }
 
-    /// Every piece of the cut that holds any of `keys`, by key - the other pieces of the file came
-    /// out of the same cut, and a caller that keeps them (PassageRecovery) gets the next hit in the
-    /// same file without extracting and cutting it again. Empty when no cut holds any of the keys.
-    public func recoverChunkTexts(path: String, keys: Set<String>, locator: String, settings: IndexSettings) -> [String: String] {
+    /// Every piece the recovering cuts made, by key, the wanted ones among them; empty when none.
+    /// A piece is filed under the digest of its own text, so whatever else a cut yields is true too,
+    /// and a caller that keeps it (PassageRecovery) answers the next hit nearby for free.
+    public func recoverChunkTexts(path: String, anchors: [ChunkAnchor], settings: IndexSettings) -> [String: String] {
         let url = URL(fileURLWithPath: path)
         let ext = url.pathExtension.lowercased()
-        guard !keys.isEmpty, FileManager.default.fileExists(atPath: path), !FileExtractor.isDataless(path),
+        guard !anchors.isEmpty, FileManager.default.fileExists(atPath: path), !FileExtractor.isDataless(path),
               FileExtractor.kind(forExtension: ext) == .text else { return [:] }
         let fingerprint = Self.cutterParams(settings).fingerprint
-        func find(_ text: String, _ origin: TextOrigin, wholeDocument: Bool) -> [String: String]? {
+        let span = Self.maxChunkBytes(settings)
+        let wanted = Set(anchors.map(\.key))
+        var out: [String: String] = [:]
+        var got: Set<String> = []
+        func keep(_ text: String, origin: TextOrigin, wholeDocument: Bool) {
             for cdc in [true, false] {
-                var all: [String: String] = [:]
                 var hit = false
-                for p in chunk(text, settings: settings, origin: origin, filterOpaque: false,
-                               wholeDocument: wholeDocument, cdc: cdc) {
+                for p in chunk(text, settings: settings, origin: origin, filterOpaque: false, wholeDocument: wholeDocument, cdc: cdc) {
                     let k = cdc ? ChunkKey.text(p.text, cutter: fingerprint, dim: embedder.dim)
                                 : ChunkKey.grid(p.text, maxChars: settings.maxCharsPerChunk, overlap: chunkOverlap, dim: embedder.dim)
-                    all[k] = p.text
-                    if keys.contains(k) { hit = true }
+                    out[k] = p.text
+                    if wanted.contains(k) { got.insert(k); hit = true }
                 }
-                if hit { return all }
+                if hit { return }
             }
-            return nil
+        }
+        // A window opened at a chunk's start: the indexer's text ran on past it, so its content cutter
+        // ran here even where what is left would fit one chunk - which `chunk` returns whole, uncut.
+        // The cutter directly first; then `chunk`, for a text that did fit (a short file, a page of a
+        // short PDF) and for the grid.
+        let params = Self.cutterParams(settings)
+        func keepAnchored(_ text: String) {
+            var hit = false
+            for p in ContentChunker.cut(text, params) {
+                let k = ChunkKey.text(p.text, cutter: fingerprint, dim: embedder.dim)
+                out[k] = p.text
+                if wanted.contains(k) { got.insert(k); hit = true }
+            }
+            if !hit { keep(text, origin: .opaque, wholeDocument: false) }
+        }
+        // Cuts from every place `a`'s snippet starts between byte offsets lo and hi of `text`, each
+        // ending at the content cut and at each of `ends` it reaches. True once `a` is found.
+        func anchored(_ a: ChunkAnchor, _ text: UnsafeBufferPointer<UInt8>, lo: Int, hi: Int, ends: [Int]) -> Bool {
+            guard !a.snippet.isEmpty else { return false }
+            // A snippet can open many places (a repeated paragraph, boilerplate); what a start yields
+            // depends only on the bytes from it to its reach, so each distinct stretch is cut once.
+            var seen: Set<Data> = []
+            for s in Self.anchorStarts(Array(a.snippet.utf8), in: text, from: lo, to: hi) {
+                let reach = Swift.min(text.count, s + span)
+                let tail = ends.filter { $0 > s && $0 < reach }.map { $0 - s }
+                var sig = Data(UnsafeBufferPointer(rebasing: text[s ..< reach]))
+                for t in tail { withUnsafeBytes(of: t) { sig.append(contentsOf: $0) } }
+                guard seen.insert(sig).inserted else { continue }
+                for e in tail.map({ $0 + s }) + [reach] {
+                    let cut = Self.scalarFloor(text, e)
+                    guard cut > s else { continue }
+                    keepAnchored(String(decoding: UnsafeBufferPointer(rebasing: text[s ..< cut]), as: UTF8.self))
+                    if got.contains(a.key) { return true }
+                }
+            }
+            return false
         }
         if FileExtractor.pdfExtensions.contains(ext) {
             guard let doc = PDFDocument(url: url), doc.pageCount > 0 else { return [:] }
-            // Pages assembled exactly as extraction and the turns assemble them; each page read once.
-            var pageText: [Int: String] = [:]
-            func pages(_ r: Range<Int>) -> (String, [Int]) {
-                var text = "", starts: [Int] = []
-                for i in r {
-                    starts.append(text.count)
-                    let s = pageText[i] ?? autoreleasepool { doc.page(at: i)?.string ?? "" }
-                    pageText[i] = s
-                    text += s
-                    if !s.hasSuffix("\n") { text += "\n" }
-                }
-                return (text, starts)
-            }
             let n = doc.pageCount
-            if locator.hasPrefix("Page "), let p = Int(locator.dropFirst(5)), p >= 1, p <= n {
-                // Windows around the hit's page. Starting at the page itself, then up to three before:
-                // a chunk that OPENS a turn was cut from that turn's first page, which only a window
-                // starting there reproduces, and any other chunk is reproduced by one starting earlier
-                // once the cut finds its first shared boundary. Ending one page after the hit's, then
-                // at the hit's own: a chunk that CLOSES a turn ends where the turn stopped reading,
-                // not at a boundary of its own, and only a window ending there gives that end.
-                for end in Set([Swift.min(n, p + 1), p]).sorted(by: >) {
-                    for start in stride(from: p - 1, through: Swift.max(0, p - 4), by: -1) where start < end {
-                        let (t, s) = pages(start ..< end)
-                        if let hit = find(t, .paged(s), wholeDocument: false) { return hit }
+            // Pages as extraction and the turns assemble them, each read once.
+            var pages: [Int: [UInt8]] = [:]
+            func page(_ i: Int) -> [UInt8] {
+                if let b = pages[i] { return b }
+                var s = autoreleasepool { doc.page(at: i)?.string ?? "" }
+                if !s.hasSuffix("\n") { s += "\n" }
+                let b = Array(s.utf8)
+                pages[i] = b
+                return b
+            }
+            for a in anchors where !got.contains(a.key) {
+                guard a.locator.hasPrefix("Page "), let p = Int(a.locator.dropFirst(5)), p >= 1, p <= n else { continue }
+                // Its locator is the page holding most of it, so it starts on that page or within a
+                // chunk's length before it; the window runs a chunk's length past it for the cut.
+                var first = p - 1, before = 0
+                while first > 0, before < span { first -= 1; before += page(first).count }
+                var bytes: [UInt8] = [], ends: [Int] = [], startLimit = 0, last = first
+                while last < n, last <= p - 1 || bytes.count - startLimit < span {
+                    bytes += page(last); ends.append(bytes.count)
+                    if last == p - 1 { startLimit = bytes.count }
+                    last += 1
+                }
+                _ = bytes.withUnsafeBufferPointer { anchored(a, $0, lo: 0, hi: startLimit, ends: ends) }
+            }
+            // A snippet stored empty has nothing to find: a short document is cut whole, as before.
+            if anchors.contains(where: { !got.contains($0.key) && $0.snippet.isEmpty }), n <= 60 {
+                var text = "", starts: [Int] = []
+                for i in 0 ..< n { starts.append(text.count); text += String(decoding: page(i), as: UTF8.self) }
+                keep(text, origin: .paged(starts), wholeDocument: true)
+                if anchors.contains(where: { !got.contains($0.key) }) { keep(text, origin: .paged(starts), wholeDocument: false) }
+            }
+            return out
+        }
+        // A text file the stream reads (past its first window): untrimmed, to its end or its cut.
+        if FileExtractor.textExtensions.contains(ext),
+           let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int,
+           size > Swift.min(Self.firstWindowBytes, FileExtractor.maxTextBytes),
+           let data = try? Data(contentsOf: url, options: .alwaysMapped) {
+            let limit = Swift.min(data.count, Self.readLimit(size: size, ext: ext, settings: settings))
+            data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+                guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+                // At a cut the stream drops a character split by it.
+                let end = limit < data.count ? Self.scalarFloor(UnsafeBufferPointer(start: base, count: data.count), limit) : limit
+                let all = UnsafeBufferPointer(start: base, count: end)
+                // The end as the stream saw it, and as the extractor trimmed it (an index from before
+                // files past 64 KB were streamed keeps those keys for every file not edited since).
+                var trimmed = all.count
+                while trimmed > 0, [0x20, 0x09, 0x0A, 0x0B, 0x0C, 0x0D].contains(all[trimmed - 1]) { trimmed -= 1 }
+                let ends = trimmed < all.count ? [trimmed] : []
+                for a in anchors where !got.contains(a.key) {
+                    // Near its line, then anywhere in what was read.
+                    if a.locator.hasPrefix("Line "), let line = Int(a.locator.dropFirst(5)) {
+                        let (lo, hi) = Self.lineSpan(all, from: line - 1, through: line + 1)
+                        if anchored(a, all, lo: lo, hi: hi, ends: ends) { continue }
+                        if String(bytes: UnsafeBufferPointer(rebasing: all[lo ..< hi]), encoding: .utf8) == nil {
+                            // Not UTF-8 there: the stream decoded that window as Latin-1. Read it the same way.
+                            let decoded = Array(Self.streamDecodedText(UnsafeRawBufferPointer(all), cut: limit < data.count).utf8)
+                            var tEnd = decoded.count
+                            while tEnd > 0, [0x20, 0x09, 0x0A, 0x0B, 0x0C, 0x0D].contains(decoded[tEnd - 1]) { tEnd -= 1 }
+                            _ = decoded.withUnsafeBufferPointer { b in
+                                anchored(a, b, lo: 0, hi: b.count, ends: tEnd < b.count ? [tEnd] : [])
+                            }
+                            continue
+                        }
                     }
+                    _ = anchored(a, all, lo: 0, hi: all.count, ends: ends)
                 }
             }
-            guard n <= 60 else { return [:] }
-            let (t, s) = pages(0 ..< n)
-            return find(t, .paged(s), wholeDocument: true) ?? find(t, .paged(s), wholeDocument: false) ?? [:]
-        }
-        // A text file past the extraction cap was streamed to its end in windows; the extractor's text
-        // stops at 2 MB. The cut is started at the hit's line instead: the cutter lands its cuts on
-        // line starts, so a cut beginning at the chunk's first line reproduces it, and the next
-        // boundaries follow from the bytes alone. The line before is tried too, for a cut that fell
-        // mid-line.
-        if FileExtractor.textExtensions.contains(ext), locator.hasPrefix("Line "), let line = Int(locator.dropFirst(5)),
-           let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int, size > FileExtractor.maxTextBytes,
-           let data = try? Data(contentsOf: url, options: .alwaysMapped) {
-            for from in [line, line - 1] where from >= 1 {
-                guard let window = Self.textWindow(data, fromLine: from, bytes: 16 * Swift.max(1, settings.maxCharsPerChunk)) else { continue }
-                if let hit = find(window, .plain, wholeDocument: false) { return hit }
-            }
-            return [:]
+            return out
         }
         switch try? FileExtractor.extract(url) {
         case .text(let t)?:
-            return find(t, FileExtractor.textExtensions.contains(ext) ? .plain : .opaque, wholeDocument: true) ?? [:]
+            keep(t, origin: FileExtractor.textExtensions.contains(ext) ? .plain : .opaque, wholeDocument: true)
         case .pagedText(let t, let s)?:
-            return find(t, .paged(s), wholeDocument: true) ?? [:]
+            keep(t, origin: .paged(s), wholeDocument: true)
         default:
-            return [:]
+            break
         }
+        return out
     }
 
-    /// UTF-8 text from the start of line `fromLine` (1-based), about `bytes` long, from mapped data.
-    static func textWindow(_ data: Data, fromLine: Int, bytes: Int) -> String? {
-        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> String? in
-            let p = raw.bindMemory(to: UInt8.self)
-            guard let base = p.baseAddress else { return nil }
-            var line = 1, i = 0
-            while line < fromLine, i < p.count {
-                guard let nl = memchr(base + i, 0x0A, p.count - i) else { return nil }
-                i = UnsafePointer<UInt8>(nl.assumingMemoryBound(to: UInt8.self)) - base + 1
-                line += 1
-            }
-            guard line == fromLine, i < p.count else { return nil }
-            return String(decoding: UnsafeBufferPointer(rebasing: p[i ..< Swift.min(p.count, i + bytes)]), as: UTF8.self)
+    /// The most bytes one chunk can hold, under either cutter: past it a window's first piece is
+    /// the content cut, whatever follows. A character is at most four bytes; the line snap adds its
+    /// search distance.
+    static func maxChunkBytes(_ settings: IndexSettings) -> Int {
+        let p = cutterParams(settings)
+        return (Swift.max(p.maxChars, settings.maxCharsPerChunk) + 1) * 4 + p.lineSnapWindow + 4
+    }
+
+    /// `at`, moved back to the start of the character it falls inside.
+    static func scalarFloor(_ b: UnsafeBufferPointer<UInt8>, _ at: Int) -> Int {
+        var i = Swift.min(at, b.count)
+        while i > 0, i < b.count, b[i] & 0xC0 == 0x80 { i -= 1 }
+        return i
+    }
+
+    /// How far a text file is read, from its size and extension: its end, or the 2 MB cut.
+    static func readLimit(size: Int, ext: String, settings: IndexSettings) -> Int {
+        let long = size > FileExtractor.maxTextBytes && FileExtractor.textExtensions.contains(ext)
+        return !long || settings.readLongDataFiles || !dataTextExtensions.contains(ext) ? size : FileExtractor.maxTextBytes
+    }
+
+    /// Byte offsets from the start of line `from` to the end of line `through` (1-based, by "\n").
+    static func lineSpan(_ b: UnsafeBufferPointer<UInt8>, from: Int, through: Int) -> (Int, Int) {
+        guard let base = b.baseAddress, b.count > 0 else { return (0, 0) }
+        var line = 1, i = 0, lo = 0
+        while line <= through, i < b.count {
+            if line == Swift.max(1, from) { lo = i }
+            guard let nl = memchr(base + i, 0x0A, b.count - i) else { i = b.count; break }
+            i = UnsafePointer<UInt8>(nl.assumingMemoryBound(to: UInt8.self)) - base + 1
+            line += 1
         }
+        return (Swift.min(lo, b.count), Swift.min(i, b.count))
+    }
+
+    /// The text the stream decodes from these bytes: a window at a time (the first window, then full
+    /// ones), each UTF-8 when it is and Latin-1 when not, a character split across two windows
+    /// carried over - storeStreamedText's reading, for a file that is not UTF-8 throughout.
+    static func streamDecodedText(_ raw: UnsafeRawBufferPointer, cut: Bool) -> String {
+        var text = "", undecoded = Data(), offset = 0
+        while offset < raw.count {
+            let w = Swift.min(offset == 0 ? firstWindowBytes : FileExtractor.maxTextBytes, raw.count - offset)
+            undecoded.append(contentsOf: UnsafeRawBufferPointer(rebasing: raw[offset ..< offset + w]))
+            offset += w
+            let (decoded, rest) = decodeTextWindow(undecoded, final: offset >= raw.count && !cut)
+            text += decoded
+            undecoded = rest
+        }
+        return text
+    }
+
+    /// Where text whose snippet is `snippet` can start, searched from `lo` to `hi`: each place the
+    /// snippet matches with a run of newlines and tabs read as one space - the way the snippet was
+    /// made - and, since a snippet drops the newlines its chunk opens with, the start of each such
+    /// run just before a match too. Every place, however many: the caller cuts each distinct one once.
+    static func anchorStarts(_ snippet: [UInt8], in b: UnsafeBufferPointer<UInt8>, from lo: Int, to hi: Int) -> [Int] {
+        guard let base = b.baseAddress, !snippet.isEmpty, lo < hi else { return [] }
+        // Length of the newline or tab character at i, 0 if none (Character.isNewline, and "\t").
+        @inline(__always) func run(_ i: Int) -> Int {
+            let c = b[i]
+            if c == 0x09 || (c >= 0x0A && c <= 0x0D) { return 1 }
+            if c == 0xC2, i + 1 < b.count, b[i + 1] == 0x85 { return 2 }
+            if c == 0xE2, i + 2 < b.count, b[i + 1] == 0x80, b[i + 2] == 0xA8 || b[i + 2] == 0xA9 { return 3 }
+            return 0
+        }
+        func matches(at m: Int) -> Bool {
+            var i = m, j = 0
+            while j < snippet.count {
+                guard i < b.count else { return false }
+                let r = run(i)
+                if r > 0 {
+                    guard snippet[j] == 0x20 else { return false }
+                    i += r
+                    while i < b.count, run(i) > 0 { i += run(i) }
+                } else {
+                    guard b[i] == snippet[j] else { return false }
+                    i += 1
+                }
+                j += 1
+            }
+            return true
+        }
+        var out: [Int] = []
+        let first = snippet[0]
+        var m = lo
+        while m < hi {
+            if first != 0x20 {
+                guard let hit = memchr(base + m, Int32(first), hi - m) else { break }
+                m = UnsafePointer<UInt8>(hit.assumingMemoryBound(to: UInt8.self)) - base
+            }
+            if run(m) == 0, matches(at: m) {
+                out.append(m)
+                var back = m
+                while back > 0 {
+                    var step = 0
+                    if b[back - 1] == 0x09 || (b[back - 1] >= 0x0A && b[back - 1] <= 0x0D) { step = 1 }
+                    else if back >= 2, b[back - 2] == 0xC2, b[back - 1] == 0x85 { step = 2 }
+                    else if back >= 3, b[back - 3] == 0xE2, b[back - 2] == 0x80, b[back - 1] == 0xA8 || b[back - 1] == 0xA9 { step = 3 }
+                    guard step > 0 else { break }
+                    back -= step
+                    out.append(back)
+                }
+            }
+            m += 1
+        }
+        return out
     }
 
     /// CONTENT-DEFINED CHUNKING, the generation-2 cutter. ON.
@@ -899,6 +1061,7 @@ public final class Indexer: @unchecked Sendable {
                       onProgress: @escaping (IndexProgress) -> Void) {
         beginChunkReuse(settings)
         retextLargeFiles = store.metaGet(Self.textStreamMetaKey) != Self.longTextPolicy(settings)
+        recutDataFiles = !settings.readLongDataFiles && store.metaGet(Self.textCutMetaKey) != "1"
         queue.sync { cancelled = false; cancelReason = .discard }
         var p = IndexProgress()
         // The known-files snapshot is an O(rows) walk of the resident row table that shares no
@@ -2166,7 +2329,7 @@ public final class Indexer: @unchecked Sendable {
 
     /// How far a text file is read: its end, or the 2 MB cut.
     static func readLimit(_ file: CrawledFile, settings: IndexSettings) -> Int {
-        readsToEnd(file, settings: settings) ? file.size : Swift.min(file.size, FileExtractor.maxTextBytes)
+        file.isPhoto ? file.size : readLimit(size: file.size, ext: file.ext.lowercased(), settings: settings)
     }
 
     /// TAKES TURNS: a plain-text file past the first window, read a window at a time with the rest
@@ -2227,9 +2390,19 @@ public final class Indexer: @unchecked Sendable {
     }
     /// Read at the start of each pass (see index()).
     var retextLargeFiles = false
+    /// ONE-TIME REPAIR of long data files read before the cut decoded correctly (decodeTextWindow):
+    /// while this key is not set, every log, .json and .jsonl past 2 MB under the cut is read again -
+    /// its unchanged chunks keep their vectors, the ones decoded as Latin-1 are cut and embedded
+    /// again. The app sets it when a full pass completes, as it does `textStreamMetaKey`.
+    public static let textCutMetaKey = "text_cut_utf8"
+    var recutDataFiles = false
 
     /// Bytes to text, keeping a UTF-8 sequence split by the read for the next one. Not UTF-8 at all:
     /// Latin-1, as the whole-file read always did.
+    /// `final`: these bytes run to the END OF THE FILE. A read that stopped at the 2 MB cut of a long
+    /// data file is not final: a character split there is dropped like any window's, where taking the
+    /// cut for the end decoded the whole last window - 1.9 MB of an agent's log - as Latin-1 the
+    /// moment the cut fell inside a character (index.md, "Passages").
     static func decodeTextWindow(_ d: Data, final: Bool) -> (text: String, rest: Data) {
         if d.isEmpty { return ("", Data()) }
         if let s = String(data: d, encoding: .utf8) { return (s, Data()) }
@@ -2399,7 +2572,7 @@ public final class Indexer: @unchecked Sendable {
                 offset += UInt64(data.count)
                 let eof = data.isEmpty || offset >= limit
                 undecoded.append(data)
-                let (decoded, rest) = Self.decodeTextWindow(undecoded, final: eof)
+                let (decoded, rest) = Self.decodeTextWindow(undecoded, final: eof && limit >= UInt64(file.size))
                 undecoded = rest
                 let text = carry + decoded
                 var pieces = text.isEmpty ? [] : chunk(text, settings: settings, origin: .plain, filterOpaque: false)
@@ -2781,7 +2954,7 @@ public final class Indexer: @unchecked Sendable {
         let eof = data.isEmpty || c.offset + UInt64(data.count) >= limit
         var undecoded = c.undecoded
         undecoded.append(data)
-        let (decoded, rest) = Self.decodeTextWindow(undecoded, final: eof)
+        let (decoded, rest) = Self.decodeTextWindow(undecoded, final: eof && limit >= UInt64(file.size))
         let text = c.carry + decoded
         var pieces = text.isEmpty ? [] : chunk(text, settings: settings, origin: .plain, filterOpaque: false)
         let carry = (!eof && !pieces.isEmpty) ? pieces.removeLast().text : ""
@@ -2929,8 +3102,9 @@ public final class Indexer: @unchecked Sendable {
     func streamedPieces(_ file: CrawledFile, settings: IndexSettings) -> [TextPiece]? {
         guard let handle = try? FileHandle(forReadingFrom: file.url) else { return nil }
         defer { try? handle.close() }
-        let data = (try? handle.read(upToCount: Self.readLimit(file, settings: settings))) ?? Data()
-        let text = Self.decodeTextWindow(data, final: true).text
+        let limit = Self.readLimit(file, settings: settings)
+        let data = (try? handle.read(upToCount: limit)) ?? Data()
+        let text = Self.decodeTextWindow(data, final: limit >= file.size).text
         return text.isEmpty ? [] : OpaqueText.filter(streamCut(text, settings: settings)) { $0.text }
     }
 
@@ -2958,7 +3132,7 @@ public final class Indexer: @unchecked Sendable {
             offset += UInt64(data.count)
             let eof = data.isEmpty || offset >= limit
             undecoded.append(data)
-            let (decoded, rest) = Self.decodeTextWindow(undecoded, final: eof)
+            let (decoded, rest) = Self.decodeTextWindow(undecoded, final: eof && limit >= UInt64(item.file.size))
             undecoded = rest
             let text = carry + decoded
             var pieces = text.isEmpty ? [] : streamCut(text, settings: settings)
@@ -3482,6 +3656,7 @@ public final class Indexer: @unchecked Sendable {
                 let unchanged = !force && ((known[file.path].map {
                     $0.modified == file.modified && $0.size == file.size
                 } ?? false) && !(self.retextLargeFiles && Self.isLongText(file))
+                    && !(self.recutDataFiles && Self.isLongText(file) && Self.dataTextExtensions.contains(file.ext.lowercased()))
                     && !self.streams.inProgress(file.path)
                     || self.quarantine.contains(path: file.path, modified: file.modified, size: file.size))
                 if self.isCancelled || unchanged {
@@ -3827,7 +4002,9 @@ public final class Indexer: @unchecked Sendable {
         // other. Measured on a 212k-file index: 9 key groups / 35 files aliased that way, all
         // append-only session logs from 4.2 MB to 18.0 MB carrying one embedding between them.
         // Genuinely identical copies still dedup - equal bytes implies equal size.
-        return "2|\(category.rawValue)|\(ext)|m\(dim)|s\(file.size)|\(fp)|\(digest)"
+        // u8: text under the cut is decoded with the character the cut splits dropped, not the whole
+        // last window as Latin-1 (decodeTextWindow) - a file's old rows must not be copied back to it.
+        return "2|\(category.rawValue)|\(ext)|m\(dim)|s\(file.size)|\(fp)\(cut ? "|u8" : "")|\(digest)"
     }
 
     /// Streaming SHA-256 of a file's first `cap` bytes (whole file when cap covers it).

@@ -162,35 +162,24 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     func passages(for hits: [(path: String, chunk: Int, locator: String)], query: String, vector: [Float]?, width: Int) -> [String?] {
         guard let recovery = passageRecovery, width > 0, !hits.isEmpty else { return hits.map { _ in nil } }
         let t0 = omniPerfEnabled ? Date() : nil
-        let texts = recovery.texts(hits)
-        let tRecovered = Date()
-        var out = [String?](repeating: nil, count: hits.count)
-        var long: [(i: Int, text: String)] = []
-        for (i, t) in texts.enumerated() {
-            guard let t else { continue }
-            if t.count <= width { out[i] = t } else { long.append((i, t)) }
-        }
-        guard !long.isEmpty else { return out }
         let q = vector ?? engine.embedQuery(query)
-        var windowCount = 0
-        let best = PassageWindow.best(long.map(\.text), width: width, query: q, cache: recovery.windowVectors) { windows in
-            windowCount += windows.count
+        var windows = 0
+        let out = recovery.passages(hits, query: q, width: width, budgetMs: PassageRecovery.servedBudgetMs, shed: true) { ws in
+            windows += ws.count
             var vecs: [[Float]] = []
             var i = 0
-            while i < windows.count {   // a forward per group, as embedBatch groups a client's batch
-                let end = min(i + groupCap, windows.count)
-                vecs += engine.embedPassages(Array(windows[i ..< end]), waiting: true)
+            while i < ws.count {   // a forward per group, as embedBatch groups a client's batch
+                let end = min(i + groupCap, ws.count)
+                vecs += engine.embedPassages(Array(ws[i ..< end]), waiting: true)
                 i = end
             }
             return vecs
         }
-        for (k, l) in long.enumerated() { out[l.i] = best[k] }
         if let t0 {
-            omniPerfLog(String(format: "passages hits=%d recovered=%d windowed=%d windows=%d recover=%.0fms windows=%.0fms",
-                               hits.count, texts.compactMap { $0 }.count, long.count, windowCount,
-                               tRecovered.timeIntervalSince(t0) * 1000, -tRecovered.timeIntervalSinceNow * 1000))
+            omniPerfLog(String(format: "passages hits=%d shown=%d windows=%d total=%.0fms",
+                               hits.count, out.compactMap { $0 }.count, windows, -t0.timeIntervalSinceNow * 1000))
         }
-        return out
+        return out.map { $0?.text }
     }
 
     /// RECORDED TOO. Ranking passages within named files is a search the user did not type, which

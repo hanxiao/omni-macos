@@ -13129,34 +13129,47 @@ public final class VectorStore: @unchecked Sendable {
     /// 46 ms a search under load, more than the search. Paths come from search hits, so they are
     /// already the stored spelling.
     public func chunkKeys(paths: [String], only: [String: Set<Int>]? = nil) -> [String: [Int: String]] {
+        chunkAnchors(paths: paths, only: only).mapValues { $0.mapValues(\.key) }
+    }
+
+    /// What passage recovery needs of each chunk asked for: its key, its locator and the snippet it
+    /// was stored with - the chunk's opening, which says exactly where in the file the chunk starts.
+    public func chunkAnchors(wanted: [String: Set<Int>]) -> [String: [Int: ChunkAnchor]] {
+        chunkAnchors(paths: Array(wanted.keys), only: wanted)
+    }
+
+    public func chunkAnchors(paths: [String], only: [String: Set<Int>]? = nil) -> [String: [Int: ChunkAnchor]] {
         guard !paths.isEmpty else { return [:] }
         return onReader(interactiveLane, [:]) { h in
             let sql = splitBuilt ? """
-                SELECT o.ordinal, c.key FROM occurrence o JOIN chunk c ON c.id = o.chunk_id
+                SELECT o.ordinal, c.key, o.locator, s.snippet FROM occurrence o JOIN chunk c ON c.id = o.chunk_id
+                  LEFT JOIN chunk_snippet s ON s.chunk_id = c.id
                  WHERE o.file_id = \(StoreSchema.fileIDByPath);
                 """ : """
-                SELECT c.chunk_index, t.chunk_key FROM chunks c JOIN chunk_text t ON t.chunk_id = c.id
+                SELECT c.chunk_index, t.chunk_key, t.locator, t.snippet FROM chunks c JOIN chunk_text t ON t.chunk_id = c.id
                  WHERE c.file_id = \(StoreSchema.fileIDByPath);
                 """
             var st: OpaquePointer?
             defer { sqlite3_finalize(st) }
             guard sqlite3_prepare_v2(h, sql, -1, &st, nil) == SQLITE_OK else { return [:] }
-            var out: [String: [Int: String]] = [:]
+            var out: [String: [Int: ChunkAnchor]] = [:]
             for path in Set(paths) {
                 sqlite3_reset(st); sqlite3_clear_bindings(st)
                 let (dir, name) = StoreSchema.splitPath(path)
                 sqlite3_bind_text(st, 1, dir, -1, SQLITE_TRANSIENT)
                 sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT)
-                var keys: [Int: String] = [:]
+                var anchors: [Int: ChunkAnchor] = [:]
                 let wanted = only?[path]
                 while sqlite3_step(st) == SQLITE_ROW {
                     let ord = Int(sqlite3_column_int(st, 0))
                     if let wanted, !wanted.contains(ord) { continue }
                     let n = Int(sqlite3_column_bytes(st, 1))
                     guard n > 0, let p = sqlite3_column_blob(st, 1) else { continue }
-                    keys[ord] = Self.hex(UnsafeRawBufferPointer(start: p, count: n))
+                    anchors[ord] = ChunkAnchor(key: Self.hex(UnsafeRawBufferPointer(start: p, count: n)),
+                                               snippet: sqlite3_column_text(st, 3).map { String(cString: $0) } ?? "",
+                                               locator: sqlite3_column_text(st, 2).map { String(cString: $0) } ?? "")
                 }
-                out[path] = keys
+                out[path] = anchors
             }
             return out
         }

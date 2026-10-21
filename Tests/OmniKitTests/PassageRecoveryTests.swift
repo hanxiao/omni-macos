@@ -168,6 +168,94 @@ final class PassageRecoveryTests: XCTestCase {
         for (_, _, t) in late { if let t { XCTAssertTrue(text.contains(t)) } }
     }
 
+    // MARK: - Found by its opening (real files that the windows around a locator lost)
+
+    private func missing(_ all: [(Int, String, String?)]) -> [String] { all.filter { $0.2 == nil }.map { "\($0.0)@\($0.1)" } }
+
+    /// Past 64 KB a text file is read by the stream, untrimmed; the extractor trims a file's ends,
+    /// so its last chunk (and a first one after blank lines) was cut from different text.
+    func testTheEndsOfAStreamedTextFileComeBack() throws {
+        let text = "\n\n  " + prose(1600) + "\n\n"
+        XCTAssertGreaterThan(text.utf8.count, Indexer.firstWindowBytes)
+        let file = root.appendingPathComponent("journal.md")
+        try text.write(to: file, atomically: true, encoding: .utf8)
+        let (indexer, store) = try indexed()
+        defer { store.close() }
+        let all = recoverAll(file.path, indexer, store)
+        XCTAssertGreaterThan(all.count, 20)
+        XCTAssertEqual(missing(all), [], "chunks not recovered")
+    }
+
+    /// Lines longer than a chunk (an agent's .jsonl log: 178,000 characters a line on this Mac): the
+    /// chunks inside a line start nowhere near its beginning. A long .jsonl keeps the 2 MB cut; a
+    /// .txt is read to its end.
+    func testChunksInsideLongLinesComeBack() throws {
+        let words = ["tool_call", "result", "assistant", "content", "tokens", "latency", "thinking", "session"]
+        for (name, total) in [("trajectory.jsonl", 2_600_000), ("export.txt", 2_300_000)] {
+            var text = ""
+            var i = 0
+            while text.utf8.count < total {
+                let line = "{\"turn\": \(i), \"text\": \"" + (0 ..< 9_000).map { words[(i * 7 + $0 * 3 + $0 / 11) % words.count] + "\($0 % 97)" }.joined(separator: " ") + "\"}"
+                text += line + "\n"
+                i += 1
+            }
+            try text.write(to: root.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        let (indexer, store) = try indexed()
+        defer { store.close() }
+        for name in ["trajectory.jsonl", "export.txt"] {
+            let path = root.appendingPathComponent(name).path
+            let keys = store.chunkKeys(path: path), locators = store.chunkLocators(path: path)
+            let sample = keys.keys.sorted().enumerated().filter { $0.offset % 7 == 0 }.map(\.element)
+            XCTAssertGreaterThan(sample.count, 100, name)
+            // One hit at a time, as searches ask: nothing a neighbour's cut left behind helps.
+            var lost: [String] = []
+            for c in sample {
+                let r = PassageRecovery(indexer: indexer, store: store, settings: IndexSettings())
+                if r.texts([(path, c, locators[c] ?? "")])[0] == nil { lost.append("\(c)@\(locators[c] ?? "")") }
+            }
+            XCTAssertEqual(lost, [], "\(name): chunks not recovered")
+        }
+    }
+
+    /// A long PDF of short, uneven pages: a chunk spans several pages, starts well before the page
+    /// that holds most of it, and the document is past the 60 pages a whole-document cut covered.
+    /// Indexed in turns first, then - changed - in one pass, which cuts it differently.
+    func testEveryChunkOfASparseLongPDFComesBackInTurnsAndInOnePass() throws {
+        let pages = (0 ..< 150).map { p in prose(2 + (p * 7) % 11, salt: "q\(p)") }
+        XCTAssertGreaterThan(pages.joined().utf8.count, Indexer.firstWindowBytes)
+        let file = root.appendingPathComponent("contract.pdf")
+        pdf(pages, at: file)
+        let (indexer, store) = try indexed()
+        let all = recoverAll(file.path, indexer, store)
+        XCTAssertGreaterThan(all.count, 30)
+        XCTAssertEqual(missing(all), [], "in turns: chunks not recovered")
+        store.close()
+        // Changed: indexed again, in one pass.
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(60)], ofItemAtPath: file.path)
+        let (indexer2, store2) = try indexed()
+        defer { store2.close() }
+        let again = recoverAll(file.path, indexer2, store2)
+        XCTAssertGreaterThan(again.count, 30)
+        XCTAssertEqual(missing(again), [], "in one pass: chunks not recovered")
+    }
+
+    /// Not UTF-8 (Latin-1), and Windows line ends: the stream decodes and the snippet collapses them
+    /// its own way, and recovery has to read them the same way.
+    func testLatin1AndCRLFTextFilesComeBack() throws {
+        let latin = prose(1400).replacingOccurrences(of: "sail", with: "voil\u{E9}") + " caf\u{E9}"
+        try latin.data(using: .isoLatin1)!.write(to: root.appendingPathComponent("legacy.txt"))
+        let crlf = (0 ..< 1400).map { "Row \($0): " + prose(1, salt: "r\($0)") }.joined(separator: "\r\n") + "\r\n"
+        try crlf.write(to: root.appendingPathComponent("windows.txt"), atomically: true, encoding: .utf8)
+        let (indexer, store) = try indexed()
+        defer { store.close() }
+        for name in ["legacy.txt", "windows.txt"] {
+            let all = recoverAll(root.appendingPathComponent(name).path, indexer, store)
+            XCTAssertGreaterThan(all.count, 20, name)
+            XCTAssertEqual(missing(all), [], "\(name): chunks not recovered")
+        }
+    }
+
     func testAFileGoneOrNotTextIsNil() throws {
         let file = root.appendingPathComponent("gone.txt")
         try prose(300).write(to: file, atomically: true, encoding: .utf8)
@@ -175,7 +263,7 @@ final class PassageRecoveryTests: XCTestCase {
         defer { store.close() }
         try FileManager.default.removeItem(at: file)
         XCTAssertTrue(recoverAll(file.path, indexer, store).allSatisfy { $0.2 == nil })
-        XCTAssertNil(indexer.recoverChunkText(path: "/nope/x.png", key: "00", locator: "", settings: IndexSettings()))
+        XCTAssertNil(indexer.recoverChunkText(path: "/nope/x.png", anchor: ChunkAnchor(key: "00", snippet: "x", locator: ""), settings: IndexSettings()))
     }
 
     // MARK: - Windows

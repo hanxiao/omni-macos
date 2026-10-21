@@ -14,7 +14,7 @@ OMNI_PERF_LOG=1 OMNI_PERF_SCRIPT_SETTLE=0.6 OMNI_PERF_SCRIPT="$SCRIPT" EXTRA_ARG
 P=$(cat $OUT.dir/pid)
 for i in {1..1800}; do grep -q "script done" $OUT.dir/omni.log 2>/dev/null && break; kill -0 $P 2>/dev/null || break; sleep 1; done
 alive=$(kill -0 $P 2>/dev/null && echo yes || echo NO)
-kill $P 2>/dev/null; sleep 2
+kill $P 2>/dev/null; for i in {1..40}; do kill -0 $P 2>/dev/null || break; sleep 0.5; done   # gone, port free
 python3 - $OUT.dir/footprint.log $OUT.hang $OUT.dir/omni.log <<'PY'
 import sys
 fp=[tuple(map(int,l.split())) for l in open(sys.argv[1]) if l.strip()]

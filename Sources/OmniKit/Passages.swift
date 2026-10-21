@@ -170,6 +170,85 @@ public final class PassageRecovery: @unchecked Sendable {
 
     public func setSettings(_ s: IndexSettings) { lock.lock(); settings = s; lock.unlock() }
 
+    // MARK: - Passages for a ranked list, within a budget
+
+    /// WINDOWS COST WHAT THEIR TEXT COSTS. Embedding is compute-bound - the same text in windows of
+    /// 200, 800 or 1,800 characters takes the same time (winbench: 42, 43, 35-40 ms on an M3 Ultra) -
+    /// so tiling a result's 1,800-character chunk costs ~10 ms here and ten times that on a small
+    /// Mac's GPU, and tiling every result of a real search cost 197 ms p50 (passreal, a fresh index
+    /// of 7,048 real documents). Answers sit at rank 1 for 85% of queries and agents do not page
+    /// (index.md, "Passages"), so the work goes in rank order, as far as `budgetMs` of this Mac's
+    /// measured rate reaches - the first result always - and the rest keep their stored opening.
+    /// Windows already embedded for another query cost nothing.
+    private var charsPerMs = 120.0   // measured from every window embed after the first (EWMA)
+    private var inFlight = 0
+    /// Served requests computing passages at once; past it a request keeps its stored snippets, so
+    /// a burst of agents gets the throughput it had before passages instead of queueing on the GPU.
+    public static let maxInFlight = 2
+    /// Window embedding a served search may spend on its passages, and a result list in the window.
+    public static let servedBudgetMs = 30.0
+    public static let rowsBudgetMs = 2 * servedBudgetMs
+
+    /// The passage each item shows, in order: the item's chunk whole when it fits `width`, else the
+    /// window of it closest to `query`; nil where there is none (media, unrecoverable, past the
+    /// budget, or `shed` and too many already in flight) and the caller keeps the stored snippet.
+    /// `embed` returns nil to abandon the work (a newer search superseded it).
+    public func passages(_ items: [(path: String, chunk: Int, locator: String)], query: [Float], width: Int,
+                         budgetMs: Double, shed: Bool, embed: ([String]) -> [[Float]]?) -> [Passage?] {
+        guard !items.isEmpty, width > 0 else { return items.map { _ in nil } }
+        lock.lock()
+        if shed, inFlight >= Self.maxInFlight { lock.unlock(); return items.map { _ in nil } }
+        inFlight += 1
+        let rate = charsPerMs, chunkChars = settings.maxCharsPerChunk
+        lock.unlock()
+        defer { lock.lock(); inFlight -= 1; lock.unlock() }
+        // In rank order while the estimate fits: a chunk not yet read costs a chunk's tiles and the
+        // two straddling windows; one already read costs the tiles not yet embedded, and those two.
+        let anchors = anchors(items)
+        let budget = budgetMs * rate
+        var chosen: [Int] = [], spent = 0.0
+        for i in items.indices {
+            let cost = Double(unembedded(anchors[i]?.key, width: width) ?? chunkChars) + Double(2 * width)
+            if !chosen.isEmpty, spent + cost > budget { continue }
+            chosen.append(i); spent += cost
+        }
+        let texts = self.texts(chosen.map { items[$0] }, anchors: chosen.map { anchors[$0] })
+        var out = [Passage?](repeating: nil, count: items.count)
+        var long: [(i: Int, text: String)] = []
+        for (j, t) in texts.enumerated() {
+            guard let t else { continue }
+            if t.count <= width { out[chosen[j]] = Passage(text: t, opensChunk: true) } else { long.append((chosen[j], t)) }
+        }
+        guard !long.isEmpty else { return out }
+        var abandoned = false
+        let best = PassageWindow.best(long.map(\.text), width: width, query: query, cache: windowVectors) { ws in
+            let t0 = Date()
+            guard let v = embed(ws) else { abandoned = true; return [] }
+            let ms = -t0.timeIntervalSinceNow * 1000, chars = Double(ws.reduce(0) { $0 + $1.count })
+            if ms > 2, chars > 200 { lock.lock(); charsPerMs = 0.7 * charsPerMs + 0.3 * chars / ms; lock.unlock() }
+            return v
+        }
+        guard !abandoned else { return items.map { _ in nil } }
+        for (k, l) in long.enumerated() { out[l.i] = Passage(text: best[k], opensChunk: l.text.hasPrefix(best[k])) }
+        return out
+    }
+
+    /// Characters of a held chunk's tiles not yet embedded; nil when its text is not held.
+    private func unembedded(_ key: String?, width: Int) -> Int? {
+        guard let key else { return nil }
+        lock.lock(); let text = cache[key]; lock.unlock()
+        guard let text else { return nil }
+        guard text.count > width else { return 0 }
+        return PassageWindow.windows(text, width: width).filter { windowVectors.get($0) == nil }.reduce(0) { $0 + $1.count }
+    }
+
+    private func anchors(_ items: [(path: String, chunk: Int, locator: String)]) -> [ChunkAnchor?] {
+        var wanted: [String: Set<Int>] = [:]
+        for it in items { wanted[it.path, default: []].insert(it.chunk) }
+        let byPath = store.chunkAnchors(wanted: wanted)
+        return items.map { byPath[$0.path]?[$0.chunk] }
+    }
+
     /// Caller holds `lock`.
     private func remember(_ k: String, _ t: String) {
         guard cache[k] == nil else { return }
@@ -186,24 +265,23 @@ public final class PassageRecovery: @unchecked Sendable {
     /// One per item, in order: the chunk's exact text, or nil where there is none to recover - a
     /// media chunk, a file changed or removed since it was indexed, a file not on this Mac.
     public func texts(_ items: [(path: String, chunk: Int, locator: String)]) -> [String?] {
+        texts(items, anchors: anchors(items))
+    }
+
+    private func texts(_ items: [(path: String, chunk: Int, locator: String)], anchors: [ChunkAnchor?]) -> [String?] {
         guard !items.isEmpty else { return [] }
         lock.lock(); let s = settings; lock.unlock()
-        var wanted: [String: Set<Int>] = [:]
-        for it in items { wanted[it.path, default: []].insert(it.chunk) }
-        let keysByPath = store.chunkKeys(wanted: wanted)
-        let keys = items.map { keysByPath[$0.path]?[$0.chunk] }
         var out = [String?](repeating: nil, count: items.count)
         var missing: [Int] = []
         lock.lock()
         for i in items.indices {
-            guard let k = keys[i], !unrecoverable.contains(k) else { continue }
+            guard let k = anchors[i]?.key, !unrecoverable.contains(k) else { continue }
             if let t = cache[k] { out[i] = t } else { missing.append(i) }
         }
         lock.unlock()
         guard !missing.isEmpty else { return out }
-        // By FILE, in parallel: a file is extracted and cut once for all of its hits here, and every
-        // piece of that cut is kept, so the next query's hit in the same file costs a lookup. A PDF
-        // hit whose page window did not hold it is tried again with its own locator.
+        // By FILE, in parallel: a file is opened once for all of its hits here, and every piece the
+        // recovering cuts make is kept, so the next query's hit nearby costs a lookup.
         var byPath: [String: [Int]] = [:]
         for i in missing { byPath[items[i].path, default: []].append(i) }
         let groups = Array(byPath.values)
@@ -212,32 +290,22 @@ public final class PassageRecovery: @unchecked Sendable {
         defer { found.deinitialize(); found.deallocate() }
         let indexer = self.indexer
         DispatchQueue.concurrentPerform(iterations: groups.count) { g in
-            var got: [String: String] = [:]
-            // The locator decides what is cut for a PDF (its page window) and for a text file past the
-            // extraction cap (the line its cut starts on); anything else is cut whole, once.
-            let path = items[groups[g][0]].path, ext = (path as NSString).pathExtension.lowercased()
-            let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int ?? 0
-            let locatorMatters = FileExtractor.pdfExtensions.contains(ext)
-                || (FileExtractor.textExtensions.contains(ext) && size > FileExtractor.maxTextBytes)
-            for i in groups[g] where got[keys[i]!] == nil {
-                let want = Set(groups[g].compactMap { keys[$0] }).subtracting(got.keys)
-                got.merge(indexer.recoverChunkTexts(path: items[i].path, keys: want, locator: items[i].locator, settings: s)) { a, _ in a }
-                if !locatorMatters { break }
-            }
-            found[g] = got
+            let wantedHere = Array(Set(groups[g].compactMap { anchors[$0] }))
+            found[g] = indexer.recoverChunkTexts(path: items[groups[g][0]].path, anchors: wantedHere, settings: s)
         }
         lock.lock()
         for (g, idxs) in groups.enumerated() {
             let pieces = found[g]
             for i in idxs {
-                out[i] = pieces[keys[i]!]
+                let k = anchors[i]!.key
+                out[i] = pieces[k]
                 // A key is the text's digest: what cannot be recovered now never will be, and asking
                 // again re-reads the file for nothing (a 3.6 MB log, every query that hit it).
-                if out[i] == nil, unrecoverable.count < 65_536 { unrecoverable.insert(keys[i]!) }
+                if out[i] == nil, unrecoverable.count < 65_536 { unrecoverable.insert(k) }
             }
-            // Keep the whole cut, a file's worth at most: what the next hit in it will ask for.
+            // Keep what the cuts made, a file's worth at most: what the next hit nearby will ask for.
             guard pieces.values.reduce(0, { $0 + $1.utf8.count }) <= FileExtractor.maxTextBytes else {
-                for i in idxs { if let t = out[i] { remember(keys[i]!, t) } }
+                for i in idxs { if let t = out[i] { remember(anchors[i]!.key, t) } }
                 continue
             }
             for (k, t) in pieces { remember(k, t) }
@@ -245,6 +313,23 @@ public final class PassageRecovery: @unchecked Sendable {
         lock.unlock()
         return out
     }
+}
+
+/// The text a result shows from its chunk, and whether it is the chunk's opening (a window from
+/// further in reads as continued: the window draws it after an ellipsis, as Mail and Spotlight do).
+public struct Passage: Sendable, Equatable {
+    public let text: String
+    public let opensChunk: Bool
+}
+
+/// What recovering a stored chunk's text needs of it: its KEY (the digest of its exact text and its
+/// cutter, which decides), its stored SNIPPET (its opening, which says where in the file it starts)
+/// and its LOCATOR (the page or line to look near first).
+public struct ChunkAnchor: Sendable, Hashable {
+    public let key: String
+    public let snippet: String
+    public let locator: String
+    public init(key: String, snippet: String, locator: String) { self.key = key; self.snippet = snippet; self.locator = locator }
 }
 
 /// A stretch of the text Omni reads from a file, for an agent to read past a search result: the

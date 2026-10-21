@@ -733,9 +733,25 @@ watchdog). Three modes of `Tools/agenteval/agenteval.py`, stdlib only:
   Footprint, interleaved: 3,346 -> 3,336 and 3,330 -> 3,336 MB new, 3,310 -> 3,322 and 3,312 ->
   3,317 MB old, flat in all four (the swing is MLX's cache trim), so no leak; the new build sits
   15-20 MB higher (the passages' two bounded caches).
-- THE FIRST-RESULTS BLOCK IS OLDER THAN THIS WORK AND WAS NOT FIXED. The toolbar's result controls
+- THE FIRST-RESULTS BLOCK, AND HOW IT WAS TAKEN APART (2026-10-21). The toolbar's result controls
   (bookmark, filter, sort/view) are `if` branches on `hasResults`, so every first result set
-  inserts them. `.hidden()` (macOS 15+) on always-present items with stable ids was tried: 2.7 blocks
-  a round at ~170 ms against 2.8 at 184 - the toolbar re-tiles either way and the rest of the
-  window's layout is most of it - and on Tahoe it broke the Liquid Glass grouping after Recents
-  (filter, sort and view squeezed into one pill, a separator under the toolbar). Reverted.
+  inserts them. `.hidden()` (macOS 15+) on always-present items with stable ids was tried first: 2.7
+  blocks a round at ~170 ms against 2.8 at 184, and on Tahoe it broke the Liquid Glass grouping after
+  Recents (filter, sort and view squeezed into one pill, a separator under the toolbar). Reverted.
+  - WHAT THE BLOCK IS (xctrace Time Profiler, main thread, contiguous runs of 100 ms or more): the
+    toolbar's layout 42% of it, SwiftUI updating its items 38% (`updatePlatformItems` - each item's
+    menus built as `NSMenuItem`s - 18%, `addSubview` 21%, viewer configuration 14%), the results
+    view's own layout and graph updates ~25% each. Dropping one item at a time (a measurement build):
+    all three, 17 of 27 search-step blocks at 90 ms or more, median 146; without the filter menu 8,
+    median 106, the rest ~69; without sort/view 3, the rest ~75; without the bookmark 17, median 129.
+    The filter menu and the sort/view group are ~60-75 ms each to insert, the bookmark little.
+  - SO THEY ARRIVE IN TURN: `toolbarHasResults` follows `hasResults` a frame (16 ms) later, and
+    `toolbarShowsSortView` a frame after that, while leaving stays in the results' own frame (spread
+    over frames, a clear only paid for more toolbar passes: 20 clears a run over 100 ms against 3-8).
+    `ContentView` keeps reading `hasResults` - its empty states must not lag. Interleaved UI stress,
+    10 rounds, threshold 100 ms, the build before vs this one: blocks over 100 ms 45/70 vs 22/45, over
+    150 ms 25/21 vs 0/0, max 210/226 vs 139/121 ms, total blocked 6.8/9.2 vs 2.4/4.9 s; in the typing
+    and search steps 10-11 blocks a step at 152-178 ms mean vs 1-3 at 102-124. The settled toolbar
+    is pixel-identical in results, cleared, folder, Recents and search-after-Recents (the caret aside).
+  - LEFT AS IT WAS: switching grid and list (~110 ms, both builds alike) and an occasional Find
+    Similar, arrow key or browse just over 100 ms.

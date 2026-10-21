@@ -78,7 +78,7 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (845 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (850 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|delfolders|
@@ -91,7 +91,13 @@ codebase were already measured there, and many were rejected.
 - Search QUALITY: `omni-verify evalbed /Volumes/han2tb/omni-eval` once, then `omni-verify eval <model>
   /Volumes/han2tb/omni-eval [--json out] [--tag t]` - 125 labeled queries through the app's
   own search, scored at the right place and the right file. Any ranking change is judged here, A/B on
-  the same cached index; baselines in docs/notes/roadmap.md.
+  the same cached index; baselines in docs/notes/roadmap.md. `--queries Tools/eval/queries-generated.json`
+  adds 315 known-item and 40 absent queries; `--distractors ~/Documents,~/Downloads,~/Desktop` indexes
+  the bed beside real documents (a real-scale yardstick; the index stays local, nothing is sent).
+- Passages at real scale (index.md, "Passages at real scale"): `omni-verify passreal <model> <index
+  clone>` (the served step's cost and recovery on real files), `recovercheck <model> <scratch> <files>`
+  (index files fresh, recover every chunk alone), `winbench <model> <tree>` (window embedding cost).
+  Scan-text reader A/B: `visionab <dir>` on `Tools/ocr/make_vision_pages.py` pages.
 - What an AGENT gets (testing.md, "The agent eval"): `Tools/agenteval/serve-eval.sh <bed> <new dir>
   [app]` starts an isolated instance on the eval testbed, then `uv run Tools/agenteval/agenteval.py
   probe|load|agent --bed /Volumes/han2tb/omni-eval`. `probe` is the deterministic A/B for anything

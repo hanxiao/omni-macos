@@ -5437,11 +5437,241 @@ if args.count >= 4 && args[1] == "nameconcat" {
 // Times the three query SHAPES separately, because the fusion change does different amounts of
 // work in each: a prose query never opens the name channel, a bare filename query opens it with
 // 24 candidates, and a `filename:` clause is now a SCOPE and opens it with 512.
+// Apple Vision's two document readers on pages of known text: omni-verify visionab <dir>
+// <dir> holds name.png + name.txt (Tools/ocr/make_vision_pages.py). VNRecognizeTextRequest as Omni
+// reads scans today (ScreenText) against RecognizeDocumentsRequest (macOS 26), same settings:
+// character error rate on whitespace-normalized text, an order-free token F1 (words; characters
+// for Chinese and Japanese) that does not charge a reader for a different column order, and ms.
+if args.count >= 3 && args[1] == "visionab" {
+    let dir = URL(fileURLWithPath: args[2])
+    func norm(_ s: String) -> [Unicode.Scalar] {
+        Array(s.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ").unicodeScalars)
+    }
+    func cer(_ ref: String, _ hyp: String) -> Double {
+        let a = norm(ref), b = norm(hyp)
+        guard !a.isEmpty else { return 0 }
+        var prev = Array(0 ... b.count), cur = [Int](repeating: 0, count: b.count + 1)
+        for i in 1 ... a.count {
+            cur[0] = i
+            for j in 1 ... max(1, b.count) where j <= b.count {
+                cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1))
+            }
+            if b.isEmpty { cur[0] = i }
+            swap(&prev, &cur)
+        }
+        return Double(prev[b.count]) / Double(a.count)
+    }
+    func tokens(_ s: String, cjk: Bool) -> [String: Int] {
+        var out: [String: Int] = [:]
+        let units = cjk ? s.filter { !$0.isWhitespace }.map(String.init) : s.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        for u in units { out[u, default: 0] += 1 }
+        return out
+    }
+    func f1(_ ref: String, _ hyp: String, cjk: Bool) -> Double {
+        let r = tokens(ref, cjk: cjk), h = tokens(hyp, cjk: cjk)
+        let hit = r.reduce(0) { $0 + min($1.value, h[$1.key] ?? 0) }
+        let nr = r.values.reduce(0, +), nh = h.values.reduce(0, +)
+        guard nr > 0, nh > 0, hit > 0 else { return 0 }
+        let p = Double(hit) / Double(nh), rc = Double(hit) / Double(nr)
+        return 2 * p * rc / (p + rc)
+    }
+    let names = try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { $0.hasSuffix(".png") }.sorted()
+    var sums: [String: (cer: Double, f1: Double, ms: [Double])] = ["text": (0, 0, []), "docs": (0, 0, [])]
+    print("page                 text: CER    F1    ms    docs: CER    F1    ms")
+    for name in names {
+        let stem = String(name.dropLast(4))
+        let ref = try String(contentsOf: dir.appendingPathComponent(stem + ".txt"), encoding: .utf8)
+        guard let src = CGImageSourceCreateWithURL(dir.appendingPathComponent(name) as CFURL, nil),
+              let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { continue }
+        let cjk = stem.hasPrefix("zh") || stem.hasPrefix("ja")
+        _ = ScreenText.recognize(img)   // warm both before timing
+        var t = Date(); let a = ScreenText.recognize(img); let msA = -t.timeIntervalSinceNow * 1000
+        var b = "", msB = 0.0
+        if #available(macOS 26.0, *) {
+            var req = RecognizeDocumentsRequest()
+            req.textRecognitionOptions.automaticallyDetectLanguage = true
+            req.textRecognitionOptions.useLanguageCorrection = false
+            _ = try? await req.perform(on: img)
+            t = Date()
+            let obs = (try? await req.perform(on: img)) ?? []
+            msB = -t.timeIntervalSinceNow * 1000
+            b = obs.map { $0.document.text.transcript }.joined(separator: "\n")
+        }
+        let ca = cer(ref, a), cb = cer(ref, b), fa = f1(ref, a, cjk: cjk), fb = f1(ref, b, cjk: cjk)
+        sums["text"]!.cer += ca; sums["text"]!.f1 += fa; sums["text"]!.ms.append(msA)
+        sums["docs"]!.cer += cb; sums["docs"]!.f1 += fb; sums["docs"]!.ms.append(msB)
+        print(String(format: "%-20@  %6.3f %5.3f %5.0f      %6.3f %5.3f %5.0f", stem as NSString, ca, fa, msA, cb, fb, msB))
+    }
+    let n = Double(names.count)
+    for k in ["text", "docs"] {
+        let s = sums[k]!, ms = s.ms.sorted()
+        print(String(format: "%@  mean CER %.3f  mean F1 %.3f  p50 %.0f ms  max %.0f ms", k == "text" ? "VNRecognizeTextRequest  " : "RecognizeDocumentsRequest",
+                     s.cer / n, s.f1 / n, ms[ms.count / 2], ms.last!))
+    }
+    exit(0)
+}
+
+// Does recovery reproduce what THIS build indexed? omni-verify recovercheck <model> <scratch dir> <file>...
+// Copies the files into <scratch dir>/tree, indexes them with the current code (text only, default
+// settings), then recovers every stored chunk as one search hit would: a fresh PassageRecovery each
+// time, so nothing cached from a neighbour helps. A miss here is a recovery bug, not a stale index.
+if args.count >= 5 && args[1] == "recovercheck" {
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    // A capped buffer cache, as the app keeps one: uncapped, MLX held 240 GB through one long index.
+    MLX.Memory.cacheLimit = 2 << 30
+    let base = URL(fileURLWithPath: args[3]), tree = base.appendingPathComponent("tree")
+    try FileManager.default.createDirectory(at: tree, withIntermediateDirectories: true)
+    for f in args[4...] {
+        let dst = tree.appendingPathComponent((f as NSString).lastPathComponent)
+        if !FileManager.default.fileExists(atPath: dst.path) { try FileManager.default.copyItem(atPath: f, toPath: dst.path) }
+    }
+    let store = try VectorStore(dbURL: base.appendingPathComponent("index.sqlite"))
+    let idx = Indexer(store: store, embedder: engine)
+    var settings = IndexSettings(enabledKinds: [.text])
+    settings.ignore = OmniIgnore(text: OmniIgnore.hiddenRule)
+    let t0 = Date()
+    await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+        let done = NSLock(); var fired = false
+        idx.index(roots: [tree], settings: settings, force: false) { p in
+            if p.done { done.lock(); let go = !fired; fired = true; done.unlock(); if go { cont.resume() } }
+        }
+    }
+    print(String(format: "indexed in %.1f s", -t0.timeIntervalSinceNow))
+    let files = (try FileManager.default.contentsOfDirectory(atPath: tree.path)).sorted()
+    for name in files {
+        let path = tree.appendingPathComponent(name).path
+        let locs = store.chunkLocators(path: path), keys = store.chunkKeys(path: path)
+        // Text chunks only: a PDF with no text layer is stored as page pictures, which have no text to recover.
+        let textual = Set((store.storedChunks(path: path) ?? []).filter { $0.kind == "text" }.map(\.chunkIndex))
+        let chunks = keys.keys.sorted().filter { textual.contains($0) }
+        if chunks.isEmpty { continue }
+        let sample = chunks.count <= 40 ? chunks : stride(from: 0, to: chunks.count, by: max(1, chunks.count / 40)).map { chunks[$0] }
+        var got = 0, ms: [Double] = [], missed: [String] = []
+        for c in sample {
+            let r = PassageRecovery(indexer: idx, store: store, settings: settings)
+            let t = Date()
+            let text = r.texts([(path: path, chunk: c, locator: locs[c] ?? "")])[0]
+            ms.append(-t.timeIntervalSinceNow * 1000)
+            if text != nil { got += 1 } else { missed.append("#\(c) \(locs[c] ?? "-")") }
+        }
+        ms.sort()
+        print(String(format: "  %@: %d chunks, recovered %d/%d sampled, p50 %.0f ms max %.0f ms%@", name, chunks.count, got, sample.count,
+                     ms.isEmpty ? 0 : ms[ms.count / 2], ms.last ?? 0, missed.isEmpty ? "" : "  missed: " + missed.prefix(8).joined(separator: ", ")))
+    }
+    store.close()
+    exit(0)
+}
+
+// Passages at real scale: omni-verify passreal <model> <index clone> [width]
+// The served search's passage step (PassageRecovery + PassageWindow) on a real index's top text hits:
+// how many recover, and what recovery and windows cost cold and warm. The testbed's files are small;
+// real ones are long PDFs, big logs and Office documents.
+if args.count >= 4 && args[1] == "passreal" {
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    // A capped buffer cache, as the app keeps one: uncapped, MLX held 240 GB through one long index.
+    MLX.Memory.cacheLimit = 2 << 30
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[3]))
+    defer { store.close() }
+    let width = (args.count >= 5 ? Int(args[4]) : nil) ?? 200
+    let recovery = PassageRecovery(indexer: Indexer(store: store, embedder: engine), store: store, settings: IndexSettings())
+    let probes = ["distributed search index", "coverage claim positions", "the vector file",
+                  "swift test failure", "chunk key content hash", "folder scoped search",
+                  "quantized funnel rerank", "tombstone dead row", "quarterly revenue report",
+                  "how do I cancel a subscription", "lease agreement deposit", "meeting notes action items",
+                  "invoice total due", "flight booking confirmation", "tax return 2025"]
+    var text = SearchFilter(); text.kinds = ["text"]
+    var rows: [(q: String, hits: Int, got: Int, cold: Double, warm: Double, win: Double, windows: Int, exts: String)] = []
+    var missStates: [String: Int] = [:], sameMisses: [String] = []
+    for q in probes {
+        let qv = engine.embedText(q, as: .query)
+        let hits = store.search(qv, filter: text, topK: 10)
+        let items = hits.map { (path: $0.path, chunk: $0.chunkIndex, locator: $0.locator) }
+        var t = Date(); let texts = recovery.texts(items); let cold = -t.timeIntervalSinceNow * 1000
+        t = Date(); _ = recovery.texts(items); let warm = -t.timeIntervalSinceNow * 1000
+        let long = texts.compactMap { $0 }.filter { $0.count > width }
+        var n = 0
+        t = Date()
+        _ = PassageWindow.best(long, width: width, query: qv, cache: recovery.windowVectors) { w in n += w.count; return engine.embedPassages(w, waiting: true) }
+        let win = -t.timeIntervalSinceNow * 1000
+        let exts = Dictionary(grouping: hits.map { ($0.path as NSString).pathExtension.lowercased() }, by: { $0 }).map { "\($0.key):\($0.value.count)" }.sorted().joined(separator: ",")
+        rows.append((q, hits.count, texts.compactMap { $0 }.count, cold, warm, win, n, exts))
+        // A miss on a file changed since it was indexed is by design (the key names the old text).
+        for (h, t) in zip(hits, texts) where t == nil {
+            let m = (try? FileManager.default.attributesOfItem(atPath: h.path))?[.modificationDate] as? Date
+            let state = m == nil ? "gone" : abs(m!.timeIntervalSince1970 - h.modified) > 1 ? "changed" : "SAME-MTIME"
+            missStates[state, default: 0] += 1
+            if state == "SAME-MTIME" { sameMisses.append("\(h.path) [\(h.locator)]") }
+        }
+    }
+    print("misses: \(missStates.sorted { $0.key < $1.key }.map { "\($0.key) \($0.value)" }.joined(separator: ", "))")
+    for m in sameMisses.prefix(12) { print("  unchanged but unrecovered: \(m)") }
+    // OMNI_PASSREAL_BATCH=1: the round-one windows of every query, embedded as served search does (in
+    // order, 48 a forward) against sorted by length first - what padding to the longest costs.
+    if ProcessInfo.processInfo.environment["OMNI_PASSREAL_BATCH"] == "1" {
+        var all: [[String]] = []
+        for q in probes {
+            let qv = engine.embedText(q, as: .query)
+            let hits = store.search(qv, filter: text, topK: 10)
+            let texts = PassageRecovery(indexer: Indexer(store: store, embedder: engine), store: store, settings: IndexSettings())
+                .texts(hits.map { (path: $0.path, chunk: $0.chunkIndex, locator: $0.locator) })
+            all.append(texts.compactMap { $0 }.filter { $0.count > width }.flatMap { PassageWindow.windows($0, width: width) })
+        }
+        for rep in 0 ..< 3 {
+            for sorted in [false, true] {
+                var ms: [Double] = []
+                for ws in all {
+                    let order = sorted ? ws.sorted { $0.utf8.count < $1.utf8.count } : ws
+                    let t = Date()
+                    var i = 0
+                    while i < order.count { let e = min(i + 48, order.count); _ = engine.embedPassages(Array(order[i ..< e]), waiting: true); i = e }
+                    ms.append(-t.timeIntervalSinceNow * 1000)
+                }
+                ms.sort()
+                print(String(format: "  rep %d %@  p50 %.1f ms  max %.1f ms  (%d windows a query)", rep, sorted ? "length-sorted" : "in order     ",
+                             ms[ms.count / 2], ms.last!, all.map(\.count).reduce(0, +) / all.count))
+            }
+        }
+    }
+    // The served step as it ships (PassageRecovery.passages, the served budget, groups of 48 on the
+    // high lane), on a fresh recovery: per query, cold and then warm, and how many results it served.
+    let served = PassageRecovery(indexer: Indexer(store: store, embedder: engine), store: store, settings: IndexSettings())
+    var coldMs: [Double] = [], warmMs: [Double] = [], shownN = 0, hitN = 0
+    for q in probes {
+        let qv = engine.embedText(q, as: .query)
+        let items = store.search(qv, filter: text, topK: 10).map { (path: $0.path, chunk: $0.chunkIndex, locator: $0.locator) }
+        func run() -> [Passage?] {
+            served.passages(items, query: qv, width: width, budgetMs: PassageRecovery.servedBudgetMs, shed: false) { ws in
+                var v: [[Float]] = [], i = 0
+                while i < ws.count { let e = min(i + 48, ws.count); v += engine.embedPassages(Array(ws[i ..< e]), waiting: true); i = e }
+                return v
+            }
+        }
+        var t = Date(); let got = run(); coldMs.append(-t.timeIntervalSinceNow * 1000)
+        t = Date(); _ = run(); warmMs.append(-t.timeIntervalSinceNow * 1000)
+        shownN += got.compactMap { $0 }.count; hitN += items.count
+    }
+    coldMs.sort(); warmMs.sort()
+    print(String(format: "SERVED budget %.0f ms: cold p50 %.1f ms p90 %.1f max %.1f; warm p50 %.1f; passages %d of %d results",
+                 PassageRecovery.servedBudgetMs, coldMs[coldMs.count / 2], coldMs[coldMs.count * 9 / 10], coldMs.last!,
+                 warmMs[warmMs.count / 2], shownN, hitN))
+    for r in rows {
+        print(String(format: "  %-34@ recovered %2d/%2d  cold %7.1f ms  warm %5.1f ms  windows %3d in %6.1f ms  [%@]",
+                     r.q as NSString, r.got, r.hits, r.cold, r.warm, r.windows, r.win, r.exts as NSString))
+    }
+    let cold = rows.map(\.cold).sorted(), win = rows.map(\.win).sorted()
+    print(String(format: "PASSREAL chunks=%d recovered %d/%d  recovery cold p50 %.1f ms max %.1f  warm max %.1f  windows p50 %.1f ms max %.1f",
+                 store.count, rows.map(\.got).reduce(0, +), rows.map(\.hits).reduce(0, +), cold[cold.count / 2], cold.last!,
+                 rows.map(\.warm).max()!, win[win.count / 2], win.last!))
+    exit(0)
+}
+
 // The cost of a served search's passages is the windows it embeds: omni-verify winbench <model> <tree> [width]
 // Real prose from <tree> cut the way PassageWindow cuts it, embedded N at a time as embedPassages does,
 // never the same window twice (nothing is cached), p50 over 15 calls per N.
 if args.count >= 4 && args[1] == "winbench" {
     let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    // A capped buffer cache, as the app keeps one: uncapped, MLX held 240 GB through one long index.
+    MLX.Memory.cacheLimit = 2 << 30
     let width = (args.count >= 5 ? Int(args[4]) : nil) ?? 200
     var pool: [String] = []
     let walker = FileManager.default.enumerator(at: URL(fileURLWithPath: args[3]), includingPropertiesForKeys: nil)

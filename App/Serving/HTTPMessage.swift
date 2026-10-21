@@ -215,10 +215,10 @@ struct HTTPResponse {
     }
 
     /// Build a JSON response from a JSONSerialization-compatible object.
-    static func json(_ obj: Any, status: Int = 200) -> HTTPResponse {
+    static func json(_ obj: Any, status: Int = 200, sortedKeys: Bool = false) -> HTTPResponse {
         let data: Data
         var status = status
-        if let d = try? JSONSerialization.data(withJSONObject: obj, options: []) {
+        if let d = try? JSONSerialization.data(withJSONObject: obj, options: sortedKeys ? [.sortedKeys] : []) {
             data = d
         } else {
             // e.g. a NaN Float slipped into a vector: the payload is garbage, so the status must

@@ -24,6 +24,18 @@ enum MCPAdapter {
     /// spec says the client then accepts or disconnects on. It used to echo whatever was asked -
     /// "2099-01-01" and "bogus" included - so a client believed it had negotiated anything.
     static let supportedVersions = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]
+    /// MODERN revisions: no handshake, no session - every request names its revision and the
+    /// client's capabilities in `_meta`, and the server answers each on its own (2026-07-28). A
+    /// request that carries that metadata is served this way; one that opens with `initialize` is a
+    /// legacy client and is served as before. Both on one endpoint, as the spec allows a dual-era
+    /// server to.
+    static let modernVersions = ["2026-07-28"]
+    static let versionMetaKey = "io.modelcontextprotocol/protocolVersion"
+    static let serverInfoMetaKey = "io.modelcontextprotocol/serverInfo"
+
+    /// The passage width an agent gets by default. 500 was A/B'd against it with real agents: no
+    /// fewer calls, no more answers, more input tokens on 81 of 125 queries (index.md, "Passages").
+    static let defaultSnippet = 200
 
     /// Longest edge of an inlined thumbnail (matches jina-ai/MCP's image handling).
     private static let inlineImageMaxEdge = 800
@@ -145,13 +157,6 @@ enum MCPAdapter {
                                                   message: "use POST; this server does not offer an SSE stream"),
                                      status: 405)
         }
-        // After initialize the client names its revision on every request; one this server does
-        // not speak is a 400, as the spec says.
-        if let v = req.headers["mcp-protocol-version"], !supportedVersions.contains(v) {
-            return HTTPResponse.json(jsonRPCError(id: NSNull(), code: -32600,
-                message: "unsupported MCP-Protocol-Version \(v); supported: \(supportedVersions.joined(separator: ", "))"),
-                status: 400)
-        }
         guard let obj = try? JSONSerialization.jsonObject(with: req.body) else {
             return HTTPResponse.json(jsonRPCError(id: NSNull(), code: -32700, message: "parse error"), status: 400)
         }
@@ -164,6 +169,19 @@ enum MCPAdapter {
         let method = msg["method"] as? String ?? ""
         let id = msg["id"] ?? NSNull()
         let params = msg["params"] as? [String: Any] ?? [:]
+
+        if let version = (params["_meta"] as? [String: Any])?[versionMetaKey] as? String {
+            return await handleModern(req, method: method, id: id, params: params, isNotification: msg["id"] == nil,
+                                      version: version, backend, appVersion: appVersion, sources: sources, surface: surface)
+        }
+        // After initialize the client names its revision on every request; one this server does
+        // not speak is a 400, as the spec says. (A modern request was checked above, against its
+        // `_meta`, so an unknown modern revision gets the error that lists the supported ones.)
+        if let v = req.headers["mcp-protocol-version"], !supportedVersions.contains(v) {
+            return HTTPResponse.json(jsonRPCError(id: NSNull(), code: -32600,
+                message: "unsupported MCP-Protocol-Version \(v); supported: \(supportedVersions.joined(separator: ", "))"),
+                status: 400)
+        }
 
         // Notifications (no id) get a 202 with no body.
         if msg["id"] == nil {
@@ -185,53 +203,11 @@ enum MCPAdapter {
             return result(id: id, [:])
 
         case "tools/list":
-            return result(id: id, ["tools": tools(withSources: sources != nil)])
+            // Sorted keys: the same bytes every launch, so a client's prompt cache holds across them.
+            return HTTPResponse.json(["jsonrpc": "2.0", "id": id, "result": ["tools": tools(withSources: sources != nil)]], sortedKeys: true)
 
         case "tools/call":
-            guard let name = params["name"] as? String else {
-                return HTTPResponse.json(jsonRPCError(id: id, code: -32602, message: "missing tool name"))
-            }
-            let args = params["arguments"] as? [String: Any] ?? [:]
-            // AN ARGUMENT THE TOOL DOES NOT TAKE IS AN ERROR, naming the ones it does. `topK` for
-            // `top_k` - the slip every agent makes - used to be ignored without a word, and the call
-            // ran with the default instead of what was asked.
-            if let schema = tools(withSources: sources != nil).first(where: { $0["name"] as? String == name })?["inputSchema"] as? [String: Any],
-               let props = schema["properties"] as? [String: Any] {
-                let unknown = args.keys.filter { props[$0] == nil }.sorted()
-                if !unknown.isEmpty {
-                    let known = props.keys.sorted().joined(separator: ", ")
-                    return toolError(id: id, "\(name) failed: unknown argument\(unknown.count == 1 ? "" : "s") \(unknown.map { "'\($0)'" }.joined(separator: ", ")); \(name) takes: \(known)")
-                }
-            }
-            // The `omni` command line marks its calls (CLI.md): it gets structuredContent and the
-            // diagnostic blocks marked for stderr. Every other client's answer is unchanged.
-            let cli = (params["_meta"] as? [String: Any])?[cliMetaKey] as? Bool == true
-            let surface: ServedSurface = cli ? .cli : surface
-            switch name {
-            case "search":        return await callSearch(id: id, args: args, backend: backend, sources: sources, surface: surface, cli: cli)
-            case "search_inline", "file_status", "tag_image", "read_file":
-                // Blocking tools, so the whole call runs on the served work queue (see ServedWork).
-                let call = ReadOnlyRequest(id: id, args: args)
-                return await ServedWork.run {
-                    switch name {
-                    case "search_inline": return callSearchInline(id: call.id, args: call.args, backend: backend, surface: surface, cli: cli)
-                    case "file_status":   return callFileStatus(id: call.id, args: call.args, backend: backend, cli: cli)
-                    case "read_file":     return callReadFile(id: call.id, args: call.args, backend: backend, cli: cli)
-                    default:              return callTagImage(id: call.id, args: call.args, backend: backend, cli: cli)
-                    }
-                }
-            case "ocr":           return await callOCR(id: id, args: args, cli: cli)
-            case "get_linked_file":
-                guard let fetch = sources?.linkedFetch else { return toolError(id: id, "get_linked_file failed: Omni is still loading") }
-                return await callLinkedFile(id: id, args: args, fetch: fetch, cli: cli)
-            case "list_sources", "add_source", "pause_source", "remove_source":
-                guard let sources else {
-                    return toolError(id: id, "\(name) failed: indexing control is unavailable (the index is still loading)")
-                }
-                return await callSources(id: id, tool: name, args: args, sources: sources, cli: cli)
-            default:
-                return HTTPResponse.json(jsonRPCError(id: id, code: -32602, message: "unknown tool: \(name)"))
-            }
+            return await callTool(id: id, params: params, backend, sources: sources, surface: surface)
 
         default:
             return HTTPResponse.json(jsonRPCError(id: id, code: -32601, message: "method not found: \(method)"))
@@ -259,7 +235,7 @@ enum MCPAdapter {
                     ],
                     "max_snippet": [
                         "type": "integer",
-                        "description": "Max characters of text shown per result (default 200, max 2000): for a text result, the part of its matching passage closest to the query, or the whole passage when it fits. 0 omits it.",
+                        "description": "Max characters of text shown per result (default \(defaultSnippet), max 2000): for a text result, the part of its matching passage closest to the query, or the whole passage when it fits. 0 omits it.",
                         "minimum": 0, "maximum": 2000
                     ],
                     "include_images": [
@@ -359,7 +335,7 @@ enum MCPAdapter {
         }
         var topK = (args["top_k"] as? Int) ?? 10
         topK = max(1, min(topK, 50))
-        var maxSnippet = (args["max_snippet"] as? Int) ?? 200
+        var maxSnippet = (args["max_snippet"] as? Int) ?? Self.defaultSnippet
         maxSnippet = max(0, min(maxSnippet, 2000))
         let includeImages = (args["include_images"] as? Bool) ?? false
         let (parsed, err) = SearchArgs.filter(args)
@@ -1049,6 +1025,130 @@ enum MCPAdapter {
     }
 
     // MARK: - JSON-RPC envelopes
+
+    /// `tools/call`, for either era: the arguments checked against the tool's schema, then the tool.
+    static func callTool(id: Any, params: [String: Any], _ backend: any ServingBackend,
+                         sources: SourcesControl?, surface: ServedSurface) async -> HTTPResponse {
+        guard let name = params["name"] as? String else {
+            return HTTPResponse.json(jsonRPCError(id: id, code: -32602, message: "missing tool name"))
+        }
+        let args = params["arguments"] as? [String: Any] ?? [:]
+        // AN ARGUMENT THE TOOL DOES NOT TAKE IS AN ERROR, naming the ones it does. `topK` for
+        // `top_k` - the slip every agent makes - used to be ignored without a word, and the call
+        // ran with the default instead of what was asked.
+        if let schema = tools(withSources: sources != nil).first(where: { $0["name"] as? String == name })?["inputSchema"] as? [String: Any],
+           let props = schema["properties"] as? [String: Any] {
+            let unknown = args.keys.filter { props[$0] == nil }.sorted()
+            if !unknown.isEmpty {
+                let known = props.keys.sorted().joined(separator: ", ")
+                return toolError(id: id, "\(name) failed: unknown argument\(unknown.count == 1 ? "" : "s") \(unknown.map { "'\($0)'" }.joined(separator: ", ")); \(name) takes: \(known)")
+            }
+        }
+        // The `omni` command line marks its calls (CLI.md): it gets structuredContent and the
+        // diagnostic blocks marked for stderr. Every other client's answer is unchanged.
+        let cli = (params["_meta"] as? [String: Any])?[cliMetaKey] as? Bool == true
+        let surface: ServedSurface = cli ? .cli : surface
+        switch name {
+        case "search":        return await callSearch(id: id, args: args, backend: backend, sources: sources, surface: surface, cli: cli)
+        case "search_inline", "file_status", "tag_image", "read_file":
+            // Blocking tools, so the whole call runs on the served work queue (see ServedWork).
+            let call = ReadOnlyRequest(id: id, args: args)
+            return await ServedWork.run {
+                switch name {
+                case "search_inline": return callSearchInline(id: call.id, args: call.args, backend: backend, surface: surface, cli: cli)
+                case "file_status":   return callFileStatus(id: call.id, args: call.args, backend: backend, cli: cli)
+                case "read_file":     return callReadFile(id: call.id, args: call.args, backend: backend, cli: cli)
+                default:              return callTagImage(id: call.id, args: call.args, backend: backend, cli: cli)
+                }
+            }
+        case "ocr":           return await callOCR(id: id, args: args, cli: cli)
+        case "get_linked_file":
+            guard let fetch = sources?.linkedFetch else { return toolError(id: id, "get_linked_file failed: Omni is still loading") }
+            return await callLinkedFile(id: id, args: args, fetch: fetch, cli: cli)
+        case "list_sources", "add_source", "pause_source", "remove_source":
+            guard let sources else {
+                return toolError(id: id, "\(name) failed: indexing control is unavailable (the index is still loading)")
+            }
+            return await callSources(id: id, tool: name, args: args, sources: sources, cli: cli)
+        default:
+            return HTTPResponse.json(jsonRPCError(id: id, code: -32602, message: "unknown tool: \(name)"))
+        }
+    }
+
+    // MARK: - The modern revision (2026-07-28)
+
+    /// Who answers, in each modern result's `_meta`.
+    private static func serverInfo(_ appVersion: String) -> [String: Any] {
+        ["name": "omni", "title": "Omni - local semantic file search", "version": appVersion]
+    }
+
+    /// A request carrying its revision in `_meta`: the revision checked, the HTTP headers that mirror
+    /// the body checked against it (Streamable HTTP: a mismatch is refused, so a proxy routing on a
+    /// header cannot be made to run something else), then the method.
+    static func handleModern(_ req: HTTPRequest, method: String, id: Any, params: [String: Any], isNotification: Bool,
+                             version: String, _ backend: any ServingBackend, appVersion: String,
+                             sources: SourcesControl?, surface: ServedSurface) async -> HTTPResponse {
+        guard modernVersions.contains(version) else {
+            return HTTPResponse.json(["jsonrpc": "2.0", "id": id, "error": [
+                "code": -32022, "message": "unsupported protocol version \(version)",
+                "data": ["supported": modernVersions + supportedVersions, "requested": version]]], status: 400)
+        }
+        func mismatch(_ why: String) -> HTTPResponse {
+            HTTPResponse.json(["jsonrpc": "2.0", "id": id, "error": ["code": -32020, "message": why]], status: 400)
+        }
+        guard req.headers["mcp-protocol-version"] == version else {
+            return mismatch("the MCP-Protocol-Version header must be \(version), as the request's _meta says")
+        }
+        guard req.headers["mcp-method"] == method else {
+            return mismatch("the Mcp-Method header must be \(method), as the request's method says")
+        }
+        if ["tools/call", "prompts/get", "resources/read"].contains(method) {
+            let named = (params["name"] as? String) ?? (params["uri"] as? String)
+            guard let header = req.headers["mcp-name"], let decoded = Self.headerValue(header), decoded == named else {
+                return mismatch("the Mcp-Name header must name the same \(method == "resources/read" ? "resource" : "tool") as the request")
+            }
+        }
+        if isNotification { return HTTPResponse(status: 202, headers: ["Content-Type": "application/json"], body: Data()) }
+        let info = serverInfo(appVersion)
+        // Every result says it is complete and who answered; the list results say how long they keep.
+        func complete(_ value: [String: Any]) -> [String: Any] {
+            var v = value
+            v["resultType"] = v["resultType"] ?? "complete"
+            var meta = v["_meta"] as? [String: Any] ?? [:]
+            meta[serverInfoMetaKey] = info
+            v["_meta"] = meta
+            return v
+        }
+        // The tool list changes only when the app wires its source tools, once, while it loads.
+        let ttl = sources == nil ? 5_000 : 300_000
+        switch method {
+        case "server/discover":
+            return HTTPResponse.json(["jsonrpc": "2.0", "id": id, "result": complete([
+                "supportedVersions": modernVersions + supportedVersions,
+                "capabilities": ["tools": [:] as [String: Any]],
+                "instructions": instructions, "ttlMs": ttl, "cacheScope": "private"])], sortedKeys: true)
+        case "tools/list":
+            return HTTPResponse.json(["jsonrpc": "2.0", "id": id, "result": complete([
+                "tools": tools(withSources: sources != nil), "ttlMs": ttl, "cacheScope": "private"])], sortedKeys: true)
+        case "tools/call":
+            let r = await callTool(id: id, params: params, backend, sources: sources, surface: surface)
+            guard var obj = (try? JSONSerialization.jsonObject(with: r.body)) as? [String: Any],
+                  let value = obj["result"] as? [String: Any] else { return r }
+            obj["result"] = complete(value)
+            return HTTPResponse.json(obj, status: r.status)
+        default:
+            // Not in this revision (`ping` and `initialize` belong to the legacy handshake) or not offered.
+            return HTTPResponse.json(jsonRPCError(id: id, code: -32601, message: "method not found: \(method)"), status: 404)
+        }
+    }
+
+    /// A header value as sent, or decoded from the spec's `=?base64?...?=` form (for a value that is
+    /// not plain header-safe ASCII); nil when that form does not decode.
+    static func headerValue(_ raw: String) -> String? {
+        guard raw.hasPrefix("=?base64?"), raw.hasSuffix("?="), raw.count >= 11 else { return raw }
+        let b64 = String(raw.dropFirst(9).dropLast(2))
+        return Data(base64Encoded: b64).flatMap { String(data: $0, encoding: .utf8) }
+    }
 
     private static func result(id: Any, _ value: [String: Any]) -> HTTPResponse {
         HTTPResponse.json(["jsonrpc": "2.0", "id": id, "result": value])

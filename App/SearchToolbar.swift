@@ -384,7 +384,7 @@ struct SearchToolbar: ViewModifier {
         // browser lists indexed children, not filtered results. Inert chrome. (The star stays:
         // bookmarking a browsed folder saves a state you can actually return to.)
         if model.phase == .ready, !model.ocrMode, !showsBrowser, browse != .clipboardOff,
-           model.hasResults || model.filtersActive {
+           model.toolbarHasResults || model.filtersActive {
         // Filter joins sort/view in the trailing placement so on Tahoe the three result controls
         // share ONE Liquid Glass pill (search-by-file + bookmark form the other). filterPlacement
         // keeps filter leading on pre-26 so the Sequoia toolbar layout is unchanged.
@@ -401,10 +401,10 @@ struct SearchToolbar: ViewModifier {
         // VIEW IS BOTH. A listing is a list of things with a name and a date whichever way you
         // arrived at it, and both browsers draw a gallery - which nothing could switch to while
         // the Photos browser was missing from this condition.
-        if model.phase == .ready, !model.ocrMode, showsBrowser, !model.hasResults {
+        if model.phase == .ready, !model.ocrMode, showsBrowser, !model.toolbarHasResults {
             ToolbarItem(id: "browse.view", placement: .primaryAction) { viewPicker }
         }
-        if model.phase == .ready, !model.ocrMode, model.hasResults {
+        if model.phase == .ready, !model.ocrMode, model.toolbarShowsSortView {
         ToolbarItem(placement: .primaryAction) {
             if #available(macOS 26.0, *) {
                 // Tahoe: the inline sort menu + segmented view toggle render and overflow cleanly.

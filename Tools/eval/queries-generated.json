@@ -1,0 +1,2407 @@
+[
+ {
+  "q": "Kamakura Hakone ryokan onsen",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Travel/Tokyo itinerary.md"
+  ]
+ },
+ {
+  "q": "five day Japan trip plan with the Great Buddha and the Romancecar",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Travel/Tokyo itinerary.md"
+  ]
+ },
+ {
+  "q": "Japanreise fünf Tage im Oktober mit Kamakura, Hakone und Onsen",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Travel/Tokyo itinerary.md"
+  ]
+ },
+ {
+  "q": "rental deposit cat allowed",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Home/Lease agreement 2026.docx"
+  ]
+ },
+ {
+  "q": "apartment rental contract with Maria Okafor, rent 2350 dollars a month",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Home/Lease agreement 2026.docx"
+  ]
+ },
+ {
+  "q": "Mietvertrag Wohnung Kaution zwei Monatsmieten, eine Katze erlaubt",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Home/Lease agreement 2026.docx"
+  ]
+ },
+ {
+  "q": "rent increase 1980 to 2050",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Home/Lease renewal 2024.docx"
+  ]
+ },
+ {
+  "q": "notice that my apartment rent went up and the contract was extended a year",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Home/Lease renewal 2024.docx"
+  ]
+ },
+ {
+  "q": "Mieterhöhung und Vertragsverlängerung Harbor Road, keine Haustiere, Parkplatz",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Home/Lease renewal 2024.docx"
+  ]
+ },
+ {
+  "q": "Blue Harbor Printing business cards",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Finance/Invoice INV-2014.txt"
+  ]
+ },
+ {
+  "q": "bill for printed letterhead and business cards with 19 percent VAT",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Finance/Invoice INV-2014.txt"
+  ]
+ },
+ {
+  "q": "Rechnung der Druckerei für Visitenkarten und Briefpapier mit Mehrwertsteuer",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Finance/Invoice INV-2014.txt"
+  ]
+ },
+ {
+  "q": "starter hydration Dutch oven",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Recipes/Sourdough notes.txt"
+  ]
+ },
+ {
+  "q": "how to bake bread with a starter and an overnight fridge proof",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Recipes/Sourdough notes.txt"
+  ]
+ },
+ {
+  "q": "Brot backen mit Anstellgut, 75 Prozent Hydration, Dehnen und Falten",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Recipes/Sourdough notes.txt"
+  ]
+ },
+ {
+  "q": "ripe fruit loaf walnuts",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Recipes/Banana bread.md"
+  ]
+ },
+ {
+  "q": "quick loaf recipe with mashed overripe fruit, melted butter and walnuts",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Recipes/Banana bread.md"
+  ]
+ },
+ {
+  "q": "Rührkuchen in der Kastenform mit zerdrückten reifen Früchten und Walnüssen",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Recipes/Banana bread.md"
+  ]
+ },
+ {
+  "q": "cocoa cake buttermilk coffee ganache",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Recipes/Chocolate cake.md"
+  ]
+ },
+ {
+  "q": "birthday cake recipe for Lea with hot coffee in the batter",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Recipes/Chocolate cake.md"
+  ]
+ },
+ {
+  "q": "Geburtstagskuchen für Lea mit Kakao, Buttermilch und Ganache",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Recipes/Chocolate cake.md"
+  ]
+ },
+ {
+  "q": "tetanus booster hepatitis A",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Health/Vaccination record.txt"
+  ]
+ },
+ {
+  "q": "when is my next tetanus shot due, and where did I get the flu shot",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Health/Vaccination record.txt"
+  ]
+ },
+ {
+  "q": "Wann ist die nächste Tetanus-Auffrischung fällig, Grippeimpfung in der Apotheke",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Health/Vaccination record.txt"
+  ]
+ },
+ {
+  "q": "billing migration launch November 18",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Work/Q3 planning meeting.md"
+  ]
+ },
+ {
+  "q": "decisions about hiring two backend engineers and the November launch date",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Work/Q3 planning meeting.md"
+  ]
+ },
+ {
+  "q": "Protokoll: Wechsel des Zahlungsanbieters, zwei Backend-Entwickler einstellen, Starttermin November",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Work/Q3 planning meeting.md"
+  ]
+ },
+ {
+  "q": "expired TLS certificate payment outage",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Work/Incident report 0417.md"
+  ]
+ },
+ {
+  "q": "why the payment API went down for 47 minutes after certificate renewal failed",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Work/Incident report 0417.md"
+  ]
+ },
+ {
+  "q": "Ausfall der Zahlungs-API wegen abgelaufenem TLS-Zertifikat und fehlendem DNS-Eintrag",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Work/Incident report 0417.md"
+  ]
+ },
+ {
+  "q": "stale search results cache invalidation",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Work/Incident report 0471.md"
+  ]
+ },
+ {
+  "q": "postmortem where customers saw outdated prices after a deploy",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Work/Incident report 0471.md"
+  ]
+ },
+ {
+  "q": "veraltete Suchergebnisse nach Deployment, Cache-Job durch Tippfehler in der Konfiguration deaktiviert",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Work/Incident report 0471.md"
+  ]
+ },
+ {
+  "q": "RAV4 oil change brake pads",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Car/Service history.txt"
+  ]
+ },
+ {
+  "q": "when were the front brake pads replaced and the last oil change done",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Car/Service history.txt"
+  ]
+ },
+ {
+  "q": "Toyota RAV4 Ölwechsel, Bremsbeläge vorne, Wartung nach Kilometerstand",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Car/Service history.txt"
+  ]
+ },
+ {
+  "q": "Civic timing belt battery winter tires",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Car/Honda service.txt"
+  ]
+ },
+ {
+  "q": "when did I replace the car battery and mount winter tires",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Car/Honda service.txt"
+  ]
+ },
+ {
+  "q": "registro de mantenimiento del coche con cambio de batería y neumáticos de invierno",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Car/Honda service.txt"
+  ]
+ },
+ {
+  "q": "Calvin cycle thylakoid RuBisCO",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/School/Photosynthesis study notes.md"
+  ]
+ },
+ {
+  "q": "biology notes on light reactions, ATP NADPH and where oxygen comes from",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/School/Photosynthesis study notes.md"
+  ]
+ },
+ {
+  "q": "apuntes de biología sobre el ciclo de Calvin y la clorofila",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/School/Photosynthesis study notes.md"
+  ]
+ },
+ {
+  "q": "W-2 1099-B mortgage interest 1098",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Taxes/2025 tax checklist.txt"
+  ]
+ },
+ {
+  "q": "list of forms and receipts needed for the April filing, home office deduction",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Taxes/2025 tax checklist.txt"
+  ]
+ },
+ {
+  "q": "documentos para la declaración de impuestos: donaciones, hipoteca y guardería",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Taxes/2025 tax checklist.txt"
+  ]
+ },
+ {
+  "q": "router admin 192.168.1.1 guest network",
+  "tag": "gen-doc",
+  "expect": [
+   "Downloads/Wifi setup.txt"
+  ]
+ },
+ {
+  "q": "home network name and where the mesh satellite is upstairs",
+  "tag": "gen-doc",
+  "expect": [
+   "Downloads/Wifi setup.txt"
+  ]
+ },
+ {
+  "q": "configuración de la red doméstica, el router y la red de invitados",
+  "tag": "gen-doc",
+  "expect": [
+   "Downloads/Wifi setup.txt"
+  ]
+ },
+ {
+  "q": "玉龙雪山 洱海 丽江古城",
+  "tag": "gen-doc",
+  "expect": [
+   "文档/旅行/云南旅行计划.md"
+  ]
+ },
+ {
+  "q": "从昆明出发去大理、丽江和泸沽湖的七天行程，还有酒店订单号",
+  "tag": "gen-doc",
+  "expect": [
+   "文档/旅行/云南旅行计划.md"
+  ]
+ },
+ {
+  "q": "itinerario de siete días por Kunming, Dali, Lijiang y la montaña nevada",
+  "tag": "gen-doc",
+  "expect": [
+   "文档/旅行/云南旅行计划.md"
+  ]
+ },
+ {
+  "q": "第三季度 销售额 同比增长18%",
+  "tag": "gen-doc",
+  "expect": [
+   "文档/工作/季度销售报告.txt"
+  ]
+ },
+ {
+  "q": "华东区占比最大、西南区增长最快的那份季度业绩总结",
+  "tag": "gen-doc",
+  "expect": [
+   "文档/工作/季度销售报告.txt"
+  ]
+ },
+ {
+  "q": "informe de ventas del tercer trimestre con crecimiento del 18 por ciento",
+  "tag": "gen-doc",
+  "expect": [
+   "文档/工作/季度销售报告.txt"
+  ]
+ },
+ {
+  "q": "厨房 橱柜台面 抽油烟机 费用",
+  "tag": "gen-doc",
+  "expect": [
+   "文档/家庭/装修预算.md"
+  ]
+ },
+ {
+  "q": "厨房翻新总共八万元的开支明细，十月中旬开工",
+  "tag": "gen-doc",
+  "expect": [
+   "文档/家庭/装修预算.md"
+  ]
+ },
+ {
+  "q": "presupuesto de reforma de la cocina de ochenta mil yuanes",
+  "tag": "gen-doc",
+  "expect": [
+   "文档/家庭/装修预算.md"
+  ]
+ },
+ {
+  "q": "五花肉 冰糖 炒糖色 收汁",
+  "tag": "gen-doc",
+  "expect": [
+   "文档/菜谱/红烧肉做法.txt"
+  ]
+ },
+ {
+  "q": "五花肉焯水后加老抽和八角小火炖一小时的家常菜",
+  "tag": "gen-doc",
+  "expect": [
+   "文档/菜谱/红烧肉做法.txt"
+  ]
+ },
+ {
+  "q": "receta de panceta de cerdo estofada con azúcar de roca y salsa de soja",
+  "tag": "gen-doc",
+  "expect": [
+   "文档/菜谱/红烧肉做法.txt"
+  ]
+ },
+ {
+  "q": "東福寺 嵐山 竹林 ライトアップ",
+  "tag": "gen-doc",
+  "expect": [
+   "書類/旅行/京都の紅葉旅行.md"
+  ]
+ },
+ {
+  "q": "清水寺と永観堂の夜の見学を含む11月の3日間の旅程",
+  "tag": "gen-doc",
+  "expect": [
+   "書類/旅行/京都の紅葉旅行.md"
+  ]
+ },
+ {
+  "q": "viaje de otoño en noviembre para ver hojas rojas en Arashiyama y templos",
+  "tag": "gen-doc",
+  "expect": [
+   "書類/旅行/京都の紅葉旅行.md"
+  ]
+ },
+ {
+  "q": "新製品 発売日 12月1日 広告予算",
+  "tag": "gen-doc",
+  "expect": [
+   "書類/仕事/議事録 10月.txt"
+  ]
+ },
+ {
+  "q": "大阪支店の移転を来年3月に延期すると決めた会議の記録",
+  "tag": "gen-doc",
+  "expect": [
+   "書類/仕事/議事録 10月.txt"
+  ]
+ },
+ {
+  "q": "acta de la reunión: lanzamiento el 1 de diciembre y más presupuesto de publicidad",
+  "tag": "gen-doc",
+  "expect": [
+   "書類/仕事/議事録 10月.txt"
+  ]
+ },
+ {
+  "q": "牛肉 じゃがいも ルー はちみつ",
+  "tag": "gen-doc",
+  "expect": [
+   "書類/料理/カレーの作り方.md"
+  ]
+ },
+ {
+  "q": "玉ねぎを飴色になるまで炒めてから煮込む4人分の料理の手順",
+  "tag": "gen-doc",
+  "expect": [
+   "書類/料理/カレーの作り方.md"
+  ]
+ },
+ {
+  "q": "receta japonesa de ternera con patatas y zanahoria y un toque de miel",
+  "tag": "gen-doc",
+  "expect": [
+   "書類/料理/カレーの作り方.md"
+  ]
+ },
+ {
+  "q": "한라산 성판악 백록담 우도",
+  "tag": "gen-doc",
+  "expect": [
+   "문서/여행/제주도 여행 계획.md"
+  ]
+ },
+ {
+  "q": "렌터카로 애월 해안도로 드라이브하고 성산일출봉에서 일출 보는 일정",
+  "tag": "gen-doc",
+  "expect": [
+   "문서/여행/제주도 여행 계획.md"
+  ]
+ },
+ {
+  "q": "viaje de cuatro días a la isla con subida al monte Hallasan y amanecer en Seongsan",
+  "tag": "gen-doc",
+  "expect": [
+   "문서/여행/제주도 여행 계획.md"
+  ]
+ },
+ {
+  "q": "입사 첫주 보안 멘토 회식",
+  "tag": "gen-doc",
+  "expect": [
+   "문서/업무/신입사원 교육 일정.txt"
+  ]
+ },
+ {
+  "q": "월요일 회사 소개부터 금요일 회식까지 새로 온 직원 첫 주 계획",
+  "tag": "gen-doc",
+  "expect": [
+   "문서/업무/신입사원 교육 일정.txt"
+  ]
+ },
+ {
+  "q": "programme de la première semaine d'un nouvel employé : sécurité, comptes, mentor et dîner d'équipe",
+  "tag": "gen-doc",
+  "expect": [
+   "문서/업무/신입사원 교육 일정.txt"
+  ]
+ },
+ {
+  "q": "Kaltmiete Kaution Boxhagener Straße",
+  "tag": "gen-doc",
+  "expect": [
+   "Dokumente/Wohnung/Mietvertrag Berlin.txt"
+  ]
+ },
+ {
+  "q": "Vertrag mit Hausverwaltung Kranich, 1150 Euro kalt und drei Monate Kündigungsfrist",
+  "tag": "gen-doc",
+  "expect": [
+   "Dokumente/Wohnung/Mietvertrag Berlin.txt"
+  ]
+ },
+ {
+  "q": "contrat de location deux pièces, loyer 1150 euros, caution payable en trois fois",
+  "tag": "gen-doc",
+  "expect": [
+   "Dokumente/Wohnung/Mietvertrag Berlin.txt"
+  ]
+ },
+ {
+  "q": "Photovoltaik Lagerhalle 42 Module",
+  "tag": "gen-doc",
+  "expect": [
+   "Dokumente/Arbeit/Projektbericht Solaranlage.md"
+  ]
+ },
+ {
+  "q": "Bericht zur PV-Anlage auf dem Hallendach mit 16 kWp und vorbereitetem Batteriespeicher",
+  "tag": "gen-doc",
+  "expect": [
+   "Dokumente/Arbeit/Projektbericht Solaranlage.md"
+  ]
+ },
+ {
+  "q": "panneaux photovoltaïques sur le toit d'un entrepôt, 16 kWc, en attente de validation par le gestionnaire de réseau",
+  "tag": "gen-doc",
+  "expect": [
+   "Dokumente/Arbeit/Projektbericht Solaranlage.md"
+  ]
+ },
+ {
+  "q": "Äpfel Zimt Rosinen Semmelbrösel",
+  "tag": "gen-doc",
+  "expect": [
+   "Dokumente/Rezepte/Apfelstrudel.txt"
+  ]
+ },
+ {
+  "q": "Wie lange backe ich den hauchdünn ausgezogenen Teig mit Apfelfüllung?",
+  "tag": "gen-doc",
+  "expect": [
+   "Dokumente/Rezepte/Apfelstrudel.txt"
+  ]
+ },
+ {
+  "q": "pâte étirée très fine roulée avec pommes, cannelle et raisins secs, 40 minutes à 190 degrés",
+  "tag": "gen-doc",
+  "expect": [
+   "Dokumente/Rezepte/Apfelstrudel.txt"
+  ]
+ },
+ {
+  "q": "Sénanque lavender Gordes Verdon",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Voyages/Week-end en Provence.md"
+  ]
+ },
+ {
+  "q": "July trip plan with Palais des Papes, lavender abbey and a swim in the Verdon gorge",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Voyages/Week-end en Provence.md"
+  ]
+ },
+ {
+  "q": "itinéraire de juillet avec champs de lavande, marché de L'Isle-sur-la-Sorgue et chambre d'hôtes à Roussillon",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Voyages/Week-end en Provence.md"
+  ]
+ },
+ {
+  "q": "cortisone cream eczema",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Santé/Ordonnance dermatologue.txt"
+  ]
+ },
+ {
+  "q": "skin doctor's instructions for eczema cream morning and evening for ten days",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Santé/Ordonnance dermatologue.txt"
+  ]
+ },
+ {
+  "q": "crème à la cortisone pour l'eczéma, éviter les douches chaudes, contrôle dans six semaines",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Santé/Ordonnance dermatologue.txt"
+  ]
+ },
+ {
+  "q": "eggplant zucchini peppers thyme simmer",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Cuisine/Ratatouille.txt"
+  ]
+ },
+ {
+  "q": "French vegetable stew where each vegetable is fried separately in olive oil",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Cuisine/Ratatouille.txt"
+  ]
+ },
+ {
+  "q": "aubergine, courgettes et poivrons revenus séparément puis mijotés avec thym et laurier",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Cuisine/Ratatouille.txt"
+  ]
+ },
+ {
+  "q": "entradas Alhambra código reserva",
+  "tag": "gen-doc",
+  "expect": [
+   "Documentos/Viajes/Ruta por Andalucía.md"
+  ]
+ },
+ {
+  "q": "¿A qué hora son las entradas de la Alhambra en el viaje de primavera?",
+  "tag": "gen-doc",
+  "expect": [
+   "Documentos/Viajes/Ruta por Andalucía.md"
+  ]
+ },
+ {
+  "q": "itinéraire de printemps Séville, Cordoue, Grenade avec billets pour l'Alhambra à 10h30",
+  "tag": "gen-doc",
+  "expect": [
+   "Documentos/Viajes/Ruta por Andalucía.md"
+  ]
+ },
+ {
+  "q": "publicidad redes sociales ferias eventos",
+  "tag": "gen-doc",
+  "expect": [
+   "Documentos/Trabajo/Presupuesto marketing 2026.txt"
+  ]
+ },
+ {
+  "q": "reparto de 100.000 euros entre redes sociales, ferias y vídeo, un 12 % más",
+  "tag": "gen-doc",
+  "expect": [
+   "Documentos/Trabajo/Presupuesto marketing 2026.txt"
+  ]
+ },
+ {
+  "q": "dépenses publicitaires prévues de 100 000 euros entre réseaux sociaux, salons et vidéo pour le lancement d'automne",
+  "tag": "gen-doc",
+  "expect": [
+   "Documentos/Trabajo/Presupuesto marketing 2026.txt"
+  ]
+ },
+ {
+  "q": "Пётр I Табель о рангах",
+  "tag": "gen-doc",
+  "expect": [
+   "Документы/Учёба/Конспект по истории.md"
+  ]
+ },
+ {
+  "q": "заметки о реформах Петра Первого, основании Петербурга и Северной войне",
+  "tag": "gen-doc",
+  "expect": [
+   "Документы/Учёба/Конспект по истории.md"
+  ]
+ },
+ {
+  "q": "notes sur Pierre le Grand, la fondation de Saint-Pétersbourg et la paix de Nystad",
+  "tag": "gen-doc",
+  "expect": [
+   "Документы/Учёба/Конспект по истории.md"
+  ]
+ },
+ {
+  "q": "электроэнергия 412 кВт·ч сентябрь",
+  "tag": "gen-doc",
+  "expect": [
+   "Документы/Дом/Счёт за электричество.txt"
+  ]
+ },
+ {
+  "q": "сколько платить за свет за сентябрь и до какого числа",
+  "tag": "gen-doc",
+  "expect": [
+   "Документы/Дом/Счёт за электричество.txt"
+  ]
+ },
+ {
+  "q": "combien payer pour 412 kWh consommés en septembre, à régler avant le 25 octobre",
+  "tag": "gen-doc",
+  "expect": [
+   "Документы/Дом/Счёт за электричество.txt"
+  ]
+ },
+ {
+  "q": "وادي رم مخيم بدوي",
+  "tag": "gen-doc",
+  "expect": [
+   "مستندات/سفر/رحلة إلى البتراء.txt"
+  ]
+ },
+ {
+  "q": "خطة أربعة أيام في الأردن تشمل السيق والخزنة والدير والعقبة",
+  "tag": "gen-doc",
+  "expect": [
+   "مستندات/سفر/رحلة إلى البتراء.txt"
+  ]
+ },
+ {
+  "q": "itinéraire en Jordanie : le Siq, le Trésor, nuit dans un camp bédouin au Wadi Rum et baignade à Aqaba",
+  "tag": "gen-doc",
+  "expect": [
+   "مستندات/سفر/رحلة إلى البتراء.txt"
+  ]
+ },
+ {
+  "q": "عملاء جدد إعلانات ميزانية",
+  "tag": "gen-doc",
+  "expect": [
+   "مستندات/عمل/خطة التسويق.txt"
+  ]
+ },
+ {
+  "q": "Q1 plan to grow new customers 20% with social ads and local store partnerships",
+  "tag": "gen-doc",
+  "expect": [
+   "مستندات/عمل/خطة التسويق.txt"
+  ]
+ },
+ {
+  "q": "第一季度新客户增长计划，社交媒体广告和本地商店合作，预算五万美元",
+  "tag": "gen-doc",
+  "expect": [
+   "مستندات/عمل/خطة التسويق.txt"
+  ]
+ },
+ {
+  "q": "हवा महल आमेर किला",
+  "tag": "gen-doc",
+  "expect": [
+   "दस्तावेज़/यात्रा/जयपुर यात्रा.txt"
+  ]
+ },
+ {
+  "q": "three day itinerary with Hawa Mahal, Amber Fort and Nahargarh sunset",
+  "tag": "gen-doc",
+  "expect": [
+   "दस्तावेज़/यात्रा/जयपुर यात्रा.txt"
+  ]
+ },
+ {
+  "q": "三天行程：风之宫殿、琥珀堡和纳哈加尔堡看日落",
+  "tag": "gen-doc",
+  "expect": [
+   "दस्तावेज़/यात्रा/जयपुर यात्रा.txt"
+  ]
+ },
+ {
+  "q": "Louvre Montmartre Orsay itinerary",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Travel/Paris weekend.md"
+  ]
+ },
+ {
+  "q": "two-day plan with the Louvre, Marais lunch and Sacre-Coeur before an evening train",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Travel/Paris weekend.md"
+  ]
+ },
+ {
+  "q": "卢浮宫、玛黑区午餐、蒙马特和奥赛博物馆的两天行程",
+  "tag": "gen-doc",
+  "expect": [
+   "Documents/Travel/Paris weekend.md"
+  ]
+ },
+ {
+  "q": "道頓堀 たこ焼き 打ち合わせ 本町",
+  "tag": "gen-doc",
+  "expect": [
+   "書類/旅行/大阪出張.txt"
+  ]
+ },
+ {
+  "q": "client meeting in Honmachi at 2 pm, takoyaki in Dotonbori, shinkansen back to Tokyo",
+  "tag": "gen-doc",
+  "expect": [
+   "書類/旅行/大阪出張.txt"
+  ]
+ },
+ {
+  "q": "下午两点和客户开会，晚上去道顿堀吃章鱼烧，第二天坐新干线回东京",
+  "tag": "gen-doc",
+  "expect": [
+   "書類/旅行/大阪出張.txt"
+  ]
+ },
+ {
+  "q": "quarterly revenue 4.9 million Europe",
+  "tag": "gen-pdf",
+  "expect": [
+   "Documents/Notes/Annual notes 2026.pdf"
+  ]
+ },
+ {
+  "q": "climbing Fuji on the Yoshida trail overnight to see sunrise from the summit",
+  "tag": "gen-pdf",
+  "expect": [
+   "Documents/Notes/Annual notes 2026.pdf"
+  ]
+ },
+ {
+  "q": "走吉田路线夜爬富士山，在八合目小屋休息，山顶看日出",
+  "tag": "gen-pdf",
+  "expect": [
+   "Documents/Notes/Annual notes 2026.pdf"
+  ]
+ },
+ {
+  "q": "Northwind Lindqvist website redesign",
+  "tag": "gen-pdf",
+  "expect": [
+   "Documents/Finance/Invoice INV-2041.pdf"
+  ]
+ },
+ {
+  "q": "bill for website redesign design and front-end work totaling 4,820 euros",
+  "tag": "gen-pdf",
+  "expect": [
+   "Documents/Finance/Invoice INV-2041.pdf"
+  ]
+ },
+ {
+  "q": "网站改版设计和前端开发的账单，总额4820欧元，10月30日前付款",
+  "tag": "gen-pdf",
+  "expect": [
+   "Documents/Finance/Invoice INV-2041.pdf"
+  ]
+ },
+ {
+  "q": "Blue Bottle cappuccino croissant receipt",
+  "tag": "gen-pdf",
+  "expect": [
+   "Scans/Scan 2026-09-14.pdf"
+  ]
+ },
+ {
+  "q": "coffee shop receipt for two cappuccinos and a croissant in Hayes Valley",
+  "tag": "gen-pdf",
+  "expect": [
+   "Scans/Scan 2026-09-14.pdf"
+  ]
+ },
+ {
+  "q": "海斯谷咖啡店小票，两杯卡布奇诺和一个可颂，共16.90美元",
+  "tag": "gen-pdf",
+  "expect": [
+   "Scans/Scan 2026-09-14.pdf"
+  ]
+ },
+ {
+  "q": "card declined payment failed",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-14 at 10.02.11.png"
+  ]
+ },
+ {
+  "q": "checkout error saying my card was declined and the invoice is still unpaid",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-14 at 10.02.11.png"
+  ]
+ },
+ {
+  "q": "结账时银行卡被拒，付款失败，发票仍未支付",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-14 at 10.02.11.png"
+  ]
+ },
+ {
+  "q": "ANA SFO Haneda confirmation",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-20 at 21.15.40.png"
+  ]
+ },
+ {
+  "q": "flight booking from San Francisco to Tokyo Haneda on October 21, seat 32A",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-20 at 21.15.40.png"
+  ]
+ },
+ {
+  "q": "全日空旧金山飞东京羽田的订票确认，10月21日，座位32A",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-20 at 21.15.40.png"
+  ]
+ },
+ {
+  "q": "pip externally-managed-environment numpy",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-22 at 14.30.02.png"
+  ]
+ },
+ {
+  "q": "terminal error installing numpy with pip, then module not found running the script",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-22 at 14.30.02.png"
+  ]
+ },
+ {
+  "q": "终端用pip安装numpy报错，运行Python脚本提示找不到numpy模块",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-22 at 14.30.02.png"
+  ]
+ },
+ {
+  "q": "design review moved Thursday",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-23 at 09.12.55.png"
+  ]
+ },
+ {
+  "q": "chat with Alex about moving the design review to Thursday afternoon",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-23 at 09.12.55.png"
+  ]
+ },
+ {
+  "q": "和Alex的聊天，设计评审改到周四下午三点，原型还没准备好",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-23 at 09.12.55.png"
+  ]
+ },
+ {
+  "q": "heavy rain 18 C southwest wind",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-25 at 07.45.10.png"
+  ]
+ },
+ {
+  "q": "weather for Thursday with a 90 percent chance of rain and strong wind",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-25 at 07.45.10.png"
+  ]
+ },
+ {
+  "q": "木曜日 大雨 降水確率90% 南西の風",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-25 at 07.45.10.png"
+  ]
+ },
+ {
+  "q": "product review meeting room B",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-26 at 16.20.33.png"
+  ]
+ },
+ {
+  "q": "calendar event Thursday 3pm product review with Wang Fang and Li Qiang",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-26 at 16.20.33.png"
+  ]
+ },
+ {
+  "q": "製品レビュー会議 木曜15時 3階会議室B",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-26 at 16.20.33.png"
+  ]
+ },
+ {
+  "q": "Nozomi Tokyo Shin-Osaka seat 12A",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-27 at 08.03.21.png"
+  ]
+ },
+ {
+  "q": "shinkansen booking from Tokyo to Shin-Osaka leaving at ten in the morning",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-27 at 08.03.21.png"
+  ]
+ },
+ {
+  "q": "のぞみ 東京から新大阪 8号車 座席予約",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-27 at 08.03.21.png"
+  ]
+ },
+ {
+  "q": "noise cancelling headphones shipped",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-29 at 19.48.06.png"
+  ]
+ },
+ {
+  "q": "shipping notice for black headphones arriving Friday October 2",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-29 at 19.48.06.png"
+  ]
+ },
+ {
+  "q": "ノイズキャンセリングヘッドホン 発送済み 10月2日到着",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-09-29 at 19.48.06.png"
+  ]
+ },
+ {
+  "q": "Swift cosine similarity function",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-10-01 at 11.11.11.png"
+  ]
+ },
+ {
+  "q": "code that computes the dot product and norms of two float arrays",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-10-01 at 11.11.11.png"
+  ]
+ },
+ {
+  "q": "Swiftでコサイン類似度を計算する関数",
+  "tag": "gen-shot",
+  "expect": [
+   "Desktop/Screenshot 2026-10-01 at 11.11.11.png"
+  ]
+ },
+ {
+  "q": "milk eggs spinach vet Luna",
+  "tag": "gen-audio",
+  "expect": [
+   "Recordings/Voice memo 1.m4a"
+  ]
+ },
+ {
+  "q": "reminder to buy groceries and call the vet about Luna on Friday",
+  "tag": "gen-audio",
+  "expect": [
+   "Recordings/Voice memo 1.m4a"
+  ]
+ },
+ {
+  "q": "牛乳と卵を買って獣医に予約確認の電話をするリマインダー",
+  "tag": "gen-audio",
+  "expect": [
+   "Recordings/Voice memo 1.m4a"
+  ]
+ },
+ {
+  "q": "UA 837 Tokyo flight delayed",
+  "tag": "gen-audio",
+  "expect": [
+   "Recordings/Voice memo 2.m4a"
+  ]
+ },
+ {
+  "q": "airport announcement that the Tokyo flight is two hours late, gate G92",
+  "tag": "gen-audio",
+  "expect": [
+   "Recordings/Voice memo 2.m4a"
+  ]
+ },
+ {
+  "q": "東京行きUA837便 2時間遅延 搭乗口G92のアナウンス",
+  "tag": "gen-audio",
+  "expect": [
+   "Recordings/Voice memo 2.m4a"
+  ]
+ },
+ {
+  "q": "chocolate cocoa buttermilk ganache",
+  "tag": "gen-audio",
+  "expect": [
+   "Recordings/Cake recipe.m4a"
+  ]
+ },
+ {
+  "q": "baking steps with flour, sugar, cocoa and hot coffee at 175 degrees",
+  "tag": "gen-audio",
+  "expect": [
+   "Recordings/Cake recipe.m4a"
+  ]
+ },
+ {
+  "q": "ココアとコーヒーを使ったチョコ生地 175度で30分焼く",
+  "tag": "gen-audio",
+  "expect": [
+   "Recordings/Cake recipe.m4a"
+  ]
+ },
+ {
+  "q": "new version launch 15th marketing materials",
+  "tag": "gen-audio",
+  "expect": [
+   "录音/会议纪要.m4a"
+  ]
+ },
+ {
+  "q": "meeting decided the new release goes live next month, testing done by Friday",
+  "tag": "gen-audio",
+  "expect": [
+   "录音/会议纪要.m4a"
+  ]
+ },
+ {
+  "q": "新バージョン来月15日リリース決定 金曜までにテスト完了",
+  "tag": "gen-audio",
+  "expect": [
+   "录音/会议纪要.m4a"
+  ]
+ },
+ {
+  "q": "Tokyo rain tomorrow umbrella",
+  "tag": "gen-audio",
+  "expect": [
+   "録音/天気予報.m4a"
+  ]
+ },
+ {
+  "q": "spoken report that Tokyo gets rain all day, high 18 and low 13",
+  "tag": "gen-audio",
+  "expect": [
+   "録音/天気予報.m4a"
+  ]
+ },
+ {
+  "q": "東京 終日雨 最高18度 最低13度 傘",
+  "tag": "gen-audio",
+  "expect": [
+   "録音/天気予報.m4a"
+  ]
+ },
+ {
+  "q": "water shut off Tuesday basement pipes",
+  "tag": "gen-audio",
+  "expect": [
+   "Aufnahmen/Mailbox Hausverwaltung.m4a"
+  ]
+ },
+ {
+  "q": "building manager message about no water Tuesday from nine to twelve",
+  "tag": "gen-audio",
+  "expect": [
+   "Aufnahmen/Mailbox Hausverwaltung.m4a"
+  ]
+ },
+ {
+  "q": "火曜日 断水 9時から12時 地下の配管修理",
+  "tag": "gen-audio",
+  "expect": [
+   "Aufnahmen/Mailbox Hausverwaltung.m4a"
+  ]
+ },
+ {
+  "q": "Sol metro Calle Mayor pharmacy",
+  "tag": "gen-audio",
+  "expect": [
+   "Grabaciones/Indicaciones restaurante.m4a"
+  ]
+ },
+ {
+  "q": "how to walk from Sol station, turn right after the plaza next to the pharmacy",
+  "tag": "gen-audio",
+  "expect": [
+   "Grabaciones/Indicaciones restaurante.m4a"
+  ]
+ },
+ {
+  "q": "ソル駅からマヨール通りを歩いて薬局の隣の店への道順",
+  "tag": "gen-audio",
+  "expect": [
+   "Grabaciones/Indicaciones restaurante.m4a"
+  ]
+ },
+ {
+  "q": "electricity bill 3450 rubles",
+  "tag": "gen-audio",
+  "expect": [
+   "Записи/Напоминание.m4a"
+  ]
+ },
+ {
+  "q": "voice note about paying the electric bill before October 25th",
+  "tag": "gen-audio",
+  "expect": [
+   "Записи/Напоминание.m4a"
+  ]
+ },
+ {
+  "q": "10월 25일까지 전기 요금 3450루블 납부",
+  "tag": "gen-audio",
+  "expect": [
+   "Записи/Напоминание.m4a"
+  ]
+ },
+ {
+  "q": "team meeting postponed Wednesday",
+  "tag": "gen-audio",
+  "expect": [
+   "تسجيلات/رسالة صوتية.m4a"
+  ]
+ },
+ {
+  "q": "audio saying the team meeting moved to Wednesday at 10 am in the big hall",
+  "tag": "gen-audio",
+  "expect": [
+   "تسجيلات/رسالة صوتية.m4a"
+  ]
+ },
+ {
+  "q": "팀 회의 수요일 오전 10시 대회의실로 연기",
+  "tag": "gen-audio",
+  "expect": [
+   "تسجيلات/رسالة صوتية.m4a"
+  ]
+ },
+ {
+  "q": "Gangnam Korean restaurant Saturday",
+  "tag": "gen-audio",
+  "expect": [
+   "녹음/저녁 약속.m4a"
+  ]
+ },
+ {
+  "q": "plans to eat at a Korean restaurant near Gangnam station Saturday at 7",
+  "tag": "gen-audio",
+  "expect": [
+   "녹음/저녁 약속.m4a"
+  ]
+ },
+ {
+  "q": "토요일 일곱 시 강남역 근처 한식당 예약",
+  "tag": "gen-audio",
+  "expect": [
+   "녹음/저녁 약속.m4a"
+  ]
+ },
+ {
+  "q": "coral bleaching polyps algae",
+  "tag": "gen-audio",
+  "expect": [
+   "Recordings/Lecture on oceans.m4a"
+  ]
+ },
+ {
+  "q": "talk explaining hydrothermal vents, giant tube worms and the Gulf Stream",
+  "tag": "gen-audio",
+  "expect": [
+   "Recordings/Lecture on oceans.m4a"
+  ]
+ },
+ {
+  "q": "산호초 백화 현상과 심해 열수구, 해류 설명",
+  "tag": "gen-audio",
+  "expect": [
+   "Recordings/Lecture on oceans.m4a"
+  ]
+ },
+ {
+  "q": "penguin photo",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0412.heic"
+  ]
+ },
+ {
+  "q": "picture of a penguin, the black and white flightless bird",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0412.heic"
+  ]
+ },
+ {
+  "q": "펭귄 사진",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0412.heic"
+  ]
+ },
+ {
+  "q": "zebra stripes",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0413.heic"
+  ]
+ },
+ {
+  "q": "photo of a zebra with its black and white stripes",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0413.heic"
+  ]
+ },
+ {
+  "q": "얼룩말 사진",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0413.heic"
+  ]
+ },
+ {
+  "q": "eagle bird of prey",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0418.heic"
+  ]
+ },
+ {
+  "q": "picture of an eagle, the big bird of prey",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0418.heic"
+  ]
+ },
+ {
+  "q": "독수리 사진",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0418.heic"
+  ]
+ },
+ {
+  "q": "owl picture",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0421.heic"
+  ]
+ },
+ {
+  "q": "photo of an owl, the nocturnal bird with big eyes",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0421.heic"
+  ]
+ },
+ {
+  "q": "올빼미 사진",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0421.heic"
+  ]
+ },
+ {
+  "q": "colorful parrot",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0430.heic"
+  ]
+ },
+ {
+  "q": "picture of a parrot, the brightly colored tropical bird",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0430.heic"
+  ]
+ },
+ {
+  "q": "앵무새 사진",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0430.heic"
+  ]
+ },
+ {
+  "q": "violin photo",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0502.heic"
+  ]
+ },
+ {
+  "q": "picture of a violin, the small bowed string instrument",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0502.heic"
+  ]
+ },
+ {
+  "q": "바이올린 사진",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0502.heic"
+  ]
+ },
+ {
+  "q": "guitar picture",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0503.heic"
+  ]
+ },
+ {
+  "q": "photo of a guitar with six strings",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0503.heic"
+  ]
+ },
+ {
+  "q": "기타 악기 사진",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0503.heic"
+  ]
+ },
+ {
+  "q": "piano keys",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0504.heic"
+  ]
+ },
+ {
+  "q": "picture of a piano with its black and white keyboard",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0504.heic"
+  ]
+ },
+ {
+  "q": "피아노 사진",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0504.heic"
+  ]
+ },
+ {
+  "q": "drum percussion photo",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0505.heic"
+  ]
+ },
+ {
+  "q": "picture of a drum, the percussion instrument",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0505.heic"
+  ]
+ },
+ {
+  "q": "фото барабана, ударный музыкальный инструмент",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0505.heic"
+  ]
+ },
+ {
+  "q": "turntable vinyl record player",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0506.heic"
+  ]
+ },
+ {
+  "q": "photo of a record player with a vinyl disc on it",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0506.heic"
+  ]
+ },
+ {
+  "q": "фото проигрывателя виниловых пластинок",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2025/IMG_0506.heic"
+  ]
+ },
+ {
+  "q": "planet earth globe",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1001.heic"
+  ]
+ },
+ {
+  "q": "image of our planet Earth seen as a globe",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1001.heic"
+  ]
+ },
+ {
+  "q": "снимок планеты Земля, земной шар",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1001.heic"
+  ]
+ },
+ {
+  "q": "lightning bolt thunderstorm",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1002.heic"
+  ]
+ },
+ {
+  "q": "photo of a lightning strike in a stormy sky",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1002.heic"
+  ]
+ },
+ {
+  "q": "фото молнии во время грозы",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1002.heic"
+  ]
+ },
+ {
+  "q": "spiky cactus desert plant",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1003.heic"
+  ]
+ },
+ {
+  "q": "picture of a prickly green cactus with spines",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1003.heic"
+  ]
+ },
+ {
+  "q": "фото колючего кактуса",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1003.heic"
+  ]
+ },
+ {
+  "q": "snowflake ice crystal",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1004.heic"
+  ]
+ },
+ {
+  "q": "close-up of a single snowflake showing its crystal pattern",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1004.heic"
+  ]
+ },
+ {
+  "q": "снежинка крупным планом, ледяной кристалл",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1004.heic"
+  ]
+ },
+ {
+  "q": "bird nest twigs",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1005.heic"
+  ]
+ },
+ {
+  "q": "photo of a bird's nest woven from small twigs",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1005.heic"
+  ]
+ },
+ {
+  "q": "фото птичьего гнезда из веточек",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1005.heic"
+  ]
+ },
+ {
+  "q": "green leaf close-up",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1006.heic"
+  ]
+ },
+ {
+  "q": "picture of a single leaf with visible veins",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1006.heic"
+  ]
+ },
+ {
+  "q": "фото зелёного листа крупным планом",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1006.heic"
+  ]
+ },
+ {
+  "q": "sand dollar beach shell",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1007.heic"
+  ]
+ },
+ {
+  "q": "image of a flat round sand dollar found on the beach",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1007.heic"
+  ]
+ },
+ {
+  "q": "плоский морской ёж на песке, песчаный доллар",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1007.heic"
+  ]
+ },
+ {
+  "q": "zen stones calm",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1008.heic"
+  ]
+ },
+ {
+  "q": "peaceful zen picture with smooth balanced stones for meditation",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1008.heic"
+  ]
+ },
+ {
+  "q": "дзен камни, спокойная картинка для медитации",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1008.heic"
+  ]
+ },
+ {
+  "q": "sunflower yellow petals",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1101.heic"
+  ]
+ },
+ {
+  "q": "photo of a big sunflower head with bright yellow petals",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1101.heic"
+  ]
+ },
+ {
+  "q": "фото подсолнуха с жёлтыми лепестками",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1101.heic"
+  ]
+ },
+ {
+  "q": "yellow daisy flower",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1102.heic"
+  ]
+ },
+ {
+  "q": "picture of a yellow daisy blossom in bloom",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1102.heic"
+  ]
+ },
+ {
+  "q": "фото жёлтой ромашки",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1102.heic"
+  ]
+ },
+ {
+  "q": "lotus flower photo",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1103.heic"
+  ]
+ },
+ {
+  "q": "picture of a pink lotus blossom floating on water",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1103.heic"
+  ]
+ },
+ {
+  "q": "Foto einer Lotusblüte auf dem Wasser",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1103.heic"
+  ]
+ },
+ {
+  "q": "red rose bloom",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1104.heic"
+  ]
+ },
+ {
+  "q": "close-up photo of a single red rose flower",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1104.heic"
+  ]
+ },
+ {
+  "q": "Nahaufnahme einer roten Rose",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1104.heic"
+  ]
+ },
+ {
+  "q": "dandelion yellow weed",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1105.heic"
+  ]
+ },
+ {
+  "q": "that shot of a dandelion flower in the grass",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1105.heic"
+  ]
+ },
+ {
+  "q": "Bild von einer Pusteblume oder Löwenzahn",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1105.heic"
+  ]
+ },
+ {
+  "q": "poppy red petals",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1106.heic"
+  ]
+ },
+ {
+  "q": "photo of a red poppy flower with dark center",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1106.heic"
+  ]
+ },
+ {
+  "q": "Foto einer roten Mohnblume",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1106.heic"
+  ]
+ },
+ {
+  "q": "dahlia blossom",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1107.heic"
+  ]
+ },
+ {
+  "q": "picture of a dahlia with many layered petals",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1107.heic"
+  ]
+ },
+ {
+  "q": "Bild einer Dahlie mit vielen Blütenblättern",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1107.heic"
+  ]
+ },
+ {
+  "q": "gingerbread man cookie",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1201.heic"
+  ]
+ },
+ {
+  "q": "photo of a gingerbread man biscuit with icing",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1201.heic"
+  ]
+ },
+ {
+  "q": "Foto eines Lebkuchenmannes mit Zuckerguss",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1201.heic"
+  ]
+ },
+ {
+  "q": "fortune cookie",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1202.heic"
+  ]
+ },
+ {
+  "q": "picture of a Chinese fortune cookie with a paper message",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1202.heic"
+  ]
+ },
+ {
+  "q": "Bild von einem Glückskeks mit Zettel",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1202.heic"
+  ]
+ },
+ {
+  "q": "gold medal ribbon",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1203.heic"
+  ]
+ },
+ {
+  "q": "photo of a winner's medal hanging on a ribbon",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1203.heic"
+  ]
+ },
+ {
+  "q": "Foto einer Medaille am Band",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1203.heic"
+  ]
+ },
+ {
+  "q": "chalk sticks",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1204.heic"
+  ]
+ },
+ {
+  "q": "picture of pieces of chalk for drawing or the blackboard",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1204.heic"
+  ]
+ },
+ {
+  "q": "Bild von Kreidestücken zum Malen",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1204.heic"
+  ]
+ },
+ {
+  "q": "black eight ball billiards",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1301.heic"
+  ]
+ },
+ {
+  "q": "photo of the black number eight pool ball",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1301.heic"
+  ]
+ },
+ {
+  "q": "Foto der schwarzen Acht Billardkugel",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1301.heic"
+  ]
+ },
+ {
+  "q": "baseball red stitching",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1302.heic"
+  ]
+ },
+ {
+  "q": "picture of a white baseball with red seams",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1302.heic"
+  ]
+ },
+ {
+  "q": "Bild eines Baseballs mit roten Nähten",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1302.heic"
+  ]
+ },
+ {
+  "q": "orange basketball",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1303.heic"
+  ]
+ },
+ {
+  "q": "photo of an orange basketball with black lines",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1303.heic"
+  ]
+ },
+ {
+  "q": "Foto eines orangefarbenen Basketballs",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1303.heic"
+  ]
+ },
+ {
+  "q": "bowling alley pins",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1304.heic"
+  ]
+ },
+ {
+  "q": "photo of someone bowling with a ball and pins",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1304.heic"
+  ]
+ },
+ {
+  "q": "foto de una bolera con bolos",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1304.heic"
+  ]
+ },
+ {
+  "q": "golf course swing",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1305.heic"
+  ]
+ },
+ {
+  "q": "picture of a golfer on the green with a club",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1305.heic"
+  ]
+ },
+ {
+  "q": "foto de golf en el campo",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1305.heic"
+  ]
+ },
+ {
+  "q": "tennis racket court",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1306.heic"
+  ]
+ },
+ {
+  "q": "photo of a tennis match on a court",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1306.heic"
+  ]
+ },
+ {
+  "q": "foto de un partido de tenis con raqueta",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1306.heic"
+  ]
+ },
+ {
+  "q": "soccer ball football pitch",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1307.heic"
+  ]
+ },
+ {
+  "q": "picture of players kicking a soccer ball on the field",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1307.heic"
+  ]
+ },
+ {
+  "q": "foto de fútbol con un balón en el campo",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1307.heic"
+  ]
+ },
+ {
+  "q": "ice hockey stick puck",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1308.heic"
+  ]
+ },
+ {
+  "q": "photo of a hockey game on the ice rink",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1308.heic"
+  ]
+ },
+ {
+  "q": "foto de hockey sobre hielo con disco",
+  "tag": "gen-image",
+  "expect": [
+   "Pictures/2026/IMG_1308.heic"
+  ]
+ },
+ {
+  "q": "penguin zebra parrot animals",
+  "tag": "gen-video",
+  "expect": [
+   "Movies/Zoo trip.mp4"
+  ]
+ },
+ {
+  "q": "video with penguins, a zebra and a colorful parrot",
+  "tag": "gen-video",
+  "expect": [
+   "Movies/Zoo trip.mp4"
+  ]
+ },
+ {
+  "q": "video de pingüinos, cebras y un loro",
+  "tag": "gen-video",
+  "expect": [
+   "Movies/Zoo trip.mp4"
+  ]
+ },
+ {
+  "q": "green leaf close-up video",
+  "tag": "gen-video",
+  "expect": [
+   "Movies/Team update.mp4"
+  ]
+ },
+ {
+  "q": "short video that just shows a single leaf",
+  "tag": "gen-video",
+  "expect": [
+   "Movies/Team update.mp4"
+  ]
+ },
+ {
+  "q": "video de una hoja verde de cerca",
+  "tag": "gen-video",
+  "expect": [
+   "Movies/Team update.mp4"
+  ]
+ },
+ {
+  "q": "fortune cookie medal turntable",
+  "tag": "gen-video",
+  "expect": [
+   "Movies/Party clip.mp4"
+  ]
+ },
+ {
+  "q": "video with a fortune cookie, a medal and a DJ turntable",
+  "tag": "gen-video",
+  "expect": [
+   "Movies/Party clip.mp4"
+  ]
+ },
+ {
+  "q": "video con galleta de la fortuna, medalla y tocadiscos",
+  "tag": "gen-video",
+  "expect": [
+   "Movies/Party clip.mp4"
+  ]
+ },
+ {
+  "q": "pressure spike calibration error",
+  "tag": "gen-log",
+  "expect": [
+   "Documents/Logs/sensor readings.txt"
+  ]
+ },
+ {
+  "q": "log where a pressure alert was flagged as a calibration error and a technician was notified",
+  "tag": "gen-log",
+  "expect": [
+   "Documents/Logs/sensor readings.txt"
+  ]
+ },
+ {
+  "q": "registro de alerta de pico de presión por error de calibración",
+  "tag": "gen-log",
+  "expect": [
+   "Documents/Logs/sensor readings.txt"
+  ]
+ },
+ {
+  "q": "office relocation Lisbon spring",
+  "tag": "gen-log",
+  "expect": [
+   "Documents/Notes/Team notes 2026.md"
+  ]
+ },
+ {
+  "q": "decision to move the office to Portugal with three months rent covered",
+  "tag": "gen-log",
+  "expect": [
+   "Documents/Notes/Team notes 2026.md"
+  ]
+ },
+ {
+  "q": "mudanza de la oficina a Lisboa con ayuda para el alquiler",
+  "tag": "gen-log",
+  "expect": [
+   "Documents/Notes/Team notes 2026.md"
+  ]
+ },
+ {
+  "q": "passport renewal application form",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "wedding photos on the beach",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "mortgage statement from the bank",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "dentist estimate for the root canal",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "my CV with work experience and references",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "home insurance policy deductible",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "photos of the Grand Canyon hike",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "video of my daughter's first steps",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "screenshot of the parking ticket",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "voice memo with my podcast idea",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "recording of grandma telling family stories",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "student loan repayment schedule",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "photos from the ski trip in the Alps",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "baby shower guest list",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "knitting pattern for a wool scarf",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "screenshot of the bitcoin wallet recovery phrase",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "job offer letter with salary",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "video of the New Year's Eve fireworks",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "dishwasher user manual",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "e-bike purchase receipt",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "screenshot of a chess puzzle",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "recording of my best man speech",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "cholesterol blood test results",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "Halloween costume photos",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "photos from the Blue Lagoon in Iceland",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "babysitter emergency contact sheet",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "video of the school play",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "screenshot of the password reset email",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "voice memo with Christmas gift ideas",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "last will and testament",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "护照复印件",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "孩子的期末成绩单",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "健康診断の結果",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "Arbeitszeugnis vom alten Arbeitgeber",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "Elterngeldantrag",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "fotos de la boda de mi hermana",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "acte de naissance",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "운전면허증 사본",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "фотографии с выпускного",
+  "tag": "absent",
+  "expect": []
+ },
+ {
+  "q": "شهادة التخرج من الجامعة",
+  "tag": "absent",
+  "expect": []
+ }
+]

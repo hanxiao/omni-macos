@@ -123,6 +123,63 @@ final class TextStreamTests: XCTestCase {
         XCTAssertLessThan(embedder.embedded - before, 5, "cutting back reuses the stored vectors")
     }
 
+    /// The 2 MB cut of a long data file falls where it falls - here inside a three-byte character. The
+    /// stream took the cut for the end of the file and decoded the whole last window as Latin-1, so
+    /// every chunk of an agent log past its first 64 KB was stored as mojibake (a real 9.3 MB .jsonl:
+    /// 239 of 1,021 chunks). Indexes written before the fix read such files again, once.
+    func testTheCutOfALongDataFileKeepsItsCharactersAndOldIndexesReadItAgain() throws {
+        var root = FileManager.default.temporaryDirectory.appendingPathComponent("stream-utf8-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        if let rp = realpath(root.path, nil) { root = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+        defer { try? FileManager.default.removeItem(at: root) }
+        var text = ""
+        var i = 0
+        while text.utf8.count < 2_300_000 { text += "{\"第\(i)行\": \"数据检索系统的设计与实现，记录读数正常，第\(i % 97)号传感器。\"}\n"; i += 1 }
+        var data = Data(text.utf8)
+        while data[FileExtractor.maxTextBytes] & 0xC0 != 0x80 { data.insert(0x20, at: 0) }   // the cut inside a character
+        let url = root.appendingPathComponent("run.jsonl")
+        try data.write(to: url)
+        let dbDir = root.deletingLastPathComponent().appendingPathComponent("stream-utf8-db-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dbDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dbDir) }
+        let store = try VectorStore(dbURL: dbDir.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let embedder = CountingEmbedder()
+        let indexer = Indexer(store: store, embedder: embedder)
+        let settings = IndexSettings(enabledKinds: [.text])
+        func pass(markRepaired: Bool) {
+            let done = expectation(description: "pass")
+            indexer.index(roots: [root], settings: settings) { p in if p.done { done.fulfill() } }
+            wait(for: [done], timeout: 300)
+            store.metaSet(Indexer.textStreamMetaKey, Indexer.longTextPolicy(settings))   // what the app records after a full pass
+            store.metaSet(Indexer.textCutMetaKey, markRepaired ? "1" : "")
+        }
+        pass(markRepaired: true)
+        let anchors = store.chunkAnchors(paths: [url.path])[url.path] ?? [:]
+        XCTAssertGreaterThan(anchors.count, 100)
+        let mojibake = anchors.filter { !$0.value.snippet.unicodeScalars.contains { $0.value >= 0x4E00 && $0.value <= 0x9FFF } }
+        XCTAssertEqual(mojibake.keys.sorted(), [], "chunks stored without their characters")
+        let recovery = PassageRecovery(indexer: indexer, store: store, settings: settings)
+        let lost = anchors.keys.sorted().filter { recovery.texts([(url.path, $0, anchors[$0]!.locator)])[0] == nil }
+        XCTAssertEqual(lost, [], "chunks not recovered")
+
+        // An index from before the fix holds other rows for the unchanged file.
+        let good = Set(anchors.values.map(\.key))
+        let mod = try XCTUnwrap((FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)?.timeIntervalSince1970)
+        let stale = String(repeating: "ab", count: 16)
+        try store.replace(path: url.path, chunks: [IndexedChunk(path: url.path, modified: mod, size: data.count, kind: "text", chunkIndex: 0,
+                                                                snippet: "stale", embedding: [Float](repeating: 0.25, count: embedder.dim),
+                                                                locator: "Line 1", chunkKey: stale)])
+        store.recordContentKeys([(url.path, "2|text|jsonl|before-the-fix", mod, data.count)])   // the key an old index recorded
+        pass(markRepaired: true)
+        XCTAssertEqual(Set((store.chunkAnchors(paths: [url.path])[url.path] ?? [:]).values.map(\.key)), [stale],
+                       "negative control: once repaired, an unchanged file is not read again")
+        store.metaSet(Indexer.textCutMetaKey, "")
+        pass(markRepaired: true)
+        XCTAssertEqual(Set((store.chunkAnchors(paths: [url.path])[url.path] ?? [:]).values.map(\.key)), good,
+                       "an index not yet repaired reads its long data files again")
+    }
+
     func testAnInterruptedStreamLeavesTheIndexAsItWas() throws {
         var root = FileManager.default.temporaryDirectory.appendingPathComponent("stream-cut-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

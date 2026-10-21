@@ -1769,6 +1769,77 @@ into windows of the width shown and the model picks the one closest to the query
   over a typing run; at 600 ms typing is at parity (main CPU 7,947/7,882 vs 7,982/7,848 ms, search
   to results p50 28.8/29.6 vs 28.5/31.4 ms, the same stalls).
 - Linked Macs' hits keep their stored snippets: the remote Mac would have to recover them.
+- AT REAL SCALE IT IS NOT FAST, AND NOT ALWAYS RIGHT (2026-10-20, found after shipping to main; not
+  released). Everything above was measured on the 226-file testbed, where recovery is ~1 ms.
+  `omni-verify passreal <model> <bench-index clone>`, 15 queries, top 10 text hits: recovery cold
+  p50 73 ms (max 243), windows 60-120 a search, p50 97 ms (max 201) - ~170 ms a cold served search
+  against ~8 without, and GPU-bound, so throughput under agent load would not hold either. Recovered
+  101/150; of the 49 misses only 10 were files changed or gone since the clone was taken.
+  `omni-verify recovercheck <model> <scratch> <files>` indexes the files fresh with the current code
+  and recovers every chunk as one hit would. Three real bugs:
+  - a text file past 2 MB with long lines: 12/42 (a 5.7 MB agent log, lines up to 178,000
+    characters) - the window is 16 chunks' worth from the START of the hit's line, and a line can be
+    longer than that;
+  - the last chunk of a file: missed in both small .jsonl files (40/41, 46/47, each miss the final
+    chunk);
+  - long PDFs: 44/48 and 40/41 (pages 27, 29, 60, 111, 118), and past 60 pages there is no fallback.
+  All three are fixed below, and the cost with them.
+
+## Passages at real scale: found by their opening, within a budget (2026-10-21)
+
+- RECOVERY FINDS A CHUNK BY ITS SNIPPET. The snippet is the chunk's first 220 characters with runs of
+  newlines and tabs read as one space, so where it starts in the file is found exactly
+  (`Indexer.anchorStarts`, every occurrence, each distinct stretch cut once), and a content-defined
+  cut from there makes the chunk again. What the start does not decide is an end where the indexer's
+  text stopped - a PDF turn on a page, the 2 MB cut, the file's end, the extractor's trimmed end for
+  an index from before files past 64 KB streamed - and those ends are tried beside the content cut.
+  The cutter is called directly on such a window: `chunk` returns a text that fits one chunk whole,
+  and the indexer's text ran on past it (a PDF's 1,223-byte remainder came back as one piece where
+  the document's cut made 1,174 + 49). `chunkAnchors` reads key, snippet and locator in one query;
+  `chunkKeys` is its projection. Real files, indexed fresh and every chunk recovered alone
+  (`recovercheck`): 1,643/1,643 text chunks over 70 files of 13 kinds plus the five that failed,
+  against 72% before. OCR text of a scanned page cannot be recovered (Vision made it); the served
+  search and the rows only ask for text files. Tests pin each case, each failing on the old code:
+  a streamed file's first and last chunks, chunks inside 125 KB lines (.jsonl under the cut and
+  .txt read to its end), a 150-page sparse PDF in turns and in one pass, Latin-1 and CRLF files.
+- THE 2 MB CUT DECODED THE WHOLE LAST WINDOW AS LATIN-1. A long log, .json or .jsonl keeps its first
+  2 MB; the stream treated the cut as the file's end, so a character split there failed UTF-8 and the
+  whole 1.9 MB window became mojibake - every non-ASCII chunk past 64 KB of an agent's log (a real
+  9.3 MB .jsonl: 239 of 1,021 chunks). `decodeTextWindow(final:)` now means the end of the file. The
+  content key of text under the cut gains `|u8`, so a file's old rows are not copied back to it by
+  its own content key, and `text_cut_utf8` - set when a full pass completes, like the long-text
+  policy - makes an index from before read its long data files once (vectors reused per unchanged
+  chunk). On this Mac's three folders: 30 long data files read again, 1 of them re-embedded.
+  TextStreamTests pins both, with a negative control for each.
+- EMBEDDING IS COMPUTE-BOUND, SO PASSAGES GET A BUDGET. The same text in windows of 200, 800 or 1,800
+  characters takes the same time (`winbench`: 42, 43, 35-40 ms), ~4.4 ms per 1,000 characters here;
+  tiling all ten results of a real search was 197 ms p50 (`passreal` on a fresh index of 7,048 real
+  documents) and would be ten times that on a small Mac's GPU. Packing, length-sorted batches and
+  late interaction all embed the same characters. So `PassageRecovery.passages` - the one path the
+  served search and the result rows share - goes in rank order within `servedBudgetMs` (30) of this
+  Mac's measured rate, the first result always, windows embedded before free; past
+  `maxInFlight` (2) served requests at once a request keeps its stored snippets, so a burst of agents
+  keeps the throughput it had before passages. At real scale: cold p50 17 ms, p90 47, max 82, against
+  202 / 292 / 293 unbudgeted. Served load on the testbed, against the build before, interleaved
+  twice: 8 clients 217-235 vs 205-223/s, 32: 246-258 vs 248-262, 64: 257-258 vs 253-262.
+- WHAT AGENTS LOSE: NOTHING MEASURABLE. `agenteval agent` (125 find-the-file) and `--qa` (24 content
+  questions), one run per arm, paired sign tests against passages for every result at 200 chars:
+  top result only - calls p = 0.36 / 0.73, success equal; the 30 ms budget - p = 0.39 / 1.0, success
+  equal; 500 characters - calls p = 0.86 / 0.75, success 0.896 vs 0.920, more input tokens on 81 of
+  125 queries against 41 (p < 0.001). The default stays 200; the budget ships.
+- REJECTED: THE BEST WINDOW AS A RANKING SIGNAL. The top K reordered by a z-scored mix of their score
+  and their best window's cosine (the training-free local-global fusion of arXiv 2610.13277), on the
+  testbed's 440 queries (125 labeled + 315 generated): K 10 at 0.5 MRR 0.889 -> 0.847, K 3 at 0.5
+  0.886, K 10 at 0.25 0.886; on the real-scale bed, K 3 at 0.5, 0.790 -> 0.777. A chunk's own vector
+  ranks files better than its best window does. And within the budget only the top few have windows.
+- A REAL-SCALE YARDSTICK. `omni-verify eval ... --distractors ~/Documents,~/Downloads,~/Desktop`
+  indexes the testbed beside a person's real documents and logs (media and code excluded there; the
+  index stays on the Mac), and `--queries Tools/eval/queries-generated.json` adds 315 known-item
+  queries written from the testbed's synthetic content (three per file, a third in another language)
+  and 40 for things not on the bed at all. Testbed: MRR 0.889 over 440, R@1 0.83, and a query whose
+  answer is absent tops out at p50 0.326 / max 0.506 against p10 0.465 for one whose answer is there
+  (AUC 0.983). With 7,048 real documents beside it: MRR 0.790, R@1 0.71; real logs bury the testbed's
+  (gen-log MRR 0.105), and "absent" is no longer absent among real files (AUC 0.741).
 
 ## The agent surface: filters, paging, read_file (2026-10-20)
 
@@ -1805,6 +1876,17 @@ into windows of the width shown and the model picks the one closest to the query
   a lookup), failures remembered by key, big text files recovered from the hit's line - and,
   largest of all, hex-encoding keys without a `String(format:)` per byte: 965 keys of one notes file
   per search had been 40 ms.
+- MCP 2026-07-28, DUAL-ERA (2026-10-21). That revision drops the handshake: each request carries its
+  revision and capabilities in `_meta`, and the server MUST answer `server/discover`. A request with
+  that metadata is served statelessly (`MCPAdapter.handleModern`): an unknown revision is 400 /
+  -32022 with the supported list; `MCP-Protocol-Version`, `Mcp-Method` and `Mcp-Name` (its
+  `=?base64?...?=` form decoded) must match the body or it is 400 / -32020, so a proxy routing on a
+  header cannot be made to run something else; results carry `resultType` and `serverInfo` in
+  `_meta`; `tools/list` and `server/discover` carry `ttlMs` / `cacheScope` and are written with
+  sorted keys (the same bytes every launch, for a client's prompt cache); `ping` is gone (404 /
+  -32601). A request that opens with `initialize` is a legacy client and is served exactly as before,
+  the `omni` command line among them. One tool dispatch (`callTool`) serves both. Checked against
+  an isolated instance with curl, case by case, and the CLI over its socket.
 
 ## The text on scanned pages, and the metadata migration not done (2026-10-20)
 
@@ -1838,3 +1920,15 @@ into windows of the width shown and the model picks the one closest to the query
   measured here without a Photos permission prompt. When the next schema migration happens, the
   capture date rides it (one column on `files`, `FileMeta`, the date filters), not a migration of
   its own.
+- APPLE'S NEWER READER WAS MEASURED AND NOT ADOPTED (2026-10-21). `RecognizeDocumentsRequest` (macOS
+  26: paragraphs, tables, lists) against the `VNRecognizeTextRequest` the scan lane uses, same
+  settings, on 24 pages of known text (`Tools/ocr/make_vision_pages.py`: prose, two columns, a table,
+  a receipt, accented Latin, Chinese, Japanese, dense type; each clean, scanned and photographed) by
+  `omni-verify visionab`: mean CER 0.104 vs 0.163, token F1 0.919 vs 0.924, p50 212 vs 137 ms. The
+  CER gap is reading order on the receipt and the table; on prose, columns, accents, Chinese and
+  Japanese the current reader is equal or better (0.000-0.017 against 0.000-0.035), and it is 55%
+  faster. An explicit language list (the user's preferred languages) emptied the Chinese and
+  Japanese pages; language correction changed nothing and cost 60% more.
+- ONE FAILURE NEITHER FIXES: a clean monospace table read as invented Chinese at confidence 0.30.
+  Dropping 0.30 lines was looked at and rejected: on real scans a Korean receipt reads at 0.30
+  almost entirely, and correctly ("매장: 테라로시", "구매 20.00") - the filter would delete real text.

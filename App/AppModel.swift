@@ -391,14 +391,42 @@ final class AppModel {
     var rawResults: [SearchHit] = [] {   // kind/folder/ext/date filtered, score-sorted
         didSet {
             let has = !rawResults.isEmpty
-            if has != hasResults { hasResults = has }
+            if has != hasResults {
+                hasResults = has
+                if !has {
+                    // Leaving: in the same frame as the results, as always - spread over frames, a
+                    // clear only paid for more toolbar passes (UI stress: 20 clears over 100 ms a run
+                    // against 3-8).
+                    if toolbarHasResults { toolbarHasResults = false }
+                    if toolbarShowsSortView { toolbarShowsSortView = false }
+                } else {
+                    // Arriving: a frame later, and the sort/view group a frame after that (see
+                    // toolbarHasResults). Each re-reads the state, so a clear in between wins.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(16)) { [weak self] in
+                        guard let self, self.hasResults else { return }
+                        if !self.toolbarHasResults { self.toolbarHasResults = true }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(16)) { [weak self] in
+                            guard let self, self.hasResults, !self.toolbarShowsSortView else { return }
+                            self.toolbarShowsSortView = true
+                        }
+                    }
+                }
+            }
             recomputeResults()
         }
     }
-    /// `!rawResults.isEmpty`, STORED and written only when it changes. The toolbar, the window and
-    /// the menu bar ask only this, and each new result set is a new array: reading `rawResults`
-    /// itself re-ran all three on every search (~500 ms of main thread per result set, measured).
+    /// `!rawResults.isEmpty`, STORED and written only when it changes. The window and the menu bar
+    /// ask only this, and each new result set is a new array: reading `rawResults` itself re-ran
+    /// them on every search (~500 ms of main thread per result set, measured).
     private(set) var hasResults = false
+    /// `hasResults` for the toolbar's result controls, ONE FRAME LATER. The first result set after a
+    /// clear inserted those controls in the same display cycle that laid the results out: one main-
+    /// thread block of ~145-185 ms, 40% of it the toolbar building and tiling three items (testing.md,
+    /// "UI stress"). Apart, the results draw first and the controls arrive in the next cycle.
+    private(set) var toolbarHasResults = false
+    /// And the sort/view group one cycle after the filter menu: SwiftUI builds each item's menus and
+    /// segmented control as it appears, ~60-75 ms apiece, and together they were one ~146 ms block.
+    private(set) var toolbarShowsSortView = false
     var searching = false {
         // A stats refresh skipped for this search is owed, and the one-shot callers (pass end,
         // tag batch, purge, folder removal) have no next tick to pay it - see refreshIndexStats.
@@ -522,27 +550,22 @@ final class AppModel {
             // Superseded while it waited: a newer result set has its own job queued behind this one.
             let current = { Self.latestPassageJob.withLock({ $0 }) == job }
             guard current() else { return }
-            let texts = recovery.texts(items)
-            var found: [(Int, String)] = []
-            for (i, t) in texts.enumerated() { if let t { found.append((i, t)) } }
-            guard !found.isEmpty, current() else { return }
-            var superseded = false
-            let best = PassageWindow.best(found.map(\.1), width: width, query: qv, cache: recovery.windowVectors) { windows in
-                // A forward of 16 windows at a time on the low lane, checking between them: a new
-                // search stops this one within one short forward.
+            // A forward of 16 windows at a time on the low lane, checking between them: a new search
+            // stops this one within one short forward.
+            let found = recovery.passages(items, query: qv, width: width, budgetMs: PassageRecovery.rowsBudgetMs, shed: false) { windows in
                 var vecs: [[Float]] = []
                 var i = 0
                 while i < windows.count {
-                    guard current() else { superseded = true; return [] }
+                    guard current() else { return nil }
                     let end = min(i + 16, windows.count)
                     vecs += engine.embedPassages(Array(windows[i ..< end]), waiting: false)
                     i = end
                 }
                 return vecs
             }
-            guard !superseded else { return }
+            guard current(), found.contains(where: { $0 != nil }) else { return }
             // An excerpt from inside the chunk reads as continued, as Mail and Spotlight show one.
-            let out = zip(found, best).map { f, w in (items[f.0], f.1.hasPrefix(w) ? w : "\u{2026}" + w) }
+            let out = zip(items, found).compactMap { it, p in p.map { (it, $0.opensChunk ? $0.text : "\u{2026}" + $0.text) } }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let self, self.passageCacheQuery == resolved else { return }
@@ -7244,7 +7267,10 @@ final class AppModel {
                             // A full pass has now walked every root under this long-text policy,
                             // so every long text file has been read to it.
                             let policy = Indexer.longTextPolicy(settings)
-                            Task.detached(priority: .utility) { store.metaSet(Indexer.textStreamMetaKey, policy) }
+                            Task.detached(priority: .utility) {
+                                store.metaSet(Indexer.textStreamMetaKey, policy)
+                                store.metaSet(Indexer.textCutMetaKey, "1")
+                            }
                             self.drainDeferredAfterPass(store)
                         }
                         self.refitFolderMapIfPending()

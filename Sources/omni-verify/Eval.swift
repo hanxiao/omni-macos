@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 import AppKit
 import AVFoundation
 import CoreText
@@ -528,7 +529,8 @@ enum EvalCommand {
     static func evaluate(_ args: [String]) async throws {
         guard args.count >= 4 else {
             throw Failure("usage: omni-verify eval <modelDir> <dir> [--json out] [--rebuild] [--tag t] [--no-screen-text] "
-                          + "[--no-soundtrack] [--no-pdf-pages] [--no-page-pick] [--no-kind-lift] [--no-name-fusion] [--no-id-lookup]")
+                          + "[--no-soundtrack] [--no-pdf-pages] [--no-page-pick] [--no-kind-lift] [--no-name-fusion] [--no-id-lookup] "
+                          + "[--queries file.json] [--distractors dir,dir,...]")
         }
         let modelDir = URL(fileURLWithPath: (args[2] as NSString).expandingTildeInPath)
         let bed = URL(fileURLWithPath: (args[3] as NSString).expandingTildeInPath, isDirectory: true)
@@ -538,8 +540,21 @@ enum EvalCommand {
         guard let treeHash = manifest?["tree"] as? String else { throw Failure("no manifest: run evalbed first") }
         let tree = bed.appendingPathComponent("tree", isDirectory: true)
         let treePath = URL(fileURLWithPath: String(cString: realpath(tree.path, nil))).path
+        // MORE QUERIES (--queries: a JSON list of {q, tag, expect}), and an EMPTY `expect` for a query
+        // whose answer is not on the bed at all - scored by whether its top score could tell it apart.
+        var queries = spec.queries
+        if let extra = opt("--queries") {
+            queries += try JSONDecoder().decode([EvalSpec.Query].self, from: Data(contentsOf: URL(fileURLWithPath: extra)))
+        }
+        // REAL DISTRACTORS (--distractors): folders indexed beside the bed, so the same answers have to
+        // be found among real files. Documents and logs only there - media and code take hours to index
+        // and are not what the questions compete with. The index stays on this Mac; nothing is sent.
+        let distractors = opt("--distractors").map { $0.split(separator: ",").map { (String($0) as NSString).expandingTildeInPath } } ?? []
 
         let engine = try await OmniEngine(modelDir: modelDir)
+        // A capped buffer cache, as the app keeps one: uncapped, MLX held 240 GB through the
+        // 7,048-document distractor index - pressure enough to matter to everything else running.
+        MLX.Memory.cacheLimit = 2 << 30
         // A/B of the indexing features: --no-screen-text, --no-soundtrack, --no-pdf-pages, each its
         // own index. The ranking steps after the scan are switched off on the same index.
         var settings = IndexSettings()
@@ -549,8 +564,18 @@ enum EvalCommand {
         if args.contains("--no-kind-lift") { VectorStore.kindLift = false }
         if args.contains("--no-name-fusion") { VectorStore.nameFusion = false }
         if args.contains("--no-id-lookup") { VectorStore.identifierLookup = false }
+        if !distractors.isEmpty {
+            let skip = FileExtractor.imageExtensions.union(FileExtractor.videoExtensions).union(FileExtractor.audioExtensions)
+                .union(["py", "h", "hpp", "c", "cc", "cpp", "swift", "m", "mm", "java", "js", "jsx", "ts", "tsx", "go", "rs", "kt",
+                        "scala", "rb", "php", "lua", "r", "sh", "yaml", "yml", "xml", "toml", "json", "ipynb", "css", "sql"])
+            var rules = [OmniIgnore.hiddenRule] + FileCrawler.skipDirNames.map { "\($0)/" }
+            for root in distractors { rules += skip.sorted().map { "\(root)/**/*.\($0)" } }
+            settings.ignore = OmniIgnore(text: rules.joined(separator: "\n"))
+        }
+        var distractorTag: UInt64 = 0xcbf29ce484222325
+        for b in distractors.joined(separator: ",").utf8 { distractorTag = (distractorTag ^ UInt64(b)) &* 0x100000001b3 }
         let arm = (settings.screenText ? "" : "-nst") + (settings.soundtrack ? "" : "-nsd")
-            + (Indexer.shortPDFByPage ? "" : "-npp")
+            + (Indexer.shortPDFByPage ? "" : "-npp") + (distractors.isEmpty ? "" : "-d" + String(distractorTag, radix: 16).prefix(8))
         let indexDir = bed.appendingPathComponent("index-\(modelDir.lastPathComponent)-\(engine.dim)-\(treeHash.prefix(8))\(arm)", isDirectory: true)
         let doneMark = indexDir.appendingPathComponent("built")
         if args.contains("--rebuild") { try? FileManager.default.removeItem(at: indexDir) }
@@ -578,7 +603,7 @@ enum EvalCommand {
             let t0 = Date()
             let last: IndexProgress = await withCheckedContinuation { cont in
                 DispatchQueue.global().async {
-                    indexer.index(roots: [URL(fileURLWithPath: treePath)], settings: settings) { p in
+                    indexer.index(roots: [URL(fileURLWithPath: treePath)] + distractors.map { URL(fileURLWithPath: $0) }, settings: settings) { p in
                         if p.done { cont.resume(returning: p) }
                     }
                 }
@@ -599,7 +624,10 @@ enum EvalCommand {
         var perQuery: [[String: Any]] = []
         // The weaker-matches fold (VectorStore.weakFold), as the app applies it to this list.
         var shownTotal = 0, hitsTotal = 0, foldedAnswers = 0, foldedTop10 = 0
-        for query in spec.queries where onlyTag == nil || query.tag == onlyTag {
+        // Top scores, as the floor and the fold read them (score over lift and scale), for queries whose
+        // answer is there and for those whose answer is not: can any floor tell the two apart?
+        var topFound: [Double] = [], topAbsent: [Double] = []
+        for query in queries where onlyTag == nil || query.tag == onlyTag {
             var hits: [SearchHit]
             if let g = engine.queryVectorGraph(query.q) {
                 hits = store.search(queryGraph: g, filter: SearchFilter(), topK: VectorStore.shippedTopK, textQuery: query.q).hits
@@ -616,6 +644,15 @@ enum EvalCommand {
                     }
                 }
             }
+            let top1 = hits.first.map { Double($0.score) / ($0.lift * $0.scale) } ?? 0
+            if query.expect.isEmpty {
+                topAbsent.append(top1)
+                let top = hits.first.map { $0.path.hasPrefix(treePath) ? String($0.path.dropFirst(treePath.count + 1)) : $0.path } ?? "-"
+                print(String(format: "abs  %@ %@  ->  %@ (%.3f)", query.tag.padding(toLength: 12, withPad: " ", startingAt: 0), query.q, top, top1))
+                perQuery.append(["q": query.q, "tag": query.tag, "absent": true, "top1": top1])
+                continue
+            }
+            topFound.append(top1)
             let rank = hits.firstIndex { hit in query.expect.contains { matches(hit, $0, tree: treePath) } }.map { $0 + 1 }
             let fileRank = hits.firstIndex { hit in
                 query.expect.contains { matches(hit, String($0.split(separator: "@")[0]), tree: treePath) }
@@ -656,6 +693,16 @@ enum EvalCommand {
             print(tag.padding(toLength: 12, withPad: " ", startingAt: 0)
                   + String(format: " %3d  %5.2f  %5.2f  %5.2f  %5.3f   %5.2f  %5.2f", r.n, Double(r.at1) / n, Double(r.at5) / n,
                                   Double(r.at10) / n, r.mrr / n, Double(r.file1) / n, Double(r.file10) / n))
+        }
+        if !topAbsent.isEmpty {
+            // AUC: the chance a query whose answer is there scores above one whose answer is not.
+            var wins = 0.0
+            for f in topFound { for a in topAbsent { wins += f > a ? 1 : (f == a ? 0.5 : 0) } }
+            let auc = topFound.isEmpty ? 0 : wins / Double(topFound.count * topAbsent.count)
+            let sortedA = topAbsent.sorted(), sortedF = topFound.sorted()
+            print(String(format: "not on the bed: %d queries, top score p50 %.3f max %.3f; answer there: p10 %.3f p50 %.3f; AUC %.3f",
+                         topAbsent.count, sortedA[sortedA.count / 2], sortedA.last!,
+                         sortedF.isEmpty ? 0 : sortedF[sortedF.count / 10], sortedF.isEmpty ? 0 : sortedF[sortedF.count / 2], auc))
         }
         let nq = Double(max(1, perQuery.count))
         print(String(format: "weaker-matches fold: %.1f of %.1f results shown per query; %d found answers folded, %d of them in the top 10",
