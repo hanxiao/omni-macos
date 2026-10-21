@@ -225,7 +225,7 @@ codebase were already measured there, and many were rejected.
   under load, passages (the text a hit matched), the agent surface (filters, paging, read_file).
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
-  and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names.
+  and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names, Shortcuts, Siri and Services (App Intents).
 - `testing.md` - UI tests and their traps, chaos suites, perf tour, hangwatch and the main-thread
   stall investigations, the agent eval.
 - `link.md` - Linked Macs: pairing, the TLS link, search across Macs, the measurements and the

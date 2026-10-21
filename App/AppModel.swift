@@ -2562,6 +2562,7 @@ final class AppModel {
             case .rest: HistorySource.serving.rawValue
             case .mcp: HistorySource.mcp.rawValue
             case .cli: HistorySource.cli.rawValue
+            case .intent: HistorySource.serving.rawValue
         }
         if let i = searchHistory.firstIndex(where: { $0.isServed && $0.displayText.caseInsensitiveCompare(q) == .orderedSame }) {
             searchHistory[i].lastUsed = Date()

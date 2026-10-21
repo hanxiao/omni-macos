@@ -11,7 +11,7 @@ import OmniLink
 /// logs the main thread's own CPU time for each step (`OMNI_PERF_LOG=1` to see it).
 ///
 /// Steps: `browse:<folder>`, `view:list|grid`, `sidebar` (toggle), `search:<text>`, `clear`,
-/// `wait:<seconds>`. For recording the intro video: `type:<text>` (a key at a time, searching at
+/// `wait:<seconds>`, `intent:<text>` (the Shortcuts search action's own search, logged). For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
 /// (window size, centered), `front`, `appearance:light|dark`, `ocrview:raw|rendered|split|triple`, `ocrpage:<n>`, `history:<n>`, `sort:<order>`,
 /// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `menu:<title>`, `recents`, `clipboard:on|off`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
@@ -32,6 +32,10 @@ enum PerfScript {
                     let cpu0 = HangWatch.threadCPU()
                     let t0 = Date()
                     if raw.hasPrefix("type:") { await type(String(raw.dropFirst(5)), model) }
+                    else if raw.hasPrefix("intent:") {   // the App Intents search, as Shortcuts runs it
+                        let files = (try? await OmniIntentSearch.run(String(raw.dropFirst(7)), limit: 5)) ?? []
+                        omniPerfLog("script intent n=\(files.count) " + files.map { "\($0.name) [\($0.location)] \($0.passage.prefix(60))" }.joined(separator: " | "))
+                    }
                     else if raw.hasPrefix("waitfile:") {   // hold here until <path> exists (another process's cue)
                         let path = String(raw.dropFirst(9))
                         for _ in 0 ..< 600 where !FileManager.default.fileExists(atPath: path) {

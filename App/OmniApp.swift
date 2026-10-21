@@ -30,6 +30,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
+    /// Services > Search in Omni: the selected text becomes the search, as if typed into the box.
+    @objc func searchOmni(_ pboard: NSPasteboard, userData: String?, error: AutoreleasingUnsafeMutablePointer<NSString?>) {
+        guard let text = pboard.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return }
+        MainActor.assumeIsolated {
+            Self.showMainWindow()
+            guard let model = AppModel.shared else { return }
+            model.applyParsedQuery(String(text.prefix(1000)))
+            model.search()
+        }
+    }
+
     /// Order the main window back to the front. The window is kept alive rather than recreated -
     /// `isReleasedWhenClosed = false` is set on it when it is first tuned - so its state, its
     /// sidebar width and its current search all survive a close.
@@ -88,6 +99,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Services > Search in Omni, for text selected in any app (Info.plist NSServices).
+        NSApp.servicesProvider = self
         // The other half of the single-instance guard: a redundant launch nudges us before it
         // exits, and this is what turns that into a visible window.
         DistributedNotificationCenter.default().addObserver(

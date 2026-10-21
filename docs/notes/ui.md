@@ -1325,3 +1325,24 @@ is 0: the flexible column gives way first, and the default columns fit 1,280pt a
 1280x800: stripe 252 -> 276, icon 270 -> 294, name 291 -> 314 - the folder browser's 294 and 314.
 A first try padded by the scroll view's leading safe-area inset and overshot: that inset reads 260,
 the whole width to the window's edge, not the part the sidebar covers.
+
+## Shortcuts, Siri, Spotlight and Services (2026-10-20, App/Intents)
+
+- ONE SEARCH, ANOTHER DOOR. `Search Files by Meaning` (background, does not open the window) returns
+  files with the passage that matched through `ServingController.searchForIntents` - the served
+  search, its duplicate collapsing and its passages, the answer an agent gets over MCP - so a Shortcut
+  can hand them to Use Model, Mail or Finder. `OmniFileQuery` is an `EntityStringQuery`: Siri passes
+  words and the served search resolves them, which is the path Apple steers large, changing datasets
+  to (rather than donating every chunk as an IndexedEntity, which would copy the index into the
+  system's with a weaker model). `Search in Omni` and `Find Similar in Omni` open the window; the
+  second, saved as a Quick Action, is a Finder context-menu item without a Finder extension.
+  `OmniShortcuts` offers the first two to Spotlight and Siri with no setup.
+- SERVICES > SEARCH IN OMNI for selected text in any app (Info.plist `NSServices`, handled by
+  `AppDelegate.searchOmni`): the selection goes through `applyParsedQuery`, the door the box uses.
+- NOT TESTED BY TRIGGERING THE SYSTEM: a Service or a Shortcut from outside would route to whichever
+  Omni the system picks - the user's own, or a dev build launched on the real index. The build's
+  `Metadata.appintents/extract.actionsdata` lists the 3 actions, the entity, its query and the 2
+  App Shortcuts; `OMNI_PERF_SCRIPT="intent:<text>"` runs the action's own search in an isolated
+  instance and logs it ("Kaution Wohnung": the Berlin lease's deposit line, then the English lease's
+  security-deposit clause; 13-32 ms main-thread CPU a call).
+- Intent searches land in the sidebar history marked as served (`ServedSurface.intent`).

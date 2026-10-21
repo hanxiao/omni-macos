@@ -105,6 +105,18 @@ final class ServingController {
         startSocket()
     }
 
+    /// The served search for App Intents (Shortcuts, Siri, Spotlight): the same search, grouping
+    /// and passages an agent gets over MCP, on the served work queue. Empty until the engine is up.
+    func searchForIntents(_ query: String, limit: Int, width: Int = Indexer.defaultSnippetLength) async -> [(hit: SearchHit, passage: String?)] {
+        guard let backend else { return [] }
+        return await ServedWork.run {
+            let (hits, vector) = backend.searchReturningVector(query, topK: min(limit * 3, 150), filter: SearchFilter(), surface: .intent)
+            let reps = backend.groupedResults(hits, enabled: true, limit: limit).map(\.representative)
+            let passages = SearchAdapter.textPassages(reps, query: query, vector: vector, width: width, backend: backend)
+            return Array(zip(reps, passages)).map { (hit: $0.0, passage: $0.1) }
+        }
+    }
+
     /// Tear down on model teardown: stop the server and drop the backend.
     func detach() {
         stopServer()

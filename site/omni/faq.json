@@ -321,12 +321,17 @@
         },
         {
           "q": "Which MCP tools are available?",
-          "a": "Ten: search, search_inline, file_status, tag_image, ocr, get_linked_file, list_sources, add_source, pause_source, and remove_source. They return paths, scores, snippets, tags, and transcripts; agents read files with their own tools.",
+          "a": "Eleven: search, search_inline, read_file, file_status, tag_image, ocr, get_linked_file, list_sources, add_source, pause_source, and remove_source. They return paths, scores, the passage that matched, tags, and transcripts; read_file returns a document's text by page, line, or offset, including Word, Pages, and Keynote files.",
           "shortcut": ""
         },
         {
           "q": "What is the SKILL.md button for?",
           "a": "It shows a skill file for agents that follow written instructions, generated from Omni's own tool definitions so it always matches the app. It tells the agent to use the omni command line, which works whether or not the server is on. Save it where your agent reads skills, such as ~/.claude/skills/omni-local-search/SKILL.md, or print it with omni skill.",
+          "shortcut": ""
+        },
+        {
+          "q": "Can I use Omni from Shortcuts, Siri, or Spotlight?",
+          "a": "Yes. Shortcuts has Search Files by Meaning, which returns files with the passage that matched without opening Omni, plus Search in Omni and Find Similar in Omni, which open the window. Make Find Similar a Quick Action to get it in Finder's context menu. Services > Search in Omni searches for text selected in any app.",
           "shortcut": ""
         },
         {

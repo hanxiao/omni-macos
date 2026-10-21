@@ -5,7 +5,8 @@ import OmniKit
 /// tool call and a script's REST call are distinguishable after the fact.
 /// Where a served search came from, for the history drawer's mark: REST, an MCP client, or the
 /// `omni` command line (an MCP call that arrived over the app's own socket).
-enum ServedSurface: String, Sendable { case rest, mcp, cli }
+/// `intent`: Shortcuts, Siri and Spotlight, through App Intents (App/Intents).
+enum ServedSurface: String, Sendable { case rest, mcp, cli, intent }
 
 /// Blocking engine, store and file work for served requests, OFF the Swift concurrency pool.
 ///
