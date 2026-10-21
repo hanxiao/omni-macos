@@ -1346,6 +1346,13 @@ the whole width to the window's edge, not the part the sidebar covers.
   instance and logs it ("Kaution Wohnung": the Berlin lease's deposit line, then the English lease's
   security-deposit clause; 13-32 ms main-thread CPU a call).
 - Intent searches land in the sidebar history marked as served (`ServedSurface.intent`).
+- MACOS 27, NOT ADOPTED (Han, 2026-10-21: skip for now). WWDC26 gives an app with a large, changing
+  dataset `.system.searchInApp` (opens the app's own search with the user's query - the documented
+  path beside EntityStringQuery), `EntityCollection` (bulk parameters by id) and View Annotations
+  (Siri sees the rows on screen); Core AI is Apple's new on-device inference framework, to be
+  measured against MLX for the encoders. All four need the macOS 27 SDK, which only Xcode 27 has;
+  this Mac builds with Xcode 26.6 on macOS 26.6.2 and release CI selects Xcode 26. When the toolchain
+  moves, they go in behind availability checks, tested on a macOS 27 machine.
 - RESULT ROWS SHOW THE PASSAGE THAT MATCHED (index.md, "Passages"), and an excerpt from inside the
   chunk starts with an ellipsis, as Mail and Spotlight show one: "...only after we found the cause:
   the raw water im..." at Page 41 for "boat engine repair", where the row showed the page's opening
