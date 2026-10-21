@@ -30,8 +30,20 @@ public final class EnrichLedger: @unchecked Sendable {
         lock.withLock {
             recipe = Self.recipe(settings)
             if db != nil, metaLocked("recipe") != recipe { resetLocked() }
+            // A WIDER SCOPE IS NOT A NEW RECIPE. Scanned PDFs joined the candidates (their text, as
+            // screenshots have it): the files already done stay done - redoing them would read every
+            // screenshot and embed every long recording again - and only "backfilled" is cleared, so
+            // the next pass looks for the candidates the ledger has never seen.
+            if openLocked(), metaLocked("scope") != Self.scope {
+                exec("INSERT OR REPLACE INTO meta(k, v) VALUES('backfilled', '0');")
+                exec("INSERT OR REPLACE INTO meta(k, v) VALUES('scope', '\(Self.scope)');")
+            }
         }
     }
+
+    /// What the enrichment covers. s1: screenshots, videos, long audio, multi-page PDFs; s2: scans.
+    static let scope = "s2"
+
 
     private func resetLocked() {
         exec("DROP TABLE IF EXISTS done; DELETE FROM meta;")

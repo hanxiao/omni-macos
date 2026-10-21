@@ -6472,7 +6472,7 @@ public final class VectorStore: @unchecked Sendable {
                     SELECT \(StoreSchema.pathExpr), f.kind, f.modified, f.size, f.duration
                       FROM files f JOIN dirs d ON d.id = f.dir_id
                      WHERE f.id >= ? AND f.id < ?
-                       AND ((f.kind = 4 AND f.duration > ?) OR f.kind IN (1, 3)
+                       AND ((f.kind = 4 AND f.duration > ?) OR f.kind IN (1, 2, 3)
                             OR (f.kind = 0 AND f.name LIKE '%.pdf'));
                     """, -1, &stmt, nil) == SQLITE_OK else { return }
                 sqlite3_bind_int64(stmt, 1, lo); sqlite3_bind_int64(stmt, 2, hi)

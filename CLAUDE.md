@@ -78,7 +78,7 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (840 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (845 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|delfolders|
@@ -222,7 +222,8 @@ codebase were already measured there, and many were rejected.
   search while long files stream, the heavy CRUD review, file-backed exact stores, iCloud
   index-then-evict (issue #29), the 0.17.0 soundtrack read that never returned, the 0.17.2
   deleted tree that stopped every Task, exclusions, the served mask and iWork text, served search
-  under load, passages (the text a hit matched), the agent surface (filters, paging, read_file).
+  under load, passages (the text a hit matched), the agent surface (filters, paging, read_file),
+  the text on scanned pages and the metadata migration not done.
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
   and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names, Shortcuts, Siri and Services (App Intents).

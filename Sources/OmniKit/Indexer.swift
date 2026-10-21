@@ -1752,7 +1752,9 @@ public final class Indexer: @unchecked Sendable {
                         phaseClock += dt
                         if textWork[path] != nil { scanPagesOf[path] = chunks.count }
                         costs.addTime(.scan, seconds: dt, units: Double(chunks.count), files: 1)
-                        storeChunks(path, chunks)   // scanned PDF (streamed) / image pages (batched)
+                        // scanned PDF (streamed) / image pages (batched); through withExtras, which
+                        // hands a scan's pages to the screen-text lane as it does a screenshot.
+                        storeChunks(path, self.withExtras(item, chunks, settings: settings))
                     case .textStream, .pdfTextTurns:
                         _ = handleStream(item)
                     default:
@@ -2313,6 +2315,11 @@ public final class Indexer: @unchecked Sendable {
         }
         c.unit = range.upperBound
         c.written += chunks.count
+        // A long scan's pages are in: its text goes to the screen-text lane, as a short scan's does
+        // from withExtras.
+        if last, item.needsScreenText, case .pdfScan = item.payload, let ck = item.contentKey {
+            screenLane.add(.init(file: f, digest: StoreSchema.contentDigestHex(ck), settings: settings))
+        }
         return last ? .done : .more
     }
 
@@ -2442,7 +2449,7 @@ public final class Indexer: @unchecked Sendable {
             for (j, piece) in screen.enumerated() {
                 out.append(IndexedChunk(path: f.path, modified: f.modified, size: f.size, kind: FileKind.text.rawValue,
                                         chunkIndex: first + out.count, snippet: snippet(piece.text), embedding: vecs[j],
-                                        locator: "Text", chunkKey: keyed[j].key))
+                                        locator: piece.locator.isEmpty ? "Text" : piece.locator, chunkKey: keyed[j].key))
             }
         }
         // A soundtrack is an audio file's stream, read by the same code (prefetch, tail skip,
@@ -2518,20 +2525,47 @@ public final class Indexer: @unchecked Sendable {
     }
 
     /// A screenshot's text, read and chunked; [] when it has none, nil when it could not be read.
+    /// A scanned PDF's too, page by page (readScanText).
     func readScreenText(_ file: CrawledFile, settings: IndexSettings) -> [TextPiece]? {
+        if FileExtractor.pdfExtensions.contains(file.ext.lowercased()) { return readScanText(file, settings: settings) }
         guard case .images(let images) = ContentSources.source(for: file).content(file, kind: .image, settings: settings),
               let image = images.first else { return nil }
         let text = ScreenText.recognize(image)
         return text.isEmpty ? [] : chunk(text, settings: settings, origin: .opaque)
     }
 
+    /// THE TEXT ON A SCANNED PAGE, read by the same Vision request as a screenshot's. A scan is
+    /// embedded as page pictures, so its words reached search only as a picture of words, and an
+    /// invoice number on it never reached the identifier lookup at all - on this Mac 1,127 of 1,612
+    /// PDFs are scans by the extractor's own rule (1,760 pages, ~1,060 characters read a page at
+    /// 159 ms p50). Each page is rendered at the index's size and cut on its own, so every piece
+    /// keeps its page as its locator. nil when the PDF cannot be opened.
+    func readScanText(_ file: CrawledFile, settings: IndexSettings) -> [TextPiece]? {
+        guard let doc = PDFDocument(url: file.url), doc.pageCount > 0 else { return nil }
+        var out: [TextPiece] = []
+        for i in 0 ..< doc.pageCount {
+            if isCancelled { return nil }
+            let text: String = autoreleasepool {
+                guard let image = FileExtractor.renderPDFPage(doc, index: i, maxDimension: settings.maxImageDimension) else { return "" }
+                return ScreenText.recognize(image)
+            }
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            out += chunk(text, settings: settings, origin: .opaque).map { TextPiece(text: $0.text, locator: "Page \(i + 1)") }
+        }
+        return out
+    }
+
     /// A screenshot's text added beside its stored picture, its identifiers recorded: one
     /// transaction. False: the file changed or is not stored as one picture, or an embed failed.
     func addScreenText(_ file: CrawledFile, digest: String, pieces: [TextPiece], settings: IndexSettings) -> Bool {
+        // The file's own chunks are kept: a screenshot's one picture, a scan's page pictures.
+        let isScan = FileExtractor.pdfExtensions.contains(file.ext.lowercased())
+        let own = isScan ? FileKind.scan.rawValue : FileKind.image.rawValue
         guard let f = store.storedFiles(paths: [file.path])[file.path], f.modified == file.modified,
-              let base = store.storedChunks(path: file.path)?.filter({ $0.kind == FileKind.image.rawValue }), base.count == 1
+              let base = store.storedChunks(path: file.path)?.filter({ $0.kind == own }).sorted(by: { $0.chunkIndex < $1.chunkIndex }),
+              isScan ? !base.isEmpty : base.count == 1
         else { return false }
-        let first = base[0].chunkIndex + 1
+        let first = (base.map(\.chunkIndex).max() ?? -1) + 1
         recordIdentifiers(pieces, digest: digest, firstChunk: first)
         guard let more = extraChunks(file: file, screen: pieces, soundtrack: nil, duration: 0, first: first, settings: settings),
               !isCancelled else { return false }
@@ -2641,6 +2675,20 @@ public final class Indexer: @unchecked Sendable {
             guard write(chunks) else { return false }
             if let ck = item.contentKey { store.recordContentKeys([(c.path, ck, c.modified, c.size)]) }
             return true
+        case FileKind.scan.rawValue:
+            guard settings.screenText else { return true }
+            // A copy of a scan whose text is already in takes the copy's rows, as a screenshot does.
+            for other in store.pathsForContentDigests([digest])[digest] ?? [] where other != c.path {
+                guard let rows = store.storedChunks(path: other), rows.contains(where: { $0.kind == FileKind.text.rawValue })
+                else { continue }
+                return write(rows.map { r in
+                    IndexedChunk(path: c.path, modified: c.modified, size: c.size, kind: r.kind, chunkIndex: r.chunkIndex,
+                                 snippet: r.snippet, embedding: r.embedding, width: r.width, height: r.height,
+                                 duration: r.duration, locator: r.locator, chunkKey: r.chunkKey)
+                })
+            }
+            guard let pieces = readScanText(file, settings: settings) else { return false }
+            return pieces.isEmpty || addScreenText(file, digest: digest, pieces: pieces, settings: settings)
         case FileKind.image.rawValue:
             guard settings.screenText, Self.isScreenshot(c.path) else { return true }   // not a screenshot: nothing to add
             // A COPY OF A SCREENSHOT whose text is already in: its rows, taken over as content dedup
@@ -3707,8 +3755,11 @@ public final class Indexer: @unchecked Sendable {
             item.enrichable = true   // located by today's rule: the enrichment has nothing to move
             return item
         case .scannedPDF(let pageCount):
-            return DecodedItem(file: file, kind: kind,
-                               payload: .pdfScan(pageCount: pageCount, maxDimension: settings.maxImageDimension), meta: meta, contentKey: contentKey)
+            let item = DecodedItem(file: file, kind: kind,
+                                   payload: .pdfScan(pageCount: pageCount, maxDimension: settings.maxImageDimension), meta: meta, contentKey: contentKey)
+            // Its pages' text, read on the screen-text lane once the page pictures are stored.
+            if settings.screenText { item.needsScreenText = true }
+            return item
         case .images(let images):
             if images.isEmpty { return DecodedItem(file: file) }
             // The decode is normally a pure downscale, so the row keeps the ORIGINAL's dimensions

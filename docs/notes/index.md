@@ -1795,3 +1795,36 @@ into windows of the width shown and the model picks the one closest to the query
   a lookup), failures remembered by key, big text files recovered from the hit's line - and,
   largest of all, hex-encoding keys without a `String(format:)` per byte: 965 keys of one notes file
   per search had been 40 ms.
+
+## The text on scanned pages, and the metadata migration not done (2026-10-20)
+
+- MEASURED FIRST, on this Mac's Documents, Downloads and Desktop: 1,127 of 1,612 PDFs are scans by
+  the extractor's own rule (under 8 text characters a page), 1,760 pages. Vision (`ScreenText`, the
+  screenshot request: accurate, no language correction) reads ~1,060 characters a page at 159 ms p50,
+  355 ms max, at the index's render size. Those scans reached search only as pictures of words, and
+  their codes never reached the identifier lookup.
+- SO A SCAN GOES THROUGH THE SCREENSHOT TEXT PATH: the lane reads it after its page pictures are
+  stored (`readScanText`: each page rendered and read, cut on its own, located "Page N"),
+  `addScreenText` keeps the page pictures and adds the text chunks and identifiers in one write, and
+  the enrichment adds it to scans indexed before. Three places had to learn about scans: the text
+  pipeline stored a scan's pages without `withExtras` (so nothing was ever queued - found by a test
+  that adds a scan after the enrichment has finished; the first tests passed only because the
+  end-of-pass enrichment caught the scan), a scan past 40 pages streams in turns and is queued when
+  its last turn lands (negative control run), and the enrichment candidates gained kind 2.
+- THE FINGERPRINT WAS NOT TOUCHED. A screenshot's content key gains "|t1" with its text; a PDF's
+  cannot, because every PDF - text or scan - shares that fingerprint and it is part of change
+  detection: changing it re-indexes every PDF. And the ledger RECIPE was not touched: a new recipe
+  starts the ledger over, which would read every screenshot and embed every long recording again.
+  `EnrichLedger.scope` clears only "backfilled", so the next pass visits just the candidates the
+  ledger has never seen.
+- QUALITY on the labeled eval, rebuilt on a clone of the testbed: MRR 0.900 -> 0.904, R@1 0.85 ->
+  0.86, scan/pdf/exact/screenshot tags all 1.0. The receipt now has a text row at "Page 1" beside its
+  picture.
+- THE METADATA MIGRATION (capture date, download source, location) IS NOT DONE, on the same
+  measurements. Of ~155,000 files here: 451 carry a download source (0.3%), 40 of ~15,000 images an
+  EXIF capture date (36 more than a day off the file date), 12 GPS - a forced schema migration,
+  proven under chaos and kill, for that yield is the wrong trade. The real case is the Photos
+  library (every edited photo is dated by its edit: PhotosSource.swift:207), which could not be
+  measured here without a Photos permission prompt. When the next schema migration happens, the
+  capture date rides it (one column on `files`, `FileMeta`, the date filters), not a migration of
+  its own.
