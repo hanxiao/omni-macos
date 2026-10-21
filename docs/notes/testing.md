@@ -701,3 +701,18 @@ watchdog). Three modes of `Tools/agenteval/agenteval.py`, stdlib only:
   answer key. Finding a file cannot show what passages or `read_file` are for; this does (66.7% ->
   95.8% right, index.md "The agent surface"). Record the tool arguments (`trail`) - the 18 wasted
   `read_file` calls on recordings were only visible there.
+
+## UI stress without automation mode (2026-10-20, Tools/agenteval/ui-stress.sh)
+
+- Automation mode is off on this Mac and enabling it is a password prompt at the keyboard
+  (`automationmodetool`: "requires user authentication"), so the XCUITest chaos suites cannot run
+  unattended. `ui-stress.sh` drives the same model and view code in-process instead: an isolated
+  instance runs OMNI_PERF_SCRIPT rounds (typing, grid/list, selection and arrow keys, Find Similar,
+  sidebar, browsing, Recents, sort, a served-query search, the Shortcuts search action) with
+  hangwatch at 250 ms and the footprint watchdog.
+- 30 rounds, ~750 steps, 10 minutes, the eval testbed. Before this work: footprint 3,033 MB in the
+  second quarter, 3,057 MB in the last, peak 3,185, no stall over 250 ms. After: 3,067 -> 3,070 MB,
+  peak 3,234, one stall (886 ms, 26% CPU, at a clear-then-type); rerun: 3,076 -> 3,096 MB, one stall
+  of 257 ms at a different step. Flat over time on both - the swing between 2.88 and 3.2 GB is MLX's
+  cache trim - so no leak; the ~35-50 MB more is the two bounded caches the passages added (24 MB of
+  text, 8,192 window vectors).

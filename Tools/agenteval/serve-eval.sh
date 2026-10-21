@@ -7,6 +7,7 @@
 # until it answers and has nothing left to index, then prints the pid. Stop it with `kill <pid>`.
 #
 #   Tools/agenteval/serve-eval.sh <bed dir> <new scratch dir> [app bundle] [cap GB]
+#   EXTRA_ARGS="-omni.hangwatch YES ..." adds launch arguments; OMNI_PERF_SCRIPT etc. pass through.
 set -euo pipefail
 BED=${1:?bed dir}; SCRATCH=${2:?scratch dir (must not exist)}
 APP=${3:-.build/xcode-rel/Build/Products/Release/Omni.app}
@@ -30,7 +31,7 @@ cp -c -R "$INDEX" "$SCRATCH/index"
   -omni.clipboard.enabled NO \
   -omni.ocr.cache.dir "$SCRATCH/ocr" \
   -omni.profiling.uploadEnabled NO \
-  -NSAppSleepDisabled YES \
+  -NSAppSleepDisabled YES ${=EXTRA_ARGS:-} \
   > "$SCRATCH/omni.log" 2>&1 &
 PID=$!
 echo $PID > "$SCRATCH/pid"

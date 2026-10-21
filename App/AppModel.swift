@@ -541,7 +541,8 @@ final class AppModel {
                 return vecs
             }
             guard !superseded else { return }
-            let out = zip(found, best).map { (items[$0.0.0], $0.1) }
+            // An excerpt from inside the chunk reads as continued, as Mail and Spotlight show one.
+            let out = zip(found, best).map { f, w in (items[f.0], f.1.hasPrefix(w) ? w : "\u{2026}" + w) }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let self, self.passageCacheQuery == resolved else { return }

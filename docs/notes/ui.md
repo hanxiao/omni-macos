@@ -1346,3 +1346,8 @@ the whole width to the window's edge, not the part the sidebar covers.
   instance and logs it ("Kaution Wohnung": the Berlin lease's deposit line, then the English lease's
   security-deposit clause; 13-32 ms main-thread CPU a call).
 - Intent searches land in the sidebar history marked as served (`ServedSurface.intent`).
+- RESULT ROWS SHOW THE PASSAGE THAT MATCHED (index.md, "Passages"), and an excerpt from inside the
+  chunk starts with an ellipsis, as Mail and Spotlight show one: "...only after we found the cause:
+  the raw water im..." at Page 41 for "boat engine repair", where the row showed the page's opening
+  before. Open-at-the-match reads the snippet (words only, so the ellipsis is ignored) and now starts
+  from the matched passage.
