@@ -1759,3 +1759,39 @@ into windows of the width shown and the model picks the one closest to the query
   over a typing run; at 600 ms typing is at parity (main CPU 7,947/7,882 vs 7,982/7,848 ms, search
   to results p50 28.8/29.6 vs 28.5/31.4 ms, the same stalls).
 - Linked Macs' hits keep their stored snippets: the remote Mac would have to recover them.
+
+## The agent surface: filters, paging, read_file (2026-10-20)
+
+- PARITY WITH THE BOX. `search` (and REST's `filters`, through `SearchArgs`) takes `exclude_folders`,
+  `exclude_ext`, `tags`, `exclude_tags` and `filename`, the box's `-in:`/`-ext:`/`tag:`/`-tag:`/
+  `filename:`; and `sort: date` and `offset`. `tag_image` had pointed agents at a `tag:` qualifier
+  the tool did not take.
+- A PAGE IS A SLICE OF A POOL at least 30 deep: `offset` pages the same ranking with no state held,
+  and the answer ends with one line - how many more, and the source folders and kinds the top 30 sit
+  in (IndexAct, arXiv 2610.07960: exact counts 74.0 vs 62.0 for "there are more"). ~150 characters.
+- `read_file`: the text the index read from a document, by PDF page, line or character offset, for
+  formats an agent cannot open (no .docx for Claude Code) and for files past the 2 MB extraction cap,
+  read by line from the mapped bytes (a 3.6 MB log's line 41,000 came back as its line 27,398 and
+  "end of file" before). Indexed files only, never the clipboard history. Scans point to `ocr`.
+- MEASURED ON AGENTS, and what it cost to get right:
+  - First version: the tool list grew 3,300 characters (~830 tokens on every turn) and agents spent
+    18 of 21 `read_file` calls trying to read recordings. Calls 2.21 -> 2.50 a query (paired sign test
+    p = 0.021), success 93.6 -> 91.2%. `offset` was never used; the summary line did not cause it.
+  - Descriptions cut to the bone (tools/list 16,801 -> 14,858 characters) and `read_file` labelled
+    DOCUMENTS ONLY: media reads 18 -> 0, calls 2.16 (vs 2.21 at step 3, p = 0.75), success 92.8%
+    (one query; the cloud-budget soundtrack query flips in every comparison). Against the build
+    before any of this work: 2.42 -> 2.16 calls, same cost and tokens per solved query.
+  - FINDING A FILE CANNOT SHOW WHAT READING IS FOR, so `Tools/agenteval/qa.json`: 24 questions
+    answered from the files' content, graded by an answer key (the deposit in a .docx, a total on a
+    scan, a value on line 41,000 of a log, ...). Build before this work: 66.7% right, 4.71 calls,
+    $0.109 and 86,276 tokens per solved question. Now: 95.8%, 2.33 calls, $0.067, 38,457 tokens.
+    The one miss is that log value: semantic search ranks the log first but its chunk around line
+    3,845, one line diluted in 1,800 characters of near-identical readings.
+- SERVED PASSAGES AT LOAD, after four rounds (`load`, 20 results of 400 characters): 40 -> 65 -> 87
+  -> 97 -> 295-307 searches/s warm, 248 cold, against 296 before passages. What it took: tiling
+  windows instead of half-overlapping ones, window vectors cached across queries (a window's vector
+  does not depend on the query), the query vector reused from the search, chunk keys read on a reader
+  connection for only the chunks asked for, every piece of a file's cut kept (the next hit in it is
+  a lookup), failures remembered by key, big text files recovered from the hit's line - and,
+  largest of all, hex-encoding keys without a `String(format:)` per byte: 965 keys of one notes file
+  per search had been 40 ms.

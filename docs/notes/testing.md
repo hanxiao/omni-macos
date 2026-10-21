@@ -697,3 +697,7 @@ watchdog). Three modes of `Tools/agenteval/agenteval.py`, stdlib only:
   run - one query took 16 calls on one build and failed in 7 on the other - so compare all 125
   queries, PAIRED, and treat flips that cancel as noise. ~$7 a build. It sends the synthetic
   testbed's text to the model; never point it at a real index.
+- `agent --qa Tools/agenteval/qa.json`: 24 questions answered from the files' CONTENT, graded by an
+  answer key. Finding a file cannot show what passages or `read_file` are for; this does (66.7% ->
+  95.8% right, index.md "The agent surface"). Record the tool arguments (`trail`) - the 18 wasted
+  `read_file` calls on recordings were only visible there.

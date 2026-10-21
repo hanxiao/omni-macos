@@ -19,6 +19,7 @@ Runs against an ISOLATED Omni serving the labeled eval testbed (serve-eval.sh st
   uv run Tools/agenteval/agenteval.py probe --bed /Volumes/han2tb/omni-eval [--port 51399] [--json out]
   uv run Tools/agenteval/agenteval.py load  --bed ... --clients 16 --seconds 30
   uv run Tools/agenteval/agenteval.py agent --bed ... [--model m] --per-tag 2 [--json out]
+  uv run Tools/agenteval/agenteval.py agent --bed ... --qa Tools/agenteval/qa.json   # answer from content
 """
 import argparse, concurrent.futures, json, os, re, shutil, statistics, subprocess, sys, tempfile, threading, time, unicodedata
 import http.client
@@ -227,22 +228,31 @@ def load(a):
 
 # ------------------------------------------------------------------------------------------------ agent
 
-OMNI_TOOLS = ["search", "search_inline", "file_status", "tag_image", "ocr"]
+OMNI_TOOLS = ["search", "search_inline", "read_file", "file_status", "tag_image", "ocr"]
 
 PROMPT = ("Find the file on this Mac that best matches this request: \"{q}\".\n"
           "Use the omni tools to search. When you are done, reply with ONLY the absolute path of the file "
           "on the first line, and on the second line the page, line or timestamp where it matches if the tools "
           "reported one. If no file matches, reply NONE.")
 
+QA_PROMPT = ("Answer this question about the user's files on this Mac: \"{q}\"\n"
+             "Use the omni tools. Reply with the answer on the first line and the absolute path of the file "
+             "it came from on the second line. If the files do not say, reply UNKNOWN.")
+
+def norm(s):
+    # "4,700" and "4 700" and "4700" are one number; case and spacing do not matter.
+    return re.sub(r"(?<=\d)[ ,](?=\d)", "", s.lower())
+
 def episode(q, a, tree, cfg, workdir):
-    cmd = [a.claude, "-p", PROMPT.format(q=q["q"])] + (["--model", a.model] if a.model else []) + ["--tools", "",
+    prompt = QA_PROMPT.format(q=q["q"]) if "keys" in q else PROMPT.format(q=q["q"])
+    cmd = [a.claude, "-p", prompt] + (["--model", a.model] if a.model else []) + ["--tools", "",
            "--strict-mcp-config", "--mcp-config", cfg,
            "--allowedTools", ",".join(f"mcp__omni__{t}" for t in OMNI_TOOLS),
            "--permission-mode", "bypassPermissions", "--output-format", "stream-json", "--verbose",
            "--no-session-persistence", "--max-budget-usd", str(a.budget)]
     t = time.time()
     p = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True, timeout=a.timeout)
-    calls, result, tool_chars = {}, None, 0
+    calls, result, tool_chars, trail = {}, None, 0, []
     for line in p.stdout.splitlines():
         try:
             ev = json.loads(line)
@@ -258,10 +268,20 @@ def episode(q, a, tree, cfg, workdir):
             for c in ev.get("message", {}).get("content", []):
                 if c.get("type") == "tool_use":
                     calls[c["name"]] = calls.get(c["name"], 0) + 1
+                    trail.append({"tool": c["name"].replace("mcp__omni__", ""), "args": c.get("input", {})})
         elif ev.get("type") == "result":
             result = ev
     answer = (result or {}).get("result") or ""
     first = answer.strip().split("\n")[0].strip().strip("`") if answer.strip() else ""
+    if "keys" in q:   # a question: right when the answer carries the key
+        ok = any(k in norm(answer.strip().split("\n")[0] if answer.strip() else "") for k in q["keys"])
+        usage = (result or {}).get("usage", {})
+        return {"q": q["q"], "tag": "qa", "ok": ok, "ok_place": ok, "answer": first[:200], "calls": calls,
+                "n_calls": sum(calls.values()), "turns": (result or {}).get("num_turns"), "tool_chars": tool_chars,
+                "trail": trail, "in_tokens": usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0),
+                "out_tokens": usage.get("output_tokens", 0), "cost": (result or {}).get("total_cost_usd", 0),
+                "s": round(time.time() - t, 1), "model": ",".join((result or {}).get("modelUsage", {}).keys()),
+                "error": None if result and not result.get("is_error") else (p.stderr[-300:] or (result or {}).get("result", ""))[:300]}
     ok_file = bool(first) and matches(first, None, q["expect"], tree, place_aware=False)
     second = answer.strip().split("\n")[1].strip() if len(answer.strip().split("\n")) > 1 else ""
     ok_place = ok_file and (all(parse_expect(e)[1] is None for e in q["expect"])
@@ -269,6 +289,7 @@ def episode(q, a, tree, cfg, workdir):
     usage = (result or {}).get("usage", {})
     return {"q": q["q"], "tag": q["tag"], "ok": ok_file, "ok_place": ok_place, "answer": first,
             "calls": calls, "n_calls": sum(calls.values()), "turns": (result or {}).get("num_turns"), "tool_chars": tool_chars,
+            "trail": trail,
             "in_tokens": usage.get("input_tokens", 0) + usage.get("cache_read_input_tokens", 0) + usage.get("cache_creation_input_tokens", 0),
             "out_tokens": usage.get("output_tokens", 0), "cost": (result or {}).get("total_cost_usd", 0),
             "s": round(time.time() - t, 1), "model": ",".join((result or {}).get("modelUsage", {}).keys()),
@@ -290,6 +311,11 @@ def agent(a):
     for q in queries:
         by_tag.setdefault(q["tag"], []).append(q)
     chosen = [q for t in sorted(by_tag) for q in by_tag[t][:a.per_tag]]
+    if a.only:
+        wanted = set(json.load(open(a.only)))
+        chosen = [q for q in queries if q["q"] in wanted]
+    if a.qa:
+        chosen = json.load(open(a.qa))
     workdir = tempfile.mkdtemp(prefix="agenteval-")   # no CLAUDE.md, no project settings
     cfg = os.path.join(workdir, "mcp.json")
     json.dump({"mcpServers": {"omni": {"type": "http", "url": f"http://127.0.0.1:{a.port}/mcp"}}}, open(cfg, "w"))
@@ -333,6 +359,8 @@ def main():
     g.add_argument("--budget", type=float, default=0.5)
     g.add_argument("--timeout", type=float, default=300)
     g.add_argument("--claude", default=shutil.which("claude") or "claude")
+    g.add_argument("--only", help="a JSON list of query texts to run instead of --per-tag")
+    g.add_argument("--qa", help="questions with answer keys (Tools/agenteval/qa.json) instead of the find-the-file queries")
     a = ap.parse_args()
     if a.port == 51299:
         sys.exit("51299 is a real install's port; run against an isolated instance (serve-eval.sh, 51399)")

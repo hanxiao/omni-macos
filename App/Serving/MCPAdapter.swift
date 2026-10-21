@@ -11,9 +11,10 @@ import AppKit
 /// transport - `claude mcp add --transport http`, Cursor, VS Code, etc. - with zero setup
 /// beyond the URL.
 ///
-/// Tools: `search` (whole-index), `search_inline` (rank passages within given paths),
-/// `file_status` (index coverage/freshness per file), `tag_image`, `ocr` (transcribe a scan to
-/// Markdown), and the four source tools when the app has wired them. Agents that want raw
+/// Tools: `search` (whole-index), `search_inline` (rank passages within given paths), `read_file`
+/// (the text Omni read from an indexed file, by page, line or offset), `file_status` (index
+/// coverage/freshness per file), `tag_image`, `ocr` (transcribe a scan to Markdown), and the four
+/// source tools when the app has wired them. Agents that want raw
 /// vectors use the OpenAI-style /v1/embeddings endpoint instead; MCP is for the things agents
 /// actually do with Omni - reach the user's files by meaning and trust what the index covers.
 enum MCPAdapter {
@@ -41,13 +42,13 @@ enum MCPAdapter {
 
     /// What `initialize` tells a client about the whole server. Also the body of SKILL.md
     /// (AgentSkill), so it is written for an agent reading it cold.
-    static let instructions = "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, snippets, and media metadata (resolution, duration, size); read the files yourself if you need their full contents.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. Linked Macs (other Macs running Omni that this one is linked with) are searched too, and their results are listed under each Mac's name: get_linked_file copies one here to read. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
+    static let instructions = "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `read_file` reads an indexed file's text by page, line or offset, including formats you cannot open; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, the passage that matched and media metadata; a search ends with how many more there are (`offset` pages) and where the top matches are.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. Linked Macs (other Macs running Omni that this one is linked with) are searched too, and their results are listed under each Mac's name: get_linked_file copies one here to read. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
 
     /// Every tool, as `tools/list` returns them - and as the `omni` command line and SKILL.md
     /// present them. The source tools are only advertised once the app has wired the control:
     /// a tool a client can see but not call is worse than one that is absent.
     static func tools(withSources: Bool) -> [[String: Any]] {
-        var tools = [searchToolDescriptor(), searchInlineToolDescriptor(),
+        var tools = [searchToolDescriptor(), searchInlineToolDescriptor(), readFileToolDescriptor(),
                      fileStatusToolDescriptor(), tagImageToolDescriptor(), ocrToolDescriptor()]
         if withSources {
             tools += [listSourcesDescriptor(), addSourceDescriptor(),
@@ -79,6 +80,8 @@ enum MCPAdapter {
             ["query": "tax return 2025", "macs": []],
         ],
         "search_inline": [["query": "termination clause", "paths": ["/Users/me/Documents/contract.pdf"]]],
+        "read_file": [["path": "/Users/me/Documents/contract.pdf", "page": 7], ["path": "/Users/me/Projects/app/server.log", "line": 1200],
+                      ["path": "/Users/me/Documents/proposal.docx", "offset": 4000]],
         "file_status": [["paths": ["/Users/me/Documents/report.pdf", "/Users/me/Desktop/notes.md"]]],
         "tag_image": [["paths": ["/Users/me/Pictures/IMG_0001.jpg"]]],
         "ocr": [["path": "/Users/me/Downloads/scan.pdf"], ["path": "/Users/me/Downloads/scan.pdf", "pages": "11-20"]],
@@ -88,6 +91,45 @@ enum MCPAdapter {
         "pause_source": [["key": "/Users/me/Downloads"], ["key": "/Users/me/Downloads", "paused": false]],
         "remove_source": [["key": "/Users/me/Old Projects"]],
     ]
+
+    /// How deep the pool a page is cut from goes, at least: deep enough to say where the matches sit.
+    static let summaryPool = 30
+
+    /// WHAT ELSE THERE IS, in one line under the results: how many more ranked results a next page
+    /// holds, and where the top matches sit - the folders under each source and the kinds. A list of
+    /// ten says nothing about the eleventh; measured on agents over a large corpus, exact counts beat
+    /// "there are more" (IndexAct, arXiv 2610.07960: 74.0 vs 62.0), and the folders are the corpus's
+    /// own structure, which the agent can pass back as `folder` to narrow the next search.
+    static func poolSummary(_ pool: [ResultGroup], offset: Int, shown: Int, pageSize: Int, roots: [String]) -> String? {
+        guard pool.count > shown else { return nil }
+        let end = offset + shown
+        var parts: [String] = []
+        if end < pool.count { parts.append("More: offset=\(end) (\(pool.count - end) more).") }
+        // A source's own top-level folders, named from the source's folder name ("Documents/Work"):
+        // specific enough to scope by - the result paths above give the full spelling - and short
+        // enough that the line costs a few tokens, not a few hundred.
+        func label(_ path: String) -> String {
+            if PhotoLibrary.isPhotoPath(path) { return "Photos" }
+            let dir = (path as NSString).deletingLastPathComponent
+            guard let root = roots.filter({ dir == $0 || dir.hasPrefix($0 + "/") }).max(by: { $0.count < $1.count }) else {
+                return (dir as NSString).lastPathComponent
+            }
+            let name = (root as NSString).lastPathComponent
+            return dir.dropFirst(root.count).split(separator: "/").first.map { name + "/" + $0 } ?? name
+        }
+        var byFolder: [String: Int] = [:], byKind: [String: Int] = [:]
+        for g in pool {
+            byFolder[label(g.representative.path), default: 0] += 1
+            byKind[g.representative.fileKind, default: 0] += 1
+        }
+        let ranked = byFolder.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+        var folders = ranked.prefix(4).map { "\($0.key) \($0.value)" }.joined(separator: ", ")
+        if ranked.count > 4 { folders += ", +\(ranked.count - 4)" }
+        let kinds = byKind.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+            .map { "\($0.key) \($0.value)" }.joined(separator: ", ")
+        parts.append("Top \(pool.count): \(folders); \(kinds).")
+        return parts.joined(separator: " ")
+    }
 
     /// A passage on one line, the way the stored snippet is: line breaks and tabs become one space.
     static func oneLine(_ s: String) -> String {
@@ -167,13 +209,14 @@ enum MCPAdapter {
             let surface: ServedSurface = cli ? .cli : surface
             switch name {
             case "search":        return await callSearch(id: id, args: args, backend: backend, sources: sources, surface: surface, cli: cli)
-            case "search_inline", "file_status", "tag_image":
+            case "search_inline", "file_status", "tag_image", "read_file":
                 // Blocking tools, so the whole call runs on the served work queue (see ServedWork).
                 let call = ReadOnlyRequest(id: id, args: args)
                 return await ServedWork.run {
                     switch name {
                     case "search_inline": return callSearchInline(id: call.id, args: call.args, backend: backend, surface: surface, cli: cli)
                     case "file_status":   return callFileStatus(id: call.id, args: call.args, backend: backend, cli: cli)
+                    case "read_file":     return callReadFile(id: call.id, args: call.args, backend: backend, cli: cli)
                     default:              return callTagImage(id: call.id, args: call.args, backend: backend, cli: cli)
                     }
                 }
@@ -201,7 +244,7 @@ enum MCPAdapter {
         [
             "name": "search",
             "title": "Search local files by meaning",
-            "description": "Semantic search over the files Omni has indexed on this Mac (text, code, PDFs, images, audio, video - all in one embedding space). Describe the content in natural language; keywords are not required and any language works. Returns file paths with relevance scores and text snippets. Copies of the same file are collapsed into one result by default (see group_duplicates), so top_k means distinct files.",
+            "description": "Semantic search over the files Omni has indexed on this Mac (text, code, PDFs, images, audio, video - one embedding space). Describe the content in any language; keywords are not required. Returns paths with scores and the passage that matched; copies of a file count once.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
@@ -221,7 +264,7 @@ enum MCPAdapter {
                     ],
                     "include_images": [
                         "type": "boolean",
-                        "description": "When true, embed a downscaled JPEG thumbnail (max 800px) for each image and scanned-PDF result so they render inline in the client. Off by default to keep responses small; at most the top \(maxInlineImages) media hits are inlined."
+                        "description": "Inline a small JPEG of each image and scan result (at most \(maxInlineImages)). Off by default."
                     ],
                     "kinds": [
                         "type": "array",
@@ -235,33 +278,67 @@ enum MCPAdapter {
                     "folders": [
                         "type": "array",
                         "items": ["type": "string"],
-                        "description": "Restrict to files under ANY of these absolute folder paths. Use this to search two or more folders at once - adding them as sources instead does not work, because an indexed parent folder already covers its children."
+                        "description": "Restrict to files under any of these absolute folder paths."
                     ],
                     "modified_after": [
                         "type": "string",
-                        "description": "Only files modified at or after this time. ISO 8601: a date ('2026-10-01', local midnight) or a date-time ('2026-10-01T09:30:00Z'). With modified_before, a range - e.g. last week is modified_after = 7 days ago."
+                        "description": "Only files modified at or after this ISO 8601 date or date-time ('2026-10-01')."
                     ],
                     "modified_before": [
                         "type": "string",
-                        "description": "Only files modified before this time (exclusive). Same formats as modified_after; a date means before that day starts."
+                        "description": "Only files modified before this date or date-time."
                     ],
                     "ext": [
                         "type": "string",
                         "description": "Only files with this extension, e.g. 'pdf' or '.md' (case-insensitive)."
                     ],
+                    "exclude_folders": [
+                        "type": "array",
+                        "items": ["type": "string"],
+                        "description": "Leave out files under these folders."
+                    ],
+                    "exclude_ext": [
+                        "type": "array",
+                        "items": ["type": "string"],
+                        "description": "Leave out these extensions."
+                    ],
+                    "tags": [
+                        "type": "array",
+                        "items": ["type": "string"],
+                        "description": "Only media with any of these tags (words tag_image reports)."
+                    ],
+                    "exclude_tags": [
+                        "type": "array",
+                        "items": ["type": "string"],
+                        "description": "Leave out media with these tags."
+                    ],
+                    "filename": [
+                        "type": "string",
+                        "description": "Only files whose name matches these words."
+                    ],
+                    "sort": [
+                        "type": "string",
+                        "enum": ["relevance", "date"],
+                        "description": "date: newest first among the top matches."
+                    ],
+                    "offset": [
+                        "type": "integer",
+                        "description": "Skip this many results: the next page.",
+                        "minimum": 0, "maximum": 140
+                    ],
                     "min_score": [
                         "type": "number",
-                        "description": "Relevance floor, 0 to 1. Defaults to the floor the app's window applies: none unless the user set one, because a fixed floor also drops right answers that score low; weaker matches are marked instead, as the app folds them. The floor is scaled per kind (a text query scores a photo on a lower scale than a document), so images are not deleted by a text-shaped cut. Pass 0.5 for strong matches only.",
+                        "description": "Relevance floor, 0 to 1, scaled per kind (default: none; weaker matches are marked instead). 0.5 keeps strong matches only.",
                         "minimum": 0, "maximum": 1
                     ],
                     "macs": [
                         "type": "array",
                         "items": ["type": "string"],
-                        "description": "Linked Macs to search too, by name. Default: every linked Mac (File > Link a Mac); [] or [\"none\"] searches this Mac only. Each answers from its own index. Their results are listed under the Mac's name with paths on THAT Mac: read one with get_linked_file."
+                        "description": "Linked Macs to search too, by name (default: all; [] for this Mac only). Their paths are on that Mac: get_linked_file copies one here."
                     ],
                     "group_duplicates": [
                         "type": "boolean", "default": true,
-                        "description": "Collapse copies of the same file into one result (default true). A collapsed result carries duplicate_count, duplicates (the other paths) and duplicate_kind ('exact' = byte-identical, 'near' = same kind and extension, sizes within 10%, cosine >= 0.98). Set false for the flat list with every copy as its own result."
+                        "description": "Collapse copies of a file into one result (default true); false lists every copy."
                     ]
                 ] as [String: Any],
                 "required": ["query"]
@@ -288,6 +365,13 @@ enum MCPAdapter {
         let (parsed, err) = SearchArgs.filter(args)
         if let err { return toolError(id: id, "search failed: \(err)") }
         let filter = parsed
+        let offset = max(0, min((args["offset"] as? Int) ?? 0, 140))
+        let byDate: Bool
+        switch (args["sort"] as? String)?.lowercased() ?? "relevance" {
+        case "relevance": byDate = false
+        case "date": byDate = true
+        default: return toolError(id: id, "search failed: 'sort' must be 'relevance' or 'date'")
+        }
 
         // INDEX STATE, FETCHED CONCURRENTLY. An agent cannot tell an empty result set caused by
         // "not on this Mac" from one caused by "not indexed yet", and the second reading is the
@@ -302,15 +386,23 @@ enum MCPAdapter {
         // already seen - so this defaults ON, with "group_duplicates": false for the flat list.
         let group = (args["group_duplicates"] as? Bool) ?? true
         let k = topK, width = maxSnippet
-        let (hits, groups, passages, tQueued, tRan) = await ServedWork.run { () -> ([SearchHit], [ResultGroup], [String?], Date, Date) in
+        // THE POOL: the top matches a page is cut from, at least 30 deep, so the answer can say what
+        // else there is (where those matches sit, how many more) and `offset` can page through the
+        // same ranking. A page is a slice of it - a second call with offset=10 runs the same search
+        // and returns the next ten, and no ranking is held between calls.
+        let poolSize = min(max(k + offset, Self.summaryPool), 190)
+        let (hits, pool, groups, passages, tQueued, tRan) = await ServedWork.run {
+            () -> ([SearchHit], [ResultGroup], [ResultGroup], [String?], Date, Date) in
             let tQueued = Date()
-            let hits = backend.search(query, topK: group ? min(k * 3, 150) : k, filter: filter, surface: surface)
-            let groups = backend.groupedResults(hits, enabled: group, limit: k)
+            let (hits, vector) = backend.searchReturningVector(query, topK: group ? min(poolSize * 3, 300) : poolSize, filter: filter, surface: surface)
+            var pool = backend.groupedResults(hits, enabled: group, limit: poolSize)
+            if byDate { pool.sort { $0.representative.modified > $1.representative.modified } }
+            let groups = offset < pool.count ? Array(pool[offset ..< min(pool.count, offset + k)]) : []
             // The text a result shows is its chunk's own, recovered from the file: the whole chunk
             // when it fits `max_snippet`, else the window of it that matches the query. Media and
             // anything that cannot be recovered keep the stored snippet.
-            let passages = SearchAdapter.textPassages(groups.map(\.representative), query: query, width: width, backend: backend)
-            return (hits, groups, passages, tQueued, Date())
+            let passages = SearchAdapter.textPassages(groups.map(\.representative), query: query, vector: vector, width: width, backend: backend)
+            return (hits, pool, groups, passages, tQueued, Date())
         }
         let reps = groups.map(\.representative)
         let dupesByPath = Dictionary(uniqueKeysWithValues: groups.map { ($0.representative.path, $0) })
@@ -352,7 +444,9 @@ enum MCPAdapter {
             var inlined = 0          // thumbnails emitted so far (capped)
             var cappedSkips = 0      // media hits skipped specifically because the cap was already reached
             // The app folds these under "Show N weaker matches"; an agent is told the same thing.
-            let weaker = VectorStore.weakFold(reps)
+            // Judged over the whole pool, so a later page is folded by the same measure as the first.
+            let poolWeak = VectorStore.weakFold(pool.map(\.representative))
+            let weaker = reps.indices.map { offset + $0 < poolWeak.count ? poolWeak[offset + $0] : false }
             for (i, h) in reps.enumerated() {
                 let score = Int((max(0, min(1, h.score)) * 100).rounded())
                 let loc = h.locator.isEmpty ? "" : ", \(h.locator)"
@@ -374,7 +468,7 @@ enum MCPAdapter {
                 if h.chunkCount > 1 { meta += ", \(h.chunkCount) passages" }
                 meta += ", \(Self.shortDate(h.modified))"
                 if weaker[i] { meta += ", weaker match" }
-                var text = "\(i + 1). \(h.path)  (\(h.fileKind), \(score)%\(loc)\(meta))"
+                var text = "\(offset + i + 1). \(h.path)  (\(h.fileKind), \(score)%\(loc)\(meta))"
                 if maxSnippet > 0 {
                     let snippet = oneLine(passages[i] ?? h.snippet)
                     if !snippet.isEmpty { text += "\n   \(String(snippet.prefix(maxSnippet)))" }
@@ -394,6 +488,12 @@ enum MCPAdapter {
             }
             if cappedSkips > 0 {
                 content.append(diagnostic("(\(cappedSkips) more image result(s) not inlined; cap is \(maxInlineImages). Open them by path.)"))
+            }
+            let roots = snap?.sources.filter { $0.kind == "folder" }.map(\.key) ?? []
+            if reps.isEmpty {
+                content.append(diagnostic("No results past \(pool.count) for \"\(query)\": offset \(offset) is beyond the end."))
+            } else if let line = poolSummary(pool, offset: offset, shown: reps.count, pageSize: topK, roots: roots) {
+                content.append(["type": "text", "text": line])
             }
         }
 
@@ -437,7 +537,8 @@ enum MCPAdapter {
         }
 
         return answer(id: id, content, cli: cli) {
-            var body: [String: Any] = ["query": query, "results": SearchAdapter.rows(groups, backend: backend, passages: passages), "grouped": group]
+            var body: [String: Any] = ["query": query, "results": SearchAdapter.rows(groups, backend: backend, passages: passages), "grouped": group,
+                                       "offset": offset, "ranked": pool.count]
             if !linked.isEmpty { body["linked"] = linked }
             return body
         }
@@ -504,7 +605,7 @@ enum MCPAdapter {
         // Each passage is the chunk's own text now, not its stored 220-character opening: the
         // whole chunk when it fits `max_snippet`, else the window of it that matches the query.
         if maxSnippet > 0 {
-            let texts = backend.passages(for: hits.map { ($0.path, $0.chunkIndex, $0.locator) }, query: query, width: maxSnippet)
+            let texts = backend.passages(for: hits.map { ($0.path, $0.chunkIndex, $0.locator) }, query: query, vector: nil, width: maxSnippet)
             for i in hits.indices { if let t = texts[i] { hits[i].snippet = t } }
         }
 
@@ -528,6 +629,64 @@ enum MCPAdapter {
                 ["path": h.path, "kind": h.kind, "chunk_index": h.chunkIndex,
                  "score": Double(max(0, min(1, h.score))), "snippet": h.snippet, "locator": h.locator]
             }]
+        }
+    }
+
+    // MARK: - The read_file tool
+
+    private static func readFileToolDescriptor() -> [String: Any] {
+        [
+            "name": "read_file",
+            "title": "Read the text of an indexed file",
+            "description": "DOCUMENTS ONLY: the text Omni read from an indexed text, code, PDF, Word, Pages, RTF or Keynote file, a stretch at a time (PDF pages, lines, or characters). For reading past a search result in formats you may not open yourself. Audio, video and images have no text to read; scans: use ocr.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "path": ["type": "string", "description": "Absolute path of a file Omni has indexed."],
+                    "page": ["type": "integer", "minimum": 1, "description": "PDF: first page (default 1)."],
+                    "line": ["type": "integer", "minimum": 1, "description": "Text and code: first line (default 1)."],
+                    "offset": ["type": "integer", "minimum": 0, "description": "First character, for documents (default 0)."],
+                    "max_chars": ["type": "integer", "minimum": 100, "maximum": 20000, "description": "Default 4000."]
+                ] as [String: Any],
+                "required": ["path"]
+            ] as [String: Any],
+            "annotations": ["readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false]
+        ]
+    }
+
+    /// Runs on the served work queue. Only files the index holds, outside the clipboard history:
+    /// this is not a general file reader for whatever path an agent names.
+    private static func callReadFile(id: Any, args: [String: Any], backend: any ServingBackend, cli: Bool) -> HTTPResponse {
+        guard let raw = args["path"] as? String, !raw.trimmingCharacters(in: .whitespaces).isEmpty else {
+            return toolError(id: id, "read_file failed: 'path' is required")
+        }
+        let path = normalizeStorePath((raw.trimmingCharacters(in: .whitespaces) as NSString).expandingTildeInPath)
+        let clip = AppModel.clipboardDirectory.path
+        guard path.hasPrefix("/"), path != clip, !path.hasPrefix(clip + "/"),
+              backend.fileStatus(paths: [path])[path] != nil else {
+            return toolError(id: id, "read_file failed: \(path) is not in Omni's index. read_file reads only indexed files; file_status says which are.")
+        }
+        let maxChars = max(100, min((args["max_chars"] as? Int) ?? 4000, 20000))
+        let outcome = TextSlice.read(path: path, page: args["page"] as? Int, line: args["line"] as? Int,
+                                     offset: args["offset"] as? Int, maxChars: maxChars)
+        switch outcome {
+        case .scanned(let n):
+            return toolError(id: id, "read_file: \(path) is a scanned PDF (\(n) page\(n == 1 ? "" : "s")) with no text layer. Use ocr with this path and the pages you want, e.g. pages \"1-3\".")
+        case .media(let kind):
+            return toolError(id: id, "read_file: \(path) is \(kind == "image" ? "an image" : kind == "audio" ? "audio" : "a video"); Omni searches it by meaning but keeps no text of it to read.\(kind == "image" ? " tag_image describes it." : "")")
+        case .unreadable(let why):
+            return toolError(id: id, "read_file failed: \(why) (\(path)).")
+        case .text(let s):
+            let plural = s.unit == "character" ? "characters" : s.unit + "s"
+            var head = s.start == s.end || s.unit == "character" && s.end - s.start <= 1
+                ? "\(path): \(s.unit) \(s.start) of \(s.total)"
+                : "\(path): \(plural) \(s.start)-\(s.end) of \(s.total)"
+            if s.unit == "character" { head = "\(path): characters \(s.start)-\(s.end) of \(s.total)" }
+            if let next = s.next { head += "; next: \(s.unit == "character" ? "offset" : s.unit)=\(next)" } else { head += "; end of file" }
+            return answer(id: id, [["type": "text", "text": head + "\n\n" + s.text]], cli: cli) {
+                ["path": path, "unit": s.unit, "start": s.start, "end": s.end, "total": s.total,
+                 "next": s.next.map { $0 as Any } ?? NSNull(), "text": s.text]
+            }
         }
     }
 

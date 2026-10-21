@@ -13116,9 +13116,21 @@ public final class VectorStore: @unchecked Sendable {
     /// Each stored chunk's KEY, by chunk index, as the hex the indexer computes (`ChunkKey`). The
     /// key is a digest of the chunk's exact text and its cutter, so it is what tells a passage
     /// recovered from the file today (`Indexer.recoverChunkText`) from one of another version.
-    public func chunkKeys(path: String) -> [Int: String] {
-        queue.sync {
-            guard dbOpen() else { return [:] }
+    public func chunkKeys(path: String) -> [Int: String] { chunkKeys(paths: [path])[path] ?? [:] }
+
+    /// Only the chunks asked for, per file: a long file's every key, hex-encoded per search, was
+    /// most of what a served search's passages cost (965 keys for one notes file, 40 ms).
+    public func chunkKeys(wanted: [String: Set<Int>]) -> [String: [Int: String]] {
+        chunkKeys(paths: Array(wanted.keys), only: wanted)
+    }
+
+    /// The same for several files in one pass, on a READ connection: served search asks for every
+    /// hit's keys, and on the writer's queue each lookup waited behind the other requests' searches -
+    /// 46 ms a search under load, more than the search. Paths come from search hits, so they are
+    /// already the stored spelling.
+    public func chunkKeys(paths: [String], only: [String: Set<Int>]? = nil) -> [String: [Int: String]] {
+        guard !paths.isEmpty else { return [:] }
+        return onReader(interactiveLane, [:]) { h in
             let sql = splitBuilt ? """
                 SELECT o.ordinal, c.key FROM occurrence o JOIN chunk c ON c.id = o.chunk_id
                  WHERE o.file_id = \(StoreSchema.fileIDByPath);
@@ -13126,18 +13138,39 @@ public final class VectorStore: @unchecked Sendable {
                 SELECT c.chunk_index, t.chunk_key FROM chunks c JOIN chunk_text t ON t.chunk_id = c.id
                  WHERE c.file_id = \(StoreSchema.fileIDByPath);
                 """
-            var out: [Int: String] = [:]
             var st: OpaquePointer?
             defer { sqlite3_finalize(st) }
-            guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return [:] }
-            bindPath(st, 1, path)
-            while sqlite3_step(st) == SQLITE_ROW {
-                let n = Int(sqlite3_column_bytes(st, 1))
-                guard n > 0, let p = sqlite3_column_blob(st, 1) else { continue }
-                let bytes = UnsafeRawBufferPointer(start: p, count: n)
-                out[Int(sqlite3_column_int(st, 0))] = bytes.map { String(format: "%02x", $0) }.joined()
+            guard sqlite3_prepare_v2(h, sql, -1, &st, nil) == SQLITE_OK else { return [:] }
+            var out: [String: [Int: String]] = [:]
+            for path in Set(paths) {
+                sqlite3_reset(st); sqlite3_clear_bindings(st)
+                let (dir, name) = StoreSchema.splitPath(path)
+                sqlite3_bind_text(st, 1, dir, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT)
+                var keys: [Int: String] = [:]
+                let wanted = only?[path]
+                while sqlite3_step(st) == SQLITE_ROW {
+                    let ord = Int(sqlite3_column_int(st, 0))
+                    if let wanted, !wanted.contains(ord) { continue }
+                    let n = Int(sqlite3_column_bytes(st, 1))
+                    guard n > 0, let p = sqlite3_column_blob(st, 1) else { continue }
+                    keys[ord] = Self.hex(UnsafeRawBufferPointer(start: p, count: n))
+                }
+                out[path] = keys
             }
             return out
+        }
+    }
+
+    /// Lowercase hex, as `ChunkKey` spells a digest, without a formatter per byte.
+    static func hex(_ bytes: UnsafeRawBufferPointer) -> String {
+        let digits = Array("0123456789abcdef".utf8)
+        return String(unsafeUninitializedCapacity: bytes.count * 2) { out in
+            for (i, b) in bytes.enumerated() {
+                out[2 * i] = digits[Int(b >> 4)]
+                out[2 * i + 1] = digits[Int(b & 0x0F)]
+            }
+            return bytes.count * 2
         }
     }
 

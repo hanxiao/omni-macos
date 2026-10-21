@@ -53,10 +53,46 @@ enum SearchArgs {
         }
         if let raw = a["ext"] {
             guard let ext = raw as? String else { return (filter, "'ext' must be a string like 'pdf'") }
-            let clean = ext.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
+            let clean = cleanExtension(ext)
             if !clean.isEmpty { filter.ext = clean }
         }
+        // THE SAME FILTERS THE SEARCH BOX HAS. An agent had kinds, folders, dates and one extension;
+        // the box also has -in:, -ext:, tag:, -tag: and filename:, and `tag_image` pointed agents at
+        // a `tag:` qualifier this tool did not take.
+        if let raw = a["exclude_folders"] {
+            guard let folders = raw as? [String] else { return (filter, "'exclude_folders' must be a list of absolute folder paths") }
+            for f in folders {
+                let t = (f.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
+                guard !t.isEmpty else { continue }
+                guard t.hasPrefix("/") else { return (filter, "'exclude_folders' takes absolute paths (got \"\(f)\")") }
+                let v = normalizeStorePath(t)
+                if !filter.excludeFolders.contains(v) { filter.excludeFolders.append(v) }
+            }
+        }
+        if let raw = a["exclude_ext"] {
+            let list: [String]
+            if let one = raw as? String { list = [one] } else if let many = raw as? [String] { list = many }
+            else { return (filter, "'exclude_ext' must be an extension like 'log' or a list of them") }
+            filter.excludeExts = list.map(cleanExtension).filter { !$0.isEmpty }
+        }
+        for (key, apply) in [("tags", { (t: [String]) in filter.tagTerms = t }),
+                             ("exclude_tags", { (t: [String]) in filter.tagExcludeTerms = t })]
+                             as [(String, ([String]) -> Void)] {
+            guard let raw = a[key] else { continue }
+            guard let list = raw as? [String] else { return (filter, "'\(key)' must be a list of tag words like [\"beach\"]") }
+            apply(list.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }.filter { !$0.isEmpty })
+        }
+        if let raw = a["filename"] {
+            guard let name = raw as? String else { return (filter, "'filename' must be a string") }
+            let t = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { filter.filenameQuery = t }
+        }
         return (filter, nil)
+    }
+
+    /// "pdf", ".pdf" and " PDF " name the same extension.
+    static func cleanExtension(_ s: String) -> String {
+        s.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased()
     }
 
     /// A JSON number as Double, whether it arrived as an integer or not. A Bool is not a number,

@@ -567,24 +567,35 @@ public final class Indexer: @unchecked Sendable {
     /// agrees with the turn's from its first boundary on, and the key is what makes trying it safe.
     /// A file whose content is not on this Mac (an evicted iCloud file) is not downloaded for this.
     public func recoverChunkText(path: String, key: String, locator: String, settings: IndexSettings) -> String? {
+        recoverChunkTexts(path: path, keys: [key], locator: locator, settings: settings)[key]
+    }
+
+    /// Every piece of the cut that holds any of `keys`, by key - the other pieces of the file came
+    /// out of the same cut, and a caller that keeps them (PassageRecovery) gets the next hit in the
+    /// same file without extracting and cutting it again. Empty when no cut holds any of the keys.
+    public func recoverChunkTexts(path: String, keys: Set<String>, locator: String, settings: IndexSettings) -> [String: String] {
         let url = URL(fileURLWithPath: path)
         let ext = url.pathExtension.lowercased()
-        guard !key.isEmpty, FileManager.default.fileExists(atPath: path), !FileExtractor.isDataless(path),
-              FileExtractor.kind(forExtension: ext) == .text else { return nil }
+        guard !keys.isEmpty, FileManager.default.fileExists(atPath: path), !FileExtractor.isDataless(path),
+              FileExtractor.kind(forExtension: ext) == .text else { return [:] }
         let fingerprint = Self.cutterParams(settings).fingerprint
-        func find(_ text: String, _ origin: TextOrigin, wholeDocument: Bool) -> String? {
+        func find(_ text: String, _ origin: TextOrigin, wholeDocument: Bool) -> [String: String]? {
             for cdc in [true, false] {
+                var all: [String: String] = [:]
+                var hit = false
                 for p in chunk(text, settings: settings, origin: origin, filterOpaque: false,
                                wholeDocument: wholeDocument, cdc: cdc) {
                     let k = cdc ? ChunkKey.text(p.text, cutter: fingerprint, dim: embedder.dim)
                                 : ChunkKey.grid(p.text, maxChars: settings.maxCharsPerChunk, overlap: chunkOverlap, dim: embedder.dim)
-                    if k == key { return p.text }
+                    all[k] = p.text
+                    if keys.contains(k) { hit = true }
                 }
+                if hit { return all }
             }
             return nil
         }
         if FileExtractor.pdfExtensions.contains(ext) {
-            guard let doc = PDFDocument(url: url), doc.pageCount > 0 else { return nil }
+            guard let doc = PDFDocument(url: url), doc.pageCount > 0 else { return [:] }
             // Pages assembled exactly as extraction and the turns assemble them; each page read once.
             var pageText: [Int: String] = [:]
             func pages(_ r: Range<Int>) -> (String, [Int]) {
@@ -613,17 +624,47 @@ public final class Indexer: @unchecked Sendable {
                     }
                 }
             }
-            guard n <= 60 else { return nil }
+            guard n <= 60 else { return [:] }
             let (t, s) = pages(0 ..< n)
-            return find(t, .paged(s), wholeDocument: true) ?? find(t, .paged(s), wholeDocument: false)
+            return find(t, .paged(s), wholeDocument: true) ?? find(t, .paged(s), wholeDocument: false) ?? [:]
+        }
+        // A text file past the extraction cap was streamed to its end in windows; the extractor's text
+        // stops at 2 MB. The cut is started at the hit's line instead: the cutter lands its cuts on
+        // line starts, so a cut beginning at the chunk's first line reproduces it, and the next
+        // boundaries follow from the bytes alone. The line before is tried too, for a cut that fell
+        // mid-line.
+        if FileExtractor.textExtensions.contains(ext), locator.hasPrefix("Line "), let line = Int(locator.dropFirst(5)),
+           let size = (try? FileManager.default.attributesOfItem(atPath: path))?[.size] as? Int, size > FileExtractor.maxTextBytes,
+           let data = try? Data(contentsOf: url, options: .alwaysMapped) {
+            for from in [line, line - 1] where from >= 1 {
+                guard let window = Self.textWindow(data, fromLine: from, bytes: 16 * Swift.max(1, settings.maxCharsPerChunk)) else { continue }
+                if let hit = find(window, .plain, wholeDocument: false) { return hit }
+            }
+            return [:]
         }
         switch try? FileExtractor.extract(url) {
         case .text(let t)?:
-            return find(t, FileExtractor.textExtensions.contains(ext) ? .plain : .opaque, wholeDocument: true)
+            return find(t, FileExtractor.textExtensions.contains(ext) ? .plain : .opaque, wholeDocument: true) ?? [:]
         case .pagedText(let t, let s)?:
-            return find(t, .paged(s), wholeDocument: true)
+            return find(t, .paged(s), wholeDocument: true) ?? [:]
         default:
-            return nil
+            return [:]
+        }
+    }
+
+    /// UTF-8 text from the start of line `fromLine` (1-based), about `bytes` long, from mapped data.
+    static func textWindow(_ data: Data, fromLine: Int, bytes: Int) -> String? {
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> String? in
+            let p = raw.bindMemory(to: UInt8.self)
+            guard let base = p.baseAddress else { return nil }
+            var line = 1, i = 0
+            while line < fromLine, i < p.count {
+                guard let nl = memchr(base + i, 0x0A, p.count - i) else { return nil }
+                i = UnsafePointer<UInt8>(nl.assumingMemoryBound(to: UInt8.self)) - base + 1
+                line += 1
+            }
+            guard line == fromLine, i < p.count else { return nil }
+            return String(decoding: UnsafeBufferPointer(rebasing: p[i ..< Swift.min(p.count, i + bytes)]), as: UTF8.self)
         }
     }
 

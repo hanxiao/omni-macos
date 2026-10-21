@@ -57,10 +57,13 @@ protocol ServingBackend: Sendable {
     func embedBatch(_ texts: [String], query: Bool) -> [[Float]]
     /// Semantic search: embeds `query` at high priority and scores against the store.
     func search(_ query: String, topK: Int, filter: SearchFilter, surface: ServedSurface) -> [SearchHit]
+    /// The same search, and the query's vector, so a caller that goes on to pick passages does not
+    /// embed the query a second time.
+    func searchReturningVector(_ query: String, topK: Int, filter: SearchFilter, surface: ServedSurface) -> ([SearchHit], [Float])
     /// For each hit, the part of its chunk that matches `query`, at most `width` characters: the
     /// whole chunk when it fits, else its best window (PassageWindow). nil where there is no text to
     /// recover (media, a file changed since it was indexed) - the caller shows the stored snippet.
-    func passages(for hits: [(path: String, chunk: Int, locator: String)], query: String, width: Int) -> [String?]
+    func passages(for hits: [(path: String, chunk: Int, locator: String)], query: String, vector: [Float]?, width: Int) -> [String?]
     /// Rank passages WITHIN an explicit set of files/folders. Embeds `query` (high priority)
     /// and scores against the already-indexed chunk vectors of those paths only.
     func searchInline(_ query: String, paths: [String], topK: Int, surface: ServedSurface) -> [InlineChunkHit]
@@ -138,6 +141,10 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     }
 
     func search(_ query: String, topK: Int, filter: SearchFilter, surface: ServedSurface) -> [SearchHit] {
+        searchReturningVector(query, topK: topK, filter: filter, surface: surface).0
+    }
+
+    func searchReturningVector(_ query: String, topK: Int, filter: SearchFilter, surface: ServedSurface) -> ([SearchHit], [Float]) {
         let vec = engine.embedQuery(query)
         onSearch?(query, surface)
         // The clipboard history is the user's alone: no served surface returns it.
@@ -147,11 +154,11 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
         // The SAME cut the window applies, so an agent and a human asking one question see one
         // answer. Per kind, because the score scale is per kind - see VectorStore.relevanceFloor.
         let floor = filter.minScore ?? Self.minScore
-        guard floor > 0 else { return hits }
-        return hits.filter { Double($0.score) / $0.lift >= VectorStore.relevanceFloor($0, base: floor) }
+        guard floor > 0 else { return (hits, vec) }
+        return (hits.filter { Double($0.score) / $0.lift >= VectorStore.relevanceFloor($0, base: floor) }, vec)
     }
 
-    func passages(for hits: [(path: String, chunk: Int, locator: String)], query: String, width: Int) -> [String?] {
+    func passages(for hits: [(path: String, chunk: Int, locator: String)], query: String, vector: [Float]?, width: Int) -> [String?] {
         guard let recovery = passageRecovery, width > 0, !hits.isEmpty else { return hits.map { _ in nil } }
         let t0 = omniPerfEnabled ? Date() : nil
         let texts = recovery.texts(hits)
@@ -163,10 +170,10 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
             if t.count <= width { out[i] = t } else { long.append((i, t)) }
         }
         guard !long.isEmpty else { return out }
-        let q = engine.embedQuery(query)
+        let q = vector ?? engine.embedQuery(query)
         var windowCount = 0
-        let best = PassageWindow.best(long.map(\.text), width: width, query: q) { windows in
-            windowCount = windows.count
+        let best = PassageWindow.best(long.map(\.text), width: width, query: q, cache: recovery.windowVectors) { windows in
+            windowCount += windows.count
             var vecs: [[Float]] = []
             var i = 0
             while i < windows.count {   // a forward per group, as embedBatch groups a client's batch

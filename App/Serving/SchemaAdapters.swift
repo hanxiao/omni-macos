@@ -365,14 +365,22 @@ enum SearchAdapter {
         // flat, pre-grouping list. When on, the search over-fetches so collapsing cannot leave the
         // caller with fewer distinct files than it asked for.
         let group = (body["group_duplicates"] as? Bool) ?? true
-        let fetch = group ? min(topK * 3, 300) : topK
-        let hits = backend.search(query, topK: fetch, filter: filter, surface: .rest)
-        let groups = backend.groupedResults(hits, enabled: group, limit: topK)
+        // `offset` and `sort` as the MCP tool takes them: a page of the same ranking, and newest
+        // first among the top matches.
+        let offset = max(0, min((body["offset"] as? Int) ?? 0, 200))
+        let sort = (body["sort"] as? String)?.lowercased() ?? "relevance"
+        guard sort == "relevance" || sort == "date" else { return badRequest("'sort' must be 'relevance' or 'date'") }
+        let deep = min(topK + offset, 400)
+        let fetch = group ? min(deep * 3, 600) : deep
+        let (hits, vector) = backend.searchReturningVector(query, topK: fetch, filter: filter, surface: .rest)
+        var pool = backend.groupedResults(hits, enabled: group, limit: deep)
+        if sort == "date" { pool.sort { $0.representative.modified > $1.representative.modified } }
+        let groups = offset < pool.count ? Array(pool[offset ..< min(pool.count, offset + topK)]) : []
         // `max_snippet`, as the MCP tool takes it: each text result's snippet becomes the part of
         // its chunk that matches, up to that many characters. Absent, the stored snippet as before.
         var passages: [String?] = []
         if let width = body["max_snippet"] as? Int, width > 0 {
-            passages = textPassages(groups.map(\.representative), query: query, width: min(width, 2000), backend: backend)
+            passages = textPassages(groups.map(\.representative), query: query, vector: vector, width: min(width, 2000), backend: backend)
         }
         return HTTPResponse.json(["query": query, "results": rows(groups, backend: backend, passages: passages),
                                   "grouped": group])
@@ -380,12 +388,12 @@ enum SearchAdapter {
 
     /// Each text hit's matching passage (ServingBackend.passages), nil for the rest. Shared with
     /// the MCP search tool.
-    static func textPassages(_ reps: [SearchHit], query: String, width: Int, backend: any ServingBackend) -> [String?] {
+    static func textPassages(_ reps: [SearchHit], query: String, vector: [Float]?, width: Int, backend: any ServingBackend) -> [String?] {
         let textual = reps.indices.filter { reps[$0].fileKind == FileKind.text.rawValue }
         var out = [String?](repeating: nil, count: reps.count)
         guard width > 0, !textual.isEmpty else { return out }
         let found = backend.passages(for: textual.map { (reps[$0].path, reps[$0].chunkIndex, reps[$0].locator) },
-                                     query: query, width: width)
+                                     query: query, vector: vector, width: width)
         for (j, i) in textual.enumerated() { out[i] = found[j] }
         return out
     }

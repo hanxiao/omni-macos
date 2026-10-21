@@ -141,6 +141,33 @@ final class PassageRecoveryTests: XCTestCase {
         for (_, _, t) in after { if let t { XCTAssertTrue(text.contains(t)) } }
     }
 
+    /// Past the 2 MB extraction cap a text file is indexed by streaming windows to its end, and the
+    /// extractor's text stops at 2 MB: those chunks are recovered from their line instead.
+    func testChunksPastTheExtractionCapComeBack() throws {
+        let words = ["pressure", "sensor", "valve", "reading", "nominal", "spike", "drift", "flow"]
+        let text = (0 ..< 40_000).map { i in
+            "\(i) " + (0 ..< 10).map { words[(i * 3 + $0 * 5) % words.count] }.joined(separator: " ") + " end of record \(i)"
+        }.joined(separator: "\n")
+        XCTAssertGreaterThan(text.utf8.count, FileExtractor.maxTextBytes + 500_000)
+        let file = root.appendingPathComponent("readings.txt")   // .txt: a long .log keeps the 2 MB cut by default
+        try text.write(to: file, atomically: true, encoding: .utf8)
+        let (indexer, store) = try indexed()
+        defer { store.close() }
+        // Chunks whose first line is past the cap, by their locator - every tenth of them: each is a
+        // window read and cut of its own, and a search asks for ten, not twelve hundred.
+        let capLine = text.utf8.prefix(FileExtractor.maxTextBytes).filter { $0 == 0x0A }.count + 1
+        let keys = store.chunkKeys(path: file.path), locators = store.chunkLocators(path: file.path)
+        let sample = keys.keys.sorted().filter { (Int((locators[$0] ?? "").dropFirst(5)) ?? 0) > capLine + 2 }
+            .enumerated().filter { $0.offset % 10 == 0 }.map(\.element)
+        let recovery = PassageRecovery(indexer: indexer, store: store, settings: IndexSettings())
+        let texts = recovery.texts(sample.map { (file.path, $0, locators[$0] ?? "") })
+        let late = zip(sample, texts).map { ($0, locators[$0] ?? "", $1) }
+        XCTAssertGreaterThan(late.count, 50, "the fixture must put many chunks past the cap")
+        let missing = late.filter { $0.2 == nil }.map(\.1)
+        XCTAssertLessThanOrEqual(missing.count, late.count / 50, "unrecovered past the cap: \(missing.prefix(5))")
+        for (_, _, t) in late { if let t { XCTAssertTrue(text.contains(t)) } }
+    }
+
     func testAFileGoneOrNotTextIsNil() throws {
         let file = root.appendingPathComponent("gone.txt")
         try prose(300).write(to: file, atomically: true, encoding: .utf8)
@@ -167,8 +194,37 @@ final class PassageRecoveryTests: XCTestCase {
     func testWindowsOverTextWithNoSpaces() {
         let text = String(repeating: "数据检索系统的设计与实现", count: 40)
         let ws = PassageWindow.windows(text, width: 100)
-        XCTAssertGreaterThan(ws.count, 5)
+        XCTAssertEqual(ws.count, 5, "480 characters tile into windows of 100")
         XCTAssertTrue(ws.allSatisfy { $0.count <= 100 && text.contains($0) })
+        XCTAssertTrue(text.hasPrefix(ws.first!)); XCTAssertTrue(text.hasSuffix(ws.last!))
+    }
+
+    /// A match split across two tiles is still found whole: the straddling windows are tried.
+    func testBestFindsAMatchAcrossATileEdge() {
+        let filler = prose(20)
+        let tiles = PassageWindow.windows(filler + " NEEDLE HALF ONE NEEDLE HALF TWO " + filler, width: 160)
+        XCTAssertTrue(tiles.contains { $0.contains("HALF ONE") && !$0.contains("HALF TWO") } || tiles.contains { $0.contains("HALF TWO") && !$0.contains("HALF ONE") }
+                      || tiles.contains { $0.contains("HALF ONE") && $0.contains("HALF TWO") })
+        let text = filler + " NEEDLE HALF ONE NEEDLE HALF TWO " + filler
+        let embed: ([String]) -> [[Float]] = { $0.map { w in
+            let both = w.contains("HALF ONE") && w.contains("HALF TWO")
+            return both ? [1, 0] : (w.contains("HALF") ? [0.6, 0.8] : [0, 1])
+        } }
+        let best = PassageWindow.best([text], width: 160, query: [1, 0], embed: embed)
+        XCTAssertTrue(best[0].contains("HALF ONE") && best[0].contains("HALF TWO"), "picked: \(best[0])")
+    }
+
+    /// Window vectors are reused across queries: the second query over the same text embeds nothing.
+    func testWindowVectorsAreReusedAcrossQueries() {
+        let text = prose(60)
+        let cache = WindowVectors()
+        var embedded = 0
+        let embed: ([String]) -> [[Float]] = { ws in embedded += ws.count; return ws.map { _ in [1, 0] } }
+        _ = PassageWindow.best([text], width: 200, query: [1, 0], cache: cache, embed: embed)
+        let first = embedded
+        XCTAssertGreaterThan(first, 3)
+        _ = PassageWindow.best([text], width: 200, query: [0, 1], cache: cache, embed: embed)
+        XCTAssertEqual(embedded, first, "the second query re-embedded windows the cache held")
     }
 
     func testBestPicksTheWindowTheQueryMatches() {

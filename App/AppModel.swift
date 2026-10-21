@@ -527,7 +527,7 @@ final class AppModel {
             for (i, t) in texts.enumerated() { if let t { found.append((i, t)) } }
             guard !found.isEmpty, current() else { return }
             var superseded = false
-            let best = PassageWindow.best(found.map(\.1), width: width, query: qv) { windows in
+            let best = PassageWindow.best(found.map(\.1), width: width, query: qv, cache: recovery.windowVectors) { windows in
                 // A forward of 16 windows at a time on the low lane, checking between them: a new
                 // search stops this one within one short forward.
                 var vecs: [[Float]] = []
