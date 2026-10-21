@@ -5437,6 +5437,47 @@ if args.count >= 4 && args[1] == "nameconcat" {
 // Times the three query SHAPES separately, because the fusion change does different amounts of
 // work in each: a prose query never opens the name channel, a bare filename query opens it with
 // 24 candidates, and a `filename:` clause is now a SCOPE and opens it with 512.
+// The cost of a served search's passages is the windows it embeds: omni-verify winbench <model> <tree> [width]
+// Real prose from <tree> cut the way PassageWindow cuts it, embedded N at a time as embedPassages does,
+// never the same window twice (nothing is cached), p50 over 15 calls per N.
+if args.count >= 4 && args[1] == "winbench" {
+    let engine = try await OmniEngine.loadValidated(modelDir: URL(fileURLWithPath: args[2]))
+    let width = (args.count >= 5 ? Int(args[4]) : nil) ?? 200
+    var pool: [String] = []
+    let walker = FileManager.default.enumerator(at: URL(fileURLWithPath: args[3]), includingPropertiesForKeys: nil)
+    while let u = walker?.nextObject() as? URL, pool.count < 6000 {
+        guard ["txt", "md", "docx", "pdf", "rtf"].contains(u.pathExtension.lowercased()),
+              let c = try? FileExtractor.extract(u) else { continue }
+        let t: String
+        switch c { case .text(let s): t = s; case .pagedText(let s, _): t = s; default: continue }
+        guard t.count > width * 2 else { continue }
+        pool += PassageWindow.windows(String(t.prefix(20_000)), width: width)
+    }
+    print("winbench windows=\(pool.count) width=\(width)")
+    var next = 0
+    func take(_ n: Int) -> [String] { defer { next += n }; return (0 ..< n).map { pool[(next + $0) % pool.count] } }
+    _ = engine.embedPassages(take(8), waiting: true); _ = engine.embedQuery("warm")
+    let sizes = ProcessInfo.processInfo.environment["WINBENCH_SIZES"].map { $0.split(separator: ",").compactMap { Int($0) } }
+        ?? [1, 2, 4, 6, 8, 12, 16, 24, 32, 48]
+    for n in sizes {
+        var ms: [Double] = [], tok: [Double] = []
+        for _ in 0 ..< 15 {
+            let w = take(n)
+            var t = Date(); _ = engine.tokenizeOnlyForBenchmark([w], as: .passage); tok.append(-t.timeIntervalSinceNow * 1000)
+            t = Date(); _ = engine.embedPassages(w, waiting: true); ms.append(-t.timeIntervalSinceNow * 1000)
+        }
+        ms.sort(); tok.sort()
+        print(String(format: "  n=%2d  p50 %6.2f ms  min %6.2f  max %6.2f   %.2f ms/window   tokenize p50 %5.2f ms", n, ms[7], ms[0], ms[14], ms[7] / Double(n), tok[7]))
+    }
+    // The same windows one at a time through the compiled whole-forward (query) path: the floor a
+    // compiled batch path could reach on the fixed part.
+    var q: [Double] = []
+    for _ in 0 ..< 30 { let w = take(1)[0]; let t = Date(); _ = engine.embedQuery(w); q.append(-t.timeIntervalSinceNow * 1000) }
+    q.sort()
+    print(String(format: "  compiled single (embedQuery) p50 %5.2f ms  min %5.2f", q[15], q[0]))
+    exit(0)
+}
+
 if args.count >= 4 && args[1] == "latbench" {
     let store = try VectorStore(dbURL: URL(fileURLWithPath: args[2]))
     store.prepareLexicalIndex()

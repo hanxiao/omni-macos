@@ -31,6 +31,7 @@ enum PerfScript {
                 for i in 0 ..< times {
                     let cpu0 = HangWatch.threadCPU()
                     let t0 = Date()
+                    HangWatch.step = raw
                     if raw.hasPrefix("type:") { await type(String(raw.dropFirst(5)), model) }
                     else if raw.hasPrefix("intent:") {   // the App Intents search, as Shortcuts runs it
                         let files = (try? await OmniIntentSearch.run(String(raw.dropFirst(7)), limit: 5)) ?? []
@@ -84,6 +85,10 @@ enum PerfScript {
             model.setSemanticText(arg); model.search()
         case "clear": model.clearSearch()
         case "wait": break   // the wait is the sleep after the step
+        case "block":   // hangwatch's positive control: block:cpu:<ms> spins, block:wait:<ms> waits on a semaphore
+            let parts = arg.split(separator: ":")
+            let ms = parts.count > 1 ? Int(parts[1]) ?? 400 : 400
+            if parts.first == "wait" { blockWaiting(ms) } else { blockSpinning(ms) }
         case "menu":   // a menu bar item by its title, as a click would: menu:Omni Keyboard Shortcuts
             func find(_ menu: NSMenu) -> NSMenuItem? {
                 for item in menu.items {
@@ -293,6 +298,20 @@ enum PerfScript {
         case "appearance": NSApp.appearance = NSAppearance(named: arg == "dark" ? .darkAqua : .aqua)
         default: omniPerfLog("script: unknown step \(step)")
         }
+    }
+
+    /// Named so the stall report can be checked against them: a block that is work, and one that is a wait.
+    @inline(never) private static func blockSpinning(_ ms: Int) {
+        let end = CFAbsoluteTimeGetCurrent() + Double(ms) / 1000
+        var x = 0.0
+        while CFAbsoluteTimeGetCurrent() < end { x += sin(x) }
+        if x.isNaN { print(x) }
+    }
+
+    @inline(never) private static func blockWaiting(_ ms: Int) {
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(ms)) { done.signal() }
+        done.wait()
     }
 
     private static func firstView<T: NSView>(of type: T.Type, in root: NSView?) -> T? {

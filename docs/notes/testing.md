@@ -137,6 +137,15 @@ day later the same tour measured ZERO blocks over 250 ms (see "UI tests").
 - `-omni.hangwatch YES [-omni.hangwatchMs N]` reports how long the MAIN THREAD was unresponsive.
   A timer on the main run loop only fires when the thread is free, so the gap between firings is
   the block. This is how "feels laggy" becomes a number; N defaults to 250 ms.
+- AND WHERE IT WAS (2026-10-20, `MainStackSampler`). A one-off 886 ms stall in a ten-minute stress
+  run, 26% CPU, could be neither profiled after the fact nor seen by a CPU profiler (a wait is not
+  CPU). While hangwatch runs, a watcher thread now suspends the main thread every 10 ms once it has
+  missed half a threshold of beats, reads its frame-pointer chain (nothing allocated or locked while
+  it is suspended) and the stall line carries the heaviest path and the functions the samples ended
+  in. Positive control, `block:cpu:500` and `block:wait:600` perf-script steps: 36 of 36 samples in
+  `PerfScript.blockSpinning`, 47 of 47 in `blockWaiting` -> `semaphore_wait_trap`. A stall line
+  names the perf-script step it fell in (`... in type:boat engine repair`), and `HANG_MS=150
+  Tools/agenteval/ui-stress.sh` lowers the bar. What it found is under "UI stress" below.
 - DRIVE THE UI FROM THE LIVE WINDOW FRAME, never hardcoded screen coordinates. The window moves
   between launches: a whole round of measurements was taken with the toolbar clicks landing at
   y=155 while the window started at y=249, so every "interaction" phase measured an app that was
@@ -710,9 +719,23 @@ watchdog). Three modes of `Tools/agenteval/agenteval.py`, stdlib only:
   instance runs OMNI_PERF_SCRIPT rounds (typing, grid/list, selection and arrow keys, Find Similar,
   sidebar, browsing, Recents, sort, a served-query search, the Shortcuts search action) with
   hangwatch at 250 ms and the footprint watchdog.
-- 30 rounds, ~750 steps, 10 minutes, the eval testbed. Before this work: footprint 3,033 MB in the
-  second quarter, 3,057 MB in the last, peak 3,185, no stall over 250 ms. After: 3,067 -> 3,070 MB,
-  peak 3,234, one stall (886 ms, 26% CPU, at a clear-then-type); rerun: 3,076 -> 3,096 MB, one stall
-  of 257 ms at a different step. Flat over time on both - the swing between 2.88 and 3.2 GB is MLX's
-  cache trim - so no leak; the ~35-50 MB more is the two bounded caches the passages added (24 MB of
-  text, 8,192 window vectors).
+- 30 rounds, ~750 steps, 10 minutes, the eval testbed. First runs, one each: before this work no
+  stall over 250 ms; after, one of 886 ms at 26% CPU, then one of 257 ms. ONE RUN EACH IS NOT A
+  COMPARISON: interleaved (new, base, new, base) with the stack sampler in both builds, the new build
+  had 1 and 0 stalls over 250 ms, the build before this work 4 and 2. Every one of them was one of
+  two things, both in the old build too:
+  - A WAIT IN `write`: 359 ms, 21% CPU, 13 of 19 samples in `omniPerfLog` -> `writeData` -> `write`
+    - the harness's own log line, written on the main thread to a file on the external disk. The
+    886 ms one (26% CPU, at a step boundary) has that shape. The log writes on its own queue now.
+  - THE FIRST RESULT SET AFTER A CLEAR: 250-275 ms at ~100% CPU in the window's layout pass,
+    `NSToolbarView layout` in 61 of 82 blocks. At a 150 ms threshold both builds show it once per
+    search step: new 85 blocks, mean 184 ms, 15.7 s in all; old 86, mean 180, 15.5 s.
+  Footprint, interleaved: 3,346 -> 3,336 and 3,330 -> 3,336 MB new, 3,310 -> 3,322 and 3,312 ->
+  3,317 MB old, flat in all four (the swing is MLX's cache trim), so no leak; the new build sits
+  15-20 MB higher (the passages' two bounded caches).
+- THE FIRST-RESULTS BLOCK IS OLDER THAN THIS WORK AND WAS NOT FIXED. The toolbar's result controls
+  (bookmark, filter, sort/view) are `if` branches on `hasResults`, so every first result set
+  inserts them. `.hidden()` (macOS 15+) on always-present items with stable ids was tried: 2.7 blocks
+  a round at ~170 ms against 2.8 at 184 - the toolbar re-tiles either way and the rest of the
+  window's layout is most of it - and on Tahoe it broke the Liquid Glass grouping after Recents
+  (filter, sort and view squeezed into one pill, a separator under the toolbar). Reverted.

@@ -1747,8 +1747,18 @@ into windows of the width shown and the model picks the one closest to the query
 
 - Recovery: 98% of text hits on the eval testbed (4.7 of 4.8 per search); every chunk in the test
   fixtures, including a 40-page PDF indexed in turns (`PassageRecoveryTests`).
-- Cost per served search at the default width (200): recovery 13.5 ms warm, ~24 ms cold; windows
-  17.7 per call, 22 ms warm (max 69). Served search p50 21 ms, p90 81 ms, against 9 / 19 without.
+- COST, like for like (one instance, the search warmed by a discarded pass first, `probe` with and
+  without `max_snippet: 0`): 7.8 ms p50 / 9.1 p90 without passages; 14.5 / 45.2 with them on queries
+  never seen (their windows cold); 7.5 / 9.1 on the same queries again; 7.9 / 9.1 without, after.
+  An earlier "21 ms against 9" ran the passages arm first, so it alone paid for the cold search.
+  Recovery is ~1 ms of it on the testbed (mean 1.1 ms cold); the rest is the window forward.
+- WHERE THE FORWARD GOES (`omni-verify winbench <model> <tree>`: real prose cut at 200, p50 of 15):
+  ~3.3 ms a forward whatever the count, then ~1 ms a window (1: 4.3 ms, 8: 9.0, 16: 15.3, 48: 55.7);
+  tokenizing is 0.1 ms a window. Two rounds are two fixed costs, which is the p50 cold delta; the
+  p90 is the calls with 20-30 windows and the padding a CJK window brings into a batch (a batch
+  pads to its longest). A compiled whole forward for batches, as queries have, was measured at the
+  floor it could reach: 2.95 ms for one window against 4.2-4.4 eager, ~1.3 ms a forward, ~2.6 ms of
+  the 6.7 - for a graph per (batch, length) shape and a rounding-level drift to prove. Not done.
 - WHAT IT BUYS, measured with real agents (Tools/agenteval `agent`, the CLI's default model, all 125
   eval queries, one run per build): success 93.6% both, place 92.8% both; tool calls 2.42 -> 2.21,
   input tokens 30,748 -> 29,119, output 481 -> 409, cost $0.0585 -> $0.0546, 8.4 -> 7.6 s a query.

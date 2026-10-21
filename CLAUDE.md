@@ -154,6 +154,10 @@ codebase were already measured there, and many were rejected.
   day is not a baseline. Interleave arms, repeat, and keep the GPU otherwise idle.
 - POSITIVE CONTROLS. A detector that reports nothing looks exactly like one that is not running
   (hangwatch, stall logs, stress runs that never reached the list under test). Prove the probe fires.
+- THE INSTRUMENT MUST NOT BLOCK WHAT IT MEASURES, AND A STALL IS READ FROM ITS STACK. A perf-log
+  line written on the main thread waited 359 ms in `write` and read as the app's stall; logs go
+  through one queue now (`omniLogWrite`). Hangwatch prints where the main thread was
+  (`MainStackSampler`); compare stalls against the old build interleaved, never one run each.
 - A NEW TOOLCHAIN OR MLX CAN CHANGE OUTPUT BY ITSELF (Swift 6.3 merged `cosf`/`sinf` and moved the
   OCR digest) AND FLIP A RACE (Xcode 26.6 lost the OCR memory-cap race every time; 26.2 never
   did). Re-run the digests AND an in-app OCR run before trusting a build from it - headless

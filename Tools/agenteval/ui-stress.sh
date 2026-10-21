@@ -9,7 +9,7 @@ ROUND="type:how much is the security deposit;view:grid;view:list;select:0;key:do
 SCRIPT="repeat:1;wait:1"
 for i in $(seq 1 $ROUNDS); do SCRIPT="$SCRIPT;$ROUND"; done
 rm -rf $OUT.dir
-OMNI_PERF_LOG=1 OMNI_PERF_SCRIPT_SETTLE=0.6 OMNI_PERF_SCRIPT="$SCRIPT" EXTRA_ARGS="-omni.hangwatch YES -omni.hangwatchMs 250 -omni.hangwatchFile $OUT.hang" \
+OMNI_PERF_LOG=1 OMNI_PERF_SCRIPT_SETTLE=0.6 OMNI_PERF_SCRIPT="$SCRIPT" EXTRA_ARGS="-omni.hangwatch YES -omni.hangwatchMs ${HANG_MS:-250} -omni.hangwatchFile $OUT.hang" \
   $(dirname "$0")/serve-eval.sh $BED $OUT.dir $APP > /dev/null
 P=$(cat $OUT.dir/pid)
 for i in {1..1800}; do grep -q "script done" $OUT.dir/omni.log 2>/dev/null && break; kill -0 $P 2>/dev/null || break; sleep 1; done
@@ -22,7 +22,7 @@ t0=fp[0][0]
 mb=[(t-t0, kb/1024) for t,kb in fp]
 n=len(mb); q=n//4
 early=sum(v for _,v in mb[q:2*q])/max(1,q); late=sum(v for _,v in mb[3*q:])/max(1,n-3*q)
-try: hangs=[l for l in open(sys.argv[2]).read().splitlines() if l.strip()]
+try: hangs=[l for l in open(sys.argv[2]).read().splitlines() if l.startswith("[hang] t+")]
 except FileNotFoundError: hangs=[]
 steps=sum(1 for l in open(sys.argv[3]) if "] script " in l)
 print(f"steps={steps} duration={mb[-1][0]}s footprint start={mb[0][1]:.0f}MB peak={max(v for _,v in mb):.0f}MB 2nd-quarter-avg={early:.0f}MB last-quarter-avg={late:.0f}MB stalls>250ms={len(hangs)}")

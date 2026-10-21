@@ -1,5 +1,7 @@
 import SwiftUI
 import AppKit
+import os
+import OmniKit
 
 /// Exits the process immediately on quit, bypassing AppKit's normal exit(). The reason: letting the C
 /// runtime run atexit/static destructors tears down MLX's C++ globals (Scheduler, CompilerCache), which
@@ -799,6 +801,9 @@ enum HangWatch {
 
     private static var sink: FileHandle?
     private static var cpuAtLast: Double = 0
+    private static var sampler: MainStackSampler?
+    /// The perf-script step running, so a stall in a stress run names what the app was asked to do.
+    static var step = ""
 
     /// Seconds of CPU this thread has actually consumed, user plus system.
     static func threadCPU() -> Double {
@@ -823,6 +828,7 @@ enum HangWatch {
             sink = FileHandle(forWritingAtPath: file)
         }
         emit(String(format: "[hang] watching, reporting blocks over %.0f ms\n", seconds * 1000))
+        sampler = MainStackSampler(after: seconds / 2)
         UIProbe.enabled = true
         UIProbe.emit = { emit($0) }
         // THE TICK MUST BE WELL UNDER THE THRESHOLD. It was a flat 0.05 s, so `-omni.hangwatchMs 30`
@@ -842,6 +848,7 @@ enum HangWatch {
                 guard gap > seconds else {
                     cpuAtLast = Self.threadCPU()
                     UIProbe.reset()
+                    sampler?.alive()
                     return
                 }
                 worst = max(worst, gap)
@@ -856,18 +863,163 @@ enum HangWatch {
                 cpuAtLast = cpu
                 // What ran DURING the gap, not since launch: the counters are cleared on every
                 // quiet tick above, so a report only ever describes the block it is attached to.
-                emit(String(format: "[hang] t+%.1fs blocked %.0f ms (cpu %.0f ms, %.0f%%) (worst %.0f)%@\n",
+                emit(String(format: "[hang] t+%.1fs blocked %.0f ms (cpu %.0f ms, %.0f%%) (worst %.0f)%@%@\n",
                             now.timeIntervalSince(began), gap * 1000, used * 1000,
                             gap > 0 ? used / gap * 100 : 0, worst * 1000,
-                            UIProbe.drain()))
+                            step.isEmpty ? "" : " in " + step,
+                            UIProbe.drain() + (sampler?.report() ?? "")))
             }
         }
         RunLoop.main.add(timer, forMode: .common)
     }
 
     private static func emit(_ line: String) {
-        let data = Data(line.utf8)
-        if let sink { sink.write(data) } else { FileHandle.standardError.write(data) }
+        omniLogWrite(sink ?? FileHandle.standardError, line)
+    }
+}
+
+/// WHERE the main thread was during a block, not just how long. HangWatch's CPU ratio says work or
+/// wait, but a wait (cpu << wall) never shows in a CPU profile, `sample` wedges on this binary, and a
+/// one-off stall in a ten-minute stress run cannot be caught by attaching anything afterwards. So
+/// while hangwatch runs, a watcher thread reads the main thread's stack every 10 ms once it has
+/// missed half a threshold of beats, and the stall report carries the heaviest path through them.
+/// On only with hangwatch; nothing runs in a shipping configuration.
+final class MainStackSampler: @unchecked Sendable {
+    private let thread: thread_act_t
+    private let stackLo: UInt
+    private let stackHi: UInt
+    private let after: Double
+    private let beat = OSAllocatedUnfairLock(initialState: CFAbsoluteTimeGetCurrent())
+    private let taken = OSAllocatedUnfairLock(initialState: [[UInt]]())
+    private var names: [UInt: String] = [:]   // read and written by `report`, on the main thread only
+    private static let maxFrames = 96
+
+    /// On the main thread: it is the thread sampled.
+    init(after seconds: Double) {
+        thread = mach_thread_self()
+        stackHi = UInt(bitPattern: pthread_get_stackaddr_np(pthread_self()))
+        stackLo = stackHi - UInt(pthread_get_stacksize_np(pthread_self()))
+        after = seconds
+        let t = Thread { [self] in watch() }
+        t.name = "omni.hangwatch.sampler"
+        t.qualityOfService = .userInteractive
+        t.start()
+    }
+
+    /// The main thread answered in time: whatever was taken belongs to no block worth reporting.
+    func alive() {
+        beat.withLock { $0 = CFAbsoluteTimeGetCurrent() }
+        taken.withLock { if !$0.isEmpty { $0.removeAll(keepingCapacity: true) } }
+    }
+
+    private func watch() {
+        let buf = UnsafeMutablePointer<UInt>.allocate(capacity: Self.maxFrames)
+        while true {
+            usleep(10_000)
+            guard CFAbsoluteTimeGetCurrent() - beat.withLock({ $0 }) > after else { continue }
+            let n = capture(into: buf)
+            guard n > 0 else { continue }
+            let frames = Array(UnsafeBufferPointer(start: buf, count: n))
+            taken.withLock { if $0.count < 2000 { $0.append(frames) } }
+        }
+    }
+
+    /// The suspended thread may hold the malloc lock or any other, so between suspend and resume
+    /// this allocates nothing and locks nothing: registers, then the frame-pointer chain (always
+    /// kept on arm64 Apple platforms), checked against the main stack's bounds, into `buf`.
+    private func capture(into buf: UnsafeMutablePointer<UInt>) -> Int {
+        #if arch(arm64)
+        guard thread_suspend(thread) == KERN_SUCCESS else { return 0 }
+        defer { thread_resume(thread) }
+        var state = arm_thread_state64_t()
+        var count = mach_msg_type_number_t(MemoryLayout<arm_thread_state64_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &state) {
+            $0.withMemoryRebound(to: natural_t.self, capacity: Int(count)) {
+                thread_get_state(thread, thread_state_flavor_t(ARM_THREAD_STATE64), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return 0 }
+        // The link register too: a leaf (a syscall stub, where every wait ends) pushes no frame.
+        buf[0] = Self.strip(state.__pc)
+        buf[1] = Self.strip(state.__lr)
+        var n = 2, fp = UInt(state.__fp)
+        while n < Self.maxFrames, fp >= stackLo, fp + 16 <= stackHi, fp & 0xF == 0 {
+            let frame = UnsafePointer<UInt>(bitPattern: fp)!
+            let ret = Self.strip(UInt64(frame[1]))
+            guard ret != 0 else { break }
+            buf[n] = ret; n += 1
+            guard frame[0] > fp else { break }
+            fp = frame[0]
+        }
+        return n
+        #else
+        return 0
+        #endif
+    }
+
+    /// A return address without its pointer-authentication bits (system libraries are arm64e).
+    private static func strip(_ a: UInt64) -> UInt { UInt(a & 0x0000_7FFF_FFFF_FFFF) }
+
+    /// The block just ended, as the path most samples share from the run loop down, then the
+    /// functions the samples ended in. "" when nothing was taken.
+    func report() -> String {
+        let samples = taken.withLock { s -> [[UInt]] in defer { s.removeAll(keepingCapacity: true) }; return s }
+        beat.withLock { $0 = CFAbsoluteTimeGetCurrent() }
+        guard !samples.isEmpty else { return "" }
+        // Root first, by function: two addresses in one function are one frame, and the link
+        // register repeats the caller's frame whenever the sampled function had pushed its own.
+        let stacks: [[String]] = samples.map { frames in
+            var out: [String] = []
+            for pc in frames.reversed() { let s = name(pc); if out.last != s { out.append(s) } }
+            return out
+        }
+        var path: [(String, Int)] = []
+        var live = stacks.indices.map { $0 }
+        var depth = 0
+        while true {
+            var tally: [String: Int] = [:]
+            for i in live where stacks[i].count > depth { tally[stacks[i][depth], default: 0] += 1 }
+            guard let (top, n) = tally.max(by: { $0.value < $1.value }), n * 5 >= samples.count else { break }
+            path.append((top, n))
+            live = live.filter { stacks[$0].count > depth && stacks[$0][depth] == top }
+            depth += 1
+        }
+        // The frames every sample shares down from the run loop; the last eight are the context.
+        let shared = path.prefix { $0.1 == samples.count }.count
+        let shown = path.dropFirst(max(0, shared - 8))
+        var leaves: [String: Int] = [:]
+        for s in stacks { if let l = s.last { leaves[l, default: 0] += 1 } }
+        var lines = ["\n  main thread, \(samples.count) samples at 10 ms:"]
+        lines += shown.map { "\n    \(String(format: "%4d", $0.1))  \($0.0)" }
+        lines.append("\n  ended in:")
+        lines += leaves.sorted { $0.value > $1.value }.prefix(6).map { "\n    \(String(format: "%4d", $0.value))  \($0.key)" }
+        return lines.joined()
+    }
+
+    private func name(_ pc: UInt) -> String {
+        if let s = names[pc] { return s }
+        var info = Dl_info()
+        var s = String(format: "0x%lx", pc)
+        // pc - 1: a return address points past its call, which may already be the next function.
+        if dladdr(UnsafeRawPointer(bitPattern: pc &- 1), &info) != 0 {
+            let image = info.dli_fname.map { (String(cString: $0) as NSString).lastPathComponent } ?? "?"
+            let symbol = info.dli_sname.map { Self.demangle(String(cString: $0)) } ?? "?"
+            s = "\(image)  \(symbol.count > 170 ? String(symbol.prefix(170)) + "..." : symbol)"
+        }
+        names[pc] = s
+        return s
+    }
+
+    private typealias Demangler = @convention(c) (UnsafePointer<CChar>, Int, UnsafeMutablePointer<CChar>?,
+                                                  UnsafeMutablePointer<Int>?, UInt32) -> UnsafeMutablePointer<CChar>?
+    private static let demangler: Demangler? = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "swift_demangle")
+        .map { unsafeBitCast($0, to: Demangler.self) }
+
+    private static func demangle(_ s: String) -> String {
+        guard let demangler, s.hasPrefix("$s") || s.hasPrefix("_$s") else { return s }
+        guard let out = s.withCString({ demangler($0, strlen($0), nil, nil, 0) }) else { return s }
+        defer { free(out) }
+        return String(cString: out)
     }
 }
 

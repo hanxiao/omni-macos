@@ -277,7 +277,16 @@ public func omniGPUCacheMemory() -> Int { MLX.Memory.cacheMemory }
 public let omniPerfEnabled = ProcessInfo.processInfo.environment["OMNI_PERF_LOG"] == "1"
 public func omniPerfLog(_ message: @autoclosure () -> String) {
     guard omniPerfEnabled else { return }
-    FileHandle.standardError.write(Data(("[perf] " + message() + "\n").utf8))
+    omniLogWrite(FileHandle.standardError, "[perf] " + message() + "\n")
+}
+
+/// THE INSTRUMENT MUST NOT BLOCK WHAT IT MEASURES. A log line written on the main thread waited
+/// 359 ms in `write` for a log file on a busy external disk, and the stall detector reported it as
+/// the app's (testing.md, "And where it was"). Lines are written in order on one serial queue.
+private let omniLogQueue = DispatchQueue(label: "omni.perf-log", qos: .utility)
+public func omniLogWrite(_ handle: FileHandle, _ line: String) {
+    let data = Data(line.utf8)
+    omniLogQueue.async { handle.write(data) }
 }
 
 public final class OmniEngine: Embedder, @unchecked Sendable {
