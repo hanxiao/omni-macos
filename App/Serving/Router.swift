@@ -55,19 +55,19 @@ struct Router: Sendable {
 
         switch (req.method, route) {
         case ("POST", "/v1/embeddings"):
-            return OpenAIJinaAdapter.handle(req, backend)
+            return await ServedWork.run { OpenAIJinaAdapter.handle(req, backend) }
         case ("POST", "/v1/embed"):
-            return CohereAdapter.handle(req, backend, v2: false)
+            return await ServedWork.run { CohereAdapter.handle(req, backend, v2: false) }
         case ("POST", "/v2/embed"):
-            return CohereAdapter.handle(req, backend, v2: true)
+            return await ServedWork.run { CohereAdapter.handle(req, backend, v2: true) }
         case ("POST", "/v1/search"):
-            return SearchAdapter.handle(req, backend)
+            return await ServedWork.run { SearchAdapter.handle(req, backend) }
         case ("POST", "/v1/files/status"):
-            return FileStatusAdapter.handle(req, backend)
+            return await ServedWork.run { FileStatusAdapter.handle(req, backend) }
         case ("POST", "/v1/files/tags"):
-            return FileTagsAdapter.handle(req, backend)
+            return await ServedWork.run { FileTagsAdapter.handle(req, backend) }
         case ("POST", "/v1/tag"):
-            return TagAdapter.handle(req, backend)
+            return await ServedWork.run { TagAdapter.handle(req, backend) }
         case ("POST", "/v1/chat/completions"):
             return await ChatOCRAdapter.handle(req)
         case ("POST", "/v1/ocr"):
@@ -83,9 +83,9 @@ struct Router: Sendable {
                 let action = String(route[route.index(after: colon)...])
                 switch action {
                 case "embedContent":
-                    return GeminiAdapter.handle(req, model: modelPart, backend, batch: false)
+                    return await ServedWork.run { GeminiAdapter.handle(req, model: modelPart, backend, batch: false) }
                 case "batchEmbedContents":
-                    return GeminiAdapter.handle(req, model: modelPart, backend, batch: true)
+                    return await ServedWork.run { GeminiAdapter.handle(req, model: modelPart, backend, batch: true) }
                 default:
                     break
                 }

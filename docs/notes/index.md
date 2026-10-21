@@ -1701,3 +1701,61 @@ Three things found by reading the code against the FAQ and against real files, f
   week. The same field drives change detection and near-duplicate stacking, so the fix is a capture
   date of its own - a column, which goes into the one metadata migration rather than a migration
   of its own.
+
+## Served search under load (2026-10-20, Tools/agenteval)
+
+Found by the agent eval's `load` mode against an isolated instance on the eval testbed. Before:
+8 keep-alive clients 37.0 searches/s (p50 213 ms), 32 clients 40.9/s (p50 779 ms), 64 clients
+40.4/s (p50 1,580 ms) with `initialize` refused; a single search 36.9 ms p50. After: 270.6/s
+(p50 27, p99 82 ms), 295.6/s (p50 108, p99 147), 296.2/s (p50 215, p99 257), a single search
+9.1 ms p50; a 5-minute soak at 32 clients ran 82,724 searches, 0 errors, `initialize` <= 1.6 ms,
+phys_footprint flat at 3.11 GB from 30 s on. Ranking identical (0 rank changes over 125 queries).
+Three causes, each found by sampling, not guessed:
+
+- TCC ON THE MAIN ACTOR, TWICE PER SEARCH. The search tool awaits a sources snapshot (the "still
+  indexing" note), built on the main actor, which asked `PHPhotoLibrary.authorizationStatus` twice -
+  each a synchronous XPC round trip to tccd. 64 concurrent searches queued 128 of them; every
+  response waited for the queue. `PhotoLibrary.authorization` is cached for 2 s now (a request from
+  the app drops it), and the search path reads a snapshot at most a second old without waiting for
+  the main actor at all (`RecentSnapshot`); `list_sources` still takes a fresh one.
+- THE SIDEBAR REDREW FOR EVERY AGENT QUERY. Each served search inserted its query into the
+  sidebar's history (`searchHistory`, observed), one main-actor hop each: at 150 searches/s the
+  history list re-diffed continuously, 39% of main-thread samples, and every other main-actor hop
+  queued behind it. Served queries now reach the history in batches twice a second
+  (`PendingServedSearches`), one list update for the lot.
+- BLOCKING WORK ON THE COOPERATIVE POOL. Every adapter called the store and the GPU synchronously
+  inside the request's Task. `ServedWork`, an OperationQueue four wide, now runs all of it (MCP
+  tools, REST adapters, the linked-Mac responder, which used a global queue); a waiting request
+  holds no thread.
+- At the 64-connection cap a new connection evicts the longest-idle kept-alive one instead of being
+  reset on every attempt (9,742 resets in 20 s with a 65th client).
+- THE FIRST LOAD NUMBERS WERE THE HARNESS. With `urllib` the client stalled 10-20 s at a time with
+  no socket open to the server - it consults SystemConfiguration for proxies per request and opens a
+  connection per request - which read exactly like the server pausing; the server's own log showed
+  0 ms requests separated by 18 s gaps. The harness keeps one HTTP connection per thread now, as MCP
+  clients do. Same lesson as the positive controls: check the instrument before the subject.
+
+## Passages: the text a hit matched (2026-10-20)
+
+Only a chunk's first 220 characters are stored, so a result row showed the top of its chunk, and
+`search`'s `max_snippet` (up to 2,000) and `search_inline`'s (up to 4,000) returned at most those
+220. `Indexer.recoverChunkText` recovers a chunk's exact text from its file - re-extract, re-cut,
+match the stored chunk KEY (a digest of the text and its cutter) - so a changed file yields nothing
+rather than another version's text; both cutters are tried, and a long PDF's turns are reproduced
+with windows that start on a turn's first page or end on its last. `PassageWindow` cuts the chunk
+into windows of the width shown and the model picks the one closest to the query.
+
+- Recovery: 98% of text hits on the eval testbed (4.7 of 4.8 per search); every chunk in the test
+  fixtures, including a 40-page PDF indexed in turns (`PassageRecoveryTests`).
+- Cost per served search at the default width (200): recovery 13.5 ms warm, ~24 ms cold; windows
+  17.7 per call, 22 ms warm (max 69). Served search p50 21 ms, p90 81 ms, against 9 / 19 without.
+- WHAT IT BUYS, measured with real agents (Tools/agenteval `agent`, the CLI's default model, all 125
+  eval queries, one run per build): success 93.6% both, place 92.8% both; tool calls 2.42 -> 2.21,
+  input tokens 30,748 -> 29,119, output 481 -> 409, cost $0.0585 -> $0.0546, 8.4 -> 7.6 s a query.
+  Paired: 26 queries needed fewer calls, 10 more, 89 the same (sign test p = 0.011).
+- The result rows take the same passage (cached per query; a live refresh re-applies it). Filled
+  600 ms after the results stop changing, on the low GPU lane in forwards of 16 windows, stopping
+  when a newer result set lands: at 200 ms it fired between words and cost +4-10% main-thread CPU
+  over a typing run; at 600 ms typing is at parity (main CPU 7,947/7,882 vs 7,982/7,848 ms, search
+  to results p50 28.8/29.6 vs 28.5/31.4 ms, the same stalls).
+- Linked Macs' hits keep their stored snippets: the remote Mac would have to recover them.

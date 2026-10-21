@@ -13113,6 +13113,34 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// Each stored chunk's KEY, by chunk index, as the hex the indexer computes (`ChunkKey`). The
+    /// key is a digest of the chunk's exact text and its cutter, so it is what tells a passage
+    /// recovered from the file today (`Indexer.recoverChunkText`) from one of another version.
+    public func chunkKeys(path: String) -> [Int: String] {
+        queue.sync {
+            guard dbOpen() else { return [:] }
+            let sql = splitBuilt ? """
+                SELECT o.ordinal, c.key FROM occurrence o JOIN chunk c ON c.id = o.chunk_id
+                 WHERE o.file_id = \(StoreSchema.fileIDByPath);
+                """ : """
+                SELECT c.chunk_index, t.chunk_key FROM chunks c JOIN chunk_text t ON t.chunk_id = c.id
+                 WHERE c.file_id = \(StoreSchema.fileIDByPath);
+                """
+            var out: [Int: String] = [:]
+            var st: OpaquePointer?
+            defer { sqlite3_finalize(st) }
+            guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return [:] }
+            bindPath(st, 1, path)
+            while sqlite3_step(st) == SQLITE_ROW {
+                let n = Int(sqlite3_column_bytes(st, 1))
+                guard n > 0, let p = sqlite3_column_blob(st, 1) else { continue }
+                let bytes = UnsafeRawBufferPointer(start: p, count: n)
+                out[Int(sqlite3_column_int(st, 0))] = bytes.map { String(format: "%02x", $0) }.joined()
+            }
+            return out
+        }
+    }
+
     /// Rank a single file's chunks against the query (for the "which passage matched" UI).
     public func rankChunks(_ query: [Float], path: String, topK: Int = 6) -> [ChunkHit] {
         queue.sync {

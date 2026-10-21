@@ -78,7 +78,7 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (824 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (832 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|delfolders|
@@ -92,6 +92,11 @@ codebase were already measured there, and many were rejected.
   /Volumes/han2tb/omni-eval [--json out] [--tag t]` - 125 labeled queries through the app's
   own search, scored at the right place and the right file. Any ranking change is judged here, A/B on
   the same cached index; baselines in docs/notes/roadmap.md.
+- What an AGENT gets (testing.md, "The agent eval"): `Tools/agenteval/serve-eval.sh <bed> <new dir>
+  [app]` starts an isolated instance on the eval testbed, then `uv run Tools/agenteval/agenteval.py
+  probe|load|agent --bed /Volumes/han2tb/omni-eval`. `probe` is the deterministic A/B for anything
+  the tools answer (must agree with `omni-verify eval`); `load` is connector throughput and
+  `initialize` latency under N keep-alive clients; `agent` is real CLI episodes, ~$7 for all 125.
 - Search digest on the real index (a CLONE, never the live one): `omni-verify searchreal
   ~/Library/Application\ Support/Omni/nano <index>` -> 134b9ff183fd2f29, p50 ~4 ms.
 - OCR quality gate (hard pages vs the torch oracle): `ocr-verify <ocrModel>
@@ -180,6 +185,12 @@ codebase were already measured there, and many were rejected.
   on a base Air), and then no Task in the app runs: 0.17.2's MCP server took connections and never
   answered (index.md, "The deleted tree that stopped every Task"). Blocking work goes on a
   DispatchQueue, one at a time, with what arrives meanwhile merged into the next run.
+- NOTHING PER SERVED REQUEST WAITS ON THE MAIN ACTOR OR A SYSTEM SERVICE. A served search awaited a
+  main-actor snapshot that asked tccd for Photos authorization twice (synchronous XPC), and recorded
+  its query into the observed sidebar history: under agent load every response queued behind both,
+  40 searches/s and seconds-long stalls (index.md, "Served search under load"). Served work runs on
+  `ServedWork`; what it reports from app state is a snapshot at most a second old; what it hands the
+  UI arrives in batches.
 - EVERY COPY OMNI MAKES goes through `OmniPasteboard` (the clipboard history must never record it).
 - A FLAG NOTHING CAN TURN OFF IS DELETED, and a settled A/B arm is retired with its numbers recorded
   in the notes. Do not leave experiments in the shipped path.
@@ -210,12 +221,13 @@ codebase were already measured there, and many were rejected.
   and defaults, renames, Recents, clipboard history, the 2026-10-02 speed review and media NaN,
   search while long files stream, the heavy CRUD review, file-backed exact stores, iCloud
   index-then-evict (issue #29), the 0.17.0 soundtrack read that never returned, the 0.17.2
-  deleted tree that stopped every Task, exclusions, the served mask and iWork text.
+  deleted tree that stopped every Task, exclusions, the served mask and iWork text, served search
+  under load, passages (the text a hit matched).
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
   and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names.
 - `testing.md` - UI tests and their traps, chaos suites, perf tour, hangwatch and the main-thread
-  stall investigations.
+  stall investigations, the agent eval.
 - `link.md` - Linked Macs: pairing, the TLS link, search across Macs, the measurements and the
   security checks against a real app.
 - Also: `docs/OCR.md` (the OCR port's design and numbers), `docs/schema-v5.md`, `docs/clipboard.md`,

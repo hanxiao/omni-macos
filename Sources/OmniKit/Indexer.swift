@@ -548,6 +548,85 @@ public final class Indexer: @unchecked Sendable {
                             overlap: chunkOverlap, dim: embedder.dim)
     }
 
+    // MARK: - The text a chunk was cut from
+
+    /// THE EXACT TEXT OF AN INDEXED CHUNK, recovered from its file - or nil.
+    ///
+    /// Only a 220-character snippet of each chunk is stored, so a hit showed the first line of its
+    /// chunk and nothing else: the passage that matched could be anywhere in the next 1,500
+    /// characters, and an agent asking `search` for 2,000 characters got 220. The text is not
+    /// stored because it does not need to be: extraction and the cutter are deterministic, so the
+    /// file cut again yields the same pieces, and the chunk KEY - a digest of a piece's exact text
+    /// and its cutter - says which piece it was. A file changed since it was indexed has no piece
+    /// with that key, and the answer is nil, never a passage from another version of the file.
+    ///
+    /// Both cutters are tried, content-defined then the grid: an index keeps generation-1 chunks for
+    /// files not edited since the content cutter shipped. A long PDF was indexed in TURNS of pages,
+    /// each cut on its own, so for one the pages around the hit's locator are cut instead of the
+    /// whole document; content-defined boundaries depend only on the bytes around them, so the cut
+    /// agrees with the turn's from its first boundary on, and the key is what makes trying it safe.
+    /// A file whose content is not on this Mac (an evicted iCloud file) is not downloaded for this.
+    public func recoverChunkText(path: String, key: String, locator: String, settings: IndexSettings) -> String? {
+        let url = URL(fileURLWithPath: path)
+        let ext = url.pathExtension.lowercased()
+        guard !key.isEmpty, FileManager.default.fileExists(atPath: path), !FileExtractor.isDataless(path),
+              FileExtractor.kind(forExtension: ext) == .text else { return nil }
+        let fingerprint = Self.cutterParams(settings).fingerprint
+        func find(_ text: String, _ origin: TextOrigin, wholeDocument: Bool) -> String? {
+            for cdc in [true, false] {
+                for p in chunk(text, settings: settings, origin: origin, filterOpaque: false,
+                               wholeDocument: wholeDocument, cdc: cdc) {
+                    let k = cdc ? ChunkKey.text(p.text, cutter: fingerprint, dim: embedder.dim)
+                                : ChunkKey.grid(p.text, maxChars: settings.maxCharsPerChunk, overlap: chunkOverlap, dim: embedder.dim)
+                    if k == key { return p.text }
+                }
+            }
+            return nil
+        }
+        if FileExtractor.pdfExtensions.contains(ext) {
+            guard let doc = PDFDocument(url: url), doc.pageCount > 0 else { return nil }
+            // Pages assembled exactly as extraction and the turns assemble them; each page read once.
+            var pageText: [Int: String] = [:]
+            func pages(_ r: Range<Int>) -> (String, [Int]) {
+                var text = "", starts: [Int] = []
+                for i in r {
+                    starts.append(text.count)
+                    let s = pageText[i] ?? autoreleasepool { doc.page(at: i)?.string ?? "" }
+                    pageText[i] = s
+                    text += s
+                    if !s.hasSuffix("\n") { text += "\n" }
+                }
+                return (text, starts)
+            }
+            let n = doc.pageCount
+            if locator.hasPrefix("Page "), let p = Int(locator.dropFirst(5)), p >= 1, p <= n {
+                // Windows around the hit's page. Starting at the page itself, then up to three before:
+                // a chunk that OPENS a turn was cut from that turn's first page, which only a window
+                // starting there reproduces, and any other chunk is reproduced by one starting earlier
+                // once the cut finds its first shared boundary. Ending one page after the hit's, then
+                // at the hit's own: a chunk that CLOSES a turn ends where the turn stopped reading,
+                // not at a boundary of its own, and only a window ending there gives that end.
+                for end in Set([Swift.min(n, p + 1), p]).sorted(by: >) {
+                    for start in stride(from: p - 1, through: Swift.max(0, p - 4), by: -1) where start < end {
+                        let (t, s) = pages(start ..< end)
+                        if let hit = find(t, .paged(s), wholeDocument: false) { return hit }
+                    }
+                }
+            }
+            guard n <= 60 else { return nil }
+            let (t, s) = pages(0 ..< n)
+            return find(t, .paged(s), wholeDocument: true) ?? find(t, .paged(s), wholeDocument: false)
+        }
+        switch try? FileExtractor.extract(url) {
+        case .text(let t)?:
+            return find(t, FileExtractor.textExtensions.contains(ext) ? .plain : .opaque, wholeDocument: true)
+        case .pagedText(let t, let s)?:
+            return find(t, .paged(s), wholeDocument: true)
+        default:
+            return nil
+        }
+    }
+
     /// CONTENT-DEFINED CHUNKING, the generation-2 cutter. ON.
     ///
     /// The grid cuts at `i * step`, so inserting a line near the top of a file moves every
@@ -590,7 +669,9 @@ public final class Indexer: @unchecked Sendable {
     // FileExtractor.maxTextBytes (the extraction read itself). A 40-chunk cap here used to
     // silently truncate long documents to ~64KB while claiming a 2MB read limit.
     public var chunkOverlap = 200
-    public var snippetLength = 220
+    public var snippetLength = Indexer.defaultSnippetLength
+    /// The stored snippet's length, and the width of the matching passage a result row shows.
+    public static let defaultSnippetLength = 220
     // Pages of a scanned PDF rasterized + patchified per streamed group in the embed stage.
     // Bounds host RAM (a page's raw patches are ~40MB at the default 1568px), NOT total pages -
     // any page count gets indexed, group by group, with the next group prefetched off-thread.
@@ -3959,7 +4040,7 @@ public final class Indexer: @unchecked Sendable {
     /// `wholeDocument`: false for one turn of a long PDF, which is never cut by page (that is for a
     /// whole short document only; turns cut as one pass would).
     func chunk(_ text: String, settings: IndexSettings, origin: TextOrigin, filterOpaque: Bool = true,
-               wholeDocument: Bool = true) -> [TextPiece] {   // internal for tests
+               wholeDocument: Bool = true, cdc: Bool = Indexer.contentDefinedChunking) -> [TextPiece] {   // internal for tests
         let limit = max(200, settings.maxCharsPerChunk)   // user-set; floor keeps chunks meaningful
         let totalCount = text.count
         // A single chunk still HAS a position - the top of the file - and an empty string made
@@ -3996,7 +4077,7 @@ public final class Indexer: @unchecked Sendable {
         // offsets, the loop carries the same two cursors the grid path does and advances them by
         // each piece's own length. The pieces concatenate to the original text by construction
         // (ContentChunkerTests pins it), which is what makes that sound.
-        if Self.contentDefinedChunking {
+        if cdc {
             var pieces: [TextPiece] = []
             var line = 1
             var lineMarkIdx = text.startIndex

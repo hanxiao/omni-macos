@@ -70,17 +70,31 @@ final class ServingController {
         load()
     }
 
+    /// Served searches on their way to the history, between batches (see `attach`).
+    private nonisolated let servedSearches = PendingServedSearches()
+
     // MARK: Lifecycle (wired from AppModel, not bound by the view)
 
     /// Build the backend from the engine/store and reconcile: auto-start if previously
     /// enabled. Safe to call again after a model swap - it replaces the backend and, if a
     /// server is running, restarts it against the new backend.
-    func attach(engine: OmniEngine, store: VectorStore, modelName: String) {
+    func attach(engine: OmniEngine, store: VectorStore, modelName: String, passages: PassageRecovery? = nil) {
         var b = EngineServingBackend(engine: engine, store: store, modelName: modelName)
-        // The hop off the connection's Task and onto the main actor, in one place. `onServedSearch`
-        // is weak-captured through self so a torn-down controller cannot resurrect the model.
+        b.passageRecovery = passages
+        // The hop off the connection's Task and onto the main actor, in one place, and in BATCHES.
+        // One hop per search inserted each query into the sidebar's history on its own, and at agent
+        // speed (50-150 searches a second) the sidebar's list re-diffed its rows continuously: 39% of
+        // main-thread samples under a 32-client load, and every main-actor hop queued behind it
+        // (index.md, "Served search under load"). Queries now wait here and reach the history together
+        // twice a second - one list update for the lot, still live to the eye. `onServedSearch` is
+        // weak-captured through self so a torn-down controller cannot resurrect the model.
+        let pending = servedSearches
         b.onSearch = { [weak self] q, surface in
-            Task { @MainActor in self?.onServedSearch?(q, surface) }
+            guard pending.add(q, surface) else { return }
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                for (q, surface) in pending.take() { self?.onServedSearch?(q, surface) }
+            }
         }
         backend = b
         if isRunning {
@@ -358,5 +372,31 @@ final class ServingController {
             ptr = p.pointee.ifa_next
         }
         return address
+    }
+}
+
+/// Served queries waiting for their batch into the history. `add` returns true for the first query
+/// since the last `take`, which is the caller's cue to schedule the batch.
+final class PendingServedSearches: @unchecked Sendable {
+    private let lock = NSLock()
+    private var items: [(String, ServedSurface)] = []
+    private var armed = false
+
+    func add(_ q: String, _ surface: ServedSurface) -> Bool {
+        lock.withLock {
+            items.append((q, surface))
+            // A burst can outrun the history's own cap; there is no point holding more than that.
+            if items.count > 400 { items.removeFirst(items.count - 400) }
+            if armed { return false }
+            armed = true
+            return true
+        }
+    }
+
+    func take() -> [(String, ServedSurface)] {
+        lock.withLock {
+            defer { items = []; armed = false }
+            return items
+        }
     }
 }

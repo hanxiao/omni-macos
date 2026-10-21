@@ -62,6 +62,12 @@ struct SourceMutation: Sendable {
 /// Async closures supplied by AppModel. Every one hops to the main actor on its own side.
 struct SourcesControl: Sendable {
     var snapshot: @Sendable () async -> SourcesSnapshot
+    /// The same snapshot, at most a second old and never waited for once there is one: what served
+    /// SEARCH reports index state from. It hopped to the main actor on every request, so an agent's
+    /// search waited for whatever the main thread was doing - with the sidebar redrawing for each
+    /// served query, that was seconds (index.md, "Served search under load"). `list_sources`, which
+    /// is ABOUT the sources, still takes `snapshot`.
+    var recentSnapshot: @Sendable () async -> SourcesSnapshot
     var addFolder: @Sendable (String) async -> SourceMutation
     var addAlbum: @Sendable (String) async -> SourceMutation
     var setPaused: @Sendable (String, Bool) async -> SourceMutation
@@ -72,6 +78,39 @@ struct SourcesControl: Sendable {
     var linkedSearch: (@Sendable (_ query: String, _ filter: SearchFilter, _ topK: Int, _ macs: [String], _ explicit: Bool) async -> [LinkedSearchAnswer])? = nil
     /// `get_linked_file`: a linked Mac's file copied here; the local path, or why not.
     var linkedFetch: (@Sendable (_ mac: String, _ path: String) async -> (path: String?, error: String?))? = nil
+}
+
+/// Stale-while-revalidate over `SourcesControl.snapshot`: the first caller waits for a snapshot;
+/// after that every caller gets the last one at once, and one that finds it over a second old
+/// starts a single refresh in the background.
+final class RecentSnapshot: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: SourcesSnapshot?
+    private var at = Date.distantPast
+    private var refreshing = false
+    private let fetch: @Sendable () async -> SourcesSnapshot
+
+    init(_ fetch: @escaping @Sendable () async -> SourcesSnapshot) { self.fetch = fetch }
+
+    func get() async -> SourcesSnapshot {
+        let (cached, refresh) = lock.withLock { () -> (SourcesSnapshot?, Bool) in
+            let stale = -at.timeIntervalSinceNow > 1
+            let start = value != nil && stale && !refreshing
+            if start { refreshing = true }
+            return (value, start)
+        }
+        if let cached {
+            if refresh { Task { self.store(await self.fetch()) } }
+            return cached
+        }
+        let s = await fetch()
+        store(s)
+        return s
+    }
+
+    private func store(_ s: SourcesSnapshot) {
+        lock.withLock { value = s; at = Date(); refreshing = false }
+    }
 }
 
 /// One linked Mac's answer to a served search: its hits (paths on THAT Mac), or why there are none.

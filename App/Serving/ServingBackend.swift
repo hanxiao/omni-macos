@@ -7,6 +7,46 @@ import OmniKit
 /// `omni` command line (an MCP call that arrived over the app's own socket).
 enum ServedSurface: String, Sendable { case rest, mcp, cli }
 
+/// Blocking engine, store and file work for served requests, OFF the Swift concurrency pool.
+///
+/// Every request runs as a Task, and every backend call blocks: the query embed waits on the GPU
+/// gate, the search on the store queue, a passage on the file. The pool is as wide as the Mac has
+/// cores, so enough concurrent requests blocked every pool thread and then nothing ran - including
+/// the continuations those requests needed to finish. Measured on the eval testbed: 8 clients 34.9
+/// searches/s, 32 clients 21.2/s with `initialize` stalled 9.9 s, 64 clients 4.5/s with every
+/// request ~21 s. The same failure as 0.17.2's removal tasks (index.md, "The deleted tree that
+/// stopped every Task"), from the other side.
+///
+/// An OperationQueue rather than a global dispatch queue: a waiting operation holds no thread, where
+/// a global queue answers blocked work by spawning more threads. Four at once - the GPU and the store
+/// serialise the expensive parts anyway, and four keeps the CPU-only parts (grouping, encoding the
+/// answer, reading files) overlapped without letting a burst of agents occupy every core.
+enum ServedWork {
+    static let queue: OperationQueue = {
+        let q = OperationQueue()
+        q.name = "omni.served-work"
+        q.maxConcurrentOperationCount = 4
+        q.qualityOfService = .userInitiated
+        return q
+    }()
+
+    static func run<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { c in queue.addOperation { c.resume(returning: work()) } }
+    }
+
+    static func run<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { c in queue.addOperation { c.resume(with: Result { try work() }) } }
+    }
+}
+
+/// A decoded JSON request (`[String: Any]` and its id) carried onto the served work queue. Read-only
+/// once parsed, so handing it to the one thread that runs the tool is safe; the type system cannot
+/// see that through `Any`.
+struct ReadOnlyRequest: @unchecked Sendable {
+    let id: Any
+    let args: [String: Any]
+}
+
 /// The only seam between the HTTP serving layer and the engine/store. Adapters call
 /// these three members; nothing else in Serving touches OmniKit directly.
 protocol ServingBackend: Sendable {
@@ -17,6 +57,10 @@ protocol ServingBackend: Sendable {
     func embedBatch(_ texts: [String], query: Bool) -> [[Float]]
     /// Semantic search: embeds `query` at high priority and scores against the store.
     func search(_ query: String, topK: Int, filter: SearchFilter, surface: ServedSurface) -> [SearchHit]
+    /// For each hit, the part of its chunk that matches `query`, at most `width` characters: the
+    /// whole chunk when it fits, else its best window (PassageWindow). nil where there is no text to
+    /// recover (media, a file changed since it was indexed) - the caller shows the stored snippet.
+    func passages(for hits: [(path: String, chunk: Int, locator: String)], query: String, width: Int) -> [String?]
     /// Rank passages WITHIN an explicit set of files/folders. Embeds `query` (high priority)
     /// and scores against the already-indexed chunk vectors of those paths only.
     func searchInline(_ query: String, paths: [String], topK: Int, surface: ServedSurface) -> [InlineChunkHit]
@@ -62,6 +106,8 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     let engine: OmniEngine
     let store: VectorStore
     let modelName: String
+    /// Recovers chunk text for `passages`; nil until the indexer exists.
+    var passageRecovery: PassageRecovery? = nil
     /// Called with the query text of every served search. Set by ServingController; it hops to the
     /// main actor itself, because this type is called from a connection's detached Task.
     ///
@@ -103,6 +149,40 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
         let floor = filter.minScore ?? Self.minScore
         guard floor > 0 else { return hits }
         return hits.filter { Double($0.score) / $0.lift >= VectorStore.relevanceFloor($0, base: floor) }
+    }
+
+    func passages(for hits: [(path: String, chunk: Int, locator: String)], query: String, width: Int) -> [String?] {
+        guard let recovery = passageRecovery, width > 0, !hits.isEmpty else { return hits.map { _ in nil } }
+        let t0 = omniPerfEnabled ? Date() : nil
+        let texts = recovery.texts(hits)
+        let tRecovered = Date()
+        var out = [String?](repeating: nil, count: hits.count)
+        var long: [(i: Int, text: String)] = []
+        for (i, t) in texts.enumerated() {
+            guard let t else { continue }
+            if t.count <= width { out[i] = t } else { long.append((i, t)) }
+        }
+        guard !long.isEmpty else { return out }
+        let q = engine.embedQuery(query)
+        var windowCount = 0
+        let best = PassageWindow.best(long.map(\.text), width: width, query: q) { windows in
+            windowCount = windows.count
+            var vecs: [[Float]] = []
+            var i = 0
+            while i < windows.count {   // a forward per group, as embedBatch groups a client's batch
+                let end = min(i + groupCap, windows.count)
+                vecs += engine.embedPassages(Array(windows[i ..< end]), waiting: true)
+                i = end
+            }
+            return vecs
+        }
+        for (k, l) in long.enumerated() { out[l.i] = best[k] }
+        if let t0 {
+            omniPerfLog(String(format: "passages hits=%d recovered=%d windowed=%d windows=%d recover=%.0fms windows=%.0fms",
+                               hits.count, texts.compactMap { $0 }.count, long.count, windowCount,
+                               tRecovered.timeIntervalSince(t0) * 1000, -tRecovered.timeIntervalSinceNow * 1000))
+        }
+        return out
     }
 
     /// RECORDED TOO. Ranking passages within named files is a search the user did not type, which

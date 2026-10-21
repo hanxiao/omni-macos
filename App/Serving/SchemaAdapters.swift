@@ -368,14 +368,32 @@ enum SearchAdapter {
         let fetch = group ? min(topK * 3, 300) : topK
         let hits = backend.search(query, topK: fetch, filter: filter, surface: .rest)
         let groups = backend.groupedResults(hits, enabled: group, limit: topK)
-        return HTTPResponse.json(["query": query, "results": rows(groups, backend: backend),
+        // `max_snippet`, as the MCP tool takes it: each text result's snippet becomes the part of
+        // its chunk that matches, up to that many characters. Absent, the stored snippet as before.
+        var passages: [String?] = []
+        if let width = body["max_snippet"] as? Int, width > 0 {
+            passages = textPassages(groups.map(\.representative), query: query, width: min(width, 2000), backend: backend)
+        }
+        return HTTPResponse.json(["query": query, "results": rows(groups, backend: backend, passages: passages),
                                   "grouped": group])
+    }
+
+    /// Each text hit's matching passage (ServingBackend.passages), nil for the rest. Shared with
+    /// the MCP search tool.
+    static func textPassages(_ reps: [SearchHit], query: String, width: Int, backend: any ServingBackend) -> [String?] {
+        let textual = reps.indices.filter { reps[$0].fileKind == FileKind.text.rawValue }
+        var out = [String?](repeating: nil, count: reps.count)
+        guard width > 0, !textual.isEmpty else { return out }
+        let found = backend.passages(for: textual.map { (reps[$0].path, reps[$0].chunkIndex, reps[$0].locator) },
+                                     query: query, width: width)
+        for (j, i) in textual.enumerated() { out[i] = found[j] }
+        return out
     }
 
     /// The JSON row for each result - REST's `results`, and the MCP search tool's
     /// structuredContent for the `omni` command line, so `omni search --json` and /v1/search
     /// answer in the same shape.
-    static func rows(_ groups: [ResultGroup], backend: any ServingBackend) -> [[String: Any]] {
+    static func rows(_ groups: [ResultGroup], backend: any ServingBackend, passages: [String?] = []) -> [[String: Any]] {
         // Lockstep rule as duplicateChunks: only trust a key whose modified matches the hit's.
         let contentKeys = backend.contentKeys(paths: groups.map { $0.representative.path })
         // Present only on a weaker match (VectorStore.weakFold), so a strong row is unchanged.
@@ -385,7 +403,7 @@ enum SearchAdapter {
             var row: [String: Any] = [
                 "path": hit.path,
                 "score": Double(max(0, min(1, hit.score))),
-                "snippet": hit.snippet,
+                "snippet": (i < passages.count ? passages[i] : nil) ?? hit.snippet,
                 "kind": hit.fileKind,
                 "modified": hit.modified,
                 // Best-matching chunk's position inside the file ("Page 3", "Line 1240"); "" if n/a.

@@ -476,6 +476,90 @@ final class AppModel {
             }
         }
     }
+    /// THE LINE UNDER A TEXT RESULT IS THE PART THAT MATCHED. The stored snippet is a chunk's first
+    /// 220 characters, so the row showed the top of a ~1,800-character chunk whatever the query was
+    /// about. Once a result set lands, the top text hits' chunks are recovered from their files
+    /// (PassageRecovery: exact, key-checked) and each row takes the window of its chunk closest to
+    /// the query (PassageWindow) - the same answer the served search gives an agent. Off the main
+    /// actor, one result set at a time on its own queue, a newer one superseding; cached per query,
+    /// so a live refresh while indexing re-applies the passages instead of flicking back to the
+    /// stored opening. Open-at-the-match reads the snippet too, and is better for it: the phrase it
+    /// hands Preview is now the matching one.
+    @ObservationIgnored private var passageCache: [String: String] = [:]
+    @ObservationIgnored private var passageCacheQuery = ""
+    private static let passageQueue = DispatchQueue(label: "omni.result-passages", qos: .userInitiated)
+    private static let latestPassageJob = OSAllocatedUnfairLock(initialState: 0)
+    @ObservationIgnored private var passageJob = 0
+    /// Rows the passage fill covers per result set: about two screens of the list.
+    static let passageRows = 24
+
+    private func withPassages(_ hits: [SearchHit], resolved: String) -> [SearchHit] {
+        if passageCacheQuery != resolved { passageCacheQuery = resolved; passageCache = [:] }
+        guard !passageCache.isEmpty else { return hits }
+        return hits.map { h in
+            guard let t = passageCache["\(h.path)\u{1}\(h.chunkIndex)"], h.snippet != t else { return h }
+            var h = h; h.snippet = t; return h
+        }
+    }
+
+    private func fillPassages(_ hits: [SearchHit], resolved: String) {
+        guard let recovery = passageRecovery, let engine, let qv = lastQueryVector else { return }
+        let width = Indexer.defaultSnippetLength
+        let todo = hits.prefix(Self.passageRows).filter {
+            $0.fileKind == FileKind.text.rawValue && !RemotePath.isRemote($0.path)
+                && passageCache["\($0.path)\u{1}\($0.chunkIndex)"] == nil
+        }
+        guard !todo.isEmpty else { return }
+        passageJob += 1
+        let job = passageJob
+        Self.latestPassageJob.withLock { $0 = job }
+        let items = todo.map { (path: $0.path, chunk: $0.chunkIndex, locator: $0.locator) }
+        // Once the user has stopped: instant search lands a result set per word, and only the one
+        // they stop on is worth reading files for. 200 ms fired between words at typing speed (a
+        // word every ~0.5 s) and re-rendered the list for each - +4-10% main-thread CPU over a typing
+        // run; at 600 ms the passages arrive just after the pause, once per query.
+        Self.passageQueue.asyncAfter(deadline: .now() + .milliseconds(600)) { [weak self] in
+            // Superseded while it waited: a newer result set has its own job queued behind this one.
+            let current = { Self.latestPassageJob.withLock({ $0 }) == job }
+            guard current() else { return }
+            let texts = recovery.texts(items)
+            var found: [(Int, String)] = []
+            for (i, t) in texts.enumerated() { if let t { found.append((i, t)) } }
+            guard !found.isEmpty, current() else { return }
+            var superseded = false
+            let best = PassageWindow.best(found.map(\.1), width: width, query: qv) { windows in
+                // A forward of 16 windows at a time on the low lane, checking between them: a new
+                // search stops this one within one short forward.
+                var vecs: [[Float]] = []
+                var i = 0
+                while i < windows.count {
+                    guard current() else { superseded = true; return [] }
+                    let end = min(i + 16, windows.count)
+                    vecs += engine.embedPassages(Array(windows[i ..< end]), waiting: false)
+                    i = end
+                }
+                return vecs
+            }
+            guard !superseded else { return }
+            let out = zip(found, best).map { (items[$0.0.0], $0.1) }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, self.passageCacheQuery == resolved else { return }
+                    for (it, text) in out {
+                        self.passageCache["\(it.path)\u{1}\(it.chunk)"] = AppModel.oneLine(text)
+                    }
+                    let updated = self.withPassages(self.rawResults, resolved: resolved)
+                    if updated != self.rawResults { self.rawResults = updated }
+                }
+            }
+        }
+    }
+
+    /// A passage on one line, the way the stored snippet is.
+    nonisolated static func oneLine(_ s: String) -> String {
+        s.split(whereSeparator: { $0.isNewline || $0 == "\t" }).joined(separator: " ")
+    }
+
     /// The full multi-selection (result paths). `selection` is the active item within it; the set
     /// drives the row highlight and a multi-path copy. A plain click collapses both to one item.
     var selectedPaths: Set<String> = [] { didSet { refreshSelectionOrdered() } }
@@ -2114,6 +2198,9 @@ final class AppModel {
     private var engine: OmniEngine?
     private var store: VectorStore?
     private var indexer: Indexer?
+    /// Exact chunk text for the served search's passages (and the result rows'), kept in step with
+    /// the cutter settings of the latest pass by `effectiveSettings`.
+    @ObservationIgnored private var passageRecovery: PassageRecovery?
     private var searchToken = 0
 
     /// One reading of where Omni's own memory is going. `total` is the process phys_footprint -
@@ -3564,7 +3651,9 @@ final class AppModel {
             let indexer = Indexer(store: store, embedder: loaded)
             indexer.onPolicyFile = Self.policyFileReporter(self)
             self.indexer = indexer
-            self.serving.attach(engine: loaded, store: store, modelName: "omni-\(self.modelVariant.rawValue)")
+            self.passageRecovery = PassageRecovery(indexer: indexer, store: store, settings: self.effectiveSettings())
+            self.serving.attach(engine: loaded, store: store, modelName: "omni-\(self.modelVariant.rawValue)",
+                                passages: self.passageRecovery)
             self.attachLink(engine: loaded, store: store)
             self.supportsImages = loaded.supportsImages
             self.audioSupported = loaded.supportsAudio
@@ -4602,7 +4691,9 @@ final class AppModel {
                     }))
             }
             EngineServingBackend.minScore = self.minScore   // one floor, window and server
-            self.serving.attach(engine: engine, store: store, modelName: "omni-\(modelVariant.rawValue)")
+            self.passageRecovery = self.indexer.map { PassageRecovery(indexer: $0, store: store, settings: self.effectiveSettings()) }
+            self.serving.attach(engine: engine, store: store, modelName: "omni-\(modelVariant.rawValue)",
+                                passages: self.passageRecovery)
             if let oldStore, oldStore !== store { Task.detached(priority: .utility) { _ = oldIndexer; oldStore.close() } }
             self.supportsImages = engine.supportsImages
             self.audioSupported = engine.supportsAudio
@@ -5242,8 +5333,11 @@ final class AppModel {
     /// Every closure hops to the main actor: the serving layer calls them from a connection's
     /// detached Task, and all of this state is main-actor-isolated.
     private func makeSourcesControl() -> SourcesControl {
-        SourcesControl(
-            snapshot: { await MainActor.run { AppModel.shared?.sourcesSnapshot() ?? .empty } },
+        let fetch: @Sendable () async -> SourcesSnapshot = { await MainActor.run { AppModel.shared?.sourcesSnapshot() ?? .empty } }
+        let recent = RecentSnapshot(fetch)
+        return SourcesControl(
+            snapshot: fetch,
+            recentSnapshot: { await recent.get() },
             addFolder: { p in await MainActor.run { AppModel.shared?.apiAddFolder(p) ?? .fail("Omni is not ready") } },
             addAlbum: { a in await MainActor.run { AppModel.shared?.apiAddAlbum(a) ?? .fail("Omni is not ready") } },
             setPaused: { k, on in await MainActor.run { AppModel.shared?.apiSetPaused(k, on) ?? .fail("Omni is not ready") } },
@@ -5282,13 +5376,14 @@ final class AppModel {
         }
         // Albums the caller has NOT added. Reading them walks the library, so it is skipped
         // entirely when access was never granted (which is also the honest answer: none).
-        let albums: [ServedAlbum] = PhotoLibrary.isAuthorized
+        let authorized = PhotoLibrary.isAuthorized
+        let albums: [ServedAlbum] = authorized
             ? PhotoLibrary.albums()
                 .filter { a in !photoSources.contains { $0.id == a.id } }
                 .map { ServedAlbum(id: $0.id, title: $0.title, count: $0.count, smart: $0.isSmart) }
             : []
         return SourcesSnapshot(sources: folders + photos, albums: albums,
-                               photosAuthorized: PhotoLibrary.isAuthorized,
+                               photosAuthorized: authorized,
                                indexing: isIndexing || !activeRoots.isEmpty)
     }
 
@@ -6346,7 +6441,7 @@ final class AppModel {
         // This Mac's half, kept apart so linked Macs' replies can be merged in as they land.
         localHits = hits
         localLanded = true
-        hits = combinedHits()
+        hits = withPassages(combinedHits(), resolved: resolved)
         let isNewQuery = resolvedQuery != resolved
         if isNewQuery, showWeakMatches { showWeakMatches = false }   // a new query folds its weaker matches
         if omniPerfEnabled {
@@ -6361,6 +6456,7 @@ final class AppModel {
         if resultsToken != token { resultsToken = token }
         loadGroupingInputs(for: hits, token: resultsToken)
         enqueueRetagCandidates(hits)
+        fillPassages(hits, resolved: resolved)
         if isNewQuery {
             // Guarded: clearing an already-empty selection still notifies, and the menu bar reads it.
             if selection != nil { selection = nil }
@@ -6623,6 +6719,7 @@ final class AppModel {
         s.evictDownloaded = evictDownloadedFiles
         s.readLongDataFiles = readLongDataFiles
         s.imageTags = imageTagsEnabled
+        passageRecovery?.setSettings(s)
         return s
     }
 

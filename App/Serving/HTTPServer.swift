@@ -41,6 +41,11 @@ final class HTTPServer: @unchecked Sendable {
     /// leaking their fds; and a cancelled flag so a stranded read loop stops re-arming work that would
     /// keep driving the GPU gate after the UI shows the server stopped.
     private var conns: [ObjectIdentifier: NWConnection] = [:]
+    /// Connections with a request being answered. The rest are kept alive between requests, and one
+    /// of those is what gives way when a new connection arrives at the cap.
+    private var inFlight: Set<ObjectIdentifier> = []
+    /// When each connection last finished a request (or was accepted): the idle one closed first.
+    private var lastActive: [ObjectIdentifier: DispatchTime] = [:]
     private var idleTimers: [ObjectIdentifier: DispatchSourceTimer] = [:]
     private var cancelled = false
     /// Local scope: the listener is on the loopback interface only, and any connection whose peer
@@ -156,6 +161,8 @@ final class HTTPServer: @unchecked Sendable {
             self.idleTimers.removeAll()
             for c in self.conns.values { c.cancel() }
             self.conns.removeAll()
+            self.inFlight.removeAll()
+            self.lastActive.removeAll()
         }
     }
 
@@ -163,11 +170,24 @@ final class HTTPServer: @unchecked Sendable {
 
     private func accept(_ conn: NWConnection) {
         // Refuse new connections once stopped, over the cap, or non-loopback peers in local scope.
-        if cancelled || conns.count >= maxConnections || (loopbackOnly && !isLoopback(conn)) {
+        if cancelled || (loopbackOnly && !isLoopback(conn)) {
             conn.cancel()
             return
         }
+        // AT THE CAP, an idle kept-alive connection gives way - the one idle longest - and only a
+        // full house of connections each mid-request refuses. Refusing outright meant one client
+        // more than the cap was reset on every attempt while others sat open with nothing to say:
+        // 64 keep-alive agents and a 65th got 9,742 resets in 20 s.
+        if conns.count >= maxConnections {
+            let idle = conns.keys.filter { !inFlight.contains($0) }
+                .min { (lastActive[$0]?.uptimeNanoseconds ?? 0) < (lastActive[$1]?.uptimeNanoseconds ?? 0) }
+            guard let victim = idle, let old = conns.removeValue(forKey: victim) else { conn.cancel(); return }
+            idleTimers.removeValue(forKey: victim)?.cancel()
+            lastActive[victim] = nil
+            old.cancel()
+        }
         conns[ObjectIdentifier(conn)] = conn   // track for teardown (accept runs on `queue`)
+        lastActive[ObjectIdentifier(conn)] = .now()
         conn.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready:
@@ -176,12 +196,20 @@ final class HTTPServer: @unchecked Sendable {
             case .failed, .cancelled:
                 self?.idleTimers.removeValue(forKey: ObjectIdentifier(conn))?.cancel()
                 self?.conns[ObjectIdentifier(conn)] = nil
+                self?.inFlight.remove(ObjectIdentifier(conn))
+                self?.lastActive[ObjectIdentifier(conn)] = nil
                 conn.cancel()
             default:
                 break
             }
         }
         conn.start(queue: queue)
+    }
+
+    /// A kept-alive connection's response is out: it is idle until its next request (runs on `queue`).
+    private func answered(_ conn: NWConnection) {
+        inFlight.remove(ObjectIdentifier(conn))
+        lastActive[ObjectIdentifier(conn)] = .now()
     }
 
     /// (Re)arm the per-connection idle deadline. Fires on `queue`; a connection that has not
@@ -285,6 +313,7 @@ final class HTTPServer: @unchecked Sendable {
         }
 
         guard let (req, consumed) = parsed else { return false }
+        inFlight.insert(ObjectIdentifier(conn))
 
         let residual = consumed < buffer.count
             ? buffer.subdata(in: buffer.index(buffer.startIndex, offsetBy: consumed)..<buffer.endIndex)
@@ -324,6 +353,7 @@ final class HTTPServer: @unchecked Sendable {
                 finish()
                 self.queue.async {
                     if keepAlive && alive {
+                        self.answered(conn)
                         self.touchIdle(conn)
                         self.readRequest(on: conn, buffer: ReadBuffer(residual))
                     } else {
@@ -339,6 +369,7 @@ final class HTTPServer: @unchecked Sendable {
                 self.write(resp, to: conn, keepAlive: keepAlive,
                            acceptEncoding: req.headers["accept-encoding"]) {
                     if keepAlive {
+                        self.answered(conn)
                         self.touchIdle(conn)
                         self.readRequest(on: conn, buffer: ReadBuffer(residual))
                     } else {

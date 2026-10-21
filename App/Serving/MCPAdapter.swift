@@ -89,6 +89,11 @@ enum MCPAdapter {
         "remove_source": [["key": "/Users/me/Old Projects"]],
     ]
 
+    /// A passage on one line, the way the stored snippet is: line breaks and tabs become one space.
+    static func oneLine(_ s: String) -> String {
+        s.split(whereSeparator: { $0.isNewline || $0 == "\t" }).joined(separator: " ")
+    }
+
     static func handle(_ req: HTTPRequest, _ backend: any ServingBackend, appVersion: String,
                        sources: SourcesControl? = nil, surface: ServedSurface = .mcp) async -> HTTPResponse {
         // GET is the SSE stream in the full spec; this server has no server-initiated
@@ -162,9 +167,16 @@ enum MCPAdapter {
             let surface: ServedSurface = cli ? .cli : surface
             switch name {
             case "search":        return await callSearch(id: id, args: args, backend: backend, sources: sources, surface: surface, cli: cli)
-            case "search_inline": return callSearchInline(id: id, args: args, backend: backend, surface: surface, cli: cli)
-            case "file_status":   return callFileStatus(id: id, args: args, backend: backend, cli: cli)
-            case "tag_image":     return callTagImage(id: id, args: args, backend: backend, cli: cli)
+            case "search_inline", "file_status", "tag_image":
+                // Blocking tools, so the whole call runs on the served work queue (see ServedWork).
+                let call = ReadOnlyRequest(id: id, args: args)
+                return await ServedWork.run {
+                    switch name {
+                    case "search_inline": return callSearchInline(id: call.id, args: call.args, backend: backend, surface: surface, cli: cli)
+                    case "file_status":   return callFileStatus(id: call.id, args: call.args, backend: backend, cli: cli)
+                    default:              return callTagImage(id: call.id, args: call.args, backend: backend, cli: cli)
+                    }
+                }
             case "ocr":           return await callOCR(id: id, args: args, cli: cli)
             case "get_linked_file":
                 guard let fetch = sources?.linkedFetch else { return toolError(id: id, "get_linked_file failed: Omni is still loading") }
@@ -204,7 +216,7 @@ enum MCPAdapter {
                     ],
                     "max_snippet": [
                         "type": "integer",
-                        "description": "Max characters of the matching text snippet shown per result (default 200, max 2000). 0 omits snippets.",
+                        "description": "Max characters of text shown per result (default 200, max 2000): for a text result, the part of its matching passage closest to the query, or the whole passage when it fits. 0 omits it.",
                         "minimum": 0, "maximum": 2000
                     ],
                     "include_images": [
@@ -282,14 +294,24 @@ enum MCPAdapter {
         // one that makes it stop trusting the tool. The snapshot is a main-actor hop, so it is
         // started BEFORE the blocking scan and awaited after: the hop overlaps the search rather
         // than adding to it.
-        async let snapshot: SourcesSnapshot? = { if let sources { return await sources.snapshot() }; return nil }()
+        let tIn = omniPerfEnabled ? Date() : nil
+        async let snapshot: SourcesSnapshot? = { if let sources { return await sources.recentSnapshot() }; return nil }()
 
         // Same duplicate collapsing as the HTTP endpoint and the app's own list. Copies cost an
         // agent more than they cost a human - every one is context spent re-reading a file it has
         // already seen - so this defaults ON, with "group_duplicates": false for the flat list.
         let group = (args["group_duplicates"] as? Bool) ?? true
-        let hits = backend.search(query, topK: group ? min(topK * 3, 150) : topK, filter: filter, surface: surface)
-        let groups = backend.groupedResults(hits, enabled: group, limit: topK)
+        let k = topK, width = maxSnippet
+        let (hits, groups, passages, tQueued, tRan) = await ServedWork.run { () -> ([SearchHit], [ResultGroup], [String?], Date, Date) in
+            let tQueued = Date()
+            let hits = backend.search(query, topK: group ? min(k * 3, 150) : k, filter: filter, surface: surface)
+            let groups = backend.groupedResults(hits, enabled: group, limit: k)
+            // The text a result shows is its chunk's own, recovered from the file: the whole chunk
+            // when it fits `max_snippet`, else the window of it that matches the query. Media and
+            // anything that cannot be recovered keep the stored snippet.
+            let passages = SearchAdapter.textPassages(groups.map(\.representative), query: query, width: width, backend: backend)
+            return (hits, groups, passages, tQueued, Date())
+        }
         let reps = groups.map(\.representative)
         let dupesByPath = Dictionary(uniqueKeysWithValues: groups.map { ($0.representative.path, $0) })
 
@@ -307,6 +329,11 @@ enum MCPAdapter {
         // Implementing resources/read instead would be the other way out, and it would mean serving
         // bytes the client can already open for itself.
         let snap = await snapshot
+        if let tIn {
+            omniPerfLog(String(format: "served-search queued=%.0fms work=%.0fms snapshot=%.0fms",
+                               tQueued.timeIntervalSince(tIn) * 1000, tRan.timeIntervalSince(tQueued) * 1000,
+                               -tRan.timeIntervalSinceNow * 1000))
+        }
         let note = indexStateLine(snap)
 
         var content: [[String: Any]] = []
@@ -349,7 +376,7 @@ enum MCPAdapter {
                 if weaker[i] { meta += ", weaker match" }
                 var text = "\(i + 1). \(h.path)  (\(h.fileKind), \(score)%\(loc)\(meta))"
                 if maxSnippet > 0 {
-                    let snippet = h.snippet.replacingOccurrences(of: "\n", with: " ")
+                    let snippet = oneLine(passages[i] ?? h.snippet)
                     if !snippet.isEmpty { text += "\n   \(String(snippet.prefix(maxSnippet)))" }
                 }
                 content.append(["type": "text", "text": text])
@@ -410,7 +437,7 @@ enum MCPAdapter {
         }
 
         return answer(id: id, content, cli: cli) {
-            var body: [String: Any] = ["query": query, "results": SearchAdapter.rows(groups, backend: backend), "grouped": group]
+            var body: [String: Any] = ["query": query, "results": SearchAdapter.rows(groups, backend: backend, passages: passages), "grouped": group]
             if !linked.isEmpty { body["linked"] = linked }
             return body
         }
@@ -442,7 +469,7 @@ enum MCPAdapter {
                     ],
                     "max_snippet": [
                         "type": "integer",
-                        "description": "Max characters of each passage in the text block (default 400, max 4000). 0 omits snippets.",
+                        "description": "Max characters of each passage (default 400, max 4000): the passage's own text, or the part of it closest to the query when it is longer. 0 omits passages.",
                         "minimum": 0, "maximum": 4000
                     ]
                 ] as [String: Any],
@@ -473,7 +500,13 @@ enum MCPAdapter {
         var maxSnippet = (args["max_snippet"] as? Int) ?? 400
         maxSnippet = max(0, min(maxSnippet, 4000))
 
-        let hits = backend.searchInline(query, paths: paths, topK: topK, surface: surface)
+        var hits = backend.searchInline(query, paths: paths, topK: topK, surface: surface)
+        // Each passage is the chunk's own text now, not its stored 220-character opening: the
+        // whole chunk when it fits `max_snippet`, else the window of it that matches the query.
+        if maxSnippet > 0 {
+            let texts = backend.passages(for: hits.map { ($0.path, $0.chunkIndex, $0.locator) }, query: query, width: maxSnippet)
+            for i in hits.indices { if let t = texts[i] { hits[i].snippet = t } }
+        }
 
         var content: [[String: Any]] = []
         if hits.isEmpty {
@@ -484,7 +517,7 @@ enum MCPAdapter {
                 let loc = h.locator.isEmpty ? "" : ", \(h.locator)"
                 var text = "\(i + 1). \(h.path)  (\(h.kind), chunk \(h.chunkIndex), \(score)%\(loc))"
                 if maxSnippet > 0 {
-                    let snippet = h.snippet.replacingOccurrences(of: "\n", with: " ")
+                    let snippet = oneLine(h.snippet)
                     if !snippet.isEmpty { text += "\n   \(String(snippet.prefix(maxSnippet)))" }
                 }
                 content.append(["type": "text", "text": text])

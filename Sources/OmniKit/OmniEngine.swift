@@ -786,6 +786,17 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         }
     }
 
+    /// The windows a hit's matching passage is picked from (`PassageWindow`), with the index's own
+    /// encoder and passage prefix, not counted as indexing tokens. `waiting`: someone is blocked on
+    /// the answer (a served search, an agent) - query priority, ahead of indexing. Otherwise (the
+    /// rows of the window, filled after the results show) the low lane, so a passage never holds a
+    /// keystroke's query back for more than the one forward already running.
+    public func embedPassages(_ texts: [String], waiting: Bool) -> [[Float]] {
+        guard !texts.isEmpty else { return [] }
+        if waiting { markQuery() }
+        return run(highPriority: waiting) { textEncoder.encodeBatch(texts, as: .passage) }
+    }
+
     /// Embed several pre-bucketed batches as ONE serialized embed, double-buffering each batch's
     /// GPU forward over the prior batch's host readout (on by default; OMNI_ASYNC_EVAL=0 makes it a
     /// plain loop).

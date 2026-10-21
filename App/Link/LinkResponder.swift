@@ -218,11 +218,11 @@ final class LinkResponder: LinkService, @unchecked Sendable {
     }
 
     /// Blocking engine and store work, off the cooperative pool (the same rule Thumbnail's decode
-    /// gate keeps: a search must not starve the threads every other task runs on).
+    /// gate keeps: a search must not starve the threads every other task runs on). On the served
+    /// work queue, which bounds it with the HTTP and socket surfaces' work, instead of a global
+    /// queue that answers blocked work with more threads.
     private func offPool<T: Sendable>(_ work: @escaping @Sendable () throws -> T) async throws -> T {
-        try await withCheckedThrowingContinuation { c in
-            DispatchQueue.global(qos: .userInitiated).async { c.resume(with: Result { try work() }) }
-        }
+        try await ServedWork.run(work)
     }
 
     static func jpeg(_ cg: CGImage, quality: Double = 0.8) -> Data? {

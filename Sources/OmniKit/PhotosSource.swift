@@ -67,17 +67,33 @@ public enum PhotoLibrary {
 
     /// Read access to the library. `.readWrite` is the only level that can READ on macOS
     /// (`.addOnly` is write-only), and Omni never writes - it asks for the level the API requires.
+    ///
+    /// CACHED FOR TWO SECONDS. Every `authorizationStatus` call is a synchronous XPC round trip to
+    /// tccd, and served search asked twice per request, on the main actor, to build the sources
+    /// snapshot it reports index state from: 64 concurrent agent searches queued 128 round trips
+    /// behind each other there, every response waited for the queue, and under sustained load tccd
+    /// slowed until each request took ~25 s (sampled). The answer changes when the user flips a
+    /// switch in System Settings, so two seconds is still live, and a request from this app drops
+    /// the cache at once.
     public static var authorization: PHAuthorizationStatus {
-        PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        authLock.lock(); defer { authLock.unlock() }
+        if let c = authCache, -c.at.timeIntervalSinceNow < 2 { return c.status }
+        let s = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        authCache = (s, Date())
+        return s
     }
+    private static let authLock = NSLock()
+    nonisolated(unsafe) private static var authCache: (status: PHAuthorizationStatus, at: Date)?
     public static var isAuthorized: Bool {
         let s = authorization
         return s == .authorized || s == .limited
     }
     public static func requestAuthorization() async -> PHAuthorizationStatus {
-        await withCheckedContinuation { cont in
+        let s = await withCheckedContinuation { cont in
             PHPhotoLibrary.requestAuthorization(for: .readWrite) { cont.resume(returning: $0) }
         }
+        authLock.withLock { authCache = (s, Date()) }
+        return s
     }
 
     // MARK: - Sources (what the user picked)

@@ -676,3 +676,24 @@ What had to change in the suite to get there:
   compacted inside the delete), the WAL valve on the store queue, and an ungated folder tail
   (index.md, "Heavy CRUD"). The store is exact below a million contents on the M3 Ultra, so
   "While reclaiming space" reports not applicable there: no coverage, nothing to relocate.
+
+## The agent eval (2026-10-20, Tools/agenteval)
+
+What an agent gets from Omni's MCP tools and what it pays, on the labeled eval testbed, through an
+ISOLATED instance (`Tools/agenteval/serve-eval.sh <bed> <new scratch dir> [app]`: an APFS clone of
+the testbed's nano index, port 51399, its own socket, no Linked Macs on the network, a footprint
+watchdog). Three modes of `Tools/agenteval/agenteval.py`, stdlib only:
+
+- `probe`: every eval query through the real `search` tool, scored by file AND place, with the
+  characters each call returns and its latency. Deterministic, so it is the A/B for anything that
+  changes what the tool answers. Positive control: it agrees with `omni-verify eval` (MRR 0.901 vs
+  0.900) once paths are compared NFC - the filesystem hands back decomposed names, and the first
+  run scored every Cyrillic, accented and Hangul answer as a miss.
+- `load`: N keep-alive clients plus a 1 Hz `initialize` probe. See index.md, "Served search under
+  load", for what it found and for why the client must not be urllib.
+- `agent`: real episodes with the `claude` CLI headless, Omni's tools only, from an empty working
+  directory. Success = the answer names an acceptable file; records calls, turns, tokens, tool-result
+  characters, cost, time. Here only the CLI's default model is available (Vertex). Agents vary run to
+  run - one query took 16 calls on one build and failed in 7 on the other - so compare all 125
+  queries, PAIRED, and treat flips that cancel as noise. ~$7 a build. It sends the synthetic
+  testbed's text to the model; never point it at a real index.
