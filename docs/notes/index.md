@@ -1876,6 +1876,19 @@ into windows of the width shown and the model picks the one closest to the query
   a lookup), failures remembered by key, big text files recovered from the hit's line - and,
   largest of all, hex-encoding keys without a `String(format:)` per byte: 965 keys of one notes file
   per search had been 40 ms.
+- AN EXACT PHRASE, INSIDE THE FILES (2026-10-21). `search_inline` with `exact: true` reads the text of
+  the indexed files its paths name (`VectorStore.indexedFiles(under:)`, the same scope resolution as
+  the semantic mode; at most 400 files, in parallel) and finds the query as written: any case, any
+  run of whitespace between its words (a phrase broken across a PDF's lines), the words the phrase's
+  own - nothing about a language (`TextSlice.find`, beside read_file's reader and sharing its checks).
+  Each place comes with its locator - Page, the file's own Line, or the character offset read_file
+  reads from - and every match is counted; scans are named, not searched (their text is OCR). The
+  index reads no content words, only names and identifiers, and agents quote phrases constantly;
+  taking cross-document matching from a research agent cut its accuracy from 82 to 40 (arXiv
+  2606.14885). With real agents, one run against the morning's budget arm: find-the-file success
+  0.928 vs 0.904, calls 2.22 vs 2.17; content QA 24/24 vs 23/24, calls 2.29 vs 2.54. Agents chose it
+  in 9 of 24 QA episodes (incident and invoice codes, an oven temperature) and 9 of 125 find episodes,
+  every one answered.
 - MCP 2026-07-28, DUAL-ERA (2026-10-21). That revision drops the handshake: each request carries its
   revision and capabilities in `_meta`, and the server MUST answer `server/discover`. A request with
   that metadata is served statelessly (`MCPAdapter.handleModern`): an unknown revision is 400 /

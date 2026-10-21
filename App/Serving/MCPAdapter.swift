@@ -548,6 +548,10 @@ enum MCPAdapter {
                         "type": "integer",
                         "description": "Max characters of each passage (default 400, max 4000): the passage's own text, or the part of it closest to the query when it is longer. 0 omits passages.",
                         "minimum": 0, "maximum": 4000
+                    ],
+                    "exact": [
+                        "type": "boolean",
+                        "description": "Find the query as an exact phrase (any case, any spacing) in the files' text instead of by meaning: for names, numbers, codes and quotes. Scans are not searched."
                     ]
                 ] as [String: Any],
                 "required": ["query", "paths"]
@@ -576,6 +580,9 @@ enum MCPAdapter {
         topK = max(1, min(topK, 100))
         var maxSnippet = (args["max_snippet"] as? Int) ?? 400
         maxSnippet = max(0, min(maxSnippet, 4000))
+        if args["exact"] as? Bool == true {
+            return callPhrase(id: id, phrase: query, paths: paths, keep: topK, backend: backend, cli: cli)
+        }
 
         var hits = backend.searchInline(query, paths: paths, topK: topK, surface: surface)
         // Each passage is the chunk's own text now, not its stored 220-character opening: the
@@ -605,6 +612,37 @@ enum MCPAdapter {
                 ["path": h.path, "kind": h.kind, "chunk_index": h.chunkIndex,
                  "score": Double(max(0, min(1, h.score))), "snippet": h.snippet, "locator": h.locator]
             }]
+        }
+    }
+
+    /// search_inline with `exact`: the phrase found in the files' text, where it occurs and how often.
+    /// GREP OVER THE FILES AN AGENT IS WORKING WITH, for what meaning does not find - a name, an amount,
+    /// a code, a quote - in formats it cannot grep itself (Word, PDF, Pages). Agents quote phrases
+    /// constantly, and taking cross-document matching away from a research agent cut its accuracy from
+    /// 82 to 40 (arXiv 2606.14885); the index reads no content words, only names and identifiers, so
+    /// the text is read here, from the files the scope names.
+    private static func callPhrase(id: Any, phrase: String, paths: [String], keep: Int,
+                                   backend: any ServingBackend, cli: Bool) -> HTTPResponse {
+        let found = backend.findPhrase(phrase, paths: paths, keep: keep)
+        var content: [[String: Any]] = []
+        for (i, p) in found.places.enumerated() {
+            content.append(["type": "text", "text": "\(i + 1). \(p.path)  (\(p.locator))\n   \(p.context)"])
+        }
+        var summary = found.total == 0
+            ? "\"\(phrase)\" does not occur in the text of \(found.filesSearched) indexed file\(found.filesSearched == 1 ? "" : "s") in those paths."
+            : "\(found.total) match\(found.total == 1 ? "" : "es") in \(found.filesWithMatches) of \(found.filesSearched) file\(found.filesSearched == 1 ? "" : "s")"
+                + (found.total > found.places.count ? "; the first \(found.places.count) shown (top_k for more)." : ".")
+        if found.filesInScope > found.filesSearched + found.scans + found.skipped {
+            summary += " Only the first \(EngineServingBackend.maxPhraseFiles) of \(found.filesInScope) files were searched: name narrower paths."
+        }
+        if found.scans > 0 { summary += " \(found.scans) scanned PDF\(found.scans == 1 ? " was" : "s were") not searched: its text is OCR (ocr reads it)." }
+        if !found.partial.isEmpty { summary += " Searched only partly (very long): \(found.partial.prefix(3).joined(separator: ", "))." }
+        if found.filesInScope == 0 { summary = "No indexed files in those paths." }
+        content.append(diagnostic(summary))
+        return answer(id: id, content, cli: cli) {
+            ["query": phrase, "exact": true, "total": found.total, "files_searched": found.filesSearched,
+             "files_with_matches": found.filesWithMatches,
+             "matches": found.places.map { ["path": $0.path, "locator": $0.locator, "context": $0.context] }]
         }
     }
 

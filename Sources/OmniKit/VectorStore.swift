@@ -13264,46 +13264,62 @@ public final class VectorStore: @unchecked Sendable {
     /// gathered and scored in ONE MLX matmul on the GPU (exact bf16 dot products), not a per-chunk host
     /// loop. Returns [] if the scope exceeds maxInlineScanRows (too broad). Snippets are fetched only for
     /// the winners. Scores are cosine (vectors are L2-normalized at index time).
+    /// The files a search_inline scope names: an indexed file by its path, a folder by every indexed
+    /// file under it. Caller holds `queue`.
+    private func scopeLocked(_ paths: [String]) -> (inScope: [Bool], ids: [Int32]) {
+        // Normalize each requested path ONCE (strip a single trailing slash) so the prefix test is
+        // allocation-free in the loop and a folder arg with a trailing slash ("/x/Docs/") still matches.
+        let bases = paths.compactMap { p -> String? in
+            let b = p.hasSuffix("/") ? String(p.dropLast()) : p
+            return b.isEmpty ? nil : b
+        }
+        var inScope = [Bool](repeating: false, count: max(1, fileChunkCount.count))
+        var scopedIds: [Int32] = []
+        guard !bases.isEmpty else { return (inScope, []) }
+        // Scope resolution, cheapest first. Callers overwhelmingly pass FILE paths, and an
+        // indexed file is one dictionary hit - so try that before falling back to the prefix
+        // scan, which visits every interned path in the index (212k on a large one) and runs a
+        // prefix test per argument against each. That scan was ~1.6 s for 12 files; it now runs
+        // only for arguments that are genuinely folders.
+        var folderBases: [String] = []
+        for b in bases {
+            if let fid = filePaths.id(b) {
+                if !inScope[Int(fid)] { inScope[Int(fid)] = true; scopedIds.append(fid) }
+            } else {
+                folderBases.append(b)
+            }
+        }
+        if !folderBases.isEmpty {
+            // Per directory, String semantics as `hasPrefix` had. Every id, not only the ones
+            // a key points at - the same set while no path is interned twice, which only a
+            // sidecar written by another table could do.
+            for b in folderBases {
+                let under = filePaths.filesUnder(b, semantics: .string)
+                for fid in 0 ..< Swift.min(under.count, inScope.count)
+                where under[fid] && !inScope[fid] {
+                    inScope[fid] = true; scopedIds.append(Int32(fid))
+                }
+            }
+        }
+        return (inScope, scopedIds)
+    }
+
+    /// The indexed files a search_inline scope names, as search_inline resolves it - for reading
+    /// their text (an exact phrase), not their vectors. Files with no rows left are not included.
+    public func indexedFiles(under paths: [String]) -> [String] {
+        queue.sync {
+            let (_, ids) = scopeLocked(paths)
+            return ids.filter { Int($0) < fileChunkCount.count && fileChunkCount[Int($0)] > 0 }.map { filePaths[Int($0)] }
+        }
+    }
+
     public func rankChunksAcross(_ query: [Float], paths: [String], topK: Int = 10) -> [InlineChunkHit] {
         queue.sync {
             // Skip tombstones rather than compact - see fileVector. This is an interactive path
             // (an agent's search_inline, the passages panel) and must not pay for a base rewrite.
             let n = slotCount
             guard dim > 0, query.count == dim, !paths.isEmpty, n > 0, flat16.count == n * dim else { return [] }
-            // Normalize each requested path ONCE (strip a single trailing slash) so the prefix test is
-            // allocation-free in the loop and a folder arg with a trailing slash ("/x/Docs/") still matches.
-            let bases = paths.compactMap { p -> String? in
-                let b = p.hasSuffix("/") ? String(p.dropLast()) : p
-                return b.isEmpty ? nil : b
-            }
-            guard !bases.isEmpty else { return [] }
-            // Scope resolution, cheapest first. Callers overwhelmingly pass FILE paths, and an
-            // indexed file is one dictionary hit - so try that before falling back to the prefix
-            // scan, which visits every interned path in the index (212k on a large one) and runs a
-            // prefix test per argument against each. That scan was ~1.6 s for 12 files; it now runs
-            // only for arguments that are genuinely folders.
-            var inScope = [Bool](repeating: false, count: max(1, fileChunkCount.count))
-            var scopedIds: [Int32] = []
-            var folderBases: [String] = []
-            for b in bases {
-                if let fid = filePaths.id(b) {
-                    if !inScope[Int(fid)] { inScope[Int(fid)] = true; scopedIds.append(fid) }
-                } else {
-                    folderBases.append(b)
-                }
-            }
-            if !folderBases.isEmpty {
-                // Per directory, String semantics as `hasPrefix` had. Every id, not only the ones
-                // a key points at - the same set while no path is interned twice, which only a
-                // sidecar written by another table could do.
-                for b in folderBases {
-                    let under = filePaths.filesUnder(b, semantics: .string)
-                    for fid in 0 ..< Swift.min(under.count, inScope.count)
-                    where under[fid] && !inScope[fid] {
-                        inScope[fid] = true; scopedIds.append(Int32(fid))
-                    }
-                }
-            }
+            let (inScope, scopedIds) = scopeLocked(paths)
             guard !scopedIds.isEmpty else { return [] }
 
             // Rows we expect, from the live per-file counts, so the walk can stop once it has them

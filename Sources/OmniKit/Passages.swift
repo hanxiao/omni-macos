@@ -169,6 +169,8 @@ public final class PassageRecovery: @unchecked Sendable {
     }
 
     public func setSettings(_ s: IndexSettings) { lock.lock(); settings = s; lock.unlock() }
+    /// The settings the index reads files by - what an exact search over their text must follow too.
+    public var currentSettings: IndexSettings { lock.lock(); defer { lock.unlock() }; return settings }
 
     // MARK: - Passages for a ranked list, within a budget
 
@@ -361,19 +363,12 @@ public enum TextSlice {
                             maxChars: Int) -> Outcome {
         let url = URL(fileURLWithPath: path)
         let ext = url.pathExtension.lowercased()
-        guard let kind = FileExtractor.kind(forExtension: ext) else { return .unreadable("Omni does not read .\(ext) files") }
-        guard kind == .text else { return .media(kind.rawValue) }
-        guard FileManager.default.fileExists(atPath: path) else { return .unreadable("the file is no longer there") }
-        guard !FileExtractor.isDataless(path) else {
-            return .unreadable("the file's content is in iCloud, not on this Mac; open it once in Finder to download it")
-        }
+        if let refused = refusal(path) { return refused }
         let cap = max(1, maxChars)
         if FileExtractor.pdfExtensions.contains(ext), offset == nil {
             guard let doc = PDFDocument(url: url), doc.pageCount > 0 else { return .unreadable("the PDF could not be opened") }
             let n = doc.pageCount
-            var chars = 0
-            for i in 0 ..< n { chars += (autoreleasepool { doc.page(at: i)?.string } ?? "").trimmingCharacters(in: .whitespacesAndNewlines).count; if chars >= FileExtractor.minCharsPerPage * n { break } }
-            guard chars >= FileExtractor.minCharsPerPage * n else { return .scanned(pages: n) }
+            guard !isScan(doc) else { return .scanned(pages: n) }
             let first = min(max(1, page ?? 1), n)
             var text = "", last = first
             for p in first ... n {
@@ -424,6 +419,117 @@ public enum TextSlice {
         let to = from + whole.distance(from: lo, to: hi)
         return .text(Slice(unit: "character", start: from, end: to, total: total, next: to < total ? to : nil,
                            text: String(whole[lo ..< hi])))
+    }
+
+    /// Why a file has no text to read: not a format Omni reads, a medium, gone, or in iCloud only.
+    static func refusal(_ path: String) -> Outcome? {
+        let ext = (path as NSString).pathExtension.lowercased()
+        guard let kind = FileExtractor.kind(forExtension: ext) else { return .unreadable("Omni does not read .\(ext) files") }
+        guard kind == .text else { return .media(kind.rawValue) }
+        guard FileManager.default.fileExists(atPath: path) else { return .unreadable("the file is no longer there") }
+        guard !FileExtractor.isDataless(path) else {
+            return .unreadable("the file's content is in iCloud, not on this Mac; open it once in Finder to download it")
+        }
+        return nil
+    }
+
+    /// A PDF whose pages carry too little text to be anything but pictures of it (the extractor's rule).
+    static func isScan(_ doc: PDFDocument) -> Bool {
+        let n = doc.pageCount
+        var chars = 0
+        for i in 0 ..< n {
+            chars += (autoreleasepool { doc.page(at: i)?.string } ?? "").trimmingCharacters(in: .whitespacesAndNewlines).count
+            if chars >= FileExtractor.minCharsPerPage * n { return false }
+        }
+        return true
+    }
+
+    // MARK: - An exact phrase
+
+    public struct Match: Sendable, Equatable {
+        /// "Page 3", "Line 41000" or "character 1200": what read_file takes to read on from there.
+        public let locator: String
+        public let context: String
+    }
+
+    public enum Found: Sendable {
+        /// The first matches with their context, every match counted; `partial` when a very long file
+        /// was searched only as far as `maxBytes`.
+        case matches([Match], total: Int, partial: Bool)
+        case scanned(pages: Int)
+        case media(String)
+        case unreadable(String)
+    }
+
+    /// Every place `phrase` occurs in the file's text, read as the index reads it: case-insensitive,
+    /// and any run of whitespace between its words matches any other, so a phrase broken across a
+    /// PDF's lines is still found. The words are the phrase's own, split where it has whitespace -
+    /// nothing about any language. The first `keep` come with `context` characters either side.
+    public static func find(_ phrase: String, path: String, keep: Int, context: Int = 90, maxBytes: Int = 32 << 20,
+                            settings: IndexSettings = IndexSettings()) -> Found {
+        let words = phrase.split(whereSeparator: { $0.isWhitespace }).map { NSRegularExpression.escapedPattern(for: String($0)) }
+        guard !words.isEmpty, let rx = try? NSRegularExpression(pattern: words.joined(separator: "\\s+"), options: [.caseInsensitive]) else {
+            return .unreadable("the phrase is empty")
+        }
+        switch refusal(path) {
+        case .media(let m)?: return .media(m)
+        case .unreadable(let why)?: return .unreadable(why)
+        default: break
+        }
+        let url = URL(fileURLWithPath: path)
+        let ext = url.pathExtension.lowercased()
+        var kept: [Match] = [], total = 0
+        func scan(_ text: String, locate: (String, Int) -> String) {
+            let ns = text as NSString
+            rx.enumerateMatches(in: text, range: NSRange(location: 0, length: ns.length)) { m, _, stop in
+                guard let r = m?.range else { return }
+                total += 1
+                if kept.count < keep {
+                    let lo = Swift.max(0, r.location - context), hi = Swift.min(ns.length, r.location + r.length + context)
+                    let around = ns.substring(with: NSRange(location: lo, length: hi - lo))
+                        .split(whereSeparator: { $0.isNewline || $0 == "\t" }).joined(separator: " ")
+                    kept.append(Match(locator: locate(text, r.location),
+                                      context: (lo > 0 ? "\u{2026}" : "") + around + (hi < ns.length ? "\u{2026}" : "")))
+                }
+                if total >= 100_000 { stop.pointee = true }
+            }
+        }
+        if FileExtractor.pdfExtensions.contains(ext) {
+            guard let doc = PDFDocument(url: url), doc.pageCount > 0 else { return .unreadable("the PDF could not be opened") }
+            guard !isScan(doc) else { return .scanned(pages: doc.pageCount) }
+            for p in 0 ..< doc.pageCount {
+                let s = autoreleasepool { doc.page(at: p)?.string ?? "" }
+                scan(s) { _, _ in "Page \(p + 1)" }
+            }
+            return .matches(kept, total: total, partial: false)
+        }
+        if FileExtractor.textExtensions.contains(ext) {
+            // The file's own lines, as far as the index reads it (its 2 MB cut for a long data file).
+            guard let data = try? Data(contentsOf: url, options: .alwaysMapped) else { return .unreadable("the file could not be read") }
+            let limit = Swift.min(data.count, maxBytes,
+                                  Indexer.readLimit(size: data.count, ext: ext, settings: settings))
+            let bytes = data.prefix(limit)
+            let text = String(data: bytes, encoding: .utf8) ?? String(decoding: bytes, as: UTF8.self)
+            // Line numbers from one pass over the newlines, looked up per match.
+            var newlines: [Int] = [], i = 0
+            for c in text.utf16 { if c == 0x0A { newlines.append(i) }; i += 1 }
+            scan(text) { _, at in
+                var lo = 0, hi = newlines.count
+                while lo < hi { let mid = (lo + hi) / 2; if newlines[mid] < at { lo = mid + 1 } else { hi = mid } }
+                return "Line \(lo + 1)"
+            }
+            return .matches(kept, total: total, partial: limit < data.count && limit == maxBytes)
+        }
+        switch try? FileExtractor.extract(url) {
+        case .text(let s)?, .pagedText(let s, _)?:
+            scan(s) { text, at in
+                let idx = String.Index(utf16Offset: at, in: text)
+                return "character \(text.distance(from: text.startIndex, to: idx))"
+            }
+            return .matches(kept, total: total, partial: false)
+        case .scannedPDF(let n)?: return .scanned(pages: n)
+        default: return .unreadable("Omni found no text in this file")
+        }
     }
 
     /// Lines `from`... of a large text file, by newline offsets over the mapped bytes - no whole-file

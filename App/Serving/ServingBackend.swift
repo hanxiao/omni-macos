@@ -68,6 +68,9 @@ protocol ServingBackend: Sendable {
     /// Rank passages WITHIN an explicit set of files/folders. Embeds `query` (high priority)
     /// and scores against the already-indexed chunk vectors of those paths only.
     func searchInline(_ query: String, paths: [String], topK: Int, surface: ServedSurface) -> [InlineChunkHit]
+    /// Where `phrase` occurs, exactly, in the text of the indexed files those paths name - the same
+    /// scope as `searchInline` - with the first `keep` places and every match counted.
+    func findPhrase(_ phrase: String, paths: [String], keep: Int) -> PhraseHits
     /// Index status for an explicit set of absolute file paths: which are indexed, as what kind,
     /// at which stored (modified, size) signature, with how many chunks. Read-only SQLite
     /// metadata lookups; never touches the engine or the vector data.
@@ -182,6 +185,36 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
         return out.map { $0?.text }
     }
 
+    /// A FOLDER IS READ AT MOST THIS FAR: each file's text is read for the phrase, so a scope of
+    /// thousands of files would hold the served queue for seconds. The answer says how far it got.
+    static let maxPhraseFiles = 400
+
+    func findPhrase(_ phrase: String, paths: [String], keep: Int) -> PhraseHits {
+        let files = store.indexedFiles(under: paths).sorted()
+        let settings = passageRecovery?.currentSettings ?? IndexSettings()
+        let searched = Array(files.prefix(Self.maxPhraseFiles))
+        // By file, in parallel (each opens its own document); merged in path order.
+        let found = UnsafeMutableBufferPointer<TextSlice.Found>.allocate(capacity: max(1, searched.count))
+        defer { found.deallocate() }
+        DispatchQueue.concurrentPerform(iterations: searched.count) { i in
+            (found.baseAddress! + i).initialize(to: TextSlice.find(phrase, path: searched[i], keep: keep, settings: settings))
+        }
+        var out = PhraseHits(filesInScope: files.count)
+        for i in searched.indices {
+            switch found[i] {
+            case .matches(let ms, let total, let partial):
+                out.filesSearched += 1
+                if total > 0 { out.filesWithMatches += 1; out.total += total }
+                for m in ms where out.places.count < keep { out.places.append((searched[i], m.locator, m.context)) }
+                if partial { out.partial.append(searched[i]) }
+            case .scanned: out.scans += 1
+            case .media, .unreadable: out.skipped += 1
+            }
+        }
+        if !searched.isEmpty { found.baseAddress!.deinitialize(count: searched.count) }
+        return out
+    }
+
     /// RECORDED TOO. Ranking passages within named files is a search the user did not type, which
     /// is the whole of what the history switch covers - it was simply the one route that never
     /// called back, so an agent reading inside files left no trace in the sidebar at all.
@@ -263,4 +296,18 @@ extension ServingBackend {
                                           nearEnabled: true)
         return Array(groups.prefix(limit))
     }
+}
+
+/// `findPhrase`'s answer: the first places a phrase occurs and how many there are in all.
+struct PhraseHits {
+    var places: [(path: String, locator: String, context: String)] = []
+    var total = 0
+    var filesWithMatches = 0
+    var filesSearched = 0
+    var filesInScope = 0
+    /// Scanned PDFs: their text is OCR, not something the index read from the file.
+    var scans = 0
+    var skipped = 0
+    /// Files searched only as far as `TextSlice.find`'s byte limit.
+    var partial: [String] = []
 }

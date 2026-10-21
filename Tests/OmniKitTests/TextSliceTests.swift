@@ -83,6 +83,90 @@ final class TextSliceTests: XCTestCase {
         XCTAssertEqual(n, 1)
     }
 
+    // MARK: - An exact phrase (search_inline's `exact`)
+
+    private func matches(_ f: TextSlice.Found, file: StaticString = #filePath, line: UInt = #line) throws -> ([TextSlice.Match], Int) {
+        guard case .matches(let ms, let total, _) = f else { XCTFail("no matches outcome: \(f)", file: file, line: line); throw XCTSkip() }
+        return (ms, total)
+    }
+
+    /// Any case, any spacing between the words - a phrase broken across a line is still one phrase -
+    /// located by the file's own line, every match counted and the first kept.
+    func testAPhraseInATextFileAcrossALineBreak() throws {
+        let url = dir.appendingPathComponent("notes.md")
+        var lines = (1 ... 300).map { "Line \($0) says nothing in particular." }
+        lines[120] = "The tenant pays a Security"
+        lines[121] = "Deposit of 4,700 dollars before moving in."
+        lines[250] = "A second security deposit clause, for the garage."
+        try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        let (ms, total) = try matches(TextSlice.find("security   deposit", path: url.path, keep: 1))
+        XCTAssertEqual(total, 2)
+        XCTAssertEqual(ms.count, 1, "only the first is kept")
+        XCTAssertEqual(ms[0].locator, "Line 121")
+        XCTAssertTrue(ms[0].context.contains("Security Deposit of 4,700"), ms[0].context)
+        let (none, zero) = try matches(TextSlice.find("security bond", path: url.path, keep: 5))
+        XCTAssertEqual(zero, 0); XCTAssertTrue(none.isEmpty)
+    }
+
+    func testAPhraseInAPDFByPageAndInAConvertedDocumentByCharacter() throws {
+        let url = dir.appendingPathComponent("lease.pdf")
+        var box = CGRect(x: 0, y: 0, width: 612, height: 792)
+        let ctx = CGContext(url as CFURL, mediaBox: &box, nil)!
+        let font = CTFontCreateWithName("Helvetica" as CFString, 10, nil)
+        for p in 1 ... 4 {
+            ctx.beginPDFPage(nil)
+            let lines = p == 3 ? ["Clause 9. The landlord returns the", "security deposit within thirty days."]
+                               : ["Page \(p) of the lease covers ordinary matters at some length."]
+            for (k, text) in lines.enumerated() {
+                let l = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: [.init(kCTFontAttributeName as String): font]))
+                ctx.textPosition = CGPoint(x: 20, y: 700 - CGFloat(k) * 14); CTLineDraw(l, ctx)
+            }
+            ctx.endPDFPage()
+        }
+        ctx.closePDF()
+        let (ms, total) = try matches(TextSlice.find("returns the security deposit", path: url.path, keep: 5))
+        XCTAssertEqual(total, 1); XCTAssertEqual(ms.first?.locator, "Page 3")
+
+        let rtf = dir.appendingPathComponent("memo.rtf")
+        let body = String(repeating: "Ordinary words fill the memo here. ", count: 40) + "Invoice INV-2041 remains unpaid."
+        let attr = NSAttributedString(string: body)
+        try attr.data(from: NSRange(location: 0, length: attr.length),
+                      documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]).write(to: rtf)
+        let (rm, rt) = try matches(TextSlice.find("inv-2041", path: rtf.path, keep: 5))
+        XCTAssertEqual(rt, 1)
+        let offset = try XCTUnwrap(Int(rm.first?.locator.replacingOccurrences(of: "character ", with: "") ?? ""))
+        guard case .text(let s) = TextSlice.read(path: rtf.path, offset: offset, maxChars: 8) else { return XCTFail("read at the offset") }
+        XCTAssertEqual(s.text, "INV-2041", "the offset is the one read_file reads from")
+    }
+
+    /// No spaces to split on: the phrase is matched as written. And a long data file is searched as
+    /// far as the index reads it - its 2 MB cut - not past.
+    func testAChinesePhraseAndTheCutOfALongDataFile() throws {
+        let zh = dir.appendingPathComponent("纪要.txt")
+        try (String(repeating: "会议讨论了预算。", count: 50) + "数据检索系统的设计与实现。").write(to: zh, atomically: true, encoding: .utf8)
+        XCTAssertEqual(try matches(TextSlice.find("检索系统", path: zh.path, keep: 5)).1, 1)
+
+        let log = dir.appendingPathComponent("agent.log")
+        var rows = (0 ..< 60_000).map { "\($0) step ok, nothing to report today" }
+        rows[100] = "NEEDLE-BEFORE-THE-CUT"
+        let text = rows.joined(separator: "\n") + "\nNEEDLE-PAST-THE-CUT\n"
+        try text.write(to: log, atomically: true, encoding: .utf8)
+        XCTAssertGreaterThan(text.utf8.count, FileExtractor.maxTextBytes)
+        XCTAssertEqual(try matches(TextSlice.find("needle-past-the-cut", path: log.path, keep: 5)).1, 0, "past the cut the index never read")
+        let (before, n) = try matches(TextSlice.find("needle-before-the-cut", path: log.path, keep: 5))
+        XCTAssertEqual(n, 1); XCTAssertEqual(before.first?.locator, "Line 101")
+    }
+
+    func testAPhraseIsNotLookedForInScansOrMedia() throws {
+        let scan = dir.appendingPathComponent("scan.pdf")
+        var box = CGRect(x: 0, y: 0, width: 612, height: 792)
+        let c = CGContext(scan as CFURL, mediaBox: &box, nil)!
+        c.beginPDFPage(nil); c.setFillColor(gray: 0.2, alpha: 1); c.fill(CGRect(x: 50, y: 50, width: 200, height: 100)); c.endPDFPage()
+        c.closePDF()
+        guard case .scanned = TextSlice.find("anything", path: scan.path, keep: 5) else { return XCTFail("a scan was searched") }
+        guard case .media = TextSlice.find("anything", path: dir.appendingPathComponent("x.mp3").path, keep: 5) else { return XCTFail("audio was searched") }
+    }
+
     func testMediaAndMissingFiles() throws {
         guard case .media("image") = TextSlice.read(path: dir.appendingPathComponent("x.png").path, maxChars: 100) else { return XCTFail() }
         guard case .unreadable = TextSlice.read(path: dir.appendingPathComponent("gone.txt").path, maxChars: 100) else { return XCTFail() }
