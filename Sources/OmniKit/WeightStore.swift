@@ -8,7 +8,8 @@ import MLX
 ///   - `language_model.*` then stored in bf16 by default (only the LoRA targets take the fp32
 ///     round-trip); OMNI_BACKBONE_DTYPE picks fp16 or fp32, and OMNI_BACKBONE_BF16=0 keeps it
 ///     fp32 as the reference does
-///   - vision/merger and audio kept in their stored dtype, unless `keepVision` / `keepAudio` is false
+///   - vision/merger stored in fp16, the dtype that tower computes in; audio kept in its stored
+///     dtype (either tower dropped when `keepVision` / `keepAudio` is false)
 public struct WeightStore {
     public private(set) var weights: [String: MLXArray]
 
@@ -23,8 +24,11 @@ public struct WeightStore {
     public init(modelDir: URL, loraScale: Float = 1.0, keepVision: Bool = true, keepAudio: Bool = true) throws {
         // The release weights (ModelDownloader) are this same merge, written once; their metadata
         // says so, and an adapter left beside them from an older download must not merge twice.
-        let (stored, meta) = try loadArraysAndMetadata(url: modelDir.appendingPathComponent("model.safetensors"))
-        var w = stored
+        // Bound once, not kept as a second dictionary: a converted tensor's source must be free to
+        // go when its replacement is evaluated, or every converted tower sits in memory twice at load.
+        var w: [String: MLXArray]
+        let meta: [String: String]
+        (w, meta) = try loadArraysAndMetadata(url: modelDir.appendingPathComponent("model.safetensors"))
         let alreadyMerged = meta["omni"] == "retrieval-lora-merged"
 
         // Drop modalities we do not run.
@@ -101,6 +105,13 @@ public struct WeightStore {
             for key in Array(w.keys) where key.hasPrefix("language_model.") {
                 if w[key]!.dtype != backboneDType { w[key] = w[key]!.asType(backboneDType) }
             }
+        }
+
+        // The vision tower and merger compute in fp16 (OmniVisionTower): store them that way, so no
+        // converted copy sits beside the stored bf16 (or Nano's fp32 merger).
+        for key in Array(w.keys) where key.hasPrefix("vision_tower.") || key.hasPrefix("merger.") {
+            let a = w[key]!
+            if a.dtype == .bfloat16 || a.dtype == .float32 { w[key] = a.asType(.float16) }
         }
 
         // Force-evaluate EVERY loaded tensor before any forward runs, the upstream norm (mlx-lm

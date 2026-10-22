@@ -2038,3 +2038,98 @@ The same review's smaller points:
   0.92, characters the tools handed the model 3,264 -> 5,269 (+61%), cost per query $0.057 ->
   $0.062 (+10%). One flip in 50 is noise; the cost is not. The command line keeps it (it asks for
   it, and pipes want JSON); `outputSchema` stays off too.
+
+## The kernel review: embedding, towers, tagging (2026-10-22)
+
+Every path measured on this M3 Ultra before anything changed (Nano unless named): text 85,061
+tok/s at batch 8, which is ~20 TFLOPS against a ~28 TFLOPS fp32/fp16 peak (Apple GPUs before M5 run
+fp16 at the fp32 rate), so text was already near what MLX's GEMMs deliver; a query 2.4 ms flat
+(dispatch-bound, 0.54 ms batched); images 30.5/s with the vision tower ~80% of their GPU time and
+the backbone ~20%; audio ~73 ms a clip; tagging ~1 ms an image on top of the forward it shares.
+
+SHIPPED:
+
+- THE VISION TOWER COMPUTES IN fp16 (`OmniVisionTower`; `WeightStore` stores vision/merger in fp16,
+  so there is no converted copy and no fp32 weight cache). It was fp32 for two reasons, both gone:
+  bf16 NaN in the softmax (attention is the fused SDPA kernel now, fp32-accumulating whatever its
+  i/o), and Nano batched-vs-single drift to cos 0.97 - which was Nano's image rows wrapped in memory
+  read past the end of its embedding table, fixed 2026-10-14 (roadmap.md), four months after the
+  fp32 decision. Precision A/B, all arms in one process, interleaved (`towerab`, retired):
+
+      Small, 46 images     full ms   vs fp32 min/mean     fixture   MLX peak
+      fp32 (shipped)        4334     1 / 1                0.99934   8190 MB
+      bf16                  4338     0.99654 / 0.99880    0.99010   4995
+      fp16 matmuls, fp32    4170     0.99952 / 0.99981    0.99840   6516
+        residual
+      fp16                  4071     0.99943 / 0.99979    0.99839   6263
+
+  fp16, not bf16: three more mantissa bits. Retrieval eval (125 queries, Nano, each arm's own fresh
+  index): MRR base 0.900, fp16 0.904, bf16 0.904 - every difference a single near-tie query. COCO-150
+  tags (`tageval`, workspace rebuilt from the study's seed): base mAP 0.644 -> 0.649, with crops
+  0.692 -> 0.699. Adversarial images (flat white/black, full-range noise, 1 px checkerboards,
+  saturated stripes, a 10:1 panorama, 40 px) stay finite on both models. A pass that is not finite
+  is computed again in fp32 (`vision-fp32-fallback` in the perf log; none seen).
+- THE SINGLE-IMAGE FIXTURE IS A NOISY GAUGE AT THIS LEVEL. fp16 in one part of the tower at a time
+  (patch embed, attention, MLP, merger, SDPA i/o) moved Small's `image_ref` cosine non-additively:
+  attention alone 0.99831, MLP alone 0.99788, both together 0.99887. The same run with the backbone
+  in fp32 (as the reference runs it) puts the fp16 tower's own cost at 0.9985 against 0.9994 for
+  fp32. VisionEncoderTests now holds fp32 to the reference at 0.999, the shipped fp16 path to the
+  reference at 0.998 and to fp32 at 0.999 (measured 0.99903 / 0.99921).
+- MLX 0.31.1 REUSES A COMPILED KERNEL ACROSS fp16 AND bf16. A compiled graph's kernel name records
+  each type as kind plus size (`compile.cpp`: `kindof(dtype) << itemsize`), so both are "f2": with
+  fp16 arms run after bf16 ones in one process, the fp16 tower came out NaN; in the other order the
+  bf16 arms came out at cosine 0.35. Any two compiled graphs of the same shape collide, in different
+  closures too (mlx#3427, fixed in core 0.31.2). Nothing shipped mixes them - the backbone's compiled
+  graphs are bf16, the towers' fp16 or fp32 - and that is now a rule (CLAUDE.md).
+- THE IMAGE BACKBONE PASSES OF A CHUNK ARE BATCHED (`OmniImageEncoder.backboneGroups`: sorted by
+  length, a group grows while padding stays under 20%). One image per forward was ~54k tok/s; a
+  group runs ~69k: the backbone 343 -> 266 ms per 46 images. Batched vectors are exact under any
+  regrouping and 0.99994 against the B=1 compiled path, the rounding the text path has always had
+  (`batchidentity`: 0.99993), so `imgbatchparity`'s gate is 0.9999 now. Tags of 39 of 46 images
+  identical; the rest swap words among the last two, where scores are near-ties.
+- RoPE, THE CASTS AND THE RELAYOUT FOR VISION ATTENTION ARE ONE METAL KERNEL (`ropeQKV`). One block
+  at n=8192, 12 heads of 64 (`towerops`): QKV GEMM 1.51 ms, RoPE 1.05 eager / 0.85 compiled+casts,
+  SDPA 1.35-1.55, output copy 0.27, projection 0.68, residual add 0.26 - the RoPE and the casts were
+  ~40% of the GEMM+SDPA work, all data movement. The kernel reads the QKV output once and writes the
+  SDPA layout: 0.565 ms, image path +3% once warm; differs from the separate path in ~1 of 50,000
+  values by one 16-bit step (vectors 0.99992-1.0). MLX builds it from source on first use (~0.1 s),
+  inside the load-time media probe. OMNI_FUSED_NORM=0 takes the separate path.
+
+Together, same machine, baseline binary interleaved (three rounds; peak = process footprint from
+`/usr/bin/time -l`, which includes MLX's buffer cache - the app bounds that; MLX's own active peak
+during image embedding is ~1.0 GB lower on Nano and ~1.7-1.9 GB on Small):
+
+      Nano images     30.0-30.5/s -> 35.5-35.9/s (+17%)    peak 17.1 -> 12.5 GB
+      Nano tagging    150.5 -> 121 ms per 8 photos (-20%)   peak 6.4 -> 4.9 GB
+      Small images    9.9-10.1/s -> 11.4-11.6/s (+15%)     peak 18.7 -> 14.6 GB
+      text            85,026-85,191 -> 84,992-85,225 tok/s, vectors bit-identical
+      queries         2.36 -> 2.39 ms; video indexing within noise
+      eval            Small MRR 0.925 -> 0.925 (every tag identical); Nano 0.900 -> 0.896 (one query,
+                      "Geige", swapping two photos of one series at rank 1-2)
+
+MEASURED AND NOT DONE:
+
+- FUSED q/k/v AND gate/up IN THE TEXT BACKBONE (`projab`, bf16, Nano shapes): at the indexing shape
+  (M 2400) three GEMMs 0.584 ms against one wide GEMM plus slices 0.613; gate/up 1.247 against
+  1.227. Only small M gains (M 400: 0.314 -> 0.266), and queries are already 2.4 ms. Not worth a
+  format change.
+- THE AUDIO TOWER (`audiomem`, `audiobench`, 11 clips, 172 s). Windows grouped by length into one
+  SDPA call per layer: 1 ms a clip, +514 MB MLX peak (contiguous q/k/v for every window at once).
+  Fused q/k/v: 1-3 ms a clip, +46-91 MB. fp16 (throughout, or under an fp32 residual): the fixture
+  0.99987 -> 0.99825 / 0.99870 - the tower is 32 layers deep - for 0-3%. The fp32 arithmetic it gets
+  by promotion stays, and so does the code. Upstream's 1.7-3.2x on batched windows is real for
+  attention, which is not where a 32-layer, 1280-wide tower spends its time.
+- THE ANE: already measured for this model (ocr.md: its MLP runs at 0.48x the GPU there; the ported
+  tower at 0.16x).
+
+ON M5, NOT MEASURABLE HERE: MLX routes GEMM and SDPA to the GPU's matrix units ("NAX") on macOS
+26.2+ for fp16/bf16, and for fp32 as TF32 unless MLX_ENABLE_TF32=0 - which is the default - so the
+fp32 towers have been running at TF32 precision on M5 all along, unseen by gates measured on M3
+(mlx#3534, #3897: TF32 matmul error ~5e-2 on M5 against ~4e-5 on M4). The fp16 tower is native
+there. Moving the pin: mlx-swift 0.32.3 is the first safe release (0.32.2 crashes below macOS 26.4)
+and brings the compile-deadlock and collision fixes; not done here - its decode regression (ocr.md,
+"MLX 0.32") is still unexplained upstream.
+
+ALSO: `TextStreamTests`' long-data-file test failed ~half its runs, at HEAD too: its stale row took
+the file's mtime from FileManager's Date, a few ulps from the crawler's reading. It reads the
+index's own value now; 8 of 8.

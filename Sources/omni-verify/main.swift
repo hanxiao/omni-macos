@@ -7867,9 +7867,25 @@ if args.count >= 4 && args[1] == "mediabench" {
 }
 
 // Single-vs-batched image parity: omni-verify imgbatchparity <modelDir> [imageDir]
-// Gate 1 (cos>=0.99999): each image embedded batch-1 must equal its vector from a batched forward,
+// Gate 1 (cos>=0.9999): each image embedded batch-1 must equal its vector from a batched forward,
 //   proving the block-diagonal cu_seqlens attention truly isolates each image (no cross-leak).
 // Gate 2 (cos>=0.999): a single image still matches the Python reference fixture image_ref.safetensors.
+if args.count >= 4 && args[1] == "audiomem" {
+    try await KernelAB.audioMem(modelDir: URL(fileURLWithPath: args[2]), audioDir: URL(fileURLWithPath: args[3]))
+    exit(0)
+}
+// Text backbone projections, separate against fused: see KernelAB.projections.
+if args.count >= 2 && args[1] == "projab" {
+    KernelAB.projections(m: args.count >= 3 ? (Int(args[2]) ?? 2400) : 2400, hidden: args.count >= 4 ? (Int(args[3]) ?? 768) : 768,
+                         inter: args.count >= 5 ? (Int(args[4]) ?? 3072) : 3072)
+    exit(0)
+}
+// One vision attention block piece by piece: see KernelAB.towerOps.
+if args.count >= 2 && args[1] == "towerops" {
+    KernelAB.towerOps(windows: args.count >= 3 ? (Int(args[2]) ?? 8) : 8, win: args.count >= 4 ? (Int(args[3]) ?? 1024) : 1024,
+                      heads: args.count >= 5 ? (Int(args[4]) ?? 12) : 12, headDim: args.count >= 6 ? (Int(args[5]) ?? 64) : 64)
+    exit(0)
+}
 if args.count >= 2 && args[1] == "imgbatchparity" {
     let modelDir = URL(fileURLWithPath: args.count >= 3 ? args[2] : "/private/tmp/omni-nano")
     let engine = try await OmniEngine(modelDir: modelDir)
@@ -7939,7 +7955,12 @@ if args.count >= 2 && args[1] == "imgbatchparity" {
     // Noise floor: worst cos of a single draw vs the centroid (the model's own jitter).
     var noiseFloor: Float = 1
     for i in 0 ..< raws.count { let c = centroid(i); for run in singleRuns { noiseFloor = min(noiseFloor, cosine(run[i], c)) } }
-    let gate = min(Float(0.99999), noiseFloor)
+    // 0.9999, not 0.99999: since 2026-10-22 a chunk's images share ONE backbone forward
+    // (OmniImageEncoder.backboneGroups), and a batched forward differs from the B=1 compiled one by
+    // GEMM tiling, at the rounding level the text path has always had (batchidentity: 0.99993).
+    // Leakage between images moves vectors far more than that; batched results were measured
+    // exact under any regrouping (index.md, "The kernel review").
+    let gate = min(Float(0.9999), noiseFloor)
     print(String(format: "noise floor (single draw vs %d-draw centroid) worst cos=%.7f  -> gate=%.7f", K, noiseFloor, gate))
 
     var worst: Float = 1

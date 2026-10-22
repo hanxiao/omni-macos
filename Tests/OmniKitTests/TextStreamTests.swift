@@ -165,7 +165,10 @@ final class TextStreamTests: XCTestCase {
 
         // An index from before the fix holds other rows for the unchanged file.
         let good = Set(anchors.values.map(\.key))
-        let mod = try XCTUnwrap((FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate] as? Date)?.timeIntervalSince1970)
+        // The crawler's own reading of the mtime, as the first pass stored it. FileManager's Date goes
+        // through the 2001 reference date and can land a few ulps away, which made the file look
+        // changed and the negative control fail about half the time.
+        let mod = try XCTUnwrap(store.fileStatus(paths: [url.path])[url.path]?.modified)
         let stale = String(repeating: "ab", count: 16)
         try store.replace(path: url.path, chunks: [IndexedChunk(path: url.path, modified: mod, size: data.count, kind: "text", chunkIndex: 0,
                                                                 snippet: "stale", embedding: [Float](repeating: 0.25, count: embedder.dim),

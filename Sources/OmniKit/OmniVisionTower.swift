@@ -36,60 +36,38 @@ public final class OmniVisionTower: @unchecked Sendable {
         self.ropeDim = (config.vision.hiddenSize / config.vision.numHeads) / 2
     }
 
-    // THE WHOLE VISION TOWER RUNS IN fp32 (SDPA i/o is the one exception, below). The small-mlx
-    // checkpoint stores vision/merger weights in bf16. Two problems follow from bf16 tower compute:
-    //   1. NaN: the attention softmax occasionally overflows to NaN on real photos (~7% drop).
-    //   2. Packing noise: a bf16 matmul over the PACKED `[sum_i N_i, *]` tensor rounds each row
-    //      slightly differently than over a single image's `[N_i, *]` tensor (different GPU
-    //      tiling/accumulation per shape). That bf16-level noise is benign for the causal Small
-    //      backbone but the bidirectional Nano backbone amplifies it near the pooled token, so
-    //      batched vs single-image vectors drift to cos~0.97 (fails the >=0.99999 batch gate).
-    // Upcasting tower compute to fp32 fixes BOTH: fp32 is shape-stable (single==packed to ~1e-7)
-    // and NaN-free. It is parity-safe: fp32 is strictly more precise than the bf16 reference, and
-    // image_ref.safetensors parity stays cos>=0.999.
+    // THE TOWER COMPUTES IN fp16 (2026-10-22 kernel review; index.md, "The kernel review").
+    // WeightStore stores vision/merger weights in fp16, so nothing is converted per forward and no
+    // second copy is kept. It ran in fp32 for two reasons that no longer hold:
+    //   1. bf16 NaN in the attention softmax - attention is the fused SDPA kernel now, which
+    //      accumulates in fp32 whatever its i/o dtype;
+    //   2. batched vs single drifting to cos ~0.97 on Nano - that was Nano's image sequences wrapped
+    //      in rows read past the end of its embedding table (fixed 2026-10-14, roadmap.md); since,
+    //      batched and single are exact here in every precision measured.
+    // fp16 rather than bf16: three more mantissa bits (bf16 moved Small's fixture to 0.990), the same
+    // speed on M1-M4, and native on M5's matrix units, where fp32 runs as TF32. Measured against fp32
+    // on Nano and Small: retrieval eval and COCO tags unchanged, vectors within cos 0.9995, peak
+    // memory -1.0 / -1.9 GB (the fp32 weight cache and fp32 activations), image path 4-7% faster.
     //
-    // SDPA i/o precision. The steel flash kernel accumulates in fp32 internally regardless of the
-    // i/o dtype, and measured at the tower's shape ([1, heads, ~4.9k, 64]) the bf16-i/o variant is
-    // ~18% faster (3.68 vs 4.50 ms; the win is bandwidth/registers - Apple GPUs run fp32 and half
-    // ALUs at the same rate). Casting q/k/v per element is packing-shape-INVARIANT (unlike bf16
-    // matmuls, whose tiling noise broke the batched-vs-single gate), so the strict batch-parity
-    // gates still hold. Everything around the SDPA stays fp32 (reference-faithful).
+    // A pass that comes out non-finite (fp16 tops out at 65504) is computed again in fp32 from
+    // per-forward casts: a rare image then costs one extra forward instead of never being indexed.
+    // Adversarial inputs (flat, noise, 1 px checkerboards, saturated stripes, panoramas) stayed finite.
+    //
+    // fp16, never bf16, also because MLX 0.31.1 names a compiled kernel by kind and byte size: fp16
+    // and bf16 are both "f2", so a compiled graph traced in one is reused for the other and reads
+    // its bits wrongly (mlx#3427, fixed in 0.31.2). The backbone's compiled graphs are bf16.
 
-    /// Weight cast to the tower compute dtype (fp32). Hoisting the cast here keeps every
-    /// matmul in one dtype so packing is shape-invariant.
-    ///
-    /// BUDGET-GATED CACHE: every weight access otherwise builds a fresh bf16->fp32
-    /// cast node - 147 cast kernels and ~352MB of fp32 temporaries PER packed forward (the single
-    /// biggest per-forward overhead found by the dtype audit). When the user's memory cap affords
-    /// it, cache the fp32 copies once (~352MB resident for the nano vision tower) and never cast
-    /// again; under tight low-end caps keep the per-forward casts (traffic, not residency). The
-    /// audio tower deliberately does NOT get this treatment: its fp32 copy would be ~2.5GB resident
-    /// for the rarest modality. Tower forwards are serialized by the engine gate, so the lazy
-    /// dictionary needs no lock.
-    private var fp32WeightCache: [String: MLXArray] = [:]
-    /// Two bugs lived in the previous `private lazy var ... capBytes >= 4 << 30`:
-    /// - `4 << 30` is a binary 4 GiB, but the cap is built from decimal GB
-    ///   (AppModel: `Int(maxMemoryGB * 1_000_000_000)`), so a user who followed the Settings footer
-    ///   and set exactly 4 got 4.0e9 < 4.295e9 and silently no cache.
-    /// - `lazy` froze the decision at the first forward, and raising the cap in Settings only calls
-    ///   applyMemoryLimit(), never a reload - so the cache stayed off until the next launch on a
-    ///   machine that could easily afford it.
-    /// Computed and decimal fixes both. Unchanged for 8GB machines, whose cap is 3.
-    private var cacheFP32Weights: Bool { OmniMemoryBudget.capBytes >= 4_000_000_000 }
+    /// The dtype of the pass in flight: fp16, or fp32 for the fallback.
+    private var dt: DType = .float16
+    /// Runs every pass as the fp32 fallback does: the reference-parity test's other arm.
+    nonisolated(unsafe) static var fp32ForTesting = false
+    /// SDPA inputs: fp16 with the tower, bf16 in the fp32 fallback (bf16 keeps fp32's range).
+    private var attnType: DType { dt == .float16 ? .float16 : .bfloat16 }
+
+    /// A weight in the dtype of the pass in flight. Stored fp16, so the fp16 pass reads it as is.
     private func wc(_ key: String) -> MLXArray {
         let a = w[key]
-        guard a.dtype != .float32 else { return a }
-        if cacheFP32Weights {
-            if let c = fp32WeightCache[key] { return c }
-            let c = a.asType(.float32)
-            MLX.eval(c)
-            fp32WeightCache[key] = c
-            return c
-        }
-        // The cap came back down (an OCR run raised it to all of RAM while it lasted): let the
-        // cache go instead of holding its copy (~352 MB on Nano) beside the per-forward casts.
-        if !fp32WeightCache.isEmpty { fp32WeightCache.removeAll() }
-        return a.asType(.float32)
+        return a.dtype == dt ? a : a.asType(dt)
     }
 
     /// pixelValues [N, 1536], grid [(t, h, w)] -> merged vision features [N/merge^2, 1024].
@@ -113,7 +91,32 @@ public final class OmniVisionTower: @unchecked Sendable {
     /// per-item operations are pos-embed / rope index construction (already per-item by grid) and
     /// the merger reshape, which MUST be applied per-item so the `[-1, 4096]` spatial-merge never
     /// groups 4 patches across an image boundary.
+    ///
+    /// Computed in fp16 and returned evaluated; a pass with anything non-finite in it is computed
+    /// again in fp32 (see the note above `dt`).
     public func forwardPerItem(_ pixelValues: MLXArray, gridTHW: [(Int, Int, Int)]) -> [MLXArray] {
+        if Self.fp32ForTesting {
+            dt = .float32
+            defer { dt = .float16 }
+            let out = pass(pixelValues, gridTHW: gridTHW)
+            eval(out)
+            return out
+        }
+        dt = .float16
+        let out = pass(pixelValues, gridTHW: gridTHW)
+        // NaN and inf survive an fp32 sum, and fp16 values cannot overflow one.
+        let probe = MLX.stacked(out.map { $0.asType(.float32).sum() }).sum()
+        eval(out + [probe])
+        if probe.item(Float.self).isFinite { return out }
+        omniPerfLog("vision-fp32-fallback items=\(gridTHW.count)")
+        dt = .float32
+        defer { dt = .float16 }
+        let again = pass(pixelValues, gridTHW: gridTHW)
+        eval(again)
+        return again
+    }
+
+    private func pass(_ pixelValues: MLXArray, gridTHW: [(Int, Int, Int)]) -> [MLXArray] {
         // --- patch embed: conv3d (full-kernel stride) == linear over the 1536-vector.
         var hidden = patchEmbed(pixelValues)                 // [N, hidden]
 
@@ -125,8 +128,9 @@ public final class OmniVisionTower: @unchecked Sendable {
         // (= h-half(16) concat w-half(16) = 32). model.py tiles cos/sin x2 along
         // the last axis -> headDim(64) before applying. We pre-tile here.
         let rotary = rotPosEmb(gridTHW)                      // [N, 32]
-        let cos = MLX.tiled(MLX.cos(rotary), repetitions: [1, 2])  // [N, 64]
-        let sin = MLX.tiled(MLX.sin(rotary), repetitions: [1, 2])  // [N, 64]
+        let cosHalf = MLX.cos(rotary), sinHalf = MLX.sin(rotary)        // [N, 32], for the fused kernel
+        let cos = MLX.tiled(cosHalf, repetitions: [1, 2])  // [N, 64]
+        let sin = MLX.tiled(sinHalf, repetitions: [1, 2])  // [N, 64]
 
         // --- cu_seqlens: per-frame attention windows over the PACKED sequence. One image (t=1)
         // contributes [.., prev+h*w]; multiple images/frames extend the boundary list, giving
@@ -139,7 +143,7 @@ public final class OmniVisionTower: @unchecked Sendable {
         for i in 0 ..< cfg.vision.depth {
             let p = "vision_tower.blocks.\(i)."
             if ablate != "blocks" {
-                if ablate != "attn" { hidden = hidden + attention(layerNorm(hidden, p + "norm1"), p, cos, sin, cuSeqlens) }
+                if ablate != "attn" { hidden = hidden + attention(layerNorm(hidden, p + "norm1"), p, cos, sin, cosHalf, sinHalf, cuSeqlens) }
                 if ablate != "mlp" { hidden = hidden + mlp(layerNorm(hidden, p + "norm2"), p) }
             }
         }
@@ -182,7 +186,7 @@ public final class OmniVisionTower: @unchecked Sendable {
             .reshaped([n, c, t, p, p])         // [N, c, t, h, w]
             .movedAxis(source: 1, destination: 4) // [N, t, h, w, c]
             .reshaped([n, t * p * p * c])       // flatten over (t, h, w, c)
-        x = x.asType(.float32)
+        x = x.asType(dt)
 
         // weight [out, t, h, w, c] -> [out, t*h*w*c]; matmul x @ W^T.
         let weight = wc("vision_tower.patch_embed.proj.weight")
@@ -232,7 +236,7 @@ public final class OmniVisionTower: @unchecked Sendable {
         }
 
         let total = idx[0].count
-        let posWeight = wc("vision_tower.pos_embed.weight")   // [2304, hidden] (fp32 by default)
+        let posWeight = wc("vision_tower.pos_embed.weight")   // [2304, hidden]
         // One fused bilinear blend: gather all four corner sets in a single take (indices
         // concatenated host-side), multiply by the [4, total, 1] weights, and sum the corner axis -
         // 3 kernels instead of the 11 (4 gathers + 4 muls + 3 adds) the per-corner loop dispatched.
@@ -328,28 +332,33 @@ public final class OmniVisionTower: @unchecked Sendable {
     private func attention(
         _ x: MLXArray, _ p: String,
         _ cos: MLXArray, _ sin: MLXArray,
+        _ cosHalf: MLXArray, _ sinHalf: MLXArray,
         _ cuSeqlens: [Int]
     ) -> MLXArray {
         let n = x.dim(0)
         let qkv = MLX.addMM(wc(p + "attn.qkv.bias"), x, wc(p + "attn.qkv.weight").transposed(1, 0))
-        // [n, 3*hidden] -> [n, 3, heads, headDim] -> [3, n, heads, headDim]
-        let split = qkv.reshaped([n, 3, numHeads, headDim]).transposed(1, 0, 2, 3)
-        var q = split[0]   // [n, heads, headDim]
-        var k = split[1]
-        let v = split[2]
+        var qh: MLXArray, kh: MLXArray, vh: MLXArray   // [heads, n, headDim], SDPA dtype
+        if Qwen3Backbone.fusedNorm {
+            (qh, kh, vh) = ropeQKV(qkv, cosHalf, sinHalf)
+        } else {
+            // [n, 3*hidden] -> [n, 3, heads, headDim] -> [3, n, heads, headDim]
+            let split = qkv.reshaped([n, 3, numHeads, headDim]).transposed(1, 0, 2, 3)
+            var q = split[0]   // [n, heads, headDim]
+            var k = split[1]
+            let v = split[2]
 
-        // Apply vision rope (rotate_half style) on [n, heads, headDim].
-        q = applyRotaryVision(q, cos, sin)
-        k = applyRotaryVision(k, cos, sin)
+            // Apply vision rope (rotate_half style) on [n, heads, headDim].
+            q = applyRotaryVision(q, cos, sin)
+            k = applyRotaryVision(k, cos, sin)
 
-        // -> [heads, n, headDim] for SDPA windows.
-        var qh = q.transposed(1, 0, 2)
-        var kh = k.transposed(1, 0, 2)
-        var vh = v.transposed(1, 0, 2)
-        // The residual stream is fp32 (reference-faithful). For the SDPA call itself, bf16 i/o is
-        // ~18% faster with identical fp32 accumulation inside the steel kernel (see the note above
-        // `wc`); the output is cast straight back to fp32 below.
-        qh = qh.asType(.bfloat16); kh = kh.asType(.bfloat16); vh = vh.asType(.bfloat16)
+            // -> [heads, n, headDim] for SDPA windows.
+            qh = q.transposed(1, 0, 2)
+            kh = k.transposed(1, 0, 2)
+            vh = v.transposed(1, 0, 2)
+            // RoPE ran in fp32 (cos/sin are fp32); the SDPA inputs are 16-bit, and the steel kernel
+            // accumulates in fp32 internally either way.
+            qh = qh.asType(attnType); kh = kh.asType(attnType); vh = vh.asType(attnType)
+        }
         let scale = Float(pow(Double(headDim), -0.5))
 
         var out: MLXArray
@@ -397,9 +406,53 @@ public final class OmniVisionTower: @unchecked Sendable {
                 out = cat.transposed(1, 0, 2).reshaped([n, numHeads * headDim])
             }
         }
-        // Cast the attention output back to the residual-stream dtype before the proj matmul.
-        out = out.asType(.float32)
+        // Cast the attention output to the pass dtype before the proj matmul.
+        out = out.asType(dt)
         return MLX.addMM(wc(p + "attn.proj.bias"), out, wc(p + "attn.proj.weight").transposed(1, 0))
+    }
+
+    /// RoPE, the SDPA-dtype casts and the [n, heads, headDim] -> [heads, n, headDim] relayout in ONE
+    /// pass: each thread reads one rotate-half pair of q, k and v from the qkv GEMM's output,
+    /// rotates q and k in fp32 registers with the position's angle, and writes all three in the
+    /// layout SDPA reads. The separate path made ~6 passes over the activations (the compiled rope
+    /// keeps a concatenate, then three casts). Same arithmetic in fp32; the result differs from it
+    /// only where the compiler's fused multiply-adds round differently (~1 in 50,000 values, by one
+    /// step of the 16-bit output; image vectors 0.99992-1.0). Measured 2026-10-22: ~3% of the Nano
+    /// image path once warm; MLX builds a custom kernel from source on first use (~0.1 s), which
+    /// the load-time media probe pays. OMNI_FUSED_NORM=0 takes the separate path.
+    private static let ropeQKVKernel = MLXFast.metalKernel(
+        name: "omni_vision_qkv_rope",
+        inputNames: ["qkv", "cosv", "sinv"],
+        outputNames: ["qo", "ko", "vo"],
+        source: """
+            uint j = thread_position_in_grid.x;
+            uint t = thread_position_in_grid.y;
+            uint h = thread_position_in_grid.z;
+            if (j >= HALF || t >= NTOK) return;
+            const uint hid = HEADS * DIM;
+            const uint base = t * 3 * hid + h * DIM + j;
+            const float c = cosv[t * HALF + j];
+            const float s = sinv[t * HALF + j];
+            const float q1 = static_cast<float>(qkv[base]), q2 = static_cast<float>(qkv[base + HALF]);
+            const float k1 = static_cast<float>(qkv[base + hid]), k2 = static_cast<float>(qkv[base + hid + HALF]);
+            const uint o = (h * NTOK + t) * DIM + j;
+            qo[o] = static_cast<OUT_T>(q1 * c + (-q2) * s);
+            qo[o + HALF] = static_cast<OUT_T>(q2 * c + q1 * s);
+            ko[o] = static_cast<OUT_T>(k1 * c + (-k2) * s);
+            ko[o + HALF] = static_cast<OUT_T>(k2 * c + k1 * s);
+            vo[o] = static_cast<OUT_T>(qkv[base + 2 * hid]);
+            vo[o + HALF] = static_cast<OUT_T>(qkv[base + 2 * hid + HALF]);
+        """)
+
+    private func ropeQKV(_ qkv: MLXArray, _ cosHalf: MLXArray, _ sinHalf: MLXArray) -> (MLXArray, MLXArray, MLXArray) {
+        let n = qkv.dim(0), half = headDim / 2
+        let outs = Self.ropeQKVKernel(
+            [qkv, cosHalf.asType(.float32), sinHalf.asType(.float32)],
+            template: [("HALF", half), ("NTOK", n), ("HEADS", numHeads), ("DIM", headDim), ("OUT_T", attnType)],
+            grid: (half, n, numHeads), threadGroup: (half, max(1, 256 / half), 1),
+            outputShapes: [[numHeads, n, headDim], [numHeads, n, headDim], [numHeads, n, headDim]],
+            outputDTypes: [attnType, attnType, attnType])
+        return (outs[0], outs[1], outs[2])
     }
 
     /// apply_rotary_pos_emb_vision on a [n, heads, headDim] tensor.
@@ -465,16 +518,17 @@ public final class OmniVisionTower: @unchecked Sendable {
     /// dtype - casting in preserves the tower's existing fp32 residual flow exactly, so the swap
     /// only fuses the schedule. Gate: the vision tower/e2e cosine tests. OMNI_FUSED_NORM=0 reverts.
     private func layerNorm(_ x: MLXArray, _ keyPrefix: String) -> MLXArray {
-        let xf = x.asType(.float32)
         if Qwen3Backbone.fusedNorm {
-            return MLXFast.layerNorm(xf, weight: wc(keyPrefix + ".weight").asType(.float32),
-                                     bias: wc(keyPrefix + ".bias").asType(.float32), eps: lnEps)
+            // In the pass dtype; the fused kernel accumulates the statistics in fp32 either way.
+            return MLXFast.layerNorm(x.asType(dt), weight: wc(keyPrefix + ".weight"),
+                                     bias: wc(keyPrefix + ".bias"), eps: lnEps)
         }
+        let xf = x.asType(.float32)
         let mean = MLX.mean(xf, axis: -1, keepDims: true)
         let centered = xf - mean
         let variance = MLX.mean(centered * centered, axis: -1, keepDims: true)
         let normed = centered * MLX.rsqrt(variance + lnEps)
-        return normed * wc(keyPrefix + ".weight") + wc(keyPrefix + ".bias")
+        return (normed * wc(keyPrefix + ".weight").asType(.float32) + wc(keyPrefix + ".bias").asType(.float32)).asType(dt)
     }
 
     /// GELU tanh approximation (nn.GELU(approx="tanh")), used by the ViT MLP.

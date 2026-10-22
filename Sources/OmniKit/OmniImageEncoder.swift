@@ -149,9 +149,9 @@ public final class OmniImageEncoder: @unchecked Sendable {
         let endEmbed = backbone.embedSpecial(cfg.visionEndTokenId)
         let wrap = (startEmbed == nil ? 0 : 1) + (endEmbed == nil ? 0 : 1)
         let sufEmbed: MLXArray? = suffixIds.isEmpty ? nil : backbone.embed(suffixIds)
-        var pooled: [MLXArray] = []
-        pooled.reserveCapacity(perImage.count)
-        var tagGraphs: [MLXArray] = []
+        // Each image's backbone sequence: [prefix][vision_start] patches [vision_end][suffix].
+        var seqs: [(embeds: MLXArray, length: Int, n: Int)] = []
+        seqs.reserveCapacity(perImage.count)
         var seqTotal = 0
         for feats in perImage {
             let n = feats.dim(0)
@@ -162,19 +162,44 @@ public final class OmniImageEncoder: @unchecked Sendable {
             if let endEmbed { parts.append(endEmbed) }
             if let sufEmbed { parts.append(sufEmbed) }
             let length = prefixIds.count + n + wrap + suffixIds.count
-            let hidden = backbone.forward(inputsEmbeds: MLX.concatenated(parts, axis: 1), length: length)
-            let pool = backbone.poolGraph(hidden, length: length)
-            pooled.append(pool)
-            if let tagger {
-                // The image's patch rows sit between [prefix][vision_start] and [vision_end]:
-                // rows [prefixLen+1, prefixLen+1+n). Same hidden tensor the pool reads - the
-                // score graph joins this chunk's single eval below.
-                let pStart = prefixIds.count + (startEmbed == nil ? 0 : 1)
-                let patches = hidden[0, pStart ..< (pStart + n)]
-                tagGraphs.append(tagger.scoreGraph(patches: patches, pooled: pool))
-            }
+            seqs.append((MLX.concatenated(parts, axis: 1), length, n))
             seqTotal += length
         }
+        // The image's patch rows sit between [prefix][vision_start] and [vision_end]: rows
+        // [pStart, pStart + n) of its hidden state, the same tensor the pool reads - the tag score
+        // graph joins this chunk's single eval below.
+        let pStart = prefixIds.count + (startEmbed == nil ? 0 : 1)
+        var pooledAt = [MLXArray?](repeating: nil, count: seqs.count)
+        var tagAt = [MLXArray?](repeating: nil, count: seqs.count)
+        for group in Self.backboneGroups(seqs.map(\.length)) {
+            if group.count == 1 {
+                let i = group[0], s = seqs[i]
+                let hidden = backbone.forward(inputsEmbeds: s.embeds, length: s.length)
+                let pool = backbone.poolGraph(hidden, length: s.length)
+                pooledAt[i] = pool
+                if let tagger { tagAt[i] = tagger.scoreGraph(patches: hidden[0, pStart ..< (pStart + s.n)], pooled: pool) }
+                continue
+            }
+            // ONE forward for the group, right-padded to its longest; equal lengths need no mask.
+            let lens = group.map { seqs[$0].length }
+            let lmax = lens.max() ?? 0
+            let rows = group.map { i -> MLXArray in
+                let s = seqs[i]
+                guard s.length < lmax else { return s.embeds }
+                return MLX.concatenated([s.embeds, MLXArray.zeros([1, lmax - s.length, dim], dtype: s.embeds.dtype)], axis: 1)
+            }
+            let uniform = lens.allSatisfy { $0 == lmax }
+            let hidden = backbone.forward(inputsEmbeds: MLX.concatenated(rows, axis: 0), length: lmax,
+                                          lengths: uniform ? nil : lens)
+            let stacked = backbone.poolBatchGraph(hidden, lengths: lens)        // [B, dim] fp32, L2
+            for (k, i) in group.enumerated() {
+                let pool = stacked[k]
+                pooledAt[i] = pool
+                if let tagger { tagAt[i] = tagger.scoreGraph(patches: hidden[k, pStart ..< (pStart + seqs[i].n)], pooled: pool) }
+            }
+        }
+        let pooled = pooledAt.map { $0! }
+        let tagGraphs = tagAt.compactMap { $0 }
         let tB = Self.mediaTiming ? Date() : nil
         if let tLoop, let tB { print(String(format: "[media] bb-graph-build(%d imgs) %.1fms", perImage.count, tB.timeIntervalSince(tLoop) * 1000)) }
         eval(pooled + tagGraphs)
@@ -185,6 +210,35 @@ public final class OmniImageEncoder: @unchecked Sendable {
     }
 
     static let mediaTiming = ProcessInfo.processInfo.environment["OMNI_MEDIA_TIMING"] == "1"
+
+    // THE PER-IMAGE BACKBONE PASSES OF A CHUNK ARE BATCHED (2026-10-22 kernel review). They ran one
+    // image per forward, ~7 ms each on Nano where the same tokens cost ~3 ms batched, because a
+    // batched Nano backbone was "numerically unstable (intermittent cos~0.97)". That instability was
+    // Nano's image sequences wrapped in rows read past the end of its embedding table, fixed
+    // 2026-10-14 (roadmap.md): batched vectors are now exact under any regrouping, and differ from
+    // the B=1 compiled path only at the rounding level the text path has always had (0.9999).
+    // Measured: the image backbone 343 -> 266 ms per 46 images, retrieval eval and tags unchanged.
+
+    /// Indices of a chunk's sequences grouped for one backbone forward each: sorted by length, and a
+    /// group grows only while its padded size stays within 120% of its real tokens. Lone images keep
+    /// the single-sequence path.
+    static func backboneGroups(_ lengths: [Int]) -> [[Int]] {
+        guard lengths.count > 1 else { return lengths.indices.map { [$0] } }
+        let order = lengths.indices.sorted { lengths[$0] < lengths[$1] }
+        var groups: [[Int]] = []
+        var cur: [Int] = []
+        var real = 0
+        for i in order {
+            let l = lengths[i]
+            // Sorted ascending, so the newcomer is the group's longest.
+            if !cur.isEmpty, l * (cur.count + 1) * 5 > (real + l) * 6 {
+                groups.append(cur); cur = []; real = 0
+            }
+            cur.append(i); real += l
+        }
+        if !cur.isEmpty { groups.append(cur) }
+        return groups
+    }
 
     /// Single-sequence inject + forward + last-token pool (the original scalar path). With a
     /// `tagger`, the vision-token hidden rows are also scored against the label matrix in the

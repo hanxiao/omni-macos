@@ -44,13 +44,24 @@ final class VisionEncoderTests: XCTestCase {
     }
 
     /// Feed the reference's exact pixel_values: isolates the tower + injection + pooling.
+    ///
+    /// Two arms. The fp32 pass (the tower's non-finite fallback) holds the port to the reference at
+    /// 0.999. The shipped fp16 pass is held to fp32 at 0.999 and to the reference at 0.998: on this
+    /// one image it measures 0.9984-0.9985 against the reference while fp32 measures 0.9993-0.9994,
+    /// and that single-image gap is not where quality is judged - the retrieval eval and the COCO
+    /// tag eval are unchanged by fp16 (index.md, "The kernel review").
     func testVisionTowerParity() async throws {
         let enc = try await makeEncoder()
         let (pv, grid, refEmb, prefix) = try loadFixture()
-        let out = enc.encode(pixelValues: pv, gridTHW: grid, prefixIds: prefix)
-        let c = cosine(out, refEmb)
-        print(String(format: "[vision tower] cosine vs reference = %.5f", c))
-        XCTAssertGreaterThanOrEqual(c, 0.999, "vision tower parity (same pixel_values)")
+        OmniVisionTower.fp32ForTesting = true
+        let fp32 = enc.encode(pixelValues: pv, gridTHW: grid, prefixIds: prefix)
+        OmniVisionTower.fp32ForTesting = false
+        let fp16 = enc.encode(pixelValues: pv, gridTHW: grid, prefixIds: prefix)
+        let c32 = cosine(fp32, refEmb), c16 = cosine(fp16, refEmb), c1632 = cosine(fp16, fp32)
+        print(String(format: "[vision tower] vs reference: fp32 %.5f fp16 %.5f; fp16 vs fp32 %.5f", c32, c16, c1632))
+        XCTAssertGreaterThanOrEqual(c32, 0.999, "fp32 vision tower parity (same pixel_values)")
+        XCTAssertGreaterThanOrEqual(c16, 0.998, "fp16 vision tower against the reference")
+        XCTAssertGreaterThanOrEqual(c1632, 0.999, "fp16 vision tower against fp32")
     }
 
     /// End-to-end from the PNG: also exercises Swift preprocessing (CoreGraphics
