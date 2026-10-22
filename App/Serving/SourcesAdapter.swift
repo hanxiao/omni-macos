@@ -44,8 +44,40 @@ struct SourcesSnapshot: Sendable {
     let albums: [ServedAlbum]
     let photosAuthorized: Bool
     let indexing: Bool
+    /// The user paused indexing in the app (File > Pause Indexing).
+    var paused = false
+    /// Why queued file changes are not being indexed (AppModel.fsChangesHeldBy), or nil.
+    var heldBy: String? = nil
+    /// File changes queued and not yet indexed, and since when. A new file that file_status cannot
+    /// find is usually one of these, and "NOT indexed" sent agents off to say it was not on the Mac.
+    var waitingChanges = 0
+    var waitingSince: Date? = nil
+    /// The queued paths and the running reconcile's batch: what file_status checks a path against.
+    var waiting: Set<String> = []
     /// What a caller gets before the model is ready - not an error, just nothing indexed yet.
     static let empty = SourcesSnapshot(sources: [], albums: [], photosAuthorized: false, indexing: false)
+
+    /// One line on queued changes that are not searchable yet, or nil when there are none and
+    /// nothing is paused. list_sources leads with it; search only says it when indexing is held.
+    var waitingLine: String? {
+        let since = waitingSince.map { " since " + Self.clock($0) } ?? ""
+        let changes = "\(waitingChanges.formatted()) file change\(waitingChanges == 1 ? "" : "s")\(since)"
+        if paused {
+            return waitingChanges > 0
+                ? "Indexing is PAUSED in Omni: \(changes) are not indexed or searchable yet. The user resumes it in the app (File > Resume Indexing)."
+                : "Indexing is PAUSED in Omni: new and changed files are not indexed until the user resumes it in the app (File > Resume Indexing)."
+        }
+        guard waitingChanges > 0 else { return nil }
+        if let heldBy { return "Indexing is waiting (\(heldBy)): \(changes) are not indexed or searchable yet." }
+        return "\(changes) queued for indexing, not searchable yet."
+    }
+
+    /// "17:53 (2h 4m ago)": the clock time a user would recognise, and the age an agent can act on.
+    static func clock(_ d: Date) -> String {
+        let s = Int(max(0, -d.timeIntervalSinceNow))
+        let age = s < 60 ? "\(s)s" : s < 3600 ? "\(s / 60)m" : "\(s / 3600)h \(s % 3600 / 60)m"
+        return d.formatted(date: .omitted, time: .shortened) + " (\(age) ago)"
+    }
 }
 
 /// The outcome of a mutation. `error` non-nil means nothing changed.
@@ -190,6 +222,10 @@ enum SourcesAdapter {
     static func snapshotBody(_ s: SourcesSnapshot) -> [String: Any] {
         [
             "indexing": s.indexing,
+            "indexing_paused": s.paused,
+            "held_by": s.heldBy.map { $0 as Any } ?? NSNull(),
+            "waiting_changes": s.waitingChanges,
+            "waiting_since": s.waitingSince.map { ISO8601DateFormatter().string(from: $0) as Any } ?? NSNull(),
             "photos_authorized": s.photosAuthorized,
             "sources": s.sources.map { src -> [String: Any] in
                 var row: [String: Any] = [

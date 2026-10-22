@@ -389,7 +389,7 @@ struct ContentView: View {
                                : "Built with a different model than the one loaded.",
                            showSpinner: false,
                            action: built.map { v in ("Switch to \(v.title)", { model.selectVariant(v) }) },
-                           secondary: ("Reindex", { model.startIndexing() }),
+                           secondary: ("Reindex", { model.resumeIndexing() }),
                            // Two ways out, and switching back is the cheap one: it keeps the index
                            // that reindexing would spend an hour rebuilding.
                            prominent: true)

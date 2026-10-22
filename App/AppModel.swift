@@ -4998,7 +4998,11 @@ final class AppModel {
         let eventsDue = !pendingFSPaths.isEmpty
             && (fsEventsWaitingSince.map { -$0.timeIntervalSinceNow > fsWaitLimit } ?? false)
         let tagsDue = explicitRetagSince.map { -$0.timeIntervalSinceNow > Self.explicitRetagWait } ?? false
-        guard isIndexing || catchUp || reconcile, !fsDrainThenResume, !restartAfterPause,
+        // A request is outstanding only while the indexer is still cancelled. One left set with no
+        // cancel behind it - a catch-up that finished just as it landed, a cancel the next run's
+        // reset cleared - turned this check off until some full pass happened to end.
+        let requested = fsDrainThenResume && indexer?.isCancelled == true
+        guard isIndexing || catchUp || reconcile, !requested, !restartAfterPause,
               eventsDue || tagsDue else { return }
         fsDrainThenResume = true
         indexer?.cancel(.pause)
@@ -5407,9 +5411,16 @@ final class AppModel {
                 .filter { a in !photoSources.contains { $0.id == a.id } }
                 .map { ServedAlbum(id: $0.id, title: $0.title, count: $0.count, smart: $0.isSmart) }
             : []
-        return SourcesSnapshot(sources: folders + photos, albums: albums,
-                               photosAuthorized: authorized,
-                               indexing: isIndexing || !activeRoots.isEmpty)
+        var snap = SourcesSnapshot(sources: folders + photos, albums: albums,
+                                   photosAuthorized: authorized,
+                                   indexing: isIndexing || !activeRoots.isEmpty)
+        // Paused with no stand-down to lift it: File > Resume Indexing is what continues it.
+        snap.paused = userPaused || (indexState == .paused && !indexStandingDown)
+        snap.heldBy = fsChangesHeldBy
+        snap.waitingChanges = pendingFSPaths.count
+        snap.waitingSince = pendingFSPaths.isEmpty ? nil : fsEventsWaitingSince
+        snap.waiting = pendingFSPaths.union(reconcilingPaths)
+        return snap
     }
 
     private func apiAddFolder(_ raw: String) -> SourceMutation {
@@ -5817,6 +5828,7 @@ final class AppModel {
         if ocrRunActive, !(pendingCatchUpRoots.isEmpty && pendingCatchUpPhotos.isEmpty), omniPerfEnabled {
             omniPerfLog("gpu-standdown catch-up held roots=\(pendingCatchUpRoots.count) (ocr run active)")
         }
+        if !(pendingCatchUpRoots.isEmpty && pendingCatchUpPhotos.isEmpty) { armDrainWatchdog() }
         // indexState != .paused: indexing is paused as a whole, and a Photos change arriving then
         // started a catch-up anyway. Resume's pass drains the queue.
         guard !indexWritesBlocked, !isPaperRunning, !indexObsolete, !ocrRunActive, powerHold == nil,
@@ -5837,6 +5849,7 @@ final class AppModel {
         for k in keys { activeRoots.insert(k); progress.perRoot[k] = RootProgress() }   // drive the pies from 0
         // Throughput in Settings, and the timer that enforces the event wait limit.
         startRateSampler()
+        runsOutstanding += 1
         Task.detached(priority: .utility) {
             var statsClock = 0.0
             indexer.index(roots: batch, photos: photoBatch, settings: settings, force: false) { p in
@@ -5857,6 +5870,7 @@ final class AppModel {
                         if doStats { self.refreshIndexStats(store) }
                     }
                     if p.done {
+                        self.runsOutstanding -= 1
                         // Always release this pass's activeRoots keys, even when superseded - else they
                         // leak and catchUpPendingRoots (gated on activeRoots.isEmpty) wedges forever.
                         for k in keys { self.activeRoots.remove(k); self.progress.perRoot[k] = nil }
@@ -6957,6 +6971,7 @@ final class AppModel {
         pendingFSPaths.formUnion(paths)
         if fsEventsWaitingSince == nil { fsEventsWaitingSince = Date() }
         if let eid = watcher?.latestEventId() { pendingFSEventId = max(pendingFSEventId, eid) }
+        armDrainWatchdog()
         // activeRoots covers the catch-up pass too: kicking update() while a catch-up index() runs
         // would overlap two pipelines on the same Indexer. The catch-up's completion re-drains.
         if indexState != .indexing && activeRoots.isEmpty && !fsReconcileInFlight { drainPendingFSChanges() }
@@ -6971,6 +6986,105 @@ final class AppModel {
     /// leaves a gone path with one of these names to the reconcile - it may be a copy's source.
     @ObservationIgnored private var arrivingNames = Set<String>()
     @ObservationIgnored private var reconcilingNames = Set<String>()
+    /// The running reconcile's batch, so file_status can say a file is being indexed right now.
+    @ObservationIgnored private var reconcilingPaths = Set<String>()
+
+    /// Why queued file changes are not being indexed, in a few words, or nil when nothing should
+    /// hold them (a drain takes them next, or one is running). What list_sources and file_status
+    /// report, so an agent can tell "not on this Mac" from "waiting", and the watchdog's test.
+    var fsChangesHeldBy: String? {
+        if userPaused { return "indexing is paused in Omni" }
+        if ocrRunActive { return "an OCR run is using the GPU" }
+        if let powerHold { return powerHold.reason.prefix(1).lowercased() + powerHold.reason.dropFirst() }
+        if isPaperRunning { return "the benchmark is running" }
+        if indexObsolete { return "the index is waiting to be rebuilt for the current model" }
+        if indexWritesBlocked { return "a maintenance step is holding indexing" }
+        if indexState == .paused { return "indexing is paused in Omni" }
+        return nil
+    }
+
+    @ObservationIgnored private var drainWatchdogArmed = false
+
+    /// THE CHECK THAT THE QUEUE MOVES, while anything is queued: a look every 30 s. Two things it
+    /// must never see on two looks in a row:
+    ///
+    /// - work queued (file changes, a folder to catch up) with nothing running and nothing holding
+    ///   it (`fsChangesHeldBy`). Every completion runs the deferred chain, so this is a chain that
+    ///   was dropped; the watchdog runs it.
+    /// - a flag claiming work in flight (`indexState == .indexing`, `activeRoots`,
+    ///   `fsReconcileInFlight`) with no launched run outstanding. Nothing will ever clear it, and
+    ///   every drain gates on it. Cleared, then the chain runs. Only on that proof: clearing a
+    ///   flag whose run is still alive would put two pipelines on one Indexer.
+    ///
+    /// Each is logged when it fires; neither should, and a log line is how the next case is found.
+    /// The index that paused itself (index.md) went unseen for hours because nothing looked.
+    private func armDrainWatchdog() {
+        guard !drainWatchdogArmed else { return }
+        drainWatchdogArmed = true
+        Task { @MainActor [weak self] in
+            var idleSince: Date?, orphanedSince: Date?
+            while true {
+                try? await Task.sleep(for: .seconds(30))
+                guard let self, self.lookAtQueue(idleSince: &idleSince, orphanedSince: &orphanedSince) else { break }
+            }
+            self?.drainWatchdogArmed = false
+        }
+    }
+
+    /// The watchdog's positive control (PerfScript `stall:queue:<path>` / `stall:flag`): the two
+    /// states it exists to catch, made on purpose. `queue` leaves a change queued with no drain
+    /// behind it, as a dropped chain would; `flag` sets the reconcile flag with no run behind it.
+    /// Each must be logged and cleared within a minute, or the watchdog is not watching.
+    func makeStallForWatchdog(_ kind: String, path: String) {
+        if kind == "flag" {
+            fsReconcileInFlight = true
+        } else {
+            pendingFSPaths.insert(path)
+            if fsEventsWaitingSince == nil { fsEventsWaitingSince = Date() }
+        }
+        armDrainWatchdog()
+    }
+
+    /// One look. True while there is something left to watch.
+    private func lookAtQueue(idleSince: inout Date?, orphanedSince: inout Date?) -> Bool {
+        guard let store, !isTerminating else { return false }
+        let claimsWork = isIndexWorkInFlight
+        if claimsWork, runsOutstanding == 0 {
+            if let t = orphanedSince, -t.timeIntervalSinceNow >= 25 {
+                let what = "state=\(indexState) roots=\(activeRoots.count) reconcile=\(fsReconcileInFlight)"
+                Self.rootLog.error("index watchdog: \(what, privacy: .public) with no run outstanding; cleared")
+                omniPerfLog("index-watchdog orphaned \(what)")
+                if indexState == .indexing { indexState = .idle }
+                for k in activeRoots { progress.perRoot[k] = nil }
+                activeRoots.removeAll()
+                fsReconcileInFlight = false
+                tagBackfillActive = false
+                reconcilingPaths.removeAll()
+                orphanedSince = nil
+                restartOrPark(store)
+            } else if orphanedSince == nil {
+                orphanedSince = Date()
+            }
+        } else {
+            orphanedSince = nil
+        }
+        let queued = !pendingFSPaths.isEmpty || !pendingCatchUpRoots.isEmpty || !pendingCatchUpPhotos.isEmpty
+        guard queued else { return false }
+        if !isIndexWorkInFlight, fsChangesHeldBy == nil {
+            if let t = idleSince, -t.timeIntervalSinceNow >= 25 {
+                let what = "changes=\(pendingFSPaths.count) catchups=\(pendingCatchUpRoots.count + pendingCatchUpPhotos.count)"
+                Self.rootLog.error("index watchdog: \(what, privacy: .public) queued with nothing running or holding them; draining")
+                omniPerfLog("index-watchdog stalled \(what)")
+                idleSince = nil
+                drainDeferredAfterPass(store)
+            } else if idleSince == nil {
+                idleSince = Date()
+            }
+        } else {
+            idleSince = nil
+        }
+        return true
+    }
     /// FSEvents could not say what changed under these paths (events coalesced or dropped, or a
     /// watched root deleted, moved, unmounted or mounted again), so a file deleted there produced
     /// no event and stayed searchable until the next launch. Walk every folder they touch: a
@@ -7079,6 +7193,8 @@ final class AppModel {
     /// Start or resume indexing. Indexing is incremental - already-embedded files are
     /// skipped by modification time, so resuming simply continues where it left off.
     func startIndexing() {
+        // The user paused: only their Resume (resumeIndexing) starts a pass again.
+        guard !userPaused else { return }
         // An OCR run owns the GPU while it lasts; see beginOCRRun. endOCRRun kicks this again.
         guard !ocrRunActive else { indexingPausedForOCR = true; return }
         guard powerHold == nil else { indexingPausedForPower = true; return }
@@ -7101,7 +7217,12 @@ final class AppModel {
         // none), there is nothing to index.
         let activeRootsToIndex = crawlRoots.filter { !pausedRoots.contains($0.path) }
         let activePhotoSources = photoSources.filter { !pausedRoots.contains($0.key) }
-        guard !activeRootsToIndex.isEmpty || !activePhotoSources.isEmpty else { return }
+        guard !activeRootsToIndex.isEmpty || !activePhotoSources.isEmpty else {
+            // Nothing to index is not a pause: left `.paused`, the state would hold every file event
+            // and catch-up back until some later pass.
+            if indexState == .paused { indexState = .idle }
+            return
+        }
         // An out-of-date index is in a different vector space: rebuild it, don't top up.
         // vectorSpaceDiffers too: it is decided at bootstrap, while indexObsolete is assigned by
         // the stats refresh, which the launch pass can start ahead of - and that pass would then
@@ -7136,6 +7257,7 @@ final class AppModel {
         let roots = activeRootsToIndex
         let photos = activePhotoSources
         let settings = effectiveSettings()
+        runsOutstanding += 1
         Task.detached(priority: .utility) {
             // Index-lifecycle store writes OFF the main actor: wipeChunks (a multi-GB buffer free + a
             // 100k-400k-key path-set clear), the force-path VACUUM, and the two metaSet stamps are all
@@ -7149,12 +7271,21 @@ final class AppModel {
             }
             // Pause/supersede during the (possibly long) force-wipe prelude, before any embed: index()
             // would otherwise reset cancelled=false and run the whole pass ignoring the Pause.
+            //
+            // ENDED LIKE ANY CANCELLED PASS, through finishPass. This set `.paused` by itself, which
+            // is right only for the user's Pause: the events wait limit pauses a pass to let waiting
+            // file events in, and when that landed here - a restart right after a long reconcile,
+            // with the events that arrived during it already overdue - the request to drain them
+            // was never served and the index stayed paused for good.
             let liveGen = await MainActor.run { self.indexGen }
             if indexer.isCancelled || gen != liveGen {
+                var stopped = IndexProgress()
+                stopped.done = true
+                stopped.cancelled = true
                 await MainActor.run {
+                    self.runsOutstanding -= 1
                     guard gen == self.indexGen else { return }
-                    self.indexState = indexer.isCancelled ? .paused : .idle
-                    self.refreshIndexStats(store)
+                    self.finishPass(stopped, store: store, settings: settings)
                 }
                 return
             }
@@ -7178,6 +7309,7 @@ final class AppModel {
                 let doStats = p.done || now - statsClock >= 1.5
                 if doStats { statsClock = now }
                 Task { @MainActor in
+                    if p.done { self.runsOutstanding -= 1 }
                     // A superseded pass (model/db switch, or a newer startIndexing) must not touch live
                     // state, stats, or the now-swapped store. Its token is stale -> drop everything.
                     guard gen == self.indexGen else { return }
@@ -7185,99 +7317,125 @@ final class AppModel {
                     // Refresh the visible stats periodically so the file count, embeddings,
                     // and per-folder counts tick up live in the sidebar and Settings.
                     if doStats { self.refreshIndexStats(store) }
-                    if p.done {
-                        // Any pass that embedded files - even one later cancelled by a pause or
-                        // folder-removal restart - updated the index just now; a clean finish with
-                        // nothing left to do also confirms it is current as of now.
-                        if p.embedded > 0 || !p.cancelled { self.markIndexed(store) }
-                        // The browser follows a pass by polling (followIndexing), and its last
-                        // poll can land before the pass's last write: settle it once here.
-                        self.requestBrowserReload()
-                        // A paper run cancelled this pass to quiesce the app. Leave every deferred
-                        // request QUEUED - this is the one completion that acts on them without
-                        // going through drainDeferredAfterPass, and its removals branch would run a
-                        // delete + VACUUM on the user's store under the suite's levers. The run's
-                        // resume drains all three in the same priority order.
-                        if self.isPaperRunning {
-                            self.indexState = p.cancelled ? .paused : .idle
-                            self.refreshIndexStats(store)
-                            return
-                        }
-                        // Deferred-recovery is keyed on WHAT was queued (removals / a paused-folder
-                        // restart / added roots), NOT on p.cancelled: a folder removed or paused in the
-                        // exact instant the pass finished naturally would otherwise strand its request.
-                        let removed = self.pendingRootRemovals; self.pendingRootRemovals.removeAll()
-                        let wantRestart = self.restartAfterPause; self.restartAfterPause = false
-                        let caughtUp = self.pendingCatchUpRoots; self.pendingCatchUpRoots.removeAll()
-                        let wantFSDrain = self.fsDrainThenResume; self.fsDrainThenResume = false
-                        if !removed.isEmpty {
-                            // Drop the removed folders' vectors now the pass stopped re-inserting them,
-                            // reclaim disk, then resume indexing the remaining roots.
-                            self.indexState = .idle
-                            let keep = self.roots.map(\.path)
-                            Task.detached {
-                                for path in removed { Self.dropRemovedFolder(path, keeping: keep, store: store) }
-                                await self.afterBulkDelete(store)
-                                store.compact()
-                                await MainActor.run {
-                                    if !self.roots.isEmpty { self.startIndexing() }
-                                }
-                            }
-                            return
-                        }
-                        if wantFSDrain, p.cancelled, !self.pendingFSPaths.isEmpty {
-                            // Paused only to let waiting watcher events in. Reconcile them now; the
-                            // reconcile's completion (drainDeferredAfterPass) resumes the pass, which
-                            // also covers anything else queued meanwhile (added roots, a restart).
-                            self.indexState = .idle
-                            self.restartAfterPause = true
-                            self.refreshIndexStats(store)
-                            self.drainPendingFSChanges()
-                            if !self.fsReconcileInFlight {   // it could not start: resume at once
-                                self.restartAfterPause = false
-                                self.startIndexing()
-                            }
-                            return
-                        }
-                        if wantFSDrain, p.cancelled, self.explicitRetagSince != nil {
-                            // Paused for tags the user asked for: run them, then resume.
-                            self.indexState = .idle
-                            self.restartAfterPause = true
-                            self.pendingCatchUpRoots.append(contentsOf: caughtUp)
-                            self.refreshIndexStats(store)
-                            self.drainDeferredAfterPass(store)
-                            return
-                        }
-                        if wantRestart || !caughtUp.isEmpty || (wantFSDrain && p.cancelled) {
-                            // A folder was paused/resumed, or roots were added, mid-pass: restart
-                            // re-scoped to the current unpaused roots (incremental, so the rest resume).
-                            self.indexState = .idle
-                            self.refreshIndexStats(store)
-                            self.startIndexing()   // covers any added roots; no-op if all folders paused
-                            return
-                        }
-                        self.indexState = p.cancelled ? .paused : .idle
-                        self.refreshIndexStats(store)
-                        self.refreshSearchAfterBackgroundChange()
-                        // The whole deferred chain, not just the watcher queue: a Photos library
-                        // change during the pass queues a catch-up that only this chain starts, and
-                        // with no file event pending nothing else ever did - the library sat at
-                        // "Waiting to be indexed" and its deletions stayed searchable.
-                        if !p.cancelled {
-                            // A full pass has now walked every root under this long-text policy,
-                            // so every long text file has been read to it.
-                            let policy = Indexer.longTextPolicy(settings)
-                            Task.detached(priority: .utility) {
-                                store.metaSet(Indexer.textStreamMetaKey, policy)
-                                store.metaSet(Indexer.textCutMetaKey, "1")
-                            }
-                            self.drainDeferredAfterPass(store)
-                        }
-                        self.refitFolderMapIfPending()
-                    }
+                    if p.done { self.finishPass(p, store: store, settings: settings) }
                 }
             }
         }
+    }
+
+    /// A full pass has ended: finished, cancelled, or stopped in its prelude before index() ran.
+    /// Every one of those ends here, so whatever was queued behind the pass is served the same way.
+    private func finishPass(_ p: IndexProgress, store: VectorStore, settings: IndexSettings) {
+        // Any pass that embedded files - even one later cancelled by a pause or
+        // folder-removal restart - updated the index just now; a clean finish with
+        // nothing left to do also confirms it is current as of now.
+        if p.embedded > 0 || !p.cancelled { self.markIndexed(store) }
+        // The browser follows a pass by polling (followIndexing), and its last
+        // poll can land before the pass's last write: settle it once here.
+        self.requestBrowserReload()
+        // A paper run cancelled this pass to quiesce the app. Leave every deferred
+        // request QUEUED - this is the one completion that acts on them without
+        // going through drainDeferredAfterPass, and its removals branch would run a
+        // delete + VACUUM on the user's store under the suite's levers. The run's
+        // resume drains all three in the same priority order.
+        if self.isPaperRunning {
+            self.indexState = p.cancelled ? .paused : .idle
+            self.refreshIndexStats(store)
+            return
+        }
+        // Deferred-recovery is keyed on WHAT was queued (removals / a paused-folder
+        // restart / added roots), NOT on p.cancelled: a folder removed or paused in the
+        // exact instant the pass finished naturally would otherwise strand its request.
+        let removed = self.pendingRootRemovals; self.pendingRootRemovals.removeAll()
+        let wantRestart = self.restartAfterPause; self.restartAfterPause = false
+        let caughtUp = self.pendingCatchUpRoots; self.pendingCatchUpRoots.removeAll()
+        let wantFSDrain = self.fsDrainThenResume; self.fsDrainThenResume = false
+        if !removed.isEmpty {
+            // Drop the removed folders' vectors now the pass stopped re-inserting them,
+            // reclaim disk, then resume indexing the remaining roots.
+            self.indexState = .idle
+            let keep = self.roots.map(\.path)
+            Task.detached {
+                for path in removed { Self.dropRemovedFolder(path, keeping: keep, store: store) }
+                await self.afterBulkDelete(store)
+                store.compact()
+                await MainActor.run {
+                    if !self.roots.isEmpty { self.restartOrPark(store) }
+                }
+            }
+            return
+        }
+        if wantFSDrain, p.cancelled, !self.pendingFSPaths.isEmpty {
+            // Paused only to let waiting watcher events in. Reconcile them now; the
+            // reconcile's completion (drainDeferredAfterPass) resumes the pass, which
+            // also covers anything else queued meanwhile (added roots, a restart).
+            self.indexState = .idle
+            self.restartAfterPause = true
+            self.refreshIndexStats(store)
+            self.drainPendingFSChanges()
+            if !self.fsReconcileInFlight {   // it could not start: resume at once
+                self.restartAfterPause = false
+                self.restartOrPark(store)
+            }
+            return
+        }
+        if wantFSDrain, p.cancelled, self.explicitRetagSince != nil {
+            // Paused for tags the user asked for: run them, then resume.
+            self.indexState = .idle
+            self.restartAfterPause = true
+            self.pendingCatchUpRoots.append(contentsOf: caughtUp)
+            self.refreshIndexStats(store)
+            self.drainDeferredAfterPass(store)
+            return
+        }
+        if wantRestart || !caughtUp.isEmpty || (wantFSDrain && p.cancelled) {
+            // A folder was paused/resumed, or roots were added, mid-pass: restart
+            // re-scoped to the current unpaused roots (incremental, so the rest resume).
+            self.indexState = .idle
+            self.refreshIndexStats(store)
+            self.restartOrPark(store)   // covers any added roots
+            return
+        }
+        self.indexState = .idle
+        self.refreshIndexStats(store)
+        self.refreshSearchAfterBackgroundChange()
+        // CANCELLED WITH NOTHING QUEUED is not the end of the work: either the user paused it, or a
+        // stand-down did (an OCR run, a power hold, a hold), or whatever cancelled it asked for a
+        // restart that arrived while this pass was still winding down and was dropped. The first
+        // two park; the last used to park too, for good.
+        if p.cancelled {
+            self.restartOrPark(store)
+            self.refitFolderMapIfPending()
+            return
+        }
+        // A full pass has now walked every root under this long-text policy,
+        // so every long text file has been read to it.
+        let policy = Indexer.longTextPolicy(settings)
+        Task.detached(priority: .utility) {
+            store.metaSet(Indexer.textStreamMetaKey, policy)
+            store.metaSet(Indexer.textCutMetaKey, "1")
+        }
+        // The whole deferred chain, not just the watcher queue: a Photos library
+        // change during the pass queues a catch-up that only this chain starts, and
+        // with no file event pending nothing else ever did - the library sat at
+        // "Waiting to be indexed" and its deletions stayed searchable.
+        self.drainDeferredAfterPass(store)
+        self.refitFolderMapIfPending()
+    }
+
+    /// The next pass, or why there is none. Parks at `.paused` for the user's Pause, or for a
+    /// stand-down that will restart indexing when it lifts (startIndexing records it for that).
+    /// With neither, whatever is queued runs now: nothing may wait on a pass that is not coming.
+    private func restartOrPark(_ store: VectorStore) {
+        if userPaused { indexState = .paused; return }
+        startIndexing()
+        if indexState == .indexing { return }
+        if indexStandingDown { indexState = .paused; return }
+        indexState = .idle
+        // A catch-up or reconcile in flight took the restart (restartAfterPause): its completion
+        // serves it, and the chain from here would only hand it straight back.
+        guard activeRoots.isEmpty, !fsReconcileInFlight else { return }
+        drainDeferredAfterPass(store)
     }
 
     /// Smoothed embedding throughput, sampled on a timer from the engine's cumulative token count.
@@ -7360,7 +7518,7 @@ final class AppModel {
         }
         if restartAfterPause {
             restartAfterPause = false
-            startIndexing()
+            restartOrPark(store)
             return
         }
         catchUpPendingRoots()
@@ -7526,9 +7684,11 @@ final class AppModel {
         // Library, build or Caches ABOVE the indexed folder (iCloud Drive, the clipboard history)
         // read as ignored and was deleted from the index by the re-tag meant to improve it.
         let rootPaths = watcherRootPaths
+        runsOutstanding += 1
         Task.detached(priority: .utility) {
             indexer.update(paths: batch, settings: s, force: true, roots: rootPaths)
             await MainActor.run {
+                self.runsOutstanding -= 1
                 self.fsReconcileInFlight = false
                 self.tagBackfillActive = false
                 if self.tagBackfillYieldedToSearch {
@@ -7595,7 +7755,9 @@ final class AppModel {
         pendingFSPaths.removeAll()
         reconcilingNames = arrivingNames; arrivingNames.removeAll()
         guard !drained.isEmpty else { fsEventsWaitingSince = nil; reconcilingNames.removeAll(); return }
+        let waitedSince = fsEventsWaitingSince ?? Date()
         fsEventsWaitingSince = nil
+        reconcilingPaths = Set(drained)
         let eid = pendingFSEventId; pendingFSEventId = 0
         let settings = effectiveSettings()
         let touched = Set(drained.compactMap { rootKey(for: $0) })
@@ -7615,6 +7777,7 @@ final class AppModel {
             if !self.reconcileShowsProgress { self.reconcileShowsProgress = true }
         }
         let rootPaths = watcherRootPaths
+        runsOutstanding += 1
         Task.detached(priority: .utility) {
             let changed = indexer.update(paths: drained, settings: settings, roots: rootPaths)
             let cancelled = indexer.isCancelled
@@ -7626,10 +7789,15 @@ final class AppModel {
                     // A path that is gone is kept even outside every root: its only work is deleting
                     // rows, which is what a moved folder's old path is waiting for.
                     self.pendingFSPaths.formUnion(drained.filter { self.rootKey(for: $0) != nil || Darwin.access($0, F_OK) != 0 })
+                    // Still waiting since they first arrived. Re-queued with no date, they were
+                    // invisible to the events wait limit and sat behind the whole next pass.
+                    self.fsEventsWaitingSince = min(self.fsEventsWaitingSince ?? waitedSince, waitedSince)
                     self.pendingFSEventId = max(self.pendingFSEventId, eid)
                     self.arrivingNames.formUnion(self.reconcilingNames)   // queued again with them
                     self.fsDrainThenResume = false   // the drain below takes the waiting events
                 } else if eid > 0 { self.eventCheckpoint = String(eid) }
+                self.runsOutstanding -= 1
+                self.reconcilingPaths.removeAll()
                 self.reconcilingNames.removeAll()
                 self.reconcileToken &+= 1
                 if self.reconcileShowsProgress { self.reconcileShowsProgress = false }
@@ -7667,10 +7835,37 @@ final class AppModel {
     /// (its completion re-queues and restarts it), so the state is set here, which is what every
     /// restart path checks. Resume is startIndexing, whose pass covers the queued folders.
     func userPauseIndexing() {
-        if isIndexing { pauseIndexing(); return }
+        if isIndexing { userPaused = true; pauseIndexing(); return }
         guard canPauseIndexing else { return }
+        userPaused = true
         indexState = .paused
         indexer?.cancel(.pause)
+    }
+
+    /// The user's Resume, Update, Index and Reindex. The only way out of the user's Pause: every
+    /// other caller of startIndexing is a restart the app makes on its own (an OCR run ending, a
+    /// power hold lifting, a hold released, a deferred chain), and those leave a paused index
+    /// paused.
+    func resumeIndexing() {
+        userPaused = false
+        startIndexing()
+    }
+
+    /// The user's Pause, as distinct from a stand-down (an OCR run, a power hold, a hold taken by
+    /// withIndexingStopped, the benchmark) that resumes by itself. A cancelled pass used to end
+    /// `.paused` whatever had cancelled it, so a restart that arrived while the pass was still
+    /// winding down (startIndexing returns while the state is still `.indexing`) was dropped and
+    /// the index stayed paused for good: no file event drained, no folder caught up, nothing said
+    /// why. Seen on a real Mac after an afternoon of agent traffic (index.md, "The index that
+    /// paused itself").
+    private var userPaused = false
+    /// Index runs launched and not yet back on the main actor: the full pass (counted from before
+    /// its prelude), a catch-up, a watcher reconcile, a tag batch. The proof the watchdog needs:
+    /// with none outstanding, a flag that claims work in flight is one nothing will ever clear.
+    @ObservationIgnored private var runsOutstanding = 0
+    /// A stand-down holding indexing that will restart it when it lifts.
+    private var indexStandingDown: Bool {
+        ocrRunActive || powerHold != nil || indexWritesBlocked || isPaperRunning
     }
 
     /// Set once the app is terminating so no new index pass starts after quiesceForQuit. Without it,

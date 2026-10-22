@@ -1945,3 +1945,96 @@ into windows of the width shown and the model picks the one closest to the query
 - ONE FAILURE NEITHER FIXES: a clean monospace table read as invented Chinese at confidence 0.30.
   Dropping 0.30 lines was looked at and rejected: on real scans a Korean receipt reads at 0.30
   almost entirely, and correctly ("매장: 테라로시", "구매 20.00") - the filter would delete real text.
+
+## The index that paused itself (2026-10-21, found by an agent's review)
+
+An agent reviewing 0.18.0 dropped sentinel files into Desktop, Documents, Downloads and its own
+run folder and waited 7 minutes: every one "NOT indexed (outside the indexed folders, a kind Omni
+skips, or not reached yet)". Han's Omni had been up 5 hours under agent traffic. What it showed,
+read without touching it (no `sample`, no debugger, no search that would enter the history):
+
+- THE INDEX STOPPED AT 17:45. Audio and image decoding in the unified log ends at 17:45:23, the
+  second `costs.json` was written (the end of a pass); after it only deletions reached the store
+  (`removeVanishedNow` runs whatever the state). 0% CPU, every thread asleep.
+- THE STATE WAS `.paused`: File menu "Resume Indexing" enabled, "Pause Indexing" disabled (read
+  through Accessibility, by pid). Nobody had pressed Pause: no OCR run, no tool call in
+  serving.log for 25 minutes either side, no thermal warning, no Low Power Mode, no hours set.
+- NOTHING SAID SO. `list_sources` had no state at all, `file_status` gave one line for "outside",
+  "skipped" and "waiting", and the agent concluded the files were not on the Mac.
+
+THE CAUSE: a cancelled full pass ended `.paused` whatever had cancelled it
+(`indexState = p.cancelled ? .paused : .idle`), and the restart its canceller meant to follow could
+be lost. Every drain, catch-up and tag batch refuses a paused index, so it stays paused until
+someone presses Resume. Three ways in, all reproduced on isolated instances (corpus of 20,000 text
+files, `ab.sh` and `soak.sh` under scratch, PerfScript steps `powerhold:`, `ocrrun:`):
+
+- A STAND-DOWN THAT LIFTS WHILE THE PASS WINDS DOWN. An OCR run, a power hold or a
+  withIndexingStopped hold pauses the pass and calls startIndexing when it ends; with the pass
+  still `.indexing`, that returns without doing anything, and the pass's completion then parks.
+  `powerhold:hot;powerhold:none` and `ocrrun:on;ocrrun:off` back to back during the first pass:
+  0.18.0 stopped at 1,307 / 1,313 of 20,000 and never resumed (sentinels 0/3 in 90 s, menu "Resume
+  Indexing"); now the pass restarts at once and the sentinels are in at 36 s (the 30 s wait limit
+  of a first pass, then the reconcile).
+- THE PRELUDE. startIndexing's task checks for a cancel before `index()` runs, and on one set
+  `.paused` by itself. The events wait limit cancels a pass to let overdue file events in; after a
+  reconcile longer than the limit, the restart begins with events already overdue, and when the
+  next check lands before the prelude reaches the main actor the pass is "paused", its request to
+  drain never served. The request flag stayed set, and the check that would have repeated it is
+  gated on that flag: off for good. This needs a busy main thread at the wrong moment. Churn soak
+  (appends every 0.3 s, a file every 2 s, a deletion every 10 s, 2,500 files every 75 s, four
+  agents searching), 20 minutes each: with an ordinary main thread neither build stalled (60/60
+  sentinels, worst 93 s and 62 s); with it busy (`block:cpu:450` every 0.8 s) 0.18.0 parked after
+  its second pass - menu "Resume Indexing", no crawl after, 44 of 56 sentinels unindexed past
+  240 s and 8 still waiting at the end - exactly Han's state. This build, the same run: 60/60,
+  worst 61 s, no stall, 11 passes (10 of them paused for file events), the watchdog silent.
+  `Tools/agenteval/drain-soak.sh` is that soak.
+- A REQUEST FLAG LEFT STANDING. `fsDrainThenResume` set as a catch-up finished, or with its cancel
+  cleared by the next run's reset, also turned the wait limit off until some full pass ended.
+
+Fixes:
+
+- THE USER'S PAUSE IS RECORDED (`userPaused`), not inferred from a cancel. A cancelled pass parks
+  only for it or for a stand-down still holding indexing (`restartOrPark`); otherwise it starts the
+  next pass or runs the deferred chain. Only Resume, Update, Index and Reindex (`resumeIndexing`)
+  lift it; the app's own restarts (OCR end, power, holds, chains) respect it, where before an OCR
+  run ending could quietly resume a paused index.
+- THE PRELUDE ENDS THROUGH `finishPass`, the one completion every pass now has, so a drain request
+  that lands there is served like any other.
+- THE WAIT LIMIT REPEATS a request that has no cancel behind it, and paths a cancelled reconcile
+  puts back keep the time they started waiting (they had none, and sat behind the next pass).
+- A WATCHDOG, armed while anything is queued, a look every 30 s. Two states it must not see on two
+  looks in a row: work queued with nothing running and nothing holding it (it runs the chain), and
+  a flag claiming work in flight with no launched run outstanding (`runsOutstanding`: every
+  launcher counts its run before detaching and its completion uncounts it; the four launchers are
+  the only places those flags are set). It clears such a flag only on that proof - clearing one
+  whose run is alive would put two pipelines on one Indexer. Each logs (`index-watchdog`); neither
+  should fire, and on every soak neither did. Positive control (`stall:queue:<path>`,
+  `stall:flag`): the queued change was drained at the second look, and a file event stuck behind
+  the orphaned flag was indexed 50 s after it was written.
+- THE STATE IS REPORTED. `list_sources` leads with it ("Indexing is PAUSED in Omni: 3 file changes
+  since 8:36 PM (6s ago) are not indexed or searchable yet. The user resumes it in the app (File >
+  Resume Indexing)."), with `indexing_paused`, `held_by`, `waiting_changes`, `waiting_since` in the
+  CLI's JSON. `search` says it only when indexing is held with changes waiting. `file_status` says
+  which of outside the sources, a paused folder, queued (and why it waits), not reached by a pass
+  running now, a kind Omni does not read, or skipped; a progress kept from a stopped pass reads
+  "stopped at", not "indexing".
+
+The same review's smaller points:
+
+- `photos://all` CAME BACK AS `/photos:/all`: normalizeStorePath split every path on "/". A
+  "<scheme>://" path is returned as given; file_status names a Photos source as one.
+- OUT-OF-RANGE ARGUMENTS ARE REFUSED, NOT CLAMPED. `top_k: 5000` became 50, `min_score: 1.5` became
+  1, and the agent read the clamped answer as the one it asked for. One check in callTool, from
+  the schemas the client is given (type, minimum, maximum, enum, item type): "'top_k' must be
+  between 1 and 50, got 5000". REST's top_k and min_score refuse too. tag_image's 1-25 moved from
+  its description into its schema.
+- `structuredContent` FOR EVERY CLIENT WAS MEASURED AND NOT TURNED ON. Claude Code (2.1.307
+  here), the Claude desktop app and Codex forward `structuredContent` to the model INSTEAD of the
+  text when both are present (claude-code #55677; Cursor forum 167346 ran a probe on all four).
+  So it is not an addition, it replaces the answer: on the 125 eval queries the JSON is 1.75x the
+  text compact and 2.21x pretty (median 3,732 / 4,724 characters against 2,131), and all 125 lose
+  the lines only the text carries (what more there is, how to page). Agent A/B on the testbed, 50
+  episodes each, same queries: success 0.92 -> 0.94 (one soundtrack query flipped), place 0.90 ->
+  0.92, characters the tools handed the model 3,264 -> 5,269 (+61%), cost per query $0.057 ->
+  $0.062 (+10%). One flip in 50 is noise; the cost is not. The command line keeps it (it asks for
+  it, and pipes want JSON); `outputSchema` stays off too.

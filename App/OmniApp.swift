@@ -459,7 +459,7 @@ struct OmniApp: App {
                 //
                 // Cmd-Shift-I, not Cmd-R: in a file browser Cmd-R reads as Finder's Show Original /
                 // Reload, so it is reserved (Reveal uses Cmd-Shift-R above).
-                Button(model.isPaused ? "Resume Indexing" : (!model.hasIndexedFiles ? "Index" : "Update Index")) { model.startIndexing() }
+                Button(model.isPaused ? "Resume Indexing" : (!model.hasIndexedFiles ? "Index" : "Update Index")) { model.resumeIndexing() }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
                     .disabled(model.isIndexing || !model.canIndex)
                 Button("Pause Indexing") { model.userPauseIndexing() }

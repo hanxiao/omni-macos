@@ -161,7 +161,7 @@ private struct IndexStatusRow: View {
                     Image(systemName: "pause.circle.fill").foregroundStyle(.orange)
                     Text("Paused")
                     Spacer()
-                    Button("Resume") { model.startIndexing() }.controlSize(.small)
+                    Button("Resume") { model.resumeIndexing() }.controlSize(.small)
                 }
             }
         case .idle:
@@ -223,7 +223,7 @@ private struct IndexStatusRow: View {
                     // No count here: the Indexed files row sits directly below.
                     Text(model.indexedFiles == 0 ? "Nothing indexed yet" : "Up to date")
                     Spacer()
-                    Button(model.indexedFiles == 0 ? "Index" : "Update") { model.startIndexing() }
+                    Button(model.indexedFiles == 0 ? "Index" : "Update") { model.resumeIndexing() }
                         .controlSize(.small).disabled(!model.canIndex)
                 }
             }
@@ -1098,7 +1098,7 @@ private struct IndexTab: View {
                                     Button("Switch to \(v.title)") { model.selectVariant(v) }
                                         .disabled(model.isDownloading || model.isPaperRunning)
                                 }
-                                Button("Reindex") { model.startIndexing() }
+                                Button("Reindex") { model.resumeIndexing() }
                                     .disabled(model.isIndexing || !model.canIndex)
                             }
                             .controlSize(.small)

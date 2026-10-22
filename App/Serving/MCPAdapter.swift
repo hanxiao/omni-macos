@@ -333,15 +333,14 @@ enum MCPAdapter {
                 "isError": true
             ])
         }
-        var topK = (args["top_k"] as? Int) ?? 10
-        topK = max(1, min(topK, 50))
-        var maxSnippet = (args["max_snippet"] as? Int) ?? Self.defaultSnippet
-        maxSnippet = max(0, min(maxSnippet, 2000))
+        // Ranges are checked against the schema before any tool runs (invalidArgument).
+        let topK = (args["top_k"] as? Int) ?? 10
+        let maxSnippet = (args["max_snippet"] as? Int) ?? Self.defaultSnippet
         let includeImages = (args["include_images"] as? Bool) ?? false
         let (parsed, err) = SearchArgs.filter(args)
         if let err { return toolError(id: id, "search failed: \(err)") }
         let filter = parsed
-        let offset = max(0, min((args["offset"] as? Int) ?? 0, 140))
+        let offset = (args["offset"] as? Int) ?? 0
         let byDate: Bool
         switch (args["sort"] as? String)?.lowercased() ?? "relevance" {
         case "relevance": byDate = false
@@ -576,10 +575,8 @@ enum MCPAdapter {
                 "isError": true
             ])
         }
-        var topK = (args["top_k"] as? Int) ?? 10
-        topK = max(1, min(topK, 100))
-        var maxSnippet = (args["max_snippet"] as? Int) ?? 400
-        maxSnippet = max(0, min(maxSnippet, 4000))
+        let topK = (args["top_k"] as? Int) ?? 10
+        let maxSnippet = (args["max_snippet"] as? Int) ?? 400
         if args["exact"] as? Bool == true {
             return callPhrase(id: id, phrase: query, paths: paths, keep: topK, backend: backend, cli: cli)
         }
@@ -680,7 +677,7 @@ enum MCPAdapter {
               backend.fileStatus(paths: [path])[path] != nil else {
             return toolError(id: id, "read_file failed: \(path) is not in Omni's index. read_file reads only indexed files; file_status says which are.")
         }
-        let maxChars = max(100, min((args["max_chars"] as? Int) ?? 4000, 20000))
+        let maxChars = (args["max_chars"] as? Int) ?? 4000
         let outcome = TextSlice.read(path: path, page: args["page"] as? Int, line: args["line"] as? Int,
                                      offset: args["offset"] as? Int, maxChars: maxChars)
         switch outcome {
@@ -727,7 +724,8 @@ enum MCPAdapter {
         ]
     }
 
-    private static func callFileStatus(id: Any, args: [String: Any], backend: any ServingBackend, cli: Bool) -> HTTPResponse {
+    private static func callFileStatus(id: Any, args: [String: Any], backend: any ServingBackend,
+                                       snap: SourcesSnapshot?, cli: Bool) -> HTTPResponse {
         let paths = (args["paths"] as? [String])?.filter { !$0.isEmpty } ?? []
         guard !paths.isEmpty else {
             return result(id: id, [
@@ -762,15 +760,64 @@ enum MCPAdapter {
                 let asked = i < paths.count ? paths[i] : p
                 var isDir: ObjCBool = false
                 let why: String
-                if !asked.hasPrefix("/") && !asked.hasPrefix("~") { why = "not an absolute file path" }
+                if PhotoLibrary.isPhotoPath(p) {
+                    why = snap?.sources.contains(where: { $0.key == p }) == true
+                        ? "a Photos source, not a file: search covers it, and list_sources says how many photos it holds"
+                        : "NOT indexed: no such photo in the index"
+                }
+                else if !asked.hasPrefix("/") && !asked.hasPrefix("~") { why = "not an absolute file path" }
                 else if !FileManager.default.fileExists(atPath: p, isDirectory: &isDir) { why = "no such file" }
                 else if isDir.boolValue { why = "a folder, not a file: search inside it with search's 'folder', or list_sources for what is indexed" }
-                else { why = "NOT indexed (outside the indexed folders, a kind Omni skips, or not reached yet)" }
+                else { why = notIndexedWhy(p, snap) }
                 line = "\(i + 1). \(p)  \(why)"
             }
             return ["type": "text", "text": line]
         }
         return answer(id: id, content, cli: cli) { ["files": rows] }
+    }
+
+    /// Why a file that exists is not in the index, as far as Omni can tell without reading it. The
+    /// next step differs for each - wait, ask the user to resume, add a folder (only when asked), or
+    /// accept that Omni does not read this file - and one vague line for all of them read as "not
+    /// on this Mac" to every agent that met it.
+    private static func notIndexedWhy(_ path: String, _ snap: SourcesSnapshot?) -> String {
+        guard let snap else { return "NOT indexed (outside the indexed folders, a kind Omni skips, or not reached yet)" }
+        let real = realpath(path, nil).map { r in defer { free(r) }; return String(cString: r) } ?? path
+        guard let source = snap.sources.first(where: { s in
+            s.kind == "folder" && (RootScope.covers(s.key, path) || RootScope.covers(s.key, real))
+        }) else {
+            return "NOT indexed: outside the folders Omni indexes (list_sources shows them; add_source adds one when the user asks)"
+        }
+        if source.paused {
+            return "NOT indexed: its folder \(source.key) is paused (pause_source with paused=false resumes it, when the user asks)"
+        }
+        // Queued by a file event: the file itself, or a folder it arrived in.
+        var queued = false
+        for p in Set([path, real]) where !queued {
+            var at = p
+            while !queued, at.count > source.key.count {
+                queued = snap.waiting.contains(at)
+                at = (at as NSString).deletingLastPathComponent
+            }
+        }
+        if queued {
+            if snap.paused { return "NOT indexed yet: queued, but indexing is PAUSED in Omni until the user resumes it (File > Resume Indexing)" }
+            if let held = snap.heldBy { return "NOT indexed yet: queued, waiting while \(held)" }
+            let since = snap.waitingSince.map { " since " + SourcesSnapshot.clock($0) } ?? ""
+            return "NOT indexed yet: queued for indexing\(since)"
+        }
+        if source.indexing {
+            let progress = source.total > 0 ? " (\(source.done.formatted()) of \(source.total.formatted()))" : ""
+            return "NOT indexed yet: Omni is indexing \(source.name) now\(progress)"
+        }
+        let ext = (path as NSString).pathExtension
+        if !ext.isEmpty, FileExtractor.kind(forExtension: ext) == nil {
+            return "NOT indexed: .\(ext.lowercased()) is not a kind of file Omni indexes"
+        }
+        if snap.paused {
+            return "NOT indexed yet: indexing is PAUSED in Omni until the user resumes it (File > Resume Indexing)"
+        }
+        return "NOT indexed: created in the last few seconds, skipped by an ignore rule or a kind turned off in Settings, or a file Omni could not read"
     }
 
     // MARK: - The tag_image tool
@@ -793,7 +840,7 @@ enum MCPAdapter {
                         "description": "Run the vision model now rather than reading stored tags. Slower (a GPU forward per image, plus 5 refinement crops) and capped at \(mcpTagRecomputeMax) images. Off by default."
                     ] as [String: Any],
                     "top_k": [
-                        "type": "integer",
+                        "type": "integer", "minimum": 1, "maximum": 25,
                         "description": "How many tags per image when recomputing (1-25, default 5). Ignored when reading stored tags."
                     ] as [String: Any]
                 ] as [String: Any],
@@ -817,8 +864,7 @@ enum MCPAdapter {
             ])
         }
         let recompute = (args["recompute"] as? Bool) ?? false
-        var topK = (args["top_k"] as? Int) ?? OmniTagger.topK
-        topK = max(1, min(topK, 25))
+        let topK = (args["top_k"] as? Int) ?? OmniTagger.topK
 
         let rows: [[String: Any]]
         if recompute {
@@ -1064,6 +1110,46 @@ enum MCPAdapter {
 
     // MARK: - JSON-RPC envelopes
 
+    /// The first argument that does not fit what its schema declares - its type, its range, its
+    /// allowed values - as a message naming what would, or nil. Checked once, here, from the
+    /// schemas the client was given. Each tool used to clamp on its own: `top_k: 5000` quietly
+    /// became 50 and `min_score: 1.5` became 1, and the agent took the clamped answer for the one it
+    /// asked for. A JSON null reads as absent, as it always has.
+    static func invalidArgument(_ args: [String: Any], _ props: [String: Any]) -> String? {
+        for key in args.keys.sorted() {
+            guard let spec = props[key] as? [String: Any], let value = args[key], !(value is NSNull) else { continue }
+            let isBool = (value as? NSNumber).map { CFGetTypeID($0) == CFBooleanGetTypeID() } ?? false
+            switch spec["type"] as? String {
+            case "integer", "number":
+                guard let n = value as? NSNumber, !isBool, n.doubleValue.isFinite else {
+                    return "'\(key)' must be a number"
+                }
+                let d = n.doubleValue
+                if spec["type"] as? String == "integer", d.rounded() != d { return "'\(key)' must be a whole number, got \(n)" }
+                let lo = (spec["minimum"] as? NSNumber)?.doubleValue, hi = (spec["maximum"] as? NSNumber)?.doubleValue
+                func show(_ x: Double) -> String { x.rounded() == x ? String(Int(x)) : String(x) }
+                if let lo, let hi, d < lo || d > hi { return "'\(key)' must be between \(show(lo)) and \(show(hi)), got \(show(d))" }
+                if let lo, hi == nil, d < lo { return "'\(key)' must be at least \(show(lo)), got \(show(d))" }
+                if let hi, lo == nil, d > hi { return "'\(key)' must be at most \(show(hi)), got \(show(d))" }
+            case "boolean":
+                guard isBool else { return "'\(key)' must be true or false" }
+            case "string":
+                guard let text = value as? String else { return "'\(key)' must be a string" }
+                if let allowed = spec["enum"] as? [String], !allowed.contains(where: { $0.caseInsensitiveCompare(text) == .orderedSame }) {
+                    return "'\(key)' must be one of \(allowed.map { "'\($0)'" }.joined(separator: ", ")), got '\(text)'"
+                }
+            case "array":
+                guard let items = value as? [Any] else { return "'\(key)' must be a list" }
+                if (spec["items"] as? [String: Any])?["type"] as? String == "string", !items.allSatisfy({ $0 is String }) {
+                    return "'\(key)' must be a list of strings"
+                }
+            default:
+                continue
+            }
+        }
+        return nil
+    }
+
     /// `tools/call`, for either era: the arguments checked against the tool's schema, then the tool.
     static func callTool(id: Any, params: [String: Any], _ backend: any ServingBackend,
                          sources: SourcesControl?, surface: ServedSurface) async -> HTTPResponse {
@@ -1081,6 +1167,7 @@ enum MCPAdapter {
                 let known = props.keys.sorted().joined(separator: ", ")
                 return toolError(id: id, "\(name) failed: unknown argument\(unknown.count == 1 ? "" : "s") \(unknown.map { "'\($0)'" }.joined(separator: ", ")); \(name) takes: \(known)")
             }
+            if let bad = invalidArgument(args, props) { return toolError(id: id, "\(name) failed: \(bad)") }
         }
         // The `omni` command line marks its calls (CLI.md): it gets structuredContent and the
         // diagnostic blocks marked for stderr. Every other client's answer is unchanged.
@@ -1091,10 +1178,13 @@ enum MCPAdapter {
         case "search_inline", "file_status", "tag_image", "read_file":
             // Blocking tools, so the whole call runs on the served work queue (see ServedWork).
             let call = ReadOnlyRequest(id: id, args: args)
+            // file_status says why a file is not indexed from the sources' state: taken first,
+            // at most a second old and never waited for, since the queue below runs synchronously.
+            let snap: SourcesSnapshot? = name == "file_status" ? await sources?.recentSnapshot() : nil
             return await ServedWork.run {
                 switch name {
                 case "search_inline": return callSearchInline(id: call.id, args: call.args, backend: backend, surface: surface, cli: cli)
-                case "file_status":   return callFileStatus(id: call.id, args: call.args, backend: backend, cli: cli)
+                case "file_status":   return callFileStatus(id: call.id, args: call.args, backend: backend, snap: snap, cli: cli)
                 case "read_file":     return callReadFile(id: call.id, args: call.args, backend: backend, cli: cli)
                 default:              return callTagImage(id: call.id, args: call.args, backend: backend, cli: cli)
                 }
@@ -1341,6 +1431,7 @@ enum MCPAdapter {
     private static func sourcesResult(id: Any, _ snap: SourcesSnapshot, headline: String?, cli: Bool) -> HTTPResponse {
         var lines: [String] = []
         if let headline { lines.append(headline) }
+        if let waiting = snap.waitingLine { lines.append(waiting) }
         if snap.sources.isEmpty {
             lines.append("Omni is not indexing anything yet.")
         } else {
@@ -1348,7 +1439,11 @@ enum MCPAdapter {
                 var state: [String] = ["\(s.indexedFiles.formatted()) indexed"]
                 if s.paused { state.append("PAUSED") }
                 else if s.queued { state.append("waiting to be indexed") }
-                else if s.total > 0, s.done < s.total { state.append("indexing \(s.done.formatted())/\(s.total.formatted())") }
+                // Progress is kept when a pass stops, and read as "indexing" it said work was going
+                // on in a paused index.
+                else if s.total > 0, s.done < s.total {
+                    state.append("\(s.indexing ? "indexing" : "stopped at") \(s.done.formatted())/\(s.total.formatted())")
+                }
                 lines.append("- [\(s.kind)] \(s.name)  \(s.key)  (\(state.joined(separator: ", ")))")
             }
         }
@@ -1373,9 +1468,17 @@ enum MCPAdapter {
     /// updated continuously (the watcher, the launch pass, tag refinement), so "indexing" is true
     /// most of the time and said nothing about whether this answer was complete - agents read it
     /// as a reason to distrust good results. Per-file freshness is on each hit and in file_status.
+    ///
+    /// The one exception: indexing HELD (paused, or a stand-down) with changes queued behind it. Then
+    /// recent files are missing from every answer and nothing else would say so - an agent asked
+    /// for a file written a minute ago reported that it was not on the Mac.
     private static func indexStateLine(_ snap: SourcesSnapshot?) -> String? {
-        guard let snap, snap.sources.isEmpty else { return nil }
-        return "index: empty - no folders or photo sources are indexed yet (see list_sources / add_source)."
+        guard let snap else { return nil }
+        if snap.sources.isEmpty {
+            return "index: empty - no folders or photo sources are indexed yet (see list_sources / add_source)."
+        }
+        guard snap.paused || snap.heldBy != nil, snap.waitingChanges > 0, let line = snap.waitingLine else { return nil }
+        return "index: " + line
     }
 
     // MARK: - Answers for the command line

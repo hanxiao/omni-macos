@@ -16,7 +16,12 @@ enum SearchArgs {
         // Absent means "use the server's default floor", which is why this is Optional rather than
         // defaulted here: a caller that says nothing gets the same cut the window applies, and
         // min_score 0 is the explicit way to ask for everything.
-        if let ms = number(a["min_score"]) { filter.minScore = Swift.max(0, Swift.min(1, ms)) }
+        // Refused outside 0...1 rather than clamped, here for REST as the schema check does for MCP:
+        // 1.5 read as 1 returned nothing, and nothing said the floor was not the one asked for.
+        if let ms = number(a["min_score"]) {
+            guard (0 ... 1).contains(ms) else { return (filter, "'min_score' must be between 0 and 1, got \(ms)") }
+            filter.minScore = ms
+        }
         if let raw = a["kinds"] {
             guard let kinds = raw as? [String] else { return (filter, "'kinds' must be a list of kinds") }
             let (set, err) = normalizedKinds(kinds)

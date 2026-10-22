@@ -56,7 +56,12 @@ func mimeType(forPath path: String) -> String? {
 /// /private-form paths verbatim (AppModel.canonicalizeRoots converts /tmp-style roots INTO
 /// /private form), so a stored path fed back in would stop matching. The index never resolves
 /// symlinks, so neither does this.
+///
+/// A "<scheme>://" path (a Photos asset or source, photos://...) is not a filesystem path and is
+/// returned as given: split on "/" it came back as "/photos:/all", which matched nothing.
 func normalizeStorePath(_ raw: String) -> String {
+    if let r = raw.range(of: "://"), !raw[..<r.lowerBound].isEmpty,
+       raw[..<r.lowerBound].allSatisfy({ $0.isLetter }) { return raw }
     let expanded = (raw as NSString).expandingTildeInPath
     var parts: [String] = []
     for comp in expanded.split(separator: "/") {
@@ -347,8 +352,9 @@ enum SearchAdapter {
             return badRequest("'query' is required")
         }
 
-        var topK = (body["top_k"] as? Int) ?? 20
-        topK = max(1, min(topK, 200))
+        let topK = (body["top_k"] as? Int) ?? 20
+        // Refused, not clamped: a caller that asked for 5000 and got 200 read 200 as all there were.
+        guard (1 ... 200).contains(topK) else { return badRequest("'top_k' must be between 1 and 200, got \(topK)") }
 
         // Read by the same code as the MCP tool (SearchArgs): kinds are checked, folders
         // normalized, `ext` cleaned, and a date may be epoch seconds or ISO 8601.
@@ -686,8 +692,8 @@ enum TagAdapter {
             return badRequest("at most \(maxImages) images per request\(hqRequested ? " in hq mode (each image is 6 forwards; pass \"hq\": false for \(tagMaxImages))" : "")")
         }
 
-        var topK = (body["top_k"] as? Int) ?? OmniTagger.topK
-        topK = max(1, min(topK, 25))
+        let topK = (body["top_k"] as? Int) ?? OmniTagger.topK
+        guard (1 ... 25).contains(topK) else { return badRequest("'top_k' must be between 1 and 25, got \(topK)") }
 
         // HQ (CWR multi-crop) refinement is ON by default so this endpoint returns the SAME tags
         // the indexer would store for the image (Indexer.swift cuts the same 5 crops on its retag

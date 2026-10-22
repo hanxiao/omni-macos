@@ -14,7 +14,7 @@ import OmniLink
 /// `wait:<seconds>`, `intent:<text>` (the Shortcuts search action's own search, logged). For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
 /// (window size, centered), `front`, `appearance:light|dark`, `ocrview:raw|rendered|split|triple`, `ocrpage:<n>`, `history:<n>`, `sort:<order>`,
-/// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `menu:<title>`, `recents`, `clipboard:on|off`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
+/// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `menu:<title>`, `recents`, `clipboard:on|off`, `powerhold:hot|lowpower|battery|none`, `ocrrun:on|off`, `stall:queue:<path>|flag`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
 enum PerfScript {
@@ -279,6 +279,13 @@ enum PerfScript {
             model.cancelPaperRun()
         case "pressure":    // what macOS's memory-pressure source reports: warning | critical | normal
             model.memoryPressureChanged(arg == "critical" ? .critical : arg == "warning" ? .warning : .normal)
+        case "powerhold":   // what PowerPolicy reports: hot | lowpower | battery | none
+            model.power.onChange?(arg == "hot" ? .hot : arg == "lowpower" ? .lowPower : arg == "battery" ? .battery : nil)
+        case "ocrrun":      // what an OCR run reports at its start (on) and end (off)
+            if arg == "on" { model.beginOCRRun() } else { model.endOCRRun() }
+        case "stall":       // the index watchdog's positive control: queue:<path> | flag
+            let parts = arg.split(separator: ":", maxSplits: 1).map(String.init)
+            model.makeStallForWatchdog(parts.first ?? "", path: parts.count > 1 ? parts[1] : "")
         case "cliinstall":  // Settings > Serving > Install... (point -omni.cliLinkDir at a scratch folder)
             let err = CommandLineTool.install()
             omniPerfLog("cli install \(err.map { $0.isEmpty ? "cancelled" : "failed: \($0)" } ?? "ok") state=\(CommandLineTool.state)")
@@ -289,7 +296,7 @@ enum PerfScript {
         case "addfolder":   // what Add... in the sidebar does with the chosen folder
             model.addRoots([URL(fileURLWithPath: arg, isDirectory: true)])
         case "pause":       // on: the user's Pause Indexing; off: Resume
-            if arg == "on" { model.userPauseIndexing() } else { model.startIndexing() }
+            if arg == "on" { model.userPauseIndexing() } else { model.resumeIndexing() }
         case "pausefolder": // <path>:on|off, the sidebar's Pause/Resume on a folder
             let parts = arg.split(separator: ":").map(String.init)
             if parts.count == 2 { model.setFolderPaused(path: parts[0], parts[1] == "on") }

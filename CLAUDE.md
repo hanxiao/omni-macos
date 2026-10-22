@@ -118,6 +118,9 @@ codebase were already measured there, and many were rejected.
   `ocr-first-page-done`, `ocr-page-done` and `ocr-run-done`; `-omni.hangwatch YES` adds the stalls.
   Current: 44.2 s, 540 tok/s, first page 12.2 s, limit = physical RAM; main thread blocked 0.3 s
   (Raw), 0.7 s (Markdown), 1.0 s (Dual), no stall over ~170 ms.
+- Watcher queue under churn and agent load: `Tools/agenteval/drain-soak.sh <app> <new scratch> [min]
+  [port]` - generated corpus, churn, four searching clients, a sentinel every 20 s; a sentinel unindexed
+  after 240 s is a STALL. With `OMNI_PERF_SCRIPT="repeat:2000;block:cpu:450"` 0.18.0 parks itself.
 - Model-free probes for MLX regressions: `ocr-verify x --probe-qmm | --probe-gather |
   --probe-rowexact [--causal-sweep]`. Re-run them on any MLX or toolchain change.
 
@@ -204,6 +207,11 @@ codebase were already measured there, and many were rejected.
 - EVERY COPY OMNI MAKES goes through `OmniPasteboard` (the clipboard history must never record it).
 - A FLAG NOTHING CAN TURN OFF IS DELETED, and a settled A/B arm is retired with its numbers recorded
   in the notes. Do not leave experiments in the shipped path.
+- A CANCEL IS NOT A PAUSE. A cancelled pass parked the index `.paused` whatever had cancelled it, and a
+  restart that arrived while it wound down was dropped: nothing drained again until someone pressed
+  Resume (0.18.0 on Han's Mac after an afternoon of agents; index.md, "The index that paused
+  itself"). The user's Pause is `userPaused`; any other cancel ends in `restartOrPark`. A new launcher
+  of an index run counts it in `runsOutstanding`, or the watchdog cannot tell its flags from leaks.
 - A CANCELLED TASK MAKES `try? await Task.sleep` RETURN AT ONCE, so a polling wait inside it is
   over before it starts. A debounce `cancel()` reached a model reload this way and cut its
   one-minute indexing hold to 1.2 s (index.md, "Settings under change"). Waits that guard
@@ -233,7 +241,8 @@ codebase were already measured there, and many were rejected.
   index-then-evict (issue #29), the 0.17.0 soundtrack read that never returned, the 0.17.2
   deleted tree that stopped every Task, exclusions, the served mask and iWork text, served search
   under load, passages (the text a hit matched), the agent surface (filters, paging, read_file),
-  the text on scanned pages and the metadata migration not done.
+  the text on scanned pages and the metadata migration not done, the index that paused itself
+  (refused arguments, structuredContent measured and not turned on).
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
   and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names, Shortcuts, Siri and Services (App Intents).
