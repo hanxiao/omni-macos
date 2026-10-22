@@ -2133,3 +2133,97 @@ and brings the compile-deadlock and collision fixes; not done here - its decode 
 ALSO: `TextStreamTests`' long-data-file test failed ~half its runs, at HEAD too: its stale row took
 the file's mtime from FileManager's Date, a few ulps from the crawler's reading. It reads the
 index's own value now; 8 of 8.
+
+## The query that waited out the hold (2026-10-22)
+
+AN AGENT'S QUERY WAITED FOR THE WHOLE INDEXING HOLD IN FLIGHT. The gate (`OmniEngine.run`) yields
+only between holds, and a hold is a whole text flush (uncapped on a wide GPU) or a 16-image call. The
+window's search stamps `interactiveQueryActive` 180 ms ahead through the keystroke debounce, so the
+indexer is already carving when it arrives; a served or linked query has no keystroke and waited out
+whatever was running. `omni-verify querylat <nano> <imageDir> [samples]` times the first query of a
+burst, the way each surface issues it (Nano, M3 Ultra, 60 samples a load; p50 / p90 / max ms):
+
+| | idle | text indexing | image indexing |
+|---|---|---|---|
+| typed (fused graph, 180 ms lead) | 5.3 / 6.5 / 7.2 | 16.6 / 33 / 37 | 22 / 164 / 170 |
+| served (`embedQuery`, no lead) | 5.6 / 7.1 / 9.2 | 83 / 170 / 176 | 175 / 339 / 358 |
+| ungated GPU op (what the scan pays) | 1.8 / 2.1 / 4.2 | 13.6 / 27 / 32 | 5.1 / 44 / 59 |
+
+The last row is the floor: the GPU itself frees up within one command buffer. The wait is the gate.
+
+FIXED BY A HAND-OVER INSIDE THE HOLD (`yieldToWaitingQuery`, passed to the encoders as `yieldPoint`):
+when a query is queued, the holder drains what it has in flight, hands it the gate and takes it back,
+so the query runs exactly as it would between two holds. Points: before each text batch after the
+first (the pipelined batch in flight is read back first), between image tower chunks, and between a
+chunk's tower and its backbone (`eval(perImage)` already syncs there). Served, after:
+
+| | text indexing | image indexing |
+|---|---|---|
+| served, before | 83 / 170 / 176 | 175 / 339 / 358 |
+| served, after | 36 / 52 / 56 | 31 / 98 / 107 |
+
+- Vectors are bit-identical with a query handed over mid-flush and mid-call (`QueryHandOverTests`;
+  each test first proves a hand-over happened, and both FAIL with the hand-over switched off).
+- No throughput cost with nobody searching, interleaved against HEAD: text 82,840-82,918 vs
+  82,903-82,916 tok/s, images 33.0-35.7 vs 35.7-35.8/s. Nobody waiting costs one lock read a batch.
+- The handed-over stretch is subtracted from `gpuBusySeconds`, which books the whole hold.
+- THE REMAINING BOUND IS ONE TOWER CHUNK: 70-127 ms here (8,192 patches = 2,048 merged tokens per
+  forward; `OMNI_MEDIA_TIMING=1`), proportionally more on a small GPU. A smaller patch budget would
+  shorten it; its throughput cost is not measured. Audio is not split: an audio batch is one forward
+  with no sync inside (the interactive per-clip carve still covers typed queries).
+
+THE ENGINE KEEPS QUERY VECTORS NOW (`cachedQueryVector`, 256, LRU), moved from AppModel, which kept
+the window's own and nobody else's. Every caller shares it: the window's re-runs, served search (an
+agent paging with `offset` re-runs the whole search), linked Macs, and `search_inline`, which embedded
+its query twice (`searchInline`, then `passages(vector: nil)`) and now hits on the second. A hit takes
+neither the gate nor the GPU. Cleared by every text-encoder swap (weight recovery), which the window's
+cache was not; a vector computed before a swap is refused (`encoderGeneration`).
+
+THE NEURAL ENGINE QUERY ENCODER: BUILT, PROVEN, NOT SHIPPED (Han's call). The idea is laya-apple's
+(github.com/tc3oliver/laya-apple, 2026-09): short requests on the ANE stay out of the GPU's queue,
+which is concurrency, not speed. `Tools/ane/build_nano_query.py` builds Nano's backbone as a Core ML
+program in the ml-ane-transformers shape (1x1 convs on (1, C, 1, L), heads split on channels, the
+attention as the two einsum forms coremltools accepts, RoPE folded into the q/k projections as
+`conv(x, W) * cos + conv(x, P W) * sin`); `omni-verify anequery <nano> <dir> <imageDir>` measures it.
+- PLACEMENT: all 1,016 ops of the L32 program on the ANE (`MLComputePlan`). The 2026-09 Small port fell
+  off it at the attention's reshape to (H, D, L); this one does not.
+- LATENCY, idle: ANE 2.66 ms, GPU `embedQuery` 2.37, CPU-only 5.04, CPU+GPU 8.88. Under indexing,
+  interleaved with the served GPU path (both after the hand-over): text 3.6 / 4.1 / 4.2 against
+  38 / 53 / 57, images 3.8 / 4.2 / 4.2 against 31 / 84 / 95. Independent of the load - ONLY once the
+  embedding rows are read from the table's memory on the CPU: an MLX gather queues on the GPU, and
+  with one the ANE path measured exactly the GPU path's wait (36.8 against 34.1 ms).
+- PARITY, 480 eval queries: cosine to an fp32 encoder median 0.99903, min 0.99608; the shipped bf16
+  GPU path 0.99996 / 0.99989. The same program in fp32 on the CPU scores 0.99992, so the graph is right
+  and the loss is fp16 arithmetic on the ANE. RMSNorm as LayerNorm of [x, -x] (ANEMLL's form) measured
+  the same, 0.99903.
+- RETRIEVAL IS UNCHANGED, with the ANE vectors swapped into the eval (a control run with the GPU's own
+  vectors through the same hook reproduced the baseline exactly): MRR 0.896 -> 0.901 over 125, 0.889
+  -> 0.891 over 440; 8 rank changes, 4 up and 4 down, all near-ties.
+- MEMORY: one L64 program serves every query at the same latency (2.76 against 2.68 ms bucketed), so
+  one copy of the fp16 weights, 254 MB. Core ML holds it outside the process: phys_footprint moved
+  +1 MB, and system wired memory swings +-500 MB between readings here. `sudo footprint aned` is the
+  measurement still owed.
+- WHY IT IS STILL OPEN: the ANE is the same 16-core unit on every M-series chip while the GPU scales
+  with its cores, so the hand-over's one-batch or one-chunk bound grows on a base Mac and the ANE's
+  ~3-4 ms does not (not measured here). Against it: a second implementation of the backbone to keep in
+  step with every checkpoint (built with coremltools, re-proven each time), ~250 MB to ship and hold,
+  Nano only (Small adds GQA and q/k norms at ~1 GB), and the search's scan still runs on the GPU
+  (the ungated row above).
+
+THE NEW FRAMEWORKS (surveyed 2026-10-22): Rapid-MLX, Sushi, VeloxQuant-MLX, Liquid's DSpark and the
+mlx.fast arena are decode-side (speculation, continuous batching, KV compression, MoE GEMM tuning on
+M5), with nothing for a prefill-only encoder; laya-apple is the lead taken above. MLX core 0.32.4
+(2026-10-14) is not in an mlx-swift release yet.
+
+REPEATED WORK FOUND AND NOT DONE (read from the code; how often each happens is not measured):
+- A media file whose bytes change but whose pixels or samples do not (an EXIF or ID3 edit, a re-mux,
+  Photos bumping `modificationDate`) re-embeds in full: the key is a SHA-256 of every byte, and
+  `ChunkKey.media(payload:)`, a key on the decoded payload, exists but nothing calls it.
+- The retag pass re-embeds the whole file (`forceFreshEmbed` turns off dedup and chunk reuse),
+  including a video's soundtrack windows, when only the image forward's patches are needed.
+- `PDFPagePick` embeds up to 24 pages per selected PDF hit and keeps nothing.
+- Chunk rows are deleted with their last reference, so content that comes back re-embeds.
+- Passage windows are cut at 200 (MCP), 220 (window) and 400 (`search_inline`) characters, so
+  their window vectors are never shared.
+- A linked Mac in the same space receives the query's text and re-embeds it.
+- The model-stamp probe text is embedded at bootstrap, at every pass start and once by Link.

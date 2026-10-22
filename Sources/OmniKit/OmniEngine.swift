@@ -304,7 +304,10 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     private var _audioEncoder: OmniAudioEncoder?
     private var textEncoder: OmniTextEncoder {
         get { encoderLock.withLock { _textEncoder } }
-        set { encoderLock.withLock { _textEncoder = newValue } }
+        set {
+            encoderLock.withLock { _textEncoder = newValue }
+            clearQueryVectors()   // new weights, new vectors
+        }
     }
     private var imageEncoder: OmniImageEncoder? {
         get { encoderLock.withLock { _imageEncoder } }
@@ -643,6 +646,37 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         return result
     }
 
+    /// A preemption point INSIDE a low-priority hold, passed to the encoders as their `yieldPoint`.
+    /// The gate yields only between holds, so a query that arrives with no warning - a served or
+    /// linked search, which has no keystroke debounce to stamp `interactiveQueryActive` ahead -
+    /// waited out the whole hold in flight: a text flush or a 16-image call, measured 83 / 175 ms
+    /// p50 on an M3 Ultra (index.md, "The query that waited out the hold"). Here the holder drains
+    /// what it has in flight, hands the gate to the waiting query and takes it back after, so the
+    /// query runs exactly as it would between two holds. One lock read when nobody waits.
+    /// Hand-overs so far, under `cond` (QueryHandOverTests: the positive control that one happened).
+    nonisolated(unsafe) static var handOvers = 0
+
+    private func yieldToWaitingQuery(_ drain: () -> Void) {
+        Self.cond.lock()
+        let waiting = Self.highWaiting > 0
+        Self.cond.unlock()
+        guard waiting else { return }
+        drain()
+        let t0 = Date()
+        Self.cond.lock()
+        Self.handOvers += 1
+        Self.busy = false
+        Self.holderThread = nil
+        if let o = Self.holderBoost { pthread_override_qos_class_end_np(o); Self.holderBoost = nil }
+        Self.cond.broadcast()
+        while Self.busy || Self.highWaiting > 0 { Self.cond.wait() }
+        Self.busy = true
+        Self.holderThread = pthread_self()
+        Self.cond.unlock()
+        // The enclosing run() books the whole hold as GPU time; the handed-over stretch was not ours.
+        trimLock.withLock { gpuBusyAccum -= -t0.timeIntervalSinceNow }
+    }
+
     /// Cumulative wall time spent inside the serialized GPU gate (embeds, probes, projections).
     /// wall-time-of-pass minus this = time the GPU pipeline sat idle waiting on host work
     /// (decode, store writes, scheduling) - the occupancy measurement for indexing passes.
@@ -706,7 +740,65 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
 
     public func embedQuery(_ text: String) -> [Float] {
         markQuery()   // signal the indexer to shrink/split its forwards while the user is searching
-        return run(highPriority: true) { textEncoder.encode(text, as: .query) }
+        if let v = cachedQueryVector(text) { return v }
+        // Remembered under the gate, so a weight recovery (which swaps the encoder under it too)
+        // can never be followed by a vector from the weights it replaced.
+        return run(highPriority: true) {
+            let v = textEncoder.encode(text, as: .query)
+            rememberQueryVector(text, v, since: encoderGeneration)
+            return v
+        }
+    }
+
+    // MARK: - Query vectors, kept
+
+    /// A text query's vector depends only on its text and the weights, so the engine keeps the last
+    /// 256 and every caller shares them: the window's re-runs (history, a filter change), served
+    /// searches (an agent paging with `offset` sends the same text again), a linked Mac asking
+    /// again. A hit takes neither the gate nor the GPU, and while indexing runs the gate is most of
+    /// a query's wait (index.md, "The query that waited out the hold"). Moved here from AppModel,
+    /// which kept the window's own and did not see the rest; cleared when the text encoder is
+    /// swapped (weight recovery), and a model reload builds a new engine.
+    private let queryVectorLock = NSLock()
+    private var queryVectors: [String: [Float]] = [:]
+    private var queryVectorOrder: [String] = []
+    private var _encoderGeneration = 0
+    private static let queryVectorCap = 256
+
+    /// Bumped by every text-encoder swap. A caller that embeds outside `embedQuery` (the fused
+    /// query graph) reads it first and passes it to `rememberQueryVector`.
+    public var encoderGeneration: Int { queryVectorLock.withLock { _encoderGeneration } }
+
+    public func cachedQueryVector(_ text: String) -> [Float]? {
+        queryVectorLock.withLock {
+            guard let v = queryVectors[text] else { return nil }
+            // LRU: a re-run query moves to the back, so hot queries outlive 256 one-off searches.
+            if let i = queryVectorOrder.lastIndex(of: text), i != queryVectorOrder.count - 1 {
+                queryVectorOrder.remove(at: i)
+                queryVectorOrder.append(text)
+            }
+            return v
+        }
+    }
+
+    /// Kept only if no encoder swap happened since `generation` was read.
+    public func rememberQueryVector(_ text: String, _ v: [Float], since generation: Int) {
+        guard !v.isEmpty else { return }
+        queryVectorLock.withLock {
+            guard generation == _encoderGeneration else { return }
+            if queryVectors[text] == nil {
+                queryVectorOrder.append(text)
+                if queryVectorOrder.count > Self.queryVectorCap { queryVectors[queryVectorOrder.removeFirst()] = nil }
+            }
+            queryVectors[text] = v
+        }
+    }
+
+    private func clearQueryVectors() {
+        queryVectorLock.withLock {
+            queryVectors.removeAll(); queryVectorOrder.removeAll()
+            _encoderGeneration += 1
+        }
     }
 
     /// Warm the text query + indexing forward Metal kernels and the compiled B==1 whole-forward query
@@ -836,7 +928,8 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                 while i < batches.count {
                     let lo = i, hi = Swift.min(i + window, batches.count)
                     out.append(contentsOf: run(highPriority: false) {
-                        let r = textEncoder.encodeTokenBatchesPipelined(count: hi - lo) { slots.take(lo + $0) }
+                        let r = textEncoder.encodeTokenBatchesPipelined(count: hi - lo, provider: { slots.take(lo + $0) },
+                                                                        yieldPoint: yieldToWaitingQuery)
                         addTokens(textEncoder.lastSequenceLength)
                         return r
                     })
@@ -845,7 +938,8 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                 return out
             }
             return run(highPriority: false) {
-                let v = textEncoder.encodeTokenBatchesPipelined(count: batches.count) { slots.take($0) }
+                let v = textEncoder.encodeTokenBatchesPipelined(count: batches.count, provider: { slots.take($0) },
+                                                                yieldPoint: yieldToWaitingQuery)
                 addTokens(textEncoder.lastSequenceLength)
                 return v
             }
@@ -886,7 +980,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                 while i < tokenized.count {
                     let group = Array(tokenized[i ..< Swift.min(i + window, tokenized.count)])
                     out.append(contentsOf: run(highPriority: false) {
-                        let r = textEncoder.encodeTokenBatchesPipelined(group)
+                        let r = textEncoder.encodeTokenBatchesPipelined(group, yieldPoint: yieldToWaitingQuery)
                         addTokens(textEncoder.lastSequenceLength)
                         return r
                     })
@@ -896,7 +990,8 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             }
         }
         return run(highPriority: type == .query) {
-            let v = textEncoder.encodeTokenBatchesPipelined(tokenized)
+            let v = type == .query ? textEncoder.encodeTokenBatchesPipelined(tokenized)
+                                   : textEncoder.encodeTokenBatchesPipelined(tokenized, yieldPoint: yieldToWaitingQuery)
             if type != .query { addTokens(textEncoder.lastSequenceLength) }
             return v
         }
@@ -1012,7 +1107,8 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         for group in groups {
             let r = run(highPriority: false) { () -> ([[Float]], [[Float]]?) in
                 let inputs: [OmniImageEncoder.Preprocessed] = group.map { (pixelValues: $0.tensor(), gridTHW: $0.gridTHW) }
-                let r = enc.encode(images: inputs, prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger)
+                let r = enc.encode(images: inputs, prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger,
+                                   yieldPoint: yieldToWaitingQuery)
                 addTokens(enc.lastSequenceLength)
                 return r
             }
@@ -1138,7 +1234,8 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             // Build tensors on the GPU thread (MLXArray is not Sendable, so it can't cross the
             // decode boundary). Then one batched encode.
             let inputs: [OmniImageEncoder.Preprocessed] = raws.map { (pixelValues: $0.tensor(), gridTHW: $0.gridTHW) }
-            let v = enc.encode(images: inputs, prefixIds: docPrefix, suffixIds: mediaSuffix)
+            let v = enc.encode(images: inputs, prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: nil,
+                               yieldPoint: yieldToWaitingQuery).vecs
             addTokens(enc.lastSequenceLength)
             return v
         }

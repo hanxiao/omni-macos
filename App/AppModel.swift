@@ -1732,12 +1732,8 @@ final class AppModel {
     /// mode would vanish the moment it was used. Maintained in `applyParsedQuery`, the single door
     /// every query change goes through, so no view has to re-parse to lay itself out.
     private(set) var rawQueryHasQualifiers = false
-    /// Query-side embedding cache. A query vector depends only on the text + model, never on the
-    /// (changing) document index, so caching lets a repeated / history / bookmark search skip the GPU
-    /// embed entirely - instant, and crucially GPU-free while indexing runs. Cleared on model reload.
-    private var queryEmbedCache: [String: [Float]] = [:]
-    private var queryEmbedOrder: [String] = []          // insertion order for a small LRU cap
-    private let queryEmbedCap = 256
+    // Text query vectors are kept by the engine (OmniEngine.cachedQueryVector), shared with served
+    // and linked searches.
     /// File-as-query embed cache (path + mtime + mode keyed). A re-run file query (history click,
     /// re-pick of the same file) otherwise re-decodes and re-embeds the file every time - up to
     /// seconds for a video/PDF. The mtime in the key makes edits invalidate naturally. Small cap:
@@ -4008,24 +4004,9 @@ final class AppModel {
 
     // MARK: - Query-side embedding cache
 
-    private func cacheQueryVector(_ q: String, _ v: [Float]) {
-        if queryEmbedCache[q] == nil {
-            queryEmbedOrder.append(q)
-            if queryEmbedOrder.count > queryEmbedCap { queryEmbedCache[queryEmbedOrder.removeFirst()] = nil }
-        }
-        queryEmbedCache[q] = v
-    }
-    /// LRU touch: a re-run query (history click, re-typed search) moves to the back of the eviction
-    /// order so hot queries survive 256 one-off searches. Without this the cache was FIFO.
-    private func touchQueryVector(_ q: String) {
-        if let i = queryEmbedOrder.lastIndex(of: q), i != queryEmbedOrder.count - 1 {
-            queryEmbedOrder.remove(at: i)
-            queryEmbedOrder.append(q)
-        }
-    }
-    /// Cleared whenever the model is (re)loaded, since the vectors are model-specific.
+    /// Cleared whenever the model is (re)loaded, since the vectors are model-specific. Text query
+    /// vectors need no clearing here: they live in the engine a reload replaces.
     func clearQueryEmbedCache() {
-        queryEmbedCache.removeAll(); queryEmbedOrder.removeAll()
         fileQueryEmbedCache.removeAll(); fileQueryEmbedOrder.removeAll()
     }
 
@@ -6695,8 +6676,7 @@ final class AppModel {
         // Linked Macs search in parallel with this one, each on its own index and GPU.
         fanOutRemote(text: q, vector: nil, filter: filter, token: token)
         // Cached query vector: skip the GPU embed entirely (instant, and no contention with indexing).
-        if let cached = queryEmbedCache[q] {
-            touchQueryVector(q)   // LRU: a re-run query shouldn't be first in line for eviction
+        if let cached = engine.cachedQueryVector(q) {
             searchWorkTask = Task.detached(priority: .userInitiated) {
                 if Task.isCancelled { return }   // superseded before the scan started: skip it
                 let hits = store.search(cached, filter: filter, topK: Self.searchTopK, textQuery: q)
@@ -6718,10 +6698,12 @@ final class AppModel {
             let vec: [Float]
             let hits: [SearchHit]
             let tSearch = omniPerfEnabled ? Date() : nil
+            let generation = engine.encoderGeneration
             if let g = engine.queryVectorGraph(q) {
                 if let tSearch { omniPerfLog(String(format: "search query-graph %.0fms", -tSearch.timeIntervalSinceNow * 1000)) }
                 if Task.isCancelled { return }
                 (hits, vec) = store.search(queryGraph: g, filter: filter, topK: Self.searchTopK, textQuery: q)
+                engine.rememberQueryVector(q, vec, since: generation)
             } else {
                 vec = engine.embedQuery(q)   // high priority: jumps ahead of indexing
                 if Task.isCancelled { return }   // superseded while embedding: don't run the store scan
@@ -6730,7 +6712,6 @@ final class AppModel {
             if let tSearch { omniPerfLog(String(format: "search total=%.0fms indexing=%@ hits=%d", -tSearch.timeIntervalSinceNow * 1000, indexingNow ? "YES" : "no", hits.count)) }
             await MainActor.run {
                 guard token == self.searchToken else { return }
-                self.cacheQueryVector(q, vec)
                 self.lastQueryVector = vec
                 self.applyResults(hits, resolved: q)
                 self.searching = false

@@ -1,4 +1,6 @@
+import CoreGraphics
 import Foundation
+import ImageIO
 import MLX
 import OmniKit
 
@@ -131,5 +133,92 @@ enum KernelAB {
         _ = engine.embedAudioMelBatch(mels, frames: frames)
         print(String(format: "audiomem: %d clips, %d frames: resident %d MB, peak during embed +%d MB",
                      mels.count, frames.reduce(0, +), base >> 20, (MLX.Memory.peakMemory - base) >> 20))
+    }
+
+    /// How long a query waits for the GPU while indexing runs, the way the app issues it:
+    /// omni-verify querylat <modelDir> <imageDir> [samples]
+    /// "typed" stamps interactive 180 ms ahead (the search box's debounce) and evaluates the fused
+    /// query graph; "served" is ServingBackend's plain embedQuery with no lead. Before each sample
+    /// the interactive window is ended and the indexer gets 0.3-0.8 s to return to full holds, so
+    /// every sample is the FIRST query of a burst - the one that waits.
+    static func queryLatency(modelDir: URL, imageDir: URL, samples: Int) async throws {
+        let engine = try await OmniEngine.loadValidated(modelDir: modelDir, keepVision: true, keepAudio: false)
+        measureQueryWait(engine, imageDir: imageDir, samples: samples)
+    }
+
+    static func measureQueryWait(_ engine: OmniEngine, imageDir: URL, samples: Int) {
+        engine.warmText()
+        let words = "the quarterly report shows revenue growth across every region while costs held steady and the board approved a new plan for hiring engineers in Berlin Tokyo and Austin next year".split(separator: " ").map(String.init)
+        var rng = SystemRandomNumberGenerator()
+        func passage(_ n: Int) -> String { (0 ..< n).map { _ in words.randomElement(using: &rng)! }.joined(separator: " ") }
+        let batches: [[String]] = (0 ..< 6).map { _ in (0 ..< 8).map { _ in passage(380) } }
+        let files = ((try? FileManager.default.contentsOfDirectory(at: imageDir, includingPropertiesForKeys: nil)) ?? []).sorted { $0.path < $1.path }
+        var raws: [OmniVisionPreprocess.RawPatches] = []
+        for f in files.prefix(16) {
+            guard let src = CGImageSourceCreateWithURL(f as CFURL, nil),
+                  let im = CGImageSourceCreateImageAtIndex(src, 0, nil) else { continue }
+            raws.append(OmniVisionPreprocess.preprocessRaw(im))
+        }
+        let queries = ["receipts from the dentist", "photo of a red car", "tax form 2025", "Rechnung Stromanbieter",
+                       "meeting notes about hiring", "beach sunset", "contract renewal clause", "how to reset the router"]
+        for mode in ["idle", "text", "image"] {
+            let stop = Flag(), done = DispatchSemaphore(value: 0)
+            let holds = Counter()
+            if mode != "idle" {
+                Thread.detachNewThread {
+                    while !stop.isOn {
+                        if mode == "text" { _ = engine.embedTextBatches(batches, as: .passage) } else { _ = engine.embedImages(raws) }
+                        holds.add()
+                    }
+                    done.signal()
+                }
+                Thread.sleep(forTimeInterval: 2)
+            }
+            var typed: [Double] = [], served: [Double] = [], ungated: [Double] = []
+            let tiny = MLXRandom.normal([256, 256]); eval(tiny)
+            for i in 0 ..< samples {
+                // Floor for ANY GPU work that skips the gate (the store's scan does): a tiny op
+                // queued behind whatever command buffers the holder has in flight.
+                if i % 3 == 0 {
+                    Thread.sleep(forTimeInterval: Double.random(in: 0.05 ... 0.3))
+                    let t0 = Date(); eval(matmul(tiny, tiny)); ungated.append(-t0.timeIntervalSinceNow * 1000)
+                }
+                engine.endInteractive()
+                Thread.sleep(forTimeInterval: Double.random(in: 0.3 ... 0.8))
+                let q = queries[i % queries.count] + " \(i)"   // unique: the engine keeps repeated queries
+                if i % 2 == 0 {
+                    engine.noteInteractive()
+                    Thread.sleep(forTimeInterval: 0.18)
+                    let t0 = Date()
+                    if let g = engine.queryVectorGraph(q) { eval(g) } else { _ = engine.embedQuery(q) }
+                    typed.append(-t0.timeIntervalSinceNow * 1000)
+                } else {
+                    let t0 = Date()
+                    _ = engine.embedQuery(q)
+                    served.append(-t0.timeIntervalSinceNow * 1000)
+                }
+            }
+            stop.turnOn()
+            if mode != "idle" { done.wait() }
+            for (arm, x) in [("typed", typed), ("served", served), ("ungated", ungated)] {
+                let s = x.sorted()
+                func pct(_ p: Double) -> Double { s[min(s.count - 1, Int(Double(s.count) * p))] }
+                print(String(format: "%-6@ %-7@ n=%3d  p50 %7.1f  p90 %7.1f  p99 %7.1f  max %7.1f ms",
+                             mode as NSString, arm as NSString, s.count, pct(0.5), pct(0.9), pct(0.99), s.last ?? .nan))
+            }
+            if mode != "idle" { print("       background forwards completed: \(holds.value)") }
+        }
+    }
+
+    final class Counter: @unchecked Sendable {
+        private let lock = NSLock(); private var n = 0
+        var value: Int { lock.withLock { n } }
+        func add() { lock.withLock { n += 1 } }
+    }
+
+    final class Flag: @unchecked Sendable {
+        private let lock = NSLock(); private var on = false
+        var isOn: Bool { lock.withLock { on } }
+        func turnOn() { lock.withLock { on = true } }
     }
 }

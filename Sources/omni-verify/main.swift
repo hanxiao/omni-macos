@@ -7880,6 +7880,20 @@ if args.count >= 2 && args[1] == "projab" {
                          inter: args.count >= 5 ? (Int(args[4]) ?? 3072) : 3072)
     exit(0)
 }
+// Nano's query encoder on the Neural Engine against the GPU path: see ANEQuery.
+if args.count >= 5 && args[1] == "anequery" {
+    if #available(macOS 15.0, *) {
+        try await ANEQuery.run(modelDir: URL(fileURLWithPath: args[2]), packages: URL(fileURLWithPath: args[3]),
+                               imageDir: URL(fileURLWithPath: args[4]))
+    }
+    exit(0)
+}
+// Query wait while indexing runs: see KernelAB.queryLatency.
+if args.count >= 4 && args[1] == "querylat" {
+    try await KernelAB.queryLatency(modelDir: URL(fileURLWithPath: args[2]), imageDir: URL(fileURLWithPath: args[3]),
+                                    samples: args.count >= 5 ? (Int(args[4]) ?? 60) : 60)
+    exit(0)
+}
 // One vision attention block piece by piece: see KernelAB.towerOps.
 if args.count >= 2 && args[1] == "towerops" {
     KernelAB.towerOps(windows: args.count >= 3 ? (Int(args[2]) ?? 8) : 8, win: args.count >= 4 ? (Int(args[3]) ?? 1024) : 1024,

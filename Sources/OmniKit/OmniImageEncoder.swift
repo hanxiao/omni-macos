@@ -75,8 +75,11 @@ public final class OmniImageEncoder: @unchecked Sendable {
     /// label matrix INSIDE the same per-chunk eval (the hidden states are already computed for
     /// pooling; tagging adds one matmul + reduce per image, no extra forward). `tagScores[i]` is
     /// the raw [2V] score vector for input i (see OmniTagger.finalize), nil array when no tagger.
+    /// `yieldPoint` runs between chunks, when nothing is in flight (each chunk evaluates before the
+    /// next is built): see OmniTextEncoder.encodeTokenBatchesPipelined.
     public func encode(images inputs: [Preprocessed], prefixIds: [Int] = [], suffixIds: [Int] = [],
-                       tagger: OmniTagger?) -> (vecs: [[Float]], tagScores: [[Float]]?) {
+                       tagger: OmniTagger?,
+                       yieldPoint: (_ drain: () -> Void) -> Void = { _ in }) -> (vecs: [[Float]], tagScores: [[Float]]?) {
         if inputs.isEmpty { lastSequenceLength = 0; return ([], tagger == nil ? nil : []) }
         var out: [[Float]] = []
         out.reserveCapacity(inputs.count)
@@ -84,6 +87,7 @@ public final class OmniImageEncoder: @unchecked Sendable {
         var seqTotal = 0
         var i = 0
         while i < inputs.count {
+            if i > 0 { yieldPoint {} }
             // Greedily fill a chunk up to the patch budget (always take >=1 to make progress).
             var j = i
             var packed = 0
@@ -94,7 +98,8 @@ public final class OmniImageEncoder: @unchecked Sendable {
                 j += 1
             }
             let chunk = Array(inputs[i ..< j])
-            let (vecs, chunkScores, seq) = encodeChunk(chunk, prefixIds: prefixIds, suffixIds: suffixIds, tagger: tagger)
+            let (vecs, chunkScores, seq) = encodeChunk(chunk, prefixIds: prefixIds, suffixIds: suffixIds, tagger: tagger,
+                                                       yieldPoint: yieldPoint)
             out.append(contentsOf: vecs)
             if let chunkScores { scores.append(contentsOf: chunkScores) }
             seqTotal += seq
@@ -110,7 +115,8 @@ public final class OmniImageEncoder: @unchecked Sendable {
     /// scored against the label matrix as part of the SAME eval; the [2V] score rows come back
     /// alongside the vectors.
     private func encodeChunk(_ inputs: [Preprocessed], prefixIds: [Int], suffixIds: [Int],
-                             tagger: OmniTagger? = nil) -> (vecs: [[Float]], tagScores: [[Float]]?, seqTotal: Int) {
+                             tagger: OmniTagger? = nil,
+                             yieldPoint: (_ drain: () -> Void) -> Void = { _ in }) -> (vecs: [[Float]], tagScores: [[Float]]?, seqTotal: Int) {
         // Pack pixel values + grids for a single block-diagonal tower forward.
         let packedPixels = inputs.count == 1 ? inputs[0].pixelValues
             : MLX.concatenated(inputs.map { $0.pixelValues }, axis: 0)
@@ -121,6 +127,7 @@ public final class OmniImageEncoder: @unchecked Sendable {
         // Realize the (packed) tower features before the backbone runs. This frees the tower's large
         // packed activations before the backbone allocates its own - bounding peak memory per chunk.
         eval(perImage)
+        yieldPoint {}   // the tower's output is resident: a waiting query can have the GPU here
         if let tT, let tBuilt {
             let toks = perImage.reduce(0) { $0 + $1.dim(0) }
             print(String(format: "[media] tower(%d imgs, %d toks) build=%.1fms eval=%.1fms", inputs.count, toks,

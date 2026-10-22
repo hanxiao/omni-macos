@@ -80,7 +80,7 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (854 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (857 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|delfolders|
@@ -126,6 +126,10 @@ codebase were already measured there, and many were rejected.
 - Kernel probes (index.md, "The kernel review"): `omni-verify towerops [windows] [win] [heads] [dim]`
   (one vision attention block piece by piece), `projab [M] [hidden] [inter]` (backbone projections
   separate vs fused), `audiomem <model> <audioDir>` (MLX peak of a batched audio embed).
+- Query wait under indexing (index.md, "The query that waited out the hold"): `omni-verify querylat
+  <nano> <imageDir> [samples]` - typed and served queries during text and image holds. Current: served
+  p50/p90 36/52 ms (text), 31/98 ms (images). The Neural Engine query encoder: `Tools/ane/
+  build_nano_query.py`, then `omni-verify anequery <nano> <dir> <imageDir>` (placement, parity, load).
 - Model-free probes for MLX regressions: `ocr-verify x --probe-qmm | --probe-gather |
   --probe-rowexact [--causal-sweep]`. Re-run them on any MLX or toolchain change.
 
@@ -229,6 +233,10 @@ codebase were already measured there, and many were rejected.
   parameter is an ObjC block or DispatchSource handler not marked Sendable, on its first nested
   stdlib closure otherwise. Callback types called off-main are `@Sendable`, or the closure is built
   in a `nonisolated` helper (makeFolderWatch). Unit tests do not run watchers or drops; the app does.
+- A QUERY WITH NO WARNING WAITS OUT THE WHOLE HOLD unless the holder hands over. The gate yields
+  between holds; a served or linked search has no keystroke debounce to make the indexer carve ahead,
+  and waited 83 / 175 ms p50 behind a text flush / an image call. A long low-priority hold passes
+  `yieldToWaitingQuery` to its encoder as `yieldPoint`, called where nothing is in flight.
 - NEVER RUN ONE COMPILED GRAPH IN BOTH fp16 AND bf16. MLX 0.31.1 names a compiled kernel by kind
   and byte size, so both are "f2" and the second type runs the first's kernel: NaN or cosine 0.35,
   silently, across different closures of the same shape too (mlx#3427, fixed in core 0.31.2). The
@@ -252,7 +260,8 @@ codebase were already measured there, and many were rejected.
   under load, passages (the text a hit matched), the agent surface (filters, paging, read_file),
   the text on scanned pages and the metadata migration not done, the index that paused itself
   (refused arguments, structuredContent measured and not turned on), the kernel review (fp16
-  vision tower, batched image backbone, the RoPE kernel; fusion and audio measured and not done).
+  vision tower, batched image backbone, the RoPE kernel; fusion and audio measured and not done),
+  the query that waited out the hold (hand-over, the engine's query cache, the ANE query encoder).
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
   and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names, Shortcuts, Siri and Services (App Intents).

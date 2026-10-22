@@ -138,8 +138,9 @@ public final class OmniTextEncoder: @unchecked Sendable {
     /// method as one logical embed, so the serialization contract is unchanged.
     ///
     /// Falls back to a plain per-batch loop when the flag is off.
-    public func encodeTokenBatchesPipelined(_ batches: [[[Int]]]) -> [[[Float]]] {
-        encodeTokenBatchesPipelined(count: batches.count) { batches[$0] }
+    public func encodeTokenBatchesPipelined(_ batches: [[[Int]]],
+                                            yieldPoint: (_ drain: () -> Void) -> Void = { _ in }) -> [[[Float]]] {
+        encodeTokenBatchesPipelined(count: batches.count, provider: { batches[$0] }, yieldPoint: yieldPoint)
     }
 
     /// Pipelined encode pulling batch i's ids from `provider` right before its graph is built,
@@ -148,11 +149,19 @@ public final class OmniTextEncoder: @unchecked Sendable {
     /// per index, in order, on this thread; it may block until that batch's ids are ready. The
     /// array overload above routes through here with an immediate provider, so both forms build
     /// the identical graph per batch - vectors are bit-identical either way.
-    public func encodeTokenBatchesPipelined(count: Int, provider: (Int) -> [[Int]]) -> [[[Float]]] {
+    ///
+    /// `yieldPoint` runs before every batch after the first, with a `drain` that reads back the
+    /// batch in flight: a caller holding the GPU gate uses it to hand the GPU to a waiting query
+    /// with nothing of its own outstanding (OmniEngine.yieldToWaitingQuery). Same graphs either way.
+    public func encodeTokenBatchesPipelined(count: Int, provider: (Int) -> [[Int]],
+                                            yieldPoint: (_ drain: () -> Void) -> Void = { _ in }) -> [[[Float]]] {
         if count == 0 { return [] }
         if !Self.asyncEvalEnabled {
             var total = 0
-            let out = (0 ..< count).map { i -> [[Float]] in let v = encodeTokenBatch(provider(i)); total += lastSequenceLength; return v }
+            let out = (0 ..< count).map { i -> [[Float]] in
+                if i > 0 { yieldPoint {} }
+                let v = encodeTokenBatch(provider(i)); total += lastSequenceLength; return v
+            }
             lastSequenceLength = total
             return out
         }
@@ -160,6 +169,14 @@ public final class OmniTextEncoder: @unchecked Sendable {
         var pending: (stacked: MLXArray, count: Int, index: Int)? = nil
         var total = 0
         for i in 0 ..< count {
+            if i > 0 {
+                yieldPoint {
+                    if let prev = pending {
+                        results[prev.index] = backbone.poolBatchReadout(prev.stacked, count: prev.count)
+                        pending = nil
+                    }
+                }
+            }
             let ids = provider(i)
             if ids.isEmpty { results[i] = []; continue }
             let (embeds, lengths) = backbone.embedBatch(ids)
