@@ -11,8 +11,9 @@ reshape-to-(H, D, L) attention falls off the ANE:
   - RMSNorm without an fp16 overflow: the l2 norm of x/64, then rescaled (LayerNorm of [x, -x],
     ANEMLL's form, measured the same: median cosine 0.99903 to fp32 either way);
   - inputs are the embedded tokens (the host gathers rows from the app's own table), an additive
-    key mask (1, L, 1, 1) and a one-hot pick (1, 1, 1, L) for the last real token. Output is the
-    final-normed pooled hidden (1, C, 1, 1); the host L2-normalizes in fp32.
+    key mask (B, L, 1, 1) and a one-hot pick (B, 1, 1, L) for each last real token. Output is the
+    final-normed pooled hidden (B, C, 1, 1); the host L2-normalizes in fp32. --batch B > 1 is the
+    indexing shape: B passages a call.
 Weights: `omni-verify dumpbackbone` with OMNI_BACKBONE_DTYPE=fp16 (the app's merged tensors).
   uv run --python 3.12 --with coremltools --with mlx Tools/ane/build_nano_query.py <weights> --out <dir>
 then `omni-verify anequery <nano> <dir> <imageDir>` (index.md, "The query that waited out the hold").
@@ -51,7 +52,7 @@ def rotate_half_matrix():
     return P
 
 
-def build(W, L):
+def build(W, L, B=1):
     f32 = {k: np.array(v.astype(mx.float32), copy=False) for k, v in W.items()}
     P = rotate_half_matrix()
     cq, sq = rope_tables(L, HDIM ** -0.5)
@@ -63,9 +64,9 @@ def build(W, L):
     def nw(name):
         return f32[name].astype(np.float16).reshape(1, HID, 1, 1)
 
-    @mb.program(input_specs=[mb.TensorSpec(shape=(1, HID, 1, L), dtype=types.fp16),
-                             mb.TensorSpec(shape=(1, L, 1, 1), dtype=types.fp16),
-                             mb.TensorSpec(shape=(1, 1, 1, L), dtype=types.fp16)],
+    @mb.program(input_specs=[mb.TensorSpec(shape=(B, HID, 1, L), dtype=types.fp16),
+                             mb.TensorSpec(shape=(B, L, 1, 1), dtype=types.fp16),
+                             mb.TensorSpec(shape=(B, 1, 1, L), dtype=types.fp16)],
                 opset_version=ct.target.macOS15)
     def prog(x, mask, pick):
         def rms(t, wname, tag):
@@ -89,7 +90,7 @@ def build(W, L):
                        name=f"{t}_kr")
             v = mb.conv(x=xn, weight=cw(f32[p + "self_attn.v_proj.weight"]), name=f"{t}_v")
             qs = mb.split(x=q, num_splits=HEADS, axis=1, name=f"{t}_qsplit")
-            kT = mb.transpose(x=k, perm=[0, 3, 2, 1], name=f"{t}_kT")                 # (1, L, 1, C)
+            kT = mb.transpose(x=k, perm=[0, 3, 2, 1], name=f"{t}_kT")                 # (B, L, 1, C)
             ks = mb.split(x=kT, num_splits=HEADS, axis=3, name=f"{t}_ksplit")
             vs = mb.split(x=v, num_splits=HEADS, axis=1, name=f"{t}_vsplit")
             outs = []
@@ -118,12 +119,13 @@ def build(W, L):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("weights"); ap.add_argument("--lengths", default="16,32,64"); ap.add_argument("--out", required=True)
+    ap.add_argument("--batch", type=int, default=1, help="sequences per call (indexing shapes)")
     ap.add_argument("--precision", default="fp16", help="fp32: the same program in fp32, a maths check on the CPU")
     a = ap.parse_args()
     PRECISION = a.precision
     W = mx.load(a.weights)
     for L in map(int, a.lengths.split(",")):
-        m = build(W, L)
-        path = f"{a.out}/nano_query_L{L}.mlpackage"
+        m = build(W, L, a.batch)
+        path = f"{a.out}/nano_query_L{L}.mlpackage" if a.batch == 1 else f"{a.out}/nano_L{L}_B{a.batch}.mlpackage"
         m.save(path)
         print("saved", path)

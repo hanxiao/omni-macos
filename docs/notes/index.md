@@ -2215,15 +2215,53 @@ mlx.fast arena are decode-side (speculation, continuous batching, KV compression
 M5), with nothing for a prefill-only encoder; laya-apple is the lead taken above. MLX core 0.32.4
 (2026-10-14) is not in an mlx-swift release yet.
 
-REPEATED WORK FOUND AND NOT DONE (read from the code; how often each happens is not measured):
-- A media file whose bytes change but whose pixels or samples do not (an EXIF or ID3 edit, a re-mux,
-  Photos bumping `modificationDate`) re-embeds in full: the key is a SHA-256 of every byte, and
-  `ChunkKey.media(payload:)`, a key on the decoded payload, exists but nothing calls it.
-- The retag pass re-embeds the whole file (`forceFreshEmbed` turns off dedup and chunk reuse),
-  including a video's soundtrack windows, when only the image forward's patches are needed.
-- `PDFPagePick` embeds up to 24 pages per selected PDF hit and keeps nothing.
-- Chunk rows are deleted with their last reference, so content that comes back re-embeds.
-- Passage windows are cut at 200 (MCP), 220 (window) and 400 (`search_inline`) characters, so
-  their window vectors are never shared.
-- A linked Mac in the same space receives the query's text and re-embeds it.
-- The model-stamp probe text is embedded at bootstrap, at every pass start and once by Link.
+## Repeated work, done (2026-10-22, Han's plan)
+
+Seven places the model ran twice for the same input, found by reading the code (how often each
+happens in the field is not measured). Each fix has a test that fails without it.
+
+- THE RE-TAG DROPPED TEXT, A SHIPPED BUG. The backfill and Generate Tags re-embed a picture for its
+  tags with dedup off (forceFreshEmbed + hqMediaTags), and with dedup off no content key was
+  computed - and the screen-text lane reads a file's text under that key. So a re-tagged
+  screenshot or scanned PDF LOST ITS TEXT ("[]" after, three lines before), and the enrichment
+  ledger already counted the file done: every screenshot the lazy backfill touched (any that
+  showed up in a search) stopped being findable by its text. It also re-embedded a video's
+  soundtrack, a forward a minute. Now a re-tag of a file unchanged since indexing (the stored
+  modification time and size, which the crawl trusts) keeps its text and soundtrack rows
+  (`retagStoredExtras`); a long medium's turns write over their own rows only and keep them in
+  place. A scan decodes as kind text but stores its pages as scan: the extras are the text and
+  audio rows, not "other kinds than the item's". EnrichmentTests and ScanTextTests (short and
+  45-page) fail on HEAD. A batch that gives way to a search re-queues only its unfinished files.
+- MEDIA IS KEYED BY WHAT THE MODEL SEES. A still's rows carry the hash of its preprocessed patches
+  and an audio window's the hash of its mel (`imagePayloadKey`, `audioPayloadKey`), so a change of
+  bytes that leaves them alone - an EXIF or XMP edit, rewritten ID3/LIST tags, a re-muxed
+  soundtrack - reuses: a still gets its stored rows back at decode (tags and screen text with
+  them), an audio window its vector in the stream. The hash runs on the parallel decode stage:
+  10.3 ms for the largest still the tower takes (31.5 MB of patches), 2.1 ms for a typical one.
+  Image indexing interleaved against HEAD: camera-size JPEGs 8.7-9.0 vs 8.8-8.9/s, small images
+  21.0-21.3 vs 20.5-21.2/s. Rows stored before this keep their vector-hash keys until re-embedded
+  once. NOT DONE: video frames (a re-muxed video embeds its frames again; its soundtrack is reused).
+- CONTENT THAT COMES BACK IS NOT EMBEDDED AGAIN. A content whose last file goes took its vector
+  with it, so a file restored from the Trash, a branch switched back or an edit undone went through
+  the model again. The store now keeps the vectors of what it releases (`released`, 16 MB in
+  memory, about 10,000 vectors at 768 dimensions), with a picture's tags and its file's name (an
+  untagged picture's snippet is its name and must not return under another). Text chunks, audio
+  windows and stills read it before embedding. Not in the database: coverage, the free list and
+  the refcounts all hold that a content no file points at is gone. Cleared on a wipe, gone at
+  relaunch. Taking a folder, a kind or an extension out keeps nothing, and a large delete keeps at
+  most 16 MB: copying every released vector made the 2.35M-file folder delete 478 s -> 548 s.
+  `mutbench --crud` on fresh clones of the 9.7M-row bench index, back to back against HEAD: 2,000
+  files in batches of 200 6.48 vs 6.42 s, 20,000 in 2,000s 26.07 vs 25.03 s, the 2.35M-file folder
+  530.6 vs 526.4 s; search latency the same, every audit clean. (The folder delete holds ONE
+  search ~125 s on HEAD too, max 120-130 s in every run: pre-existing, not looked into here.)
+- PDF PAGE PICK keeps its page vectors in the engine's window cache (WindowVectors): a second pick
+  of the same PDF embeds nothing. NOT DONE: a short PDF cut by page still embeds its neighbours on
+  the first pick.
+- LINKED MACS: a text query carries the vector this Mac already holds (the engine's query cache)
+  to a Mac in the same space that says it uses both (`Space.fusesText`, absent from older Macs,
+  which keep getting text only).
+- PASSAGE WIDTH: MCP's default 200 -> 220, the window's (`Indexer.defaultSnippetLength`), so the two
+  surfaces cut the same windows and share their vectors. `search_inline` keeps 400, its own reading
+  width.
+- THE MODEL-STAMP PROBE is embedded once per encoder (`vectorSpaceProbe`): bootstrap, every pass
+  and each Link connect asked for it, and Link kept a copy an encoder swap never cleared.

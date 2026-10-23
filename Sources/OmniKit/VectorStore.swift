@@ -3461,7 +3461,11 @@ public final class VectorStore: @unchecked Sendable {
             flat16.withUnsafeBufferPointer { buf in
                 guard buf.count >= slotCount * wantDim else { return }
                 for key in keys where !key.isEmpty && out[key] == nil {
-                    guard let slot = liveSlotForContentLocked(StoreSchema.hexToBytes(key)) else { continue }
+                    let keyBytes = StoreSchema.hexToBytes(key)
+                    guard let slot = liveSlotForContentLocked(keyBytes) else {
+                        if let r = released[keyBytes], r.vec.count == wantDim { out[key] = r.vec.map(Self.fromBF16) }
+                        continue
+                    }
                     let base = Int(slot) * wantDim
                     guard slot >= 0, base >= 0, base + wantDim <= buf.count else { continue }
                     var v = [Float](repeating: 0, count: wantDim)
@@ -3608,7 +3612,7 @@ public final class VectorStore: @unchecked Sendable {
     public func deletePaths(_ paths: Set<String>) {
         guard !paths.isEmpty else { return }
         // Sorted, so a slice is mostly neighbours: their rows share B-tree pages.
-        deleteFilesInSlices(.paths(paths.sorted()))
+        deleteFilesInSlices(.paths(paths.sorted()), keepReleased: true)
     }
 
     /// Queue time one slice of a bulk write aims at. Long enough that a slice's fixed costs stay
@@ -3639,7 +3643,13 @@ public final class VectorStore: @unchecked Sendable {
     /// most of its cost: 0.38 ms a row cold against 0.032 ms warm, same rows (index.md, "Heavy CRUD
     /// review"). The PageWarmer reads the same pages on its own connection first, so the slice that
     /// holds the queue finds them in memory.
-    private func deleteFilesInSlices(_ source: BulkSource) {
+    /// `keepReleased`: whether what the delete orphans may be kept (`released`) - for files that
+    /// went (a watcher's deletes, a prune), not for a folder, a kind or an extension taken out. A
+    /// call keeps at most one cache's worth, so a large delete pays for 16 MB of copies, not for
+    /// every vector it drops (a 2.35M-file folder delete: 478 s -> 548 s when every slice copied).
+    private func deleteFilesInSlices(_ source: BulkSource, keepReleased: Bool) {
+        queue.sync { releaseBudget = keepReleased ? Self.releasedCap : 0 }
+        defer { queue.sync { releaseBudget = nil } }
         var at = 0
         var budget = Self.bulkSliceRowsOverride ?? 512
         while at < source.count {
@@ -3982,7 +3992,7 @@ public final class VectorStore: @unchecked Sendable {
         // Re-checked per slice by the plain byte prefix, which can only be stricter than the
         // resolver's: a file it declines is left to the single transaction, never deleted wrongly.
         let prefix = Array((folder.hasSuffix("/") ? folder : folder + "/").utf8)
-        deleteFilesInSlices(.ids(ids) { p in p == folder || p.utf8.starts(with: prefix) })
+        deleteFilesInSlices(.ids(ids) { p in p == folder || p.utf8.starts(with: prefix) }, keepReleased: false)
         // BEHIND THE GATE like the slices: it runs right after them, which is when the Checkpointer
         // is most likely restarting the log, and outside the gate its BEGIN waited out that restart
         // on the store queue - 819 ms, a search behind it.
@@ -4041,7 +4051,7 @@ public final class VectorStore: @unchecked Sendable {
         // rows" refusal. Found exactly that way: 48 vectors live, the index accounting for 36.
         // THROUGH THE ONE REMOVAL, not a second spelling of it: refs recounted, positions
         // returned to the free list, snippet and staged vector dropped with the content.
-        dropSplitWhereLocked(fileIDs: "SELECT id FROM temp.victims")
+        dropSplitWhereLocked(fileIDs: "SELECT id FROM temp.victims", keepReleased: false)
         // THE v4 BLOB DELETE IS NOT A NO-OP ON A SPLIT INDEX, IT IS A WRONG ONE. Under the
         // split `pending_vecs` is keyed on the content, and this names v4 row ids - two
         // spaces that overlap numerically, so the statement does not miss, it deletes some
@@ -4104,7 +4114,7 @@ public final class VectorStore: @unchecked Sendable {
         for _ in 0 ..< 4 {
             let ids = liveFileIDs { _, kind in set.contains(kind) }
             guard !ids.isEmpty else { return }
-            deleteFilesInSlices(.ids(ids) { _ in true })
+            deleteFilesInSlices(.ids(ids) { _ in true }, keepReleased: false)
         }
     }
 
@@ -4118,7 +4128,7 @@ public final class VectorStore: @unchecked Sendable {
         for _ in 0 ..< 4 {
             let ids = liveFileIDs { [self] f, _ in lower.contains(filePaths.lowercasedExtension(f)) }
             guard !ids.isEmpty else { return }
-            deleteFilesInSlices(.ids(ids, keep: off))
+            deleteFilesInSlices(.ids(ids, keep: off), keepReleased: false)
         }
     }
 
@@ -4147,6 +4157,7 @@ public final class VectorStore: @unchecked Sendable {
             guard dbOpen() else { return }
             beginTxnLocked()
             for t in StoreSchema.allTables { exec("DELETE FROM \(t);") }   // every row is an orphan now
+            forgetReleasedLocked()
             bumpGenLocked()
             exec("COMMIT;")
             // Release the backing buffers (a wipe will not refill to the same size immediately),
@@ -6441,6 +6452,11 @@ public final class VectorStore: @unchecked Sendable {
 
     /// A file's stored chunks with their vectors, as they are now (nil: not indexed). What an
     /// enrichment keeps of a file - its picture, its frames - instead of embedding them again.
+    /// Whether the index holds this path at all: the in-memory path table, no SQL.
+    public func hasIndexedFile(_ path: String) -> Bool {
+        queue.sync { filePaths.id(path) != nil }
+    }
+
     public func storedChunks(path: String) -> [IndexedChunk]? {
         guard let f = storedFiles(paths: [path])[path] else { return nil }
         return queue.sync { dbOpen() ? chunksForCurrentPathLocked(path, modified: f.modified) : nil }
@@ -15784,13 +15800,18 @@ public final class VectorStore: @unchecked Sendable {
     /// contents they orphaned kept `refs > 0` for ever, their positions were never released,
     /// and `chunk` / `chunk_snippet` grew rows that nothing could reach. Silent, and only visible
     /// as a vector file that stops shrinking.
-    func dropSplitWhereLocked(fileIDs: String) {
+    /// `keepReleased: false` for a folder's removal: the user took a source away, not content on
+    /// the move, and copying millions of vectors to keep the last 16 MB of them is work for nothing.
+    func dropSplitWhereLocked(fileIDs: String, keepReleased: Bool = true) {
         guard splitBuilt, dbOpen() else { return }
         exec("CREATE TEMP TABLE IF NOT EXISTS split_aff(chunk_id INTEGER PRIMARY KEY);")
         exec("DELETE FROM split_aff;")
         exec("INSERT OR IGNORE INTO split_aff SELECT chunk_id FROM occurrence WHERE file_id IN (\(fileIDs));")
+        if keepReleased {
+            namePicturesLocked("SELECT o.chunk_id, f.name FROM occurrence o JOIN files f ON f.id = o.file_id WHERE o.file_id IN (\(fileIDs))")
+        }
         exec("DELETE FROM occurrence WHERE file_id IN (\(fileIDs));")
-        dropOrphanedContentsLocked()
+        dropOrphanedContentsLocked(keepReleased: keepReleased)
     }
 
     /// Whatever the pointer removal just orphaned: recount, release the position, drop the payload.
@@ -15799,7 +15820,7 @@ public final class VectorStore: @unchecked Sendable {
     /// split, so a content nobody points at any more is also a staged vector nobody will ever
     /// cover - and coverage counts the staged blobs against the contents that owe one, so one
     /// left behind makes that identity fail and the claim stops advancing for good.
-    private func dropOrphanedContentsLocked() {
+    private func dropOrphanedContentsLocked(keepReleased: Bool = true) {
         exec("""
             UPDATE chunk SET refs = (SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = chunk.id)
              WHERE id IN (SELECT chunk_id FROM split_aff);
@@ -15810,9 +15831,105 @@ public final class VectorStore: @unchecked Sendable {
         // 6.55M-content index: 0.32 s per file against under 1 ms, same rows changed. A still-shared
         // content leaves the temp list by one primary-key probe each.
         exec("DELETE FROM split_aff WHERE (SELECT refs FROM chunk WHERE id = split_aff.chunk_id) > 0;")
+        if keepReleased { keepReleasedLocked() }
         exec("DELETE FROM chunk_snippet WHERE chunk_id IN (SELECT chunk_id FROM split_aff);")
         exec("DELETE FROM pending_vecs WHERE chunk_id IN (SELECT chunk_id FROM split_aff);")
         exec("DELETE FROM chunk WHERE id IN (SELECT chunk_id FROM split_aff) AND refs = 0;")
+    }
+
+    // MARK: - Released contents
+
+    /// CONTENT THAT LEAVES THE INDEX IS KEPT A WHILE. A content whose last file went - deleted, a
+    /// branch switched away, an edit that replaced it - took its vector with it, and the same
+    /// content coming back (the branch switched back, the file restored from the Trash, the edit
+    /// undone) went through the model again. The vectors of the last 16 MB of released contents
+    /// (about 10,000 at 768 dimensions) are kept here by key, in memory, and the lookups that reuse
+    /// a vector before embedding read them: `vectorsForContentKeys` (text chunks, audio windows) and
+    /// `releasedPicture` (a still, with its tags). Not in the database: coverage, the free list and
+    /// the refcounts all hold that a content no file points at is gone. Gone at relaunch and on
+    /// a wipe, which is when the vectors could belong to other weights.
+    private var released: [Data: (vec: [UInt16], snippet: String?, name: String?)] = [:]
+    private var releasedOrder: [Data] = []
+    private var releasedHead = 0
+    private var releasedBytes = 0
+    static let releasedCap = 16 << 20
+    /// Media contents about to lose their last file, by id, with that file's name: a picture whose
+    /// snippet is its own name (no tags yet) must not come back under another file's name.
+    private var releasingNames: [Int64: String] = [:]
+    /// Bytes a bulk delete may still keep (deleteFilesInSlices); nil outside one.
+    private var releaseBudget: Int?
+
+    private func namePicturesLocked(_ select: String) {
+        releasingNames.removeAll(keepingCapacity: true)
+        if releaseBudget == 0 { return }
+        let media = ["image", "scan", "video"].compactMap { kindID[$0] }.map(String.init).joined(separator: ",")
+        guard !media.isEmpty else { return }
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "SELECT x.chunk_id, x.name FROM (\(select)) x JOIN chunk c ON c.id = x.chunk_id WHERE c.kind IN (\(media));",
+                                 -1, &stmt, nil) == SQLITE_OK else { return }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let t = sqlite3_column_text(stmt, 1) { releasingNames[sqlite3_column_int64(stmt, 0)] = String(cString: t) }
+        }
+    }
+
+    /// The contents `split_aff` now names (refs 0, positions not yet reused): their vectors, read
+    /// where they still sit, and their snippets.
+    private func keepReleasedLocked() {
+        defer { releasingNames.removeAll(keepingCapacity: true) }
+        let d = dim
+        guard d > 0, releaseBudget != 0 else { return }
+        // A release larger than the whole cache keeps nothing: which of it would survive is
+        // arbitrary, and reading all of it is the cost of a bulk delete paid for nothing.
+        var count: OpaquePointer?
+        defer { sqlite3_finalize(count) }
+        guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM split_aff;", -1, &count, nil) == SQLITE_OK,
+              sqlite3_step(count) == SQLITE_ROW, Int(sqlite3_column_int64(count, 0)) * d * 2 <= Self.releasedCap else { return }
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, """
+            SELECT c.id, c.key, c.slot, (SELECT snippet FROM chunk_snippet s WHERE s.chunk_id = c.id LIMIT 1)
+              FROM chunk c WHERE c.id IN (SELECT chunk_id FROM split_aff) AND c.refs = 0 AND c.slot >= 0;
+            """, -1, &stmt, nil) == SQLITE_OK else { return }
+        flat16.withUnsafeBufferPointer { buf in
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let n = Int(sqlite3_column_bytes(stmt, 1))
+                guard n > 0, let kb = sqlite3_column_blob(stmt, 1) else { continue }
+                let slot = Int(sqlite3_column_int(stmt, 2))
+                guard slot >= 0, (slot + 1) * d <= buf.count else { continue }
+                let key = Data(bytes: kb, count: n)
+                guard released[key] == nil else { continue }
+                let snippet = sqlite3_column_text(stmt, 3).map { String(cString: $0) }
+                released[key] = (Array(buf[slot * d ..< (slot + 1) * d]), snippet, releasingNames[sqlite3_column_int64(stmt, 0)])
+                releasedOrder.append(key)
+                releasedBytes += d * 2 + (snippet?.utf8.count ?? 0)
+                if let b = releaseBudget { releaseBudget = max(0, b - d * 2) }
+            }
+        }
+        while releasedBytes > Self.releasedCap, releasedHead < releasedOrder.count {
+            if let r = released.removeValue(forKey: releasedOrder[releasedHead]) { releasedBytes -= r.vec.count * 2 + (r.snippet?.utf8.count ?? 0) }
+            releasedHead += 1
+        }
+        if releasedHead > 4096, releasedHead * 2 > releasedOrder.count { releasedOrder.removeFirst(releasedHead); releasedHead = 0 }
+    }
+
+    private func forgetReleasedLocked() {
+        released.removeAll(); releasedOrder.removeAll(); releasedHead = 0; releasedBytes = 0
+    }
+
+    /// A still that left the index and has come back (by its payload key): its vector, and its
+    /// snippet when that is its tags or names this same file. nil when it is not kept.
+    public func releasedPicture(key: String, name: String, dim wantDim: Int) -> (vector: [Float], snippet: String?)? {
+        queue.sync {
+            guard let r = released[StoreSchema.hexToBytes(key)], r.vec.count == wantDim, wantDim == dim else { return nil }
+            let v = r.vec.map(Self.fromBF16)
+            guard v.allSatisfy({ $0.isFinite }) else { return nil }
+            // Its own name as the snippet means no tags: keep it only for a file of that name.
+            if let s = r.snippet, let was = r.name, OmniTagger.nameDerivedSnippet(s, path: was) {
+                return (v, was == name ? s : nil)
+            }
+            return (v, r.snippet)
+        }
     }
 
     /// DROP `chunk_text` AND `chunks`, WHICH IS THE POINT OF THE WHOLE EXERCISE.

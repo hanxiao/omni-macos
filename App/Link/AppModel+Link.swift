@@ -37,10 +37,14 @@ extension AppModel {
         guard !targets.isEmpty else { return }
         let folders = linkedScope?.folder.map { [$0] }
         for peer in targets {
-            if vector != nil, link.mixable[peer.id] != true { continue }
+            let mixable = link.mixable[peer.id] == true
+            if text == nil, !mixable { continue }   // a file's vector means nothing in another space
+            // A text query's vector rides beside the text to a Mac in the same space that fuses the
+            // two, which then embeds nothing; any other Mac embeds the text with its own model.
+            let v = mixable && (text == nil || link.fusesText[peer.id] == true) ? vector : nil
             var excludeHere: [String]? = nil
             if let e = exclude, let (p, path) = RemotePath.parse(e), p == peer.id { excludeHere = [path] }
-            let req = LinkWire.SearchRequest(query: vector == nil ? text : nil, vector: vector,
+            let req = LinkWire.SearchRequest(query: text, vector: v,
                                              filter: LinkWire.Filter(filter, folders: folders),
                                              topK: Self.searchTopK, exclude: excludeHere)
             launchRemote(peer.id, token: token) { [link] in

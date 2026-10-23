@@ -210,6 +210,29 @@ enum KernelAB {
         }
     }
 
+    /// Index a folder of images end to end on a scratch store, the indexer's own pipeline:
+    /// omni-verify imgindex <modelDir> <imageDir>
+    static func imageIndex(modelDir: URL, dir: URL) async throws {
+        let engine = try await OmniEngine.loadValidated(modelDir: modelDir, keepVision: true, keepAudio: false)
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("imgidx-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        let store = try VectorStore(dbURL: tmp.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let idx = Indexer(store: store, embedder: engine)
+        let t0 = Date()
+        let n: Int = await withCheckedContinuation { cont in
+            let lock = NSLock(); var fired = false
+            idx.index(roots: [dir], settings: IndexSettings(enabledKinds: [.image]), force: true) { p in
+                guard p.done else { return }
+                lock.lock(); let go = !fired; fired = true; lock.unlock()
+                if go { cont.resume(returning: p.embedded) }
+            }
+        }
+        let s = -t0.timeIntervalSinceNow
+        print(String(format: "IMGINDEX %d images in %.2fs => %.1f images/s", n, s, Double(n) / s))
+    }
+
     final class Counter: @unchecked Sendable {
         private let lock = NSLock(); private var n = 0
         var value: Int { lock.withLock { n } }

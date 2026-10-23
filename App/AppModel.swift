@@ -489,12 +489,14 @@ final class AppModel {
     private func pickPage(for path: String, then: @escaping @MainActor () -> Void) {
         guard path.lowercased().hasSuffix(".pdf"), !RemotePath.isRemote(path), let h = searchHit(for: path),
               h.locator.hasPrefix("Page "), let store, let engine, let qv = lastQueryVector else { then(); return }
+        let pageVectors = passageRecovery?.windowVectors
         if pagePickToken != resultsToken { pagePickToken = resultsToken; pagePicked = [] }
         guard pagePicked.insert(path).inserted else { then(); return }
         let token = resultsToken
         Task.detached(priority: .userInitiated) { [weak self] in
             let page = FileExtractor.isDataless(path) ? nil
-                : PDFPagePick.page(path: path, chunkIndex: h.chunkIndex, locator: h.locator, query: qv, store: store, embedder: engine)
+                : PDFPagePick.page(path: path, chunkIndex: h.chunkIndex, locator: h.locator, query: qv, store: store,
+                                   embedder: engine, cache: pageVectors)
             await MainActor.run {
                 if let self, let page, self.resultsToken == token,
                    let i = self.rawResults.firstIndex(where: { $0.path == path }), self.rawResults[i].locator != "Page \(page)" {
@@ -4890,7 +4892,7 @@ final class AppModel {
                                                variant: String, settings: IndexSettings) async -> Bool {
         await Task.detached(priority: .userInitiated) { () -> Bool in
             guard store.count > 0, !fp.isEmpty else { return false }
-            let probe = engine.embedText(vectorSpaceProbeText, as: .passage)
+            let probe = engine.vectorSpaceProbe(vectorSpaceProbeText)
             func adopt(_ why: String) -> Bool {
                 store.metaSet(vectorSpaceProbeKey, encodeProbe(probe))
                 store.metaSet("embedding_version", fp)
@@ -6669,14 +6671,16 @@ final class AppModel {
         if linkedScope != nil {
             pendingResolved = q
             localHits = []; localLanded = true
-            fanOutRemote(text: q, vector: nil, filter: filter, token: token)
+            fanOutRemote(text: q, vector: engine.cachedQueryVector(q), filter: filter, token: token)
             if remoteInFlight.isEmpty { searching = false; applyScopedResults() }   // that Mac is offline
             return
         }
-        // Linked Macs search in parallel with this one, each on its own index and GPU.
-        fanOutRemote(text: q, vector: nil, filter: filter, token: token)
+        // Linked Macs search in parallel with this one, each on its own index and GPU; one in the
+        // same space gets the vector too when this Mac already holds it.
+        let cached = engine.cachedQueryVector(q)
+        fanOutRemote(text: q, vector: cached, filter: filter, token: token)
         // Cached query vector: skip the GPU embed entirely (instant, and no contention with indexing).
-        if let cached = engine.cachedQueryVector(q) {
+        if let cached {
             searchWorkTask = Task.detached(priority: .userInitiated) {
                 if Task.isCancelled { return }   // superseded before the scan started: skip it
                 let hits = store.search(cached, filter: filter, topK: Self.searchTopK, textQuery: q)
@@ -7275,7 +7279,7 @@ final class AppModel {
             // The weights' own signature beside the stamp; see vectorSpaceDiffers.
             if let probeEngine {
                 store.metaSet(Self.vectorSpaceProbeKey,
-                              Self.encodeProbe(probeEngine.embedText(Self.vectorSpaceProbeText, as: .passage)))
+                              Self.encodeProbe(probeEngine.vectorSpaceProbe(Self.vectorSpaceProbeText)))
             }
             // Coalesce UI updates by wall-clock time. onProgress fires per ~10 scanned files;
             // on a fast crawl of a large index that floods the main actor (thousands of observed-property
@@ -7668,17 +7672,24 @@ final class AppModel {
         runsOutstanding += 1
         Task.detached(priority: .utility) {
             indexer.update(paths: batch, settings: s, force: true, roots: rootPaths)
+            // Which of the lazily queued files got their tags before any cancel: a picture's row
+            // whose snippet no longer comes from its name. An explicit request had tags already,
+            // so only its own completion could tell; it goes back whole.
+            let tagged = Set(batch.filter { p in
+                !batchExplicit.contains(p) && (store.storedChunks(path: p)?.first.map { !OmniTagger.nameDerivedSnippet($0.snippet, path: p) } ?? false)
+            })
             await MainActor.run {
                 self.runsOutstanding -= 1
                 self.fsReconcileInFlight = false
                 self.tagBackfillActive = false
                 if self.tagBackfillYieldedToSearch {
-                    // The batch was cancelled to give a search the GPU: put its files back at
-                    // the front (some may re-embed once - idle-time cost, correctness unchanged)
-                    // and let the post-search enqueue path re-arm the kick.
+                    // The batch was cancelled to give a search the GPU: put back at the front the
+                    // files it had not finished (the ones it did are tagged and stay done), and
+                    // let the post-search enqueue path re-arm the kick.
                     self.tagBackfillYieldedToSearch = false
+                    let unfinished = batch.filter { !tagged.contains($0) }
                     self.pendingRetag.removeAll { batch.contains($0) }
-                    self.pendingRetag.insert(contentsOf: batch, at: 0)
+                    self.pendingRetag.insert(contentsOf: unfinished, at: 0)
                     // Still the user's request, not the lazy kind.
                     if !batchExplicit.isEmpty {
                         self.explicitRetag.formUnion(batchExplicit)

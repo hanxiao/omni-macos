@@ -143,6 +143,54 @@ final class EnrichmentTests: XCTestCase {
         XCTAssertEqual(v.filter { $0.kind == "audio" }.map(\.locator), ["0:00", "1:00", "2:00"], "one soundtrack chunk a minute")
     }
 
+    /// RE-TAGGING A FILE (the backfill and Generate Tags: forceFreshEmbed + hqMediaTags) re-runs the
+    /// picture's forward for its tags and nothing else: a screenshot keeps its screen text and a video
+    /// its soundtrack windows, neither embedded again, when the file is unchanged since indexing.
+    func testRetagKeepsScreenTextAndSoundtrackWithoutEmbeddingThem() throws {
+        let shot = try screenshot(["Booking confirmed", "Confirmation code: K7Q2LM", "Seat 32A"], name: "Screenshot 2026-09-20 at 21.15.40.png")
+        let film = try video(seconds: 130, name: "talk.mp4")
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        final class Counting: Embedder, @unchecked Sendable {
+            let inner = Fake()
+            var dim: Int { inner.dim }
+            var audio = 0, texts = 0, pictures = 0
+            func embedText(_ text: String, as type: OmniInputType) -> [Float] { texts += 1; return inner.embedText(text, as: type) }
+            func embedTextBatch(_ t: [String], as type: OmniInputType) -> [[Float]] { texts += t.count; return inner.embedTextBatch(t, as: type) }
+            func embedImage(_ image: CGImage) -> [Float]? { pictures += 1; return inner.embedImage(image) }
+            func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? { pictures += raws.count; return inner.embedImages(raws) }
+            func embedVideoFrames(_ frames: [CGImage]) -> [Float]? { pictures += 1; return inner.embedVideoFrames(frames) }
+            func embedAudio(_ url: URL) -> [Float]? { audio += 1; return inner.embedAudio(url) }
+            func embedAudioMel(_ mel: [Float], frames: Int) -> [Float]? { audio += 1; return inner.embedAudioMel(mel, frames: frames) }
+            func embedAudioMelBatch(_ mels: [[Float]], frames: [Int]) -> [[Float]]? { audio += mels.count; return inner.embedAudioMelBatch(mels, frames: frames) }
+        }
+        let embedder = Counting()
+        let indexer = Indexer(store: store, embedder: embedder)
+        pass(indexer, IndexSettings())
+        let shotBefore = try XCTUnwrap(store.storedChunks(path: shot.path))
+        let filmBefore = try XCTUnwrap(store.storedChunks(path: film.path))
+        XCTAssertFalse(shotBefore.filter { $0.kind == "text" }.isEmpty, "no screen text indexed; the test proves nothing")
+        XCTAssertEqual(filmBefore.filter { $0.kind == "audio" }.count, 3, "no soundtrack indexed; the test proves nothing")
+        XCTAssertGreaterThanOrEqual(embedder.audio, 3)
+
+        var retag = IndexSettings()
+        retag.forceFreshEmbed = true
+        retag.hqMediaTags = true
+        let (audio0, texts0, pictures0) = (embedder.audio, embedder.texts, embedder.pictures)
+        indexer.resetCancelled()
+        indexer.update(paths: [shot.path, film.path], settings: retag, force: true, roots: [root.path])
+        XCTAssertGreaterThan(embedder.pictures, pictures0, "the retag ran no picture forward")
+
+        let shotAfter = try XCTUnwrap(store.storedChunks(path: shot.path))
+        let filmAfter = try XCTUnwrap(store.storedChunks(path: film.path))
+        XCTAssertEqual(shotAfter.filter { $0.kind == "text" }.map(\.snippet), shotBefore.filter { $0.kind == "text" }.map(\.snippet),
+                       "the retag lost or changed the screenshot's text")
+        XCTAssertEqual(filmAfter.filter { $0.kind == "audio" }.map(\.embedding), filmBefore.filter { $0.kind == "audio" }.map(\.embedding),
+                       "the retag lost or changed the soundtrack")
+        XCTAssertEqual(embedder.audio, audio0, "the retag embedded the soundtrack again")
+        XCTAssertEqual(embedder.texts, texts0, "the retag embedded the screen text again")
+    }
+
     /// An index built with neither, then enriched: pictures and frames kept as they were, the
     /// rest added, the ledger done - and a second enrichment of the same files changes nothing.
     func testEnrichmentAddsWhatIsMissingOnceAndKeepsWhatWasThere() throws {

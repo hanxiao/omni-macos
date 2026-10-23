@@ -58,18 +58,12 @@ final class LinkResponder: LinkService, @unchecked Sendable {
         let (engine, _, model) = try backend()
         let probe = try await offPool { LinkResponder.probe(engine) }
         let files = await MainActor.run { AppModel.shared?.indexedFiles ?? 0 }
-        return try .json(LinkWire.Space(dim: engine.dim, probe: probe, model: model, files: files))
+        return try .json(LinkWire.Space(dim: engine.dim, probe: probe, model: model, files: files, fusesText: true))
     }
 
-    nonisolated(unsafe) private static var probes: [ObjectIdentifier: [Float]] = [:]
-    private static let probeLock = NSLock()
-    /// Cached per engine: the probe is one forward pass, asked for at every connect.
+    /// The engine keeps it: one forward per encoder, shared with the model stamp.
     static func probe(_ engine: OmniEngine) -> [Float] {
-        let key = ObjectIdentifier(engine)
-        if let p = probeLock.withLock({ probes[key] }) { return p }
-        let p = engine.embedText(AppModel.vectorSpaceProbeText, as: .passage)
-        probeLock.withLock { probes[key] = p }
-        return p
+        engine.vectorSpaceProbe(AppModel.vectorSpaceProbeText)
     }
 
     /// One search per linked Mac at a time, and the newest wins: a Mac typing "b", "be", "bea" must
@@ -86,13 +80,18 @@ final class LinkResponder: LinkService, @unchecked Sendable {
         let exclude = Set(req.exclude ?? [])
         let t0 = DispatchTime.now().uptimeNanoseconds
         let hits: [SearchHit] = try await offPool {
+            let q = req.query.flatMap { $0.isEmpty ? nil : $0 }
             if let v = req.vector {
                 guard v.count == engine.dim else { throw LinkError.refused("Not from this Mac's model.") }
-                return store.search(v, filter: filter, topK: topK + exclude.count)
+                return store.search(v, filter: filter, topK: topK + exclude.count, textQuery: q)
             }
-            guard let q = req.query, !q.isEmpty else { return [] }
+            guard let q else { return [] }
+            if let v = engine.cachedQueryVector(q) { return store.search(v, filter: filter, topK: topK, textQuery: q) }
+            let generation = engine.encoderGeneration
             if let g = engine.queryVectorGraph(q) {
-                return store.search(queryGraph: g, filter: filter, topK: topK, textQuery: q).0
+                let (hits, v) = store.search(queryGraph: g, filter: filter, topK: topK, textQuery: q)
+                engine.rememberQueryVector(q, v, since: generation)
+                return hits
             }
             return store.search(engine.embedQuery(q), filter: filter, topK: topK, textQuery: q)
         }

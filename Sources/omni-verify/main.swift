@@ -7880,6 +7880,14 @@ if args.count >= 2 && args[1] == "projab" {
                          inter: args.count >= 5 ? (Int(args[4]) ?? 3072) : 3072)
     exit(0)
 }
+// Indexing on the Neural Engine against the GPU, fixed time (for powerlog): see ANEQuery.indexBench.
+if args.count >= 6 && args[1] == "anebench" {
+    if #available(macOS 15.0, *) {
+        try await ANEQuery.indexBench(modelDir: URL(fileURLWithPath: args[2]), package: URL(fileURLWithPath: args[3]), arm: args[4],
+                                      seconds: Double(args[5]) ?? 10, streams: args.count >= 7 ? (Int(args[6]) ?? 1) : 1)
+    }
+    exit(0)
+}
 // Nano's query encoder on the Neural Engine against the GPU path: see ANEQuery.
 if args.count >= 5 && args[1] == "anequery" {
     if #available(macOS 15.0, *) {
@@ -7892,6 +7900,11 @@ if args.count >= 5 && args[1] == "anequery" {
 if args.count >= 4 && args[1] == "querylat" {
     try await KernelAB.queryLatency(modelDir: URL(fileURLWithPath: args[2]), imageDir: URL(fileURLWithPath: args[3]),
                                     samples: args.count >= 5 ? (Int(args[4]) ?? 60) : 60)
+    exit(0)
+}
+// Image indexing end to end: see KernelAB.imageIndex.
+if args.count >= 4 && args[1] == "imgindex" {
+    try await KernelAB.imageIndex(modelDir: URL(fileURLWithPath: args[2]), dir: URL(fileURLWithPath: args[3]))
     exit(0)
 }
 // One vision attention block piece by piece: see KernelAB.towerOps.

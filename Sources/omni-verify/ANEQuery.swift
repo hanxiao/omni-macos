@@ -189,4 +189,80 @@ enum ANEQuery {
         }
         return out
     }
+
+    /// Indexing on the Neural Engine against the GPU, the same token ids through each for a fixed
+    /// time, so `powerlog -- omni-verify anebench ...` reads the energy of exactly that work:
+    ///   omni-verify anebench <nanoModelDir> <nano_L{L}_B{B}.mlpackage> gpu|ane <seconds> [streams]
+    /// `streams` > 1 runs that many ANE models at once (an M3 Ultra has two Neural Engines).
+    static func indexBench(modelDir: URL, package: URL, arm: String, seconds: Double, streams: Int) async throws {
+        let cfg = try OmniConfig(modelDir: modelDir)
+        let ws = try WeightStore(modelDir: modelDir, loraScale: cfg.loraScale, keepVision: false, keepAudio: false)
+        let enc = try await OmniTextEncoder(modelDir: modelDir, weights: ws, config: cfg)
+        guard let table = ws.weights["language_model.embed_tokens.weight"] else { return }
+        let name = package.deletingPathExtension().lastPathComponent              // nano_L512_B8
+        let parts = name.split(separator: "_")
+        guard parts.count >= 3, let L = Int(parts[1].dropFirst()), let B = Int(parts[2].dropFirst()) else { print("name the package nano_L<L>_B<B>"); return }
+        let C = cfg.text.hiddenSize, vocab = table.dim(0)
+        var rng = SystemRandomNumberGenerator()
+        let batches: [[[Int]]] = (0 ..< 8).map { _ in (0 ..< B).map { _ in (0 ..< L).map { _ in Int.random(in: 1000 ..< vocab - 1000, using: &rng) } } }
+        let compiled = try await MLModel.compileModel(at: package)
+        try runIndexBench(enc: enc, table: table, C: C, L: L, B: B, batches: batches, compiled: compiled, arm: arm, seconds: seconds, streams: streams)
+    }
+
+    static func runIndexBench(enc: OmniTextEncoder, table: MLXArray, C: Int, L: Int, B: Int, batches: [[[Int]]],
+                              compiled: URL, arm: String, seconds: Double, streams: Int) throws {
+        if arm == "gpu" {
+            for b in batches.prefix(2) { _ = enc.encodeTokenBatchesPipelined([b]) }
+            let t0 = Date(); var n = 0
+            while -t0.timeIntervalSinceNow < seconds {
+                _ = enc.encodeTokenBatchesPipelined(batches)   // the indexing call: pipelined batches
+                n += batches.count
+            }
+            let s = -t0.timeIntervalSinceNow
+            print(String(format: "ANEBENCH gpu L%d B%d: %d tokens in %.2fs => %.0f tok/s", L, B, n * B * L, s, Double(n * B * L) / s))
+            return
+        }
+        let raw = table.asData(access: .noCopyIfContiguous)
+        func rowValue(_ id: Int, _ c: Int) -> Float16 {
+            raw.data.withUnsafeBytes { b in
+                switch raw.dType {
+                case .bfloat16: return Float16(Float(bitPattern: UInt32(b.load(fromByteOffset: (id * C + c) * 2, as: UInt16.self)) << 16))
+                case .float16: return b.load(fromByteOffset: (id * C + c) * 2, as: Float16.self)
+                default: return Float16(b.load(fromByteOffset: (id * C + c) * 4, as: Float.self))
+                }
+            }
+        }
+        // Inputs built once per batch: the measurement is the Neural Engine, not the host fill.
+        var inputs: [MLDictionaryFeatureProvider] = []
+        for batch in batches {
+            let x = try MLMultiArray(shape: [NSNumber(value: B), NSNumber(value: C), 1, NSNumber(value: L)], dataType: .float16)
+            let mask = try MLMultiArray(shape: [NSNumber(value: B), NSNumber(value: L), 1, 1], dataType: .float16)
+            let pick = try MLMultiArray(shape: [NSNumber(value: B), 1, 1, NSNumber(value: L)], dataType: .float16)
+            let xs = x.strides.map(\.intValue), ps = pick.strides.map(\.intValue), ms = mask.strides.map(\.intValue)
+            x.withUnsafeMutableBufferPointer(ofType: Float16.self) { p, _ in
+                for (bi, ids) in batch.enumerated() { for c in 0 ..< C { for l in 0 ..< L { p[bi * xs[0] + c * xs[1] + l * xs[3]] = rowValue(ids[l], c) } } }
+            }
+            mask.withUnsafeMutableBufferPointer(ofType: Float16.self) { p, _ in for bi in 0 ..< B { for l in 0 ..< L { p[bi * ms[0] + l * ms[1]] = 0 } } }
+            pick.withUnsafeMutableBufferPointer(ofType: Float16.self) { p, _ in for bi in 0 ..< B { for l in 0 ..< L { p[bi * ps[0] + l * ps[3]] = l == L - 1 ? 1 : 0 } } }
+            inputs.append(try MLDictionaryFeatureProvider(dictionary: ["x": x, "mask": mask, "pick": pick]))
+        }
+        let cfgNE = MLModelConfiguration(); cfgNE.computeUnits = .cpuAndNeuralEngine
+        let models = try (0 ..< max(1, streams)).map { _ in try MLModel(contentsOf: compiled, configuration: cfgNE) }
+        for m in models { _ = try m.prediction(from: inputs[0]) }
+        let done = KernelAB.Counter(), group = DispatchGroup()
+        nonisolated(unsafe) let ins = inputs
+        let t0 = Date()
+        for m in models {
+            nonisolated(unsafe) let model = m
+            group.enter()
+            Thread.detachNewThread {
+                var i = 0
+                while -t0.timeIntervalSinceNow < seconds { _ = try? model.prediction(from: ins[i % ins.count]); done.add(); i += 1 }
+                group.leave()
+            }
+        }
+        group.wait()
+        let s = -t0.timeIntervalSinceNow, tokens = done.value * B * L
+        print(String(format: "ANEBENCH ane L%d B%d x%d: %d tokens in %.2fs => %.0f tok/s", L, B, models.count, tokens, s, Double(tokens) / s))
+    }
 }

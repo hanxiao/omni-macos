@@ -31,6 +31,9 @@ final class LinkController {
     /// Whether this Mac is in the same vector space as each linked Mac (nil until known). Same
     /// space: its hits mix into this Mac's list by score. Otherwise they are a group of their own.
     private(set) var mixable: [String: Bool] = [:]
+    /// Whether each linked Mac fuses a text query's vector with its text (`Space.fusesText`), so a
+    /// text search can carry the vector this Mac already holds instead of making it embed again.
+    private(set) var fusesText: [String: Bool] = [:]
     /// Each linked Mac's sources, as it last reported them.
     private(set) var sources: [String: [LinkWire.Source]] = [:]
     var incoming: IncomingPairing?
@@ -140,7 +143,7 @@ final class LinkController {
         if self.port != port { self.port = port }
         for id in wentOnline { learn(id) }
         let gone = Set(mixable.keys).subtracting(p.map(\.id))
-        for id in gone { mixable[id] = nil; sources[id] = nil; RemoteFiles.shared.forget(peer: id) }
+        for id in gone { mixable[id] = nil; fusesText[id] = nil; sources[id] = nil; RemoteFiles.shared.forget(peer: id) }
     }
 
     func state(_ id: String) -> LinkNode.PeerState { states[id] ?? .offline }
@@ -178,6 +181,7 @@ final class LinkController {
             same = dot / max((na * nb).squareRoot(), 1e-12) >= 0.999
         }
         if mixable[id] != same { mixable[id] = same }
+        if fusesText[id] != (sp.fusesText == true) { fusesText[id] = sp.fusesText == true }
         omniPerfLog("link \(id): space dim=\(sp.dim) model=\(sp.model) mixable=\(same)")
         onPeerReady?(id)
     }

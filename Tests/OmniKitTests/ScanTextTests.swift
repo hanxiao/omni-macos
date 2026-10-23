@@ -87,6 +87,33 @@ final class ScanTextTests: XCTestCase {
         XCTAssertEqual(chunks.filter { $0.kind == "text" && $0.snippet.contains("ALT-4471") }.map(\.locator), ["Page 43"])
     }
 
+    /// A RE-TAG of a scan (forceFreshEmbed + hqMediaTags) keeps its page text - short, and long
+    /// enough to take turns - without reading or embedding it again (Indexer.retagStoredExtras).
+    func testARetagKeepsAScansText() throws {
+        let short = scan([["Quarterly statement"], ["INVOICE INV-7731", "Total due 412.50 EUR"]], name: "short.pdf")
+        let pages = (1 ... 45).map { ["Ship log page \($0)", $0 == 43 ? "Spare part ALT-4471 ordered" : "Calm seas, steady wind"] }
+        let long = scan(pages, name: "log.pdf")
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let embedder = EnrichmentTests.Fake()
+        let indexer = Indexer(store: store, embedder: embedder)
+        pass(indexer, IndexSettings())
+        func text(_ f: URL) throws -> [String] {
+            try XCTUnwrap(store.storedChunks(path: f.path)).filter { $0.kind == "text" }.sorted { $0.chunkIndex < $1.chunkIndex }.map(\.snippet)
+        }
+        let shortBefore = try text(short), longBefore = try text(long)
+        XCTAssertTrue(shortBefore.joined().contains("INV-7731") && longBefore.joined().contains("ALT-4471"),
+                      "no page text indexed; the test proves nothing")
+        var retag = IndexSettings()
+        retag.forceFreshEmbed = true
+        retag.hqMediaTags = true
+        indexer.resetCancelled()
+        indexer.update(paths: [short.path, long.path], settings: retag, force: true, roots: [root.path])
+        XCTAssertEqual(try text(short), shortBefore, "the re-tag lost or changed the short scan's text")
+        XCTAssertEqual(try text(long), longBefore, "the re-tag lost or changed the long scan's text")
+        XCTAssertEqual(try XCTUnwrap(store.storedChunks(path: long.path)).filter { $0.kind == "scan" }.count, 45)
+    }
+
     /// A long scan arriving AFTER the enrichment has finished: no end-of-pass enrichment runs for
     /// it, so its text comes from the lane, queued when its last turn of pages is stored.
     func testALongScanAddedLaterGetsItsTextWithoutTheEnrichment() throws {

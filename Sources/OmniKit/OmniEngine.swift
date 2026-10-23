@@ -797,8 +797,22 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     private func clearQueryVectors() {
         queryVectorLock.withLock {
             queryVectors.removeAll(); queryVectorOrder.removeAll()
+            probeKept = nil
             _encoderGeneration += 1
         }
+    }
+
+    /// The model-stamp probe (AppModel.vectorSpaceProbeText) as a passage, embedded once per
+    /// encoder. Bootstrap's same-space check, every pass's stamp and each Link connect asked for it,
+    /// three identical forwards a launch, and Link kept its own copy that an encoder swap never
+    /// cleared.
+    private var probeKept: (text: String, vector: [Float])?
+    public func vectorSpaceProbe(_ text: String) -> [Float] {
+        let generation = encoderGeneration
+        if let k = queryVectorLock.withLock({ probeKept }), k.text == text { return k.vector }
+        let v = embedText(text, as: .passage)
+        queryVectorLock.withLock { if generation == _encoderGeneration, !v.isEmpty { probeKept = (text, v) } }
+        return v
     }
 
     /// Warm the text query + indexing forward Metal kernels and the compiled B==1 whole-forward query

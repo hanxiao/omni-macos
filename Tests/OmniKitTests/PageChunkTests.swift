@@ -81,6 +81,59 @@ final class PageChunkTests: XCTestCase {
         XCTAssertEqual(indexer.textsEmbedded.value, embeddedBefore, "relocation embedded text")
     }
 
+    /// Picking the page of a PDF hit embeds its pages once: a second pick, for the same hit or
+    /// another of the same PDF, reads them from the window vector cache (PDFPagePick's `cache`).
+    func testPagePickEmbedsAPageOnce() throws {
+        var r = FileManager.default.temporaryDirectory.appendingPathComponent("pick-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: r, withIntermediateDirectories: true)
+        if let rp = realpath(r.path, nil) { r = URL(fileURLWithPath: String(cString: rp), isDirectory: true); free(rp) }
+        let root = r
+        let db = root.deletingLastPathComponent().appendingPathComponent("pick-db-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: db, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root); try? FileManager.default.removeItem(at: db) }
+        let words = ["harbor", "engine", "fog", "sail", "anchor", "tide", "compass", "deck", "rope", "storm"]
+        let pages = [3000, 3000, 3000, 3000].enumerated().map { k, n in
+            var s = "", i = k
+            while s.count < n { s += words[i % words.count] + "\(k) "; i += 3 }
+            return s
+        }
+        let file = root.appendingPathComponent("log.pdf")
+        pdf(pages, at: file)
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        final class Counting: Embedder, @unchecked Sendable {
+            let inner = EnrichmentTests.Fake()
+            var dim: Int { inner.dim }
+            var texts = 0
+            func embedText(_ text: String, as type: OmniInputType) -> [Float] { texts += 1; return inner.embedText(text, as: type) }
+            func embedTextBatch(_ t: [String], as type: OmniInputType) -> [[Float]] { texts += t.count; return inner.embedTextBatch(t, as: type) }
+            func embedImage(_ image: CGImage) -> [Float]? { inner.embedImage(image) }
+            func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? { inner.embedImages(raws) }
+            func embedVideoFrames(_ frames: [CGImage]) -> [Float]? { inner.embedVideoFrames(frames) }
+            func embedAudio(_ url: URL) -> [Float]? { inner.embedAudio(url) }
+            func embedAudioMel(_ mel: [Float], frames: Int) -> [Float]? { inner.embedAudioMel(mel, frames: frames) }
+            func embedAudioMelBatch(_ mels: [[Float]], frames: [Int]) -> [[Float]]? { inner.embedAudioMelBatch(mels, frames: frames) }
+        }
+        let embedder = Counting()
+        let indexer = Indexer(store: store, embedder: embedder)
+        let done = expectation(description: "pass")
+        indexer.index(roots: [root], settings: IndexSettings()) { p in if p.done { done.fulfill() } }
+        wait(for: [done], timeout: 120)
+        let chunks = try XCTUnwrap(store.storedChunks(path: file.path)).sorted { $0.chunkIndex < $1.chunkIndex }
+        let mid = try XCTUnwrap(chunks.dropFirst().first { $0.chunkIndex < chunks.count - 1 }, "no middle chunk")
+        let cache = WindowVectors()
+        let query = embedder.inner.embedText(pages[2], as: .query)
+        let before = embedder.texts
+        let first = PDFPagePick.page(path: file.path, chunkIndex: mid.chunkIndex, locator: mid.locator, query: query,
+                                     store: store, embedder: embedder, cache: cache)
+        let embedded = embedder.texts - before
+        XCTAssertGreaterThan(embedded, 1, "the pick embedded no pages; the test proves nothing")
+        let second = PDFPagePick.page(path: file.path, chunkIndex: mid.chunkIndex, locator: mid.locator, query: query,
+                                      store: store, embedder: embedder, cache: cache)
+        XCTAssertEqual(second, first)
+        XCTAssertEqual(embedder.texts - before, embedded, "the second pick embedded pages again")
+    }
+
     /// A SHORT PDF OF SEVERAL PAGES IS CUT BY PAGE - each page its chunk, at its page - and an index
     /// that holds one as a single chunk (the cut before) gets its pages from the enrichment.
     func testAShortPDFIsCutByPageAndAnOlderOneIsRedone() throws {

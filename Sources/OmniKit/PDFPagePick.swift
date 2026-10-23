@@ -9,12 +9,15 @@ import PDFKit
 /// such PDFs page by page would fix it at the cost of 30% more chunks on real PDFs (more on slide
 /// decks). This spends the work when a hit is opened instead: the pages the chunk can be on -
 /// from the previous chunk's page to the next one's, or the whole document for a one-chunk PDF -
-/// are embedded as passages and the one closest to the query is the page. Nothing is stored and
-/// search does not change; a chunk on one page returns nil and opens as before.
+/// are embedded as passages and the one closest to the query is the page. Search does not change; a
+/// chunk on one page returns nil and opens as before. A page's vector depends only on its text, so
+/// `cache` (the engine's passage window vectors) keeps them: selecting another hit of the same PDF,
+/// or the same hit for another query, embeds nothing again.
 public enum PDFPagePick {
     /// The 1-based page to open, or nil when the chunk can only be on one page.
     public static func page(path: String, chunkIndex: Int, locator: String, query: [Float],
-                            store: VectorStore, embedder: any Embedder, maxPages: Int = 24) -> Int? {
+                            store: VectorStore, embedder: any Embedder, cache: WindowVectors? = nil,
+                            maxPages: Int = 24) -> Int? {
         guard path.lowercased().hasSuffix(".pdf"), let here = pageNumber(locator), !query.isEmpty,
               let doc = PDFDocument(url: URL(fileURLWithPath: path)), doc.pageCount > 1 else { return nil }
         let pages = store.chunkLocators(path: path).compactMapValues(pageNumber)
@@ -29,11 +32,17 @@ public enum PDFPagePick {
         let texts = span.map { n in autoreleasepool { String((doc.page(at: n - 1)?.string ?? "").prefix(4000)) } }
         let live = texts.indices.filter { !texts[$0].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard live.count > 1 else { return nil }
-        let vecs = embedder.embedTextBatch(live.map { texts[$0] }, as: .passage)
-        guard vecs.count == live.count else { return nil }
+        var vecs = live.map { cache?.get(texts[$0]) }
+        let todo = vecs.indices.filter { vecs[$0] == nil }
+        if !todo.isEmpty {
+            let got = embedder.embedTextBatch(todo.map { texts[live[$0]] }, as: .passage)
+            guard got.count == todo.count else { return nil }
+            for (k, j) in todo.enumerated() { vecs[j] = got[k]; cache?.put(texts[live[j]], got[k]) }
+        }
         var best = here, bestScore = -Float.greatestFiniteMagnitude
-        for (j, i) in live.enumerated() where vecs[j].count == query.count {
-            let s = zip(vecs[j], query).reduce(Float(0)) { $0 + $1.0 * $1.1 }
+        for (j, i) in live.enumerated() {
+            guard let v = vecs[j], v.count == query.count else { continue }
+            let s = zip(v, query).reduce(Float(0)) { $0 + $1.0 * $1.1 }
             if s > bestScore { bestScore = s; best = span[i] }
         }
         return best

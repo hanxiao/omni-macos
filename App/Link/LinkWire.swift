@@ -96,7 +96,9 @@ enum LinkWire {
 
     struct SearchRequest: Codable, Sendable, Hashable {
         /// Text, embedded by the answering Mac's own model; or a vector, sent only to a Mac in the
-        /// same vector space (a file query, Find Similar).
+        /// same vector space (a file query, Find Similar); or both, a text query with the vector the
+        /// asking Mac already holds for it, sent to a Mac whose `Space.fusesText` says it uses the
+        /// two together, which then embeds nothing.
         var query: String?
         var vector: [Float]?
         var filter: Filter
@@ -117,6 +119,9 @@ enum LinkWire {
         var probe: [Float]?
         var model: String
         var files: Int
+        /// This Mac's search takes a request's vector AND its text (the lexical and name fusion still
+        /// read the text). Absent from older Macs, which would drop the text beside a vector.
+        var fusesText: Bool?
     }
 
     struct PathRequest: Codable, Sendable {

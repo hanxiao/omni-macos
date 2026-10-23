@@ -33,9 +33,11 @@ enum MCPAdapter {
     static let versionMetaKey = "io.modelcontextprotocol/protocolVersion"
     static let serverInfoMetaKey = "io.modelcontextprotocol/serverInfo"
 
-    /// The passage width an agent gets by default. 500 was A/B'd against it with real agents: no
+    /// The passage width an agent gets by default. 500 was A/B'd against 200 with real agents: no
     /// fewer calls, no more answers, more input tokens on 81 of 125 queries (index.md, "Passages").
-    static let defaultSnippet = 200
+    /// It is the window's row width (220), so the two surfaces cut the same windows and share their
+    /// vectors (WindowVectors) instead of embedding a 200- and a 220-character tiling of one chunk.
+    static let defaultSnippet = Indexer.defaultSnippetLength
 
     /// Longest edge of an inlined thumbnail (matches jina-ai/MCP's image handling).
     private static let inlineImageMaxEdge = 800
