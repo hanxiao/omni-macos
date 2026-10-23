@@ -645,21 +645,20 @@ private struct PerformanceTab: View {
     }
     var body: some View {
         Form {
-            // FIRST: where the model runs (Han, 2026-10-22). The facts, not prose: ComputeUnitGrid.
+            // FIRST: where the model runs (Han, 2026-10-22; the comparison grid removed 2026-10-23).
             Section {
-                Toggle("Use the Neural Engine", isOn: Binding(get: { model.computeUnit == .neuralEngine },
-                                                              set: { model.computeUnit = $0 ? .neuralEngine : .gpu }))
+                Toggle("Use the Neural Engine (ANE)", isOn: Binding(get: { model.computeUnit == .neuralEngine },
+                                                                    set: { model.computeUnit = $0 ? .neuralEngine : .gpu }))
                     .toggleStyle(.switch)
                     // Not mid-benchmark: the run measures the unit it started on.
                     .disabled(model.neuralEngineStatus == .unavailable || model.isPaperRunning)
-                ComputeUnitGrid(selected: model.computeUnit)
                 switch model.neuralEngineStatus {
-                case .preparing(let p):
+                case .preparing(let build):
                     // The one-time build: every program compiled for this Mac's Neural Engine.
                     VStack(alignment: .leading, spacing: 4) {
-                        ProgressView(value: p)
-                        Text("Preparing the Neural Engine, once. The GPU runs until it is done.")
-                            .font(.callout).foregroundStyle(.secondary)
+                        ProgressView(value: build.fraction)
+                        Text(ComputeUnitFacts.buildLine(build))
+                            .font(.callout).foregroundStyle(.secondary).monospacedDigit()
                     }
                 case .unavailable:
                     Text("Not available on this Mac").foregroundStyle(.secondary)
@@ -668,6 +667,9 @@ private struct PerformanceTab: View {
                 }
             } header: {
                 Text("Model")
+            } footer: {
+                Text("Running the model on the ANE saves energy and doesn't compete with other apps for the GPU.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section {

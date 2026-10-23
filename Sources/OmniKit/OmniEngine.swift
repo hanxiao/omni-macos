@@ -809,11 +809,24 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// True once the Neural Engine program is loaded and text goes to it.
     public var neuralEngineActive: Bool { aneLock.withLock { _aneText != nil } }
 
-    /// Run the text backbone on `unit`. The Neural Engine program is built from this engine's own
-    /// weights and compiled into `cache` the first time (ANEProgram, ~40 s for Nano), then loaded
-    /// (~1 s); text stays on the GPU until it is ready, and if it cannot be built at all. `ready`
-    /// reports whether the Neural Engine took over. Blocks: call off the main actor.
-    public func setComputeUnit(_ unit: ComputeUnit, cache: URL, progress: ((Double) -> Void)? = nil,
+    /// The one-time build, as it goes: how far, what it compiles now, and the seconds left at the
+    /// rate so far (nil until a compile has finished).
+    public struct NeuralEngineBuild: Equatable, Sendable {
+        public enum Stage: Sendable { case writing, text, longText, images, audio, loading }
+        public var fraction: Double
+        public var stage: Stage
+        public var secondsLeft: Double?
+        public init(fraction: Double, stage: Stage, secondsLeft: Double? = nil) {
+            self.fraction = fraction; self.stage = stage; self.secondsLeft = secondsLeft
+        }
+    }
+
+    /// Run every model on `unit`. For the Neural Engine the programs are written from this engine's
+    /// own weights and every function compiled once on this Mac (minutes; `progress` reports it),
+    /// then text and towers switch over together; the GPU serves until then, and keeps everything
+    /// if they cannot be built. Returns whether the Neural Engine took over. Blocks: call off the
+    /// main actor.
+    public func setComputeUnit(_ unit: ComputeUnit, cache: URL, progress: ((NeuralEngineBuild) -> Void)? = nil,
                                isCancelled: (() -> Bool)? = nil) -> Bool {
         aneLock.withLock { _computeUnit = unit }
         guard unit == .neuralEngine else {
@@ -826,8 +839,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             return false
         }
         guard #available(macOS 15.0, *), let name = Self.aneProgramName(config) else { return false }
-        if neuralEngineActive { progress?(1); return true }
+        if neuralEngineActive { progress?(NeuralEngineBuild(fraction: 1, stage: .loading)); return true }
         let t0 = Date()
+        progress?(NeuralEngineBuild(fraction: 0, stage: .writing))
         // 1. The programs, their weights the app's own. Nothing changes for callers yet: the GPU
         //    serves everything until step 4.
         let prefix = name.replacingOccurrences(of: "_text", with: "")
@@ -850,30 +864,38 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         let key = Self.aneProgramsKey(prefix)
         if (try? String(contentsOf: stamp, encoding: .utf8)) != key {
             // Compiled and let go: a loaded function holds working buffers (ANEBlocks.Functions).
-            func compile(_ program: URL?, _ names: [(name: String, cost: Double)]) -> [(cost: Double, load: () -> Bool)] {
+            typealias Job = (cost: Double, stage: NeuralEngineBuild.Stage, load: () -> Bool)
+            func compile(_ program: URL?, _ stage: NeuralEngineBuild.Stage, _ names: [(name: String, cost: Double)]) -> [Job] {
                 guard let program else { return [] }
                 let f = ANEBlocks.Functions(program)
-                return names.map { n in (n.cost, { defer { f.unload(n.name) }; return f.model(n.name) != nil }) }
+                return names.map { n in (n.cost, stage, { defer { f.unload(n.name) }; return f.model(n.name) != nil }) }
             }
-            let jobs: [(cost: Double, load: () -> Bool)] =
-                text.functionNames.map { f in (f.cost, { defer { text.unload(f.name) }; return text.load(f.name) }) }
-                + compile(visionProgram, ANEVisionBackend.functionNames(ANEVisionBackend.defaultBuckets))
-                + compile(audioProgram, ANEAudioBackend.functionNames(ANEAudioBackend.defaultBatches))
+            let jobs: [Job] =
+                text.functionNames.map { f in (f.cost, f.name.hasPrefix("B") ? .longText : .text,
+                                               { defer { text.unload(f.name) }; return text.load(f.name) }) }
+                + compile(visionProgram, .images, ANEVisionBackend.functionNames(ANEVisionBackend.defaultBuckets))
+                + compile(audioProgram, .audio, ANEAudioBackend.functionNames(ANEAudioBackend.defaultBatches))
             let total = jobs.reduce(0) { $0 + $1.cost }
             var done = 0.0
-            progress?(0)
+            let started = Date()
             for job in jobs {
                 if isCancelled?() == true { omniPerfLog("ane: build cancelled"); return false }
+                // The time left at the rate so far: the costs are seconds on one Mac, the rate scales
+                // them to this one and this model. None before 5%: one compile in, it read 10 minutes
+                // for a build of 6.5.
+                let elapsed = -started.timeIntervalSinceNow
+                progress?(NeuralEngineBuild(fraction: done / total, stage: job.stage,
+                                            secondsLeft: done >= 0.05 * total ? elapsed / done * (total - done) : nil))
                 // A function the Neural Engine refuses is logged by the loader; its inputs then run
                 // the GPU path (text) or fail (a tower whose GPU copy was released).
                 _ = job.load()
                 done += job.cost
-                progress?(done / total)
             }
             try? key.write(to: stamp, atomically: true, encoding: .utf8)
             omniPerfLog(String(format: "ane: every program compiled (%.1f s)", -t0.timeIntervalSinceNow))
         }
         // The query length loaded now, so a search never waits for a load.
+        progress?(NeuralEngineBuild(fraction: 1, stage: .loading))
         _ = text.load("L\(ANETextBackend.defaultLengths[0])")
         if isCancelled?() == true { return false }
         // 3. The towers' arrays, from the app's own weights; a tower whose smallest size will not
@@ -892,7 +914,6 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         }
         if let v = vision, !v.ready() { vision = nil }
         if let a = audio, !a.ready() { audio = nil }
-        progress?(1)
         if isCancelled?() == true { return false }
         // 4. Everything at once.
         aneLock.withLock {

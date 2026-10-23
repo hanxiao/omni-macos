@@ -47,7 +47,8 @@ codebase were already measured there, and many were rejected.
     by default (`OMNI_BACKBONE_DTYPE` / `OMNI_BACKBONE_BF16=0` for fp32) and stores the vision
     tower in fp16, the dtype it computes in (fp32 recompute for a non-finite pass).
   - Indexer: crawler + text extraction + SQLite vector store + cosine search.
-  - Neural Engine mode (Settings > Performance > Run on), all or nothing: `ANETextBackend` /
+  - Neural Engine mode (Settings > Performance > Use the Neural Engine (ANE); every install starts on
+    the GPU), all or nothing: `ANETextBackend` /
     `ANEProgram` (the text backbone, baked, its weight file written on the Mac from the app's own
     weights; past 2,048 tokens one layer a call over that file), `ANEVisionBackend` / `ANEAudioBackend` (the towers as block programs shipped compiled,
     the weights passed in, `ANEBlocks`); the GPU towers are released in this mode.
@@ -154,7 +155,8 @@ codebase were already measured there, and many were rejected.
   English-only regexes, word lists per language). Use embedding-based test-time compute with the
   model we already run (https://hanxiao.io/tencent-elastic-search-ai-2026/#1).
 - EVERY UI CHANGE IS SHOWN TO HAN and follows macOS Tahoe, Liquid Glass and native macOS design.
-  UI text and hints are plain: no mannered prose.
+  UI text and hints are plain: no mannered prose. The UI writes the Neural Engine as "Neural Engine
+  (ANE)", or "ANE" once it has been named (Han, 2026-10-23).
 - DEDUP IS PART OF THE DESIGN; NEVER DISABLE IT (Han, 2026-10-14). Content dedup and chunk reuse
   (`contentDedup`, `globalChunkReuse`, `vectorsForContentKeys`) stay on in every shipped path, and a
   new path goes through them rather than around them. A test may switch something off only as a

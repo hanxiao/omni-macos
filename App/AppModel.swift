@@ -2146,9 +2146,8 @@ final class AppModel {
     // MARK: - Where the model runs
 
     /// The Neural Engine or the GPU for every model Omni runs to index and search - text, images,
-    /// video, audio, tags (OmniEngine.setComputeUnit). New installs start on the Neural Engine and
-    /// choose on the screen after the download; an install that already has an index keeps the GPU
-    /// it always had.
+    /// video, audio, tags (OmniEngine.setComputeUnit). Every install starts on the GPU; a new one
+    /// chooses on the screen after the download (the GPU preselected: Han, 2026-10-23).
     var computeUnit: OmniEngine.ComputeUnit = .gpu {
         didSet {
             guard oldValue != computeUnit else { return }
@@ -2156,8 +2155,9 @@ final class AppModel {
             applyComputeUnit()
         }
     }
-    /// `preparing(p)`: the one-time build on this Mac, p in 0...1; the GPU serves until it is done.
-    enum NeuralEngineStatus: Equatable { case off, preparing(Double), ready, unavailable }
+    /// `preparing`: the one-time build on this Mac, how far and what it does; the GPU serves until
+    /// it is done.
+    enum NeuralEngineStatus: Equatable { case off, preparing(OmniEngine.NeuralEngineBuild), ready, unavailable }
     private(set) var neuralEngineStatus: NeuralEngineStatus = .off
     var neuralEngineBuilding: Bool { if case .preparing = neuralEngineStatus { return true } else { return false } }
     /// The choice screen after a first download, shown once.
@@ -2167,8 +2167,8 @@ final class AppModel {
     var neuralEngineAvailable: Bool { engine?.neuralEngineAvailable ?? false }
 
     /// The first launch with this setting: no choice stored yet. An index on disk means an install
-    /// from before it, which keeps the GPU; none means a new one, which starts on the Neural Engine
-    /// and is asked once the model is in.
+    /// from before it, which is not asked; none means a new one, asked once the model is in. Both
+    /// start on the GPU.
     private func loadComputeUnit() {
         if let raw = UserDefaults.standard.string(forKey: "omni.computeUnit"), let u = OmniEngine.ComputeUnit(rawValue: raw) {
             computeUnit = u
@@ -2176,7 +2176,7 @@ final class AppModel {
             return
         }
         let existing = (try? Self.indexURL()).map { FileManager.default.fileExists(atPath: $0.path) } ?? false
-        computeUnit = existing ? .gpu : .neuralEngine
+        computeUnit = .gpu
         computeChoicePending = !existing
         OmniPrefs.set(computeUnit.rawValue, forKey: "omni.computeUnit")
         OmniPrefs.set(computeChoicePending, forKey: "omni.computeChoicePending")
@@ -2206,7 +2206,7 @@ final class AppModel {
         }
         guard neuralEngineAvailable else { neuralEngineStatus = .unavailable; return }
         if engine.neuralEngineActive { neuralEngineStatus = .ready; return }
-        neuralEngineStatus = .preparing(0)
+        neuralEngineStatus = .preparing(.init(fraction: 0, stage: .writing))
         // An isolated run keeps its programs in scratch (-omni.ane.cache.dir), like the OCR cache.
         let cache = UserDefaults.standard.string(forKey: "omni.ane.cache.dir").map { URL(fileURLWithPath: $0, isDirectory: true) }
             ?? OmniEngine.defaultANECache
@@ -2219,14 +2219,16 @@ final class AppModel {
         aneBuildTask = Task.detached(priority: .utility) { [weak self] in
             await previous?.value
             guard !gate.cancelled else { return }
-            var shown = -1
-            let ok = engine.setComputeUnit(.neuralEngine, cache: cache, progress: { p in
-                let pct = Int(p * 100)
-                guard pct != shown else { return }   // @Observable notifies on every write
-                shown = pct
+            var shown: OmniEngine.NeuralEngineBuild?
+            let ok = engine.setComputeUnit(.neuralEngine, cache: cache, progress: { b in
+                // To whole percent and minute: @Observable notifies on every write.
+                let r = OmniEngine.NeuralEngineBuild(fraction: (b.fraction * 100).rounded() / 100, stage: b.stage,
+                                                     secondsLeft: b.secondsLeft.map { max(30, ($0 / 60).rounded() * 60) })
+                guard r != shown else { return }
+                shown = r
                 Task { @MainActor in
                     guard let self, self.aneBuildGate === gate, !gate.cancelled else { return }
-                    self.neuralEngineStatus = .preparing(Double(pct) / 100)
+                    self.neuralEngineStatus = .preparing(r)
                 }
             }, isCancelled: { gate.cancelled })
             await MainActor.run {

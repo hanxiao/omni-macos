@@ -2347,9 +2347,11 @@ backend, which takes no GPU gate. On the GPU still: the media towers and their i
 past 2,048 tokens, and the model-stamp probe (always written by the GPU path, so a stored stamp never
 reads as weights that moved). Headless tools: OMNI_COMPUTE=neuralEngine [OMNI_ANE_CACHE=dir].
 
-THE CHOICE: new installs (no index on disk) start on the Neural Engine and see one screen after the
-download; installs with an index keep the GPU. The facts shown are the ones true on every Mac (power,
-the GPU left to other apps, media on the GPU); speed is not, it depends on the Mac.
+THE CHOICE: new installs (no index on disk) see one screen after the download; installs with an
+index are not asked. The facts shown are the ones true on every Mac (power, the GPU left to other
+apps); speed is not, it depends on the Mac. Han, 2026-10-23: EVERY INSTALL STARTS ON THE GPU - the
+screen preselects the GPU and shows it on the left, the Neural Engine on the right, so nothing
+changes for a user who just clicks Continue.
 
 NOT DONE YET, and why it matters: the program is held by the system outside Omni's memory (Nano
 ~255 MB, Small ~1.06 GB fp16) ON TOP of the GPU backbone, which stays for the long-sequence fallback
@@ -2436,9 +2438,13 @@ wrapper built once in Qwen3Backbone.mediaSequence); a switch back to the GPU loa
 its first run caught images returning nil in that switch.
 
 THE SWITCH (Han, 2026-10-23: a toggle, a one-time build with progress, then everything on the
-Neural Engine). Settings > Performance > "Use the Neural Engine". Turning it on compiles EVERY
-function of the model's programs once, with a progress bar under the switch, while the GPU keeps
-serving; then text and towers switch over together and the GPU towers are released. A stamp
+Neural Engine). Settings > Performance > "Use the Neural Engine (ANE)", one line of caption under it
+(energy, the GPU left to other apps); the comparison grid that sat under it was removed, and every
+mention in the UI reads "Neural Engine (ANE)". Turning it on compiles EVERY function of the model's
+programs once, with a progress bar under the switch and under the bar what it compiles and the time
+left ("Compiling the image model · About 3 min left": the rate so far over the remaining cost, shown
+from 5% on - one compile in, it read 10 minutes for a build of 6.5), while the GPU keeps serving;
+then text and towers switch over together and the GPU towers are released. A stamp
 (cache/<model>.prepared: macOS version + the programs' bytes) skips the build next time - a
 relaunch or a later switch-on is ready in ~2 s, each function loading from the system's compiled
 form in ~0.4 s when first used. Turning it off mid-build cancels between compiles (one in flight
