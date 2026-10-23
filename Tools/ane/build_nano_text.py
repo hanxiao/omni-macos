@@ -7,7 +7,8 @@ softmax over the key axis. RoPE folded into the projections - q = conv(x, Wq) * 
 * sin, P the signed rotate-half permutation - with cos and sin INPUTS (positions 0 ..< L, written by
 the backend), and 1/sqrt(d) folded into Wq (a power of two: exact in fp16). RMSNorm as the l2 norm
 of x/64 (no fp16 overflow). Inputs x (B, C, 1, L), cos, sin (1, C, 1, L), mask (B, L, 1, 1), pick
-(B, 1, 1, L); output the final-normed hidden at the picked token (B, C, 1, 1).
+(B, 1, 1, L); outputs `pooled`, the final-normed hidden at the picked token (B, C, 1, 1), and
+`hidden`, every position final-normed (B, C, 1, L), for the tags of an image or a clip.
 
 Weights: `omni-verify dumpbackbone` with OMNI_BACKBONE_DTYPE=fp16 (the app's merged tensors).
   uv run --python 3.12 --with coremltools --with mlx Tools/ane/build_nano_text.py <weights> --out <dir>
@@ -16,6 +17,7 @@ import argparse
 import numpy as np
 import mlx.core as mx
 import coremltools as ct
+from anelib import query_block
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import types
 
@@ -33,6 +35,11 @@ def rotate_half_matrix():
             P[o + j, o + half + j] = -1.0
             P[o + half + j, o + j] = 1.0
     return P
+
+
+# Queries in blocks of 256 (anelib.query_block): L2048 102 ms against 167 in one block, its first
+# compile 52 s against ~20; up to 256 tokens it is one block anyway.
+QBLOCK = 256
 
 
 def build(W, L, B=1):
@@ -81,11 +88,15 @@ def build(W, L, B=1):
             ks = mb.split(x=kT, num_splits=HEADS, axis=3, name=f"{t}_ksplit")
             vs = mb.split(x=v, num_splits=HEADS, axis=1, name=f"{t}_vsplit")
             outs = []
+            nb = L // query_block(L, QBLOCK)
             for hd in range(HEADS):
-                s = mb.einsum(values=(ks[hd], qs[hd]), equation="bkhc,bchq->bkhq", name=f"{t}_h{hd}_qk")
-                s = mb.add(x=s, y=mask, name=f"{t}_h{hd}_m")
-                a = mb.softmax(x=s, axis=1, name=f"{t}_h{hd}_sm")
-                outs.append(mb.einsum(values=(vs[hd], a), equation="bchk,bkhq->bchq", name=f"{t}_h{hd}_av"))
+                parts = []
+                for j, qp in enumerate([qs[hd]] if nb == 1 else mb.split(x=qs[hd], num_splits=nb, axis=3, name=f"{t}_h{hd}_qb")):
+                    s = mb.einsum(values=(ks[hd], qp), equation="bkhc,bchq->bkhq", name=f"{t}_h{hd}_{j}_qk")
+                    s = mb.add(x=s, y=mask, name=f"{t}_h{hd}_{j}_m")
+                    a = mb.softmax(x=s, axis=1, name=f"{t}_h{hd}_{j}_sm")
+                    parts.append(mb.einsum(values=(vs[hd], a), equation="bchk,bkhq->bchq", name=f"{t}_h{hd}_{j}_av"))
+                outs.append(parts[0] if nb == 1 else mb.concat(values=parts, axis=3, name=f"{t}_h{hd}_cat"))
             ctx = mb.concat(values=outs, axis=1, name=f"{t}_ctx")
             h = mb.add(x=h, y=mb.conv(x=ctx, weight=cw(f32[p + "self_attn.o_proj.weight"]), name=f"{t}_o"),
                        name=f"{t}_r1")
@@ -95,12 +106,14 @@ def build(W, L, B=1):
             act = mb.mul(x=mb.mul(x=g, y=mb.sigmoid(x=g, name=f"{t}_sig"), name=f"{t}_silu"), y=u, name=f"{t}_gu")
             h = mb.add(x=h, y=mb.conv(x=act, weight=cw(f32[p + "mlp.down_proj.weight"]), name=f"{t}_d"),
                        name=f"{t}_r2")
-        pooled = mb.reduce_sum(x=mb.mul(x=h, y=pick, name="pick"), axes=[3], keep_dims=True, name="pool")
-        return rms(pooled, "language_model.norm.weight", "final")
+        # Every position final-normed (an image's tags are scored on its rows), and the picked one.
+        hn = rms(h, "language_model.norm.weight", "final")
+        pooled = mb.reduce_sum(x=mb.mul(x=hn, y=pick, name="pick"), axes=[3], keep_dims=True, name="pooled")
+        return pooled, mb.identity(x=hn, name="hidden")
 
     return ct.convert(prog, minimum_deployment_target=ct.target.macOS15,
                       compute_precision=ct.precision.FLOAT32 if PRECISION == "fp32" else ct.precision.FLOAT16,
-                      compute_units=ct.ComputeUnit.CPU_AND_NE)
+                      compute_units=ct.ComputeUnit.CPU_AND_NE, skip_model_load=True)
 
 
 if __name__ == "__main__":

@@ -7880,6 +7880,36 @@ if args.count >= 2 && args[1] == "projab" {
                          inter: args.count >= 5 ? (Int(args[4]) ?? 3072) : 3072)
     exit(0)
 }
+// A recording's final vector on the Neural Engine against the GPU path: see ANEQuery.audio.
+if args.count >= 4 && args[1] == "aneaudiotokens" {
+    if #available(macOS 15.0, *) { try ANEQuery.audioTokens(modelDir: URL(fileURLWithPath: args[2]), clips: args[3...].map { URL(fileURLWithPath: $0) }) }
+    exit(0)
+}
+
+if args.count >= 4 && args[1] == "anepar" {
+    if #available(macOS 15.0, *) {
+        try ANEQuery.parallel(compiled: URL(fileURLWithPath: args[2]), function: args[3], seconds: args.count > 4 ? Double(args[4]) ?? 5 : 5)
+    }
+    exit(0)
+}
+
+if args.count >= 6 && args[1] == "aneengine" {
+    if #available(macOS 15.0, *) {
+        try await ANEQuery.engine(modelDir: URL(fileURLWithPath: args[2]), cache: URL(fileURLWithPath: args[3]),
+                                  tagCache: URL(fileURLWithPath: args[4]), dirs: args[5...].map { URL(fileURLWithPath: $0) })
+    }
+    exit(0)
+}
+
+// An image's final vector on the Neural Engine against the GPU path: see ANEQuery.image.
+// The vision tower on the Neural Engine against the GPU tower: see ANEQuery.vision.
+if args.count >= 5 && args[1] == "anevision" {
+    if #available(macOS 15.0, *) {
+        try await ANEQuery.vision(modelDir: URL(fileURLWithPath: args[2]), package: URL(fileURLWithPath: args[3]), images: URL(fileURLWithPath: args[4]),
+                                  buckets: args.count >= 6 ? args[5].split(separator: ",").compactMap { Int($0) } : [256, 512, 1024, 2048, 3072, 4096, 5120])
+    }
+    exit(0)
+}
 // The Neural Engine program as the app builds it on the Mac: see ANEQuery.onDevice.
 if args.count >= 5 && args[1] == "aneprogram" {
     if #available(macOS 15.0, *) {

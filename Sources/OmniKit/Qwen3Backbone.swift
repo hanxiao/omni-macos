@@ -65,6 +65,21 @@ final class Qwen3Backbone: @unchecked Sendable {
         return embed([id])
     }
 
+    /// A medium's backbone input: [prefix][start] tokens [end][suffix], `tokens` [1, n, dim] from a
+    /// tower. The one place the media wrapper is built - the GPU's injection and the Neural Engine's
+    /// rows both read it. Returns the input, its length, and the row the medium's tokens start at.
+    func mediaSequence(_ tokens: MLXArray, start: Int?, end: Int?, prefixIds: [Int], suffixIds: [Int]) -> (embeds: MLXArray, length: Int, mediaStart: Int) {
+        var parts: [MLXArray] = []
+        if !prefixIds.isEmpty { parts.append(embed(prefixIds)) }
+        let s = embedSpecial(start), e = embedSpecial(end)
+        if let s { parts.append(s) }
+        parts.append(tokens)
+        if let e { parts.append(e) }
+        if !suffixIds.isEmpty { parts.append(embed(suffixIds)) }
+        let mediaStart = prefixIds.count + (s == nil ? 0 : 1)
+        return (MLX.concatenated(parts, axis: 1), mediaStart + tokens.dim(1) + (e == nil ? 0 : 1) + suffixIds.count, mediaStart)
+    }
+
     /// Embed token ids -> [1, L, dim] (computeDType, batch 1).
     func embed(_ ids: [Int]) -> MLXArray {
         let idArray = MLXArray(ids.map { Int32($0) })

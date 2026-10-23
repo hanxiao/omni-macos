@@ -10,6 +10,7 @@ public final class OmniTextEncoder: @unchecked Sendable {
     private let backbone: Qwen3Backbone
     private let tokenizer: Tokenizer
     private let dim: Int
+    private let cfg: OmniConfig
     /// Sequence length (tokens) the backbone ran over in the last encode - for throughput.
     public private(set) var lastSequenceLength = 0
 
@@ -20,10 +21,47 @@ public final class OmniTextEncoder: @unchecked Sendable {
     /// modalities end up in near-orthogonal regions of the space (broken cross-modal search).
     public let suffixTokenIds: [Int]
 
+    /// Which wrapper a medium's tokens go in (Qwen3Backbone.mediaSequence).
+    public enum Medium { case vision, audio }
+
+    private func wrapper(_ m: Medium) -> (start: Int?, end: Int?) {
+        m == .vision ? (cfg.visionStartTokenId, cfg.visionEndTokenId) : (cfg.audioStartTokenId, cfg.audioEndTokenId)
+    }
+
+    /// The backbone's input for a medium whose tokens came from the Neural Engine's tower, built on
+    /// the CPU by the GPU path's own code: row-major [length, hidden], and where the tokens start.
+    public func mediaRows(_ medium: Medium, tokens: [Float], count: Int, prefixIds: [Int], suffixIds: [Int]) -> (rows: [Float], length: Int, mediaStart: Int) {
+        Device.withDefaultDevice(.cpu) {
+            let w = wrapper(medium)
+            let (x, length, start) = backbone.mediaSequence(MLXArray(tokens, [1, count, dim]), start: w.start, end: w.end,
+                                                            prefixIds: prefixIds, suffixIds: suffixIds)
+            let f = x.asType(.float32)
+            eval(f)
+            return (f.asArray(Float.self), length, start)
+        }
+    }
+
+    /// A medium's vector - and with a tagger its [2V] tag scores - from tower tokens, on the GPU
+    /// backbone: the Neural Engine's tokens for a sequence past its text program's longest length.
+    public func encodeMedia(_ medium: Medium, tokens: [Float], count: Int, prefixIds: [Int], suffixIds: [Int],
+                            tagger: OmniTagger?) -> (vec: [Float], tagScores: [Float]?) {
+        let w = wrapper(medium)
+        let (x, length, start) = backbone.mediaSequence(MLXArray(tokens, [1, count, dim]).asType(.float32), start: w.start, end: w.end,
+                                                        prefixIds: prefixIds, suffixIds: suffixIds)
+        lastSequenceLength = length
+        let hidden = backbone.forward(inputsEmbeds: x, length: length)
+        guard let tagger else { return (backbone.pool(hidden, length: length), nil) }
+        let pool = backbone.poolGraph(hidden, length: length)
+        let score = tagger.scoreGraph(patches: hidden[0, start ..< (start + count)], pooled: pool)
+        eval([pool, score])
+        return (pool.asArray(Float.self), score.asArray(Float.self))
+    }
+
     public init(weights: WeightStore, config: OmniConfig, tokenizer: Tokenizer) {
         self.backbone = Qwen3Backbone(weights: weights, config: config)
         self.tokenizer = tokenizer
         self.dim = config.text.hiddenSize
+        self.cfg = config
         let bare = (try? tokenizer.encode(text: "x", addSpecialTokens: false)) ?? []
         let full = (try? tokenizer.encode(text: "x", addSpecialTokens: true)) ?? []
         if full.count > bare.count, let lastBare = bare.last, let idx = full.lastIndex(of: lastBare) {

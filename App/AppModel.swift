@@ -2145,9 +2145,10 @@ final class AppModel {
 
     // MARK: - Where the model runs
 
-    /// The Neural Engine or the GPU for the text model (OmniEngine.setComputeUnit). New installs
-    /// start on the Neural Engine and choose on the screen after the download; an install that
-    /// already has an index keeps the GPU it always had. Media towers run on the GPU either way.
+    /// The Neural Engine or the GPU for every model Omni runs to index and search - text, images,
+    /// video, audio, tags (OmniEngine.setComputeUnit). New installs start on the Neural Engine and
+    /// choose on the screen after the download; an install that already has an index keeps the GPU
+    /// it always had.
     var computeUnit: OmniEngine.ComputeUnit = .gpu {
         didSet {
             guard oldValue != computeUnit else { return }
@@ -2185,15 +2186,19 @@ final class AppModel {
         OmniPrefs.set(false, forKey: "omni.computeChoicePending")
     }
 
-    /// Hand the loaded engine its unit. The Neural Engine program is built from the engine's own
-    /// weights the first time (tens of seconds to a few minutes), off the main actor; text runs on
-    /// the GPU until it is ready.
+    /// Hand the loaded engine its unit, off the main actor. The text program is written from the
+    /// engine's own weights the first time and its shortest length compiled (Nano ~7 s, Small ~27 s);
+    /// every other size compiles the first time something needs it.
     func applyComputeUnit() {
         guard let engine else { return }
         let unit = computeUnit
         guard unit == .neuralEngine else {
+            let released = engine.gpuTowersReleased
             _ = engine.setComputeUnit(.gpu, cache: OmniEngine.defaultANECache)
             neuralEngineStatus = .off
+            // Neural Engine mode let go of the GPU towers: load them again (the old engine serves
+            // text meanwhile).
+            if released { Task { await self.reloadEngine() } }
             return
         }
         guard neuralEngineAvailable else { neuralEngineStatus = .unavailable; return }
@@ -2207,6 +2212,8 @@ final class AppModel {
             await MainActor.run {
                 guard let self, self.engine === engine, self.computeUnit == .neuralEngine else { return }
                 self.neuralEngineStatus = ok ? .ready : .unavailable
+                self.supportsImages = engine.supportsImages
+                self.audioSupported = engine.supportsAudio
             }
         }
     }

@@ -26,6 +26,9 @@ public final class OmniAudioEncoder: @unchecked Sendable {
         return encode(inputFeatures: feats, featureLens: lens, prefixIds: prefixIds, suffixIds: suffixIds)
     }
 
+    /// The positions the Neural Engine's tower adds per chunk (OmniAudioTower.anePositions).
+    public var anePositions: [Float] { tower.anePositions }
+
     /// Embed from a precomputed mel buffer (mel-major [numMelBins*frames]). Lets the
     /// CPU-heavy mel run in the indexer's concurrent decode stage.
     public func encode(mel: [Float], frames: Int, prefixIds: [Int] = [], suffixIds: [Int] = []) -> [Float] {

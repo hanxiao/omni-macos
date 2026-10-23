@@ -270,6 +270,14 @@ public final class OmniAudioTower: @unchecked Sendable {
 
     // MARK: - Feed-forward (fc1 -> GELU -> fc2)
 
+    /// The positions every chunk adds after its conv frontend (rows 0 ..< n_window of the sinusoid
+    /// table), row-major [n_window, d_model]: an input of the Neural Engine's tower (ANEAudioBackend).
+    public var anePositions: [Float] {
+        let p = posTable[0 ..< nWindow, 0...].asType(.float32)
+        eval(p)
+        return p.asArray(Float.self)
+    }
+
     private func feedForward(_ x: MLXArray, _ p: String) -> MLXArray {
         let h1 = MLX.addMM(w[p + "fc1.bias"], x, w[p + "fc1.weight"].transposed(1, 0))
         let a = gelu(h1)

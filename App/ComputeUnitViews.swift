@@ -1,15 +1,16 @@
 import SwiftUI
 import OmniKit
 
-/// Neural Engine or GPU: the same facts on the first-run screen and in Settings > Performance.
-/// Only what holds on every Mac (index.md, "The Neural Engine, measured again": beside another
-/// app's GPU work, that app lost 0.7% with Omni on the Neural Engine and 31% with it on the GPU).
-/// Speed is left out: which unit is faster depends on the Mac.
+/// Neural Engine or GPU, all or nothing: on the Neural Engine every model Omni runs for search and
+/// indexing (text, images, video, audio, tags) stays off the GPU; on the GPU it is fastest and shares
+/// the GPU with other apps. The same facts on the first-run screen and in Settings > Performance
+/// (index.md, "The Neural Engine, all or nothing": beside another app's GPU work that app lost 0.7%
+/// with Omni on the Neural Engine and 31% with it on the GPU; a photo 625 ms against 112 ms here).
 enum ComputeUnitFacts {
     static let rows: [(label: String, neuralEngine: String, gpu: String)] = [
-        ("Power", "Low", "Higher"),
         ("Other apps on the GPU", "Unaffected", "Slowed"),
-        ("Photos, audio, video", "GPU", "GPU"),
+        ("Indexing speed", "Slower", "Fastest"),
+        ("Power", "Low", "Higher"),
     ]
     static func name(_ u: OmniEngine.ComputeUnit) -> String { u == .neuralEngine ? "Neural Engine" : "GPU" }
     static func symbol(_ u: OmniEngine.ComputeUnit) -> String { u == .neuralEngine ? "brain" : "cpu" }
@@ -45,15 +46,12 @@ struct ComputeChoiceView: View {
             Text("Where Omni runs")
                 .font(.title).fontWeight(.semibold)
             HStack(alignment: .top, spacing: 12) {
-                card(.neuralEngine, ["Low power", "Leaves the GPU to other apps"])
-                card(.gpu, ["Higher power", "Shares the GPU with other apps"])
+                card(.neuralEngine, ["Never uses the GPU", "Low power", "Slower indexing"])
+                card(.gpu, ["Fastest", "Shares the GPU with other apps", "Higher power"])
             }
             .padding(.top, 4)
-            VStack(spacing: 2) {
-                Text("Photos, audio and video use the GPU either way.")
-                Text("Change it in Settings > Performance.")
-            }
-            .font(.callout).foregroundStyle(.secondary)
+            Text("Change it in Settings > Performance.")
+                .font(.callout).foregroundStyle(.secondary)
             Button("Continue") { model.finishComputeChoice(choice) }
                 .controlSize(.large).buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)

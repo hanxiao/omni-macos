@@ -60,7 +60,7 @@ public final class OmniVisionTower: @unchecked Sendable {
     /// The dtype of the pass in flight: fp16, or fp32 for the fallback.
     private var dt: DType = .float16
     /// Runs every pass as the fp32 fallback does: the reference-parity test's other arm.
-    nonisolated(unsafe) static var fp32ForTesting = false
+    nonisolated(unsafe) public static var fp32ForTesting = false
     /// SDPA inputs: fp16 with the tower, bf16 in the fp32 fallback (bf16 keeps fp32's range).
     private var attnType: DType { dt == .float16 ? .float16 : .bfloat16 }
 
@@ -175,6 +175,18 @@ public final class OmniVisionTower: @unchecked Sendable {
     /// (t, h, w, c). The weight is already stored channels-last as
     /// [out, t, h, w, c] (sanitize moved axis 1 -> -1), so flattening its last
     /// four axes uses the identical (t, h, w, c) order. matmul then matches the conv.
+    /// What the Neural Engine's tower (ANEVisionBackend) takes beside the patches: the position
+    /// table interpolated for the grid and the 2D rotary angles, from this tower's own code, on the
+    /// CPU so a Neural Engine embed never queues behind GPU work. Row-major [N, hidden], [N, ropeDim].
+    public func aneSideInputs(_ gridTHW: [(Int, Int, Int)]) -> (pos: [Float], angles: [Float], ropeDim: Int) {
+        Device.withDefaultDevice(.cpu) {
+            let pos = fastPosEmbedInterpolate(gridTHW).asType(.float32)
+            let rot = rotPosEmb(gridTHW).asType(.float32)
+            eval(pos, rot)
+            return (pos.asArray(Float.self), rot.asArray(Float.self), rot.dim(1))
+        }
+    }
+
     private func patchEmbed(_ pixelValues: MLXArray) -> MLXArray {
         let n = pixelValues.dim(0)
         let c = cfg.vision.inChannels          // 3

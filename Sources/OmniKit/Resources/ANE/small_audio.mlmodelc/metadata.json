@@ -1,0 +1,2431 @@
+[
+  {
+    "metadataOutputVersion" : "3.0",
+    "outputSchema" : [
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 32 × 1024 × 1 × 50)",
+        "shortDescription" : "",
+        "shape" : "[32, 1024, 1, 50]",
+        "name" : "out",
+        "type" : "MultiArray"
+      }
+    ],
+    "modelParameters" : [
+
+    ],
+    "specificationVersion" : 9,
+    "functions" : [
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 100]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "F1",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.gelu" : 2,
+          "Ios18.add" : 3,
+          "Ios18.conv" : 2,
+          "Ios18.mul" : 1
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 128 × 1 × 200)",
+            "shortDescription" : "",
+            "shape" : "[1, 128, 1, 200]",
+            "name" : "melx",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1 × 1 × 200)",
+            "shortDescription" : "",
+            "shape" : "[1, 1, 1, 200]",
+            "name" : "fmask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 100]",
+            "name" : "pos",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 128 × 1 × 3)",
+            "shortDescription" : "",
+            "shape" : "[1280, 128, 1, 3]",
+            "name" : "w1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280 × 1 × 3)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280, 1, 3]",
+            "name" : "w2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b2",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 100]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "B1",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 1,
+          "Ios16.einsum" : 40,
+          "Ios18.add" : 31,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 20,
+          "Ios18.layerNorm" : 2,
+          "Ios18.transpose" : 1,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 3,
+          "Ios18.mul" : 2
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 100]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 100 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 100, 1, 1]",
+            "name" : "kmask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wk",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 5120 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[5120, 1280]",
+            "name" : "w1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 5120 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 5120, 1, 1]",
+            "name" : "bf1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 5120)",
+            "shortDescription" : "",
+            "shape" : "[1280, 5120]",
+            "name" : "w2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bf2",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 50)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 50]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "P1",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.realDiv" : 1,
+          "Ios18.avgPool" : 1,
+          "Ios18.reshape" : 2,
+          "Identity" : 1,
+          "Ios18.matmul" : 1,
+          "Ios18.layerNorm" : 1,
+          "Ios18.abs" : 1,
+          "Ios16.reduceMax" : 1,
+          "Ios18.add" : 3,
+          "Ios18.mul" : 1
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 100]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1024 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1024, 1280]",
+            "name" : "w",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 1]",
+            "name" : "bias",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 2 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[2, 1280, 1, 100]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "F2",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.gelu" : 2,
+          "Ios18.add" : 3,
+          "Ios18.conv" : 2,
+          "Ios18.mul" : 1
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 2 × 128 × 1 × 200)",
+            "shortDescription" : "",
+            "shape" : "[2, 128, 1, 200]",
+            "name" : "melx",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 2 × 1 × 1 × 200)",
+            "shortDescription" : "",
+            "shape" : "[2, 1, 1, 200]",
+            "name" : "fmask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 100]",
+            "name" : "pos",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 128 × 1 × 3)",
+            "shortDescription" : "",
+            "shape" : "[1280, 128, 1, 3]",
+            "name" : "w1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280 × 1 × 3)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280, 1, 3]",
+            "name" : "w2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b2",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 2 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[2, 1280, 1, 100]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "B2",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 1,
+          "Ios16.einsum" : 40,
+          "Ios18.add" : 31,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 20,
+          "Ios18.layerNorm" : 2,
+          "Ios18.transpose" : 1,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 3,
+          "Ios18.mul" : 2
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 2 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[2, 1280, 1, 100]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 2 × 100 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[2, 100, 1, 1]",
+            "name" : "kmask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wk",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 5120 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[5120, 1280]",
+            "name" : "w1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 5120 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 5120, 1, 1]",
+            "name" : "bf1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 5120)",
+            "shortDescription" : "",
+            "shape" : "[1280, 5120]",
+            "name" : "w2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bf2",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 2 × 1024 × 1 × 50)",
+            "shortDescription" : "",
+            "shape" : "[2, 1024, 1, 50]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "P2",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.realDiv" : 1,
+          "Ios18.avgPool" : 1,
+          "Ios18.reshape" : 2,
+          "Identity" : 1,
+          "Ios18.matmul" : 1,
+          "Ios18.layerNorm" : 1,
+          "Ios18.abs" : 1,
+          "Ios16.reduceMax" : 1,
+          "Ios18.add" : 3,
+          "Ios18.mul" : 1
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 2 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[2, 1280, 1, 100]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1024 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1024, 1280]",
+            "name" : "w",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 1]",
+            "name" : "bias",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 4 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[4, 1280, 1, 100]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "F4",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.gelu" : 2,
+          "Ios18.add" : 3,
+          "Ios18.conv" : 2,
+          "Ios18.mul" : 1
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 4 × 128 × 1 × 200)",
+            "shortDescription" : "",
+            "shape" : "[4, 128, 1, 200]",
+            "name" : "melx",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 4 × 1 × 1 × 200)",
+            "shortDescription" : "",
+            "shape" : "[4, 1, 1, 200]",
+            "name" : "fmask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 100]",
+            "name" : "pos",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 128 × 1 × 3)",
+            "shortDescription" : "",
+            "shape" : "[1280, 128, 1, 3]",
+            "name" : "w1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280 × 1 × 3)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280, 1, 3]",
+            "name" : "w2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b2",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 4 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[4, 1280, 1, 100]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "B4",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 1,
+          "Ios16.einsum" : 40,
+          "Ios18.add" : 31,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 20,
+          "Ios18.layerNorm" : 2,
+          "Ios18.transpose" : 1,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 3,
+          "Ios18.mul" : 2
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 4 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[4, 1280, 1, 100]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 4 × 100 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[4, 100, 1, 1]",
+            "name" : "kmask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wk",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 5120 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[5120, 1280]",
+            "name" : "w1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 5120 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 5120, 1, 1]",
+            "name" : "bf1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 5120)",
+            "shortDescription" : "",
+            "shape" : "[1280, 5120]",
+            "name" : "w2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bf2",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 4 × 1024 × 1 × 50)",
+            "shortDescription" : "",
+            "shape" : "[4, 1024, 1, 50]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "P4",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.realDiv" : 1,
+          "Ios18.avgPool" : 1,
+          "Ios18.reshape" : 2,
+          "Identity" : 1,
+          "Ios18.matmul" : 1,
+          "Ios18.layerNorm" : 1,
+          "Ios18.abs" : 1,
+          "Ios16.reduceMax" : 1,
+          "Ios18.add" : 3,
+          "Ios18.mul" : 1
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 4 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[4, 1280, 1, 100]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1024 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1024, 1280]",
+            "name" : "w",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 1]",
+            "name" : "bias",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 8 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[8, 1280, 1, 100]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "F8",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.gelu" : 2,
+          "Ios18.add" : 3,
+          "Ios18.conv" : 2,
+          "Ios18.mul" : 1
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 8 × 128 × 1 × 200)",
+            "shortDescription" : "",
+            "shape" : "[8, 128, 1, 200]",
+            "name" : "melx",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 8 × 1 × 1 × 200)",
+            "shortDescription" : "",
+            "shape" : "[8, 1, 1, 200]",
+            "name" : "fmask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 100]",
+            "name" : "pos",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 128 × 1 × 3)",
+            "shortDescription" : "",
+            "shape" : "[1280, 128, 1, 3]",
+            "name" : "w1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280 × 1 × 3)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280, 1, 3]",
+            "name" : "w2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b2",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 8 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[8, 1280, 1, 100]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "B8",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 1,
+          "Ios16.einsum" : 40,
+          "Ios18.add" : 31,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 20,
+          "Ios18.layerNorm" : 2,
+          "Ios18.transpose" : 1,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 3,
+          "Ios18.mul" : 2
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 8 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[8, 1280, 1, 100]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 8 × 100 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[8, 100, 1, 1]",
+            "name" : "kmask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wk",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 5120 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[5120, 1280]",
+            "name" : "w1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 5120 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 5120, 1, 1]",
+            "name" : "bf1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 5120)",
+            "shortDescription" : "",
+            "shape" : "[1280, 5120]",
+            "name" : "w2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bf2",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 8 × 1024 × 1 × 50)",
+            "shortDescription" : "",
+            "shape" : "[8, 1024, 1, 50]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "P8",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.realDiv" : 1,
+          "Ios18.avgPool" : 1,
+          "Ios18.reshape" : 2,
+          "Identity" : 1,
+          "Ios18.matmul" : 1,
+          "Ios18.layerNorm" : 1,
+          "Ios18.abs" : 1,
+          "Ios16.reduceMax" : 1,
+          "Ios18.add" : 3,
+          "Ios18.mul" : 1
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 8 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[8, 1280, 1, 100]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1024 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1024, 1280]",
+            "name" : "w",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 1]",
+            "name" : "bias",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 16 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[16, 1280, 1, 100]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "F16",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.gelu" : 2,
+          "Ios18.add" : 3,
+          "Ios18.conv" : 2,
+          "Ios18.mul" : 1
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 16 × 128 × 1 × 200)",
+            "shortDescription" : "",
+            "shape" : "[16, 128, 1, 200]",
+            "name" : "melx",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 16 × 1 × 1 × 200)",
+            "shortDescription" : "",
+            "shape" : "[16, 1, 1, 200]",
+            "name" : "fmask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 100]",
+            "name" : "pos",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 128 × 1 × 3)",
+            "shortDescription" : "",
+            "shape" : "[1280, 128, 1, 3]",
+            "name" : "w1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280 × 1 × 3)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280, 1, 3]",
+            "name" : "w2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b2",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 16 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[16, 1280, 1, 100]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "B16",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 1,
+          "Ios16.einsum" : 40,
+          "Ios18.add" : 31,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 20,
+          "Ios18.layerNorm" : 2,
+          "Ios18.transpose" : 1,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 3,
+          "Ios18.mul" : 2
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 16 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[16, 1280, 1, 100]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 16 × 100 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[16, 100, 1, 1]",
+            "name" : "kmask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wk",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 5120 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[5120, 1280]",
+            "name" : "w1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 5120 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 5120, 1, 1]",
+            "name" : "bf1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 5120)",
+            "shortDescription" : "",
+            "shape" : "[1280, 5120]",
+            "name" : "w2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bf2",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 16 × 1024 × 1 × 50)",
+            "shortDescription" : "",
+            "shape" : "[16, 1024, 1, 50]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "P16",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.realDiv" : 1,
+          "Ios18.avgPool" : 1,
+          "Ios18.reshape" : 2,
+          "Identity" : 1,
+          "Ios18.matmul" : 1,
+          "Ios18.layerNorm" : 1,
+          "Ios18.abs" : 1,
+          "Ios16.reduceMax" : 1,
+          "Ios18.add" : 3,
+          "Ios18.mul" : 1
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 16 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[16, 1280, 1, 100]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1024 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1024, 1280]",
+            "name" : "w",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 1]",
+            "name" : "bias",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 32 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[32, 1280, 1, 100]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "F32",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.gelu" : 2,
+          "Ios18.add" : 3,
+          "Ios18.conv" : 2,
+          "Ios18.mul" : 1
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 32 × 128 × 1 × 200)",
+            "shortDescription" : "",
+            "shape" : "[32, 128, 1, 200]",
+            "name" : "melx",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 32 × 1 × 1 × 200)",
+            "shortDescription" : "",
+            "shape" : "[32, 1, 1, 200]",
+            "name" : "fmask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 100]",
+            "name" : "pos",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 128 × 1 × 3)",
+            "shortDescription" : "",
+            "shape" : "[1280, 128, 1, 3]",
+            "name" : "w1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280 × 1 × 3)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280, 1, 3]",
+            "name" : "w2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b2",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 32 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[32, 1280, 1, 100]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "B32",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 1,
+          "Ios16.einsum" : 40,
+          "Ios18.add" : 31,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 20,
+          "Ios18.layerNorm" : 2,
+          "Ios18.transpose" : 1,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 3,
+          "Ios18.mul" : 2
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 32 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[32, 1280, 1, 100]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 32 × 100 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[32, 100, 1, 1]",
+            "name" : "kmask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wk",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1280, 1280]",
+            "name" : "wo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 5120 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[5120, 1280]",
+            "name" : "w1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 5120 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 5120, 1, 1]",
+            "name" : "bf1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1280 × 5120)",
+            "shortDescription" : "",
+            "shape" : "[1280, 5120]",
+            "name" : "w2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "bf2",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 32 × 1024 × 1 × 50)",
+            "shortDescription" : "",
+            "shape" : "[32, 1024, 1, 50]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "P32",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.realDiv" : 1,
+          "Ios18.avgPool" : 1,
+          "Ios18.reshape" : 2,
+          "Identity" : 1,
+          "Ios18.matmul" : 1,
+          "Ios18.layerNorm" : 1,
+          "Ios18.abs" : 1,
+          "Ios16.reduceMax" : 1,
+          "Ios18.add" : 3,
+          "Ios18.mul" : 1
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 32 × 1280 × 1 × 100)",
+            "shortDescription" : "",
+            "shape" : "[32, 1280, 1, 100]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "g",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1280, 1, 1]",
+            "name" : "b",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1024 × 1280)",
+            "shortDescription" : "",
+            "shape" : "[1024, 1280]",
+            "name" : "w",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 1]",
+            "name" : "bias",
+            "type" : "MultiArray"
+          }
+        ]
+      }
+    ],
+    "mlProgramOperationTypeHistogram" : {
+      "Ios18.realDiv" : 1,
+      "Ios18.avgPool" : 1,
+      "Ios18.reshape" : 2,
+      "Identity" : 1,
+      "Ios18.matmul" : 1,
+      "Ios18.layerNorm" : 1,
+      "Ios18.abs" : 1,
+      "Ios16.reduceMax" : 1,
+      "Ios18.add" : 3,
+      "Ios18.mul" : 1
+    },
+    "isUpdatable" : "0",
+    "stateSchema" : [
+
+    ],
+    "availability" : {
+      "macOS" : "15.0",
+      "tvOS" : "18.0",
+      "visionOS" : "2.0",
+      "watchOS" : "11.0",
+      "iOS" : "18.0",
+      "macCatalyst" : "18.0"
+    },
+    "computePrecision" : "Mixed (Float16, Int32)",
+    "modelType" : {
+      "name" : "MLModelType_mlProgram"
+    },
+    "inputSchema" : [
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 32 × 1280 × 1 × 100)",
+        "shortDescription" : "",
+        "shape" : "[32, 1280, 1, 100]",
+        "name" : "h",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+        "shortDescription" : "",
+        "shape" : "[1, 1280, 1, 1]",
+        "name" : "g",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 1 × 1280 × 1 × 1)",
+        "shortDescription" : "",
+        "shape" : "[1, 1280, 1, 1]",
+        "name" : "b",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 1024 × 1280)",
+        "shortDescription" : "",
+        "shape" : "[1024, 1280]",
+        "name" : "w",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
+        "shortDescription" : "",
+        "shape" : "[1, 1024, 1, 1]",
+        "name" : "bias",
+        "type" : "MultiArray"
+      }
+    ],
+    "defaultFunctionName" : "P32",
+    "generatedClassName" : "small_audio",
+    "userDefinedMetadata" : {
+
+    },
+    "method" : "predict"
+  }
+]

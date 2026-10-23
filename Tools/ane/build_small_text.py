@@ -23,6 +23,7 @@ import mlx.core as mx
 import coremltools as ct
 from coremltools.converters.mil import Builder as mb
 from coremltools.converters.mil.mil import types
+from anelib import query_block
 
 EPS, HEADS, KV, HDIM, LAYERS, HID = 1e-6, 16, 8, 128, 28, 1024
 QC, KC = HEADS * HDIM, KV * HDIM
@@ -104,6 +105,9 @@ def build(W, L):
                          y=mb.mul(x=mb.mul(x=yP, y=col(perm(wt, heads)), name=f"{tag}_pw"), y=si, name=f"{tag}_ps"), name=f"{tag}_num")
             return mb.mul(x=num, y=invc, name=f"{tag}_rot")
 
+        # Queries in blocks of 256 (build_nano_text.py), the causal mask cut into the same blocks once.
+        NB = L // query_block(L, 256)
+        masks = [cmask] if NB == 1 else mb.split(x=cmask, num_splits=NB, axis=3, name="cmask_qb")
         h = x
         for i in range(LAYERS):
             p = f"language_model.layers.{i}."; t = f"l{i}"
@@ -120,9 +124,12 @@ def build(W, L):
             outs = []
             for hd in range(HEADS):
                 g = hd // (HEADS // KV)
-                s_ = mb.einsum(values=(ks[g], qs[hd]), equation="bkhc,bchq->bkhq", name=f"{t}_h{hd}_qk")
-                a = mb.softmax(x=mb.add(x=s_, y=cmask, name=f"{t}_h{hd}_m"), axis=1, name=f"{t}_h{hd}_sm")
-                outs.append(mb.einsum(values=(vs[g], a), equation="bchk,bkhq->bchq", name=f"{t}_h{hd}_av"))
+                parts = []
+                for j, qp in enumerate([qs[hd]] if NB == 1 else mb.split(x=qs[hd], num_splits=NB, axis=3, name=f"{t}_h{hd}_qb")):
+                    s_ = mb.einsum(values=(ks[g], qp), equation="bkhc,bchq->bkhq", name=f"{t}_h{hd}_{j}_qk")
+                    a = mb.softmax(x=mb.add(x=s_, y=masks[j], name=f"{t}_h{hd}_{j}_m"), axis=1, name=f"{t}_h{hd}_{j}_sm")
+                    parts.append(mb.einsum(values=(vs[g], a), equation="bchk,bkhq->bchq", name=f"{t}_h{hd}_{j}_av"))
+                outs.append(parts[0] if NB == 1 else mb.concat(values=parts, axis=3, name=f"{t}_h{hd}_cat"))
             ctx = mb.concat(values=outs, axis=1, name=f"{t}_ctx")
             h = mb.add(x=h, y=mb.conv(x=ctx, weight=cw(f32[p + "self_attn.o_proj.weight"]), name=f"{t}_o"), name=f"{t}_r1")
             xn2 = rms(h, f32[p + "post_attention_layernorm.weight"], HID, f"{t}_post")
@@ -130,11 +137,13 @@ def build(W, L):
             u = mb.conv(x=xn2, weight=cw(f32[p + "mlp.up_proj.weight"]), name=f"{t}_u")
             act = mb.mul(x=mb.mul(x=g_, y=mb.sigmoid(x=g_, name=f"{t}_sig"), name=f"{t}_silu"), y=u, name=f"{t}_gu")
             h = mb.add(x=h, y=mb.conv(x=act, weight=cw(f32[p + "mlp.down_proj.weight"]), name=f"{t}_d"), name=f"{t}_r2")
-        pooled = mb.reduce_sum(x=mb.mul(x=h, y=pick, name="pick"), axes=[3], keep_dims=True, name="pool")
-        return rms(pooled, f32["language_model.norm.weight"], HID, "final")
+        # Every position final-normed (an image's tags are scored on its rows), and the picked one.
+        hn = rms(h, f32["language_model.norm.weight"], HID, "final")
+        pooled = mb.reduce_sum(x=mb.mul(x=hn, y=pick, name="pick"), axes=[3], keep_dims=True, name="pooled")
+        return pooled, mb.identity(x=hn, name="hidden")
 
     return ct.convert(prog, minimum_deployment_target=ct.target.macOS15, compute_precision=ct.precision.FLOAT16,
-                      compute_units=ct.ComputeUnit.CPU_AND_NE)
+                      compute_units=ct.ComputeUnit.CPU_AND_NE, skip_model_load=True)
 
 
 if __name__ == "__main__":

@@ -356,9 +356,10 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     // already hold these exact arrays, so retaining the store costs ~0 extra bytes. (F11)
     private let config: OmniConfig
     private var weightStore: WeightStore
-    public var supportsImages: Bool { imageEncoder != nil }
-    public var supportsVideo: Bool { imageEncoder != nil }
-    public var supportsAudio: Bool { audioEncoder != nil }
+    // Either unit: in Neural Engine mode the GPU towers are released (releaseGPUTowers).
+    public var supportsImages: Bool { imageEncoder != nil || aneLock.withLock { _aneVision != nil } }
+    public var supportsVideo: Bool { supportsImages }
+    public var supportsAudio: Bool { audioEncoder != nil || aneLock.withLock { _aneAudio != nil } }
 
     /// - Parameter gpuCacheBytes: cap on MLX's buffer cache (0 = library default).
     ///   Bounds memory growth during long indexing runs on unified memory.
@@ -574,6 +575,10 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                 for k in Array(w.keys) where k.hasPrefix("audio_tower.") || k.hasPrefix("audio_projector.") { w.removeValue(forKey: k) }
             }
             let filtered = WeightStore(rawWeights: w)
+            aneLock.withLock {
+                if !newKeepVision { _aneVision = nil }
+                if !newKeepAudio { _aneAudio = nil }
+            }
             textEncoder = OmniTextEncoder(weights: filtered, config: config, tokenizer: tokenizer)
             imageEncoder = newKeepVision ? OmniImageEncoder(weights: filtered, config: config) : nil
             audioEncoder = newKeepAudio ? OmniAudioEncoder(weights: filtered, config: config) : nil
@@ -779,6 +784,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
 
     private let aneLock = NSLock()
     private var _aneText: AnyObject?
+    private var _aneVision: AnyObject?, _aneAudio: AnyObject?
+    private var _gpuTowersReleased = false
+    /// Neural Engine mode released the GPU copies of the towers; a switch back to the GPU needs the
+    /// engine loaded again (AppModel.reloadEngine).
+    public var gpuTowersReleased: Bool { aneLock.withLock { _gpuTowersReleased } }
     private var _computeUnit: ComputeUnit = .gpu
     public var computeUnit: ComputeUnit { aneLock.withLock { _computeUnit } }
     /// This Mac (macOS 15) and this model (a program for it) can run text on the Neural Engine.
@@ -796,7 +806,12 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     public func setComputeUnit(_ unit: ComputeUnit, cache: URL) -> Bool {
         aneLock.withLock { _computeUnit = unit }
         guard unit == .neuralEngine else {
-            aneLock.withLock { _aneText = nil }
+            // With the GPU towers released, the programs stay the towers until the app loads the
+            // engine again (AppModel.applyComputeUnit).
+            aneLock.withLock {
+                _aneText = nil
+                if !_gpuTowersReleased { _aneVision = nil; _aneAudio = nil }
+            }
             return false
         }
         guard #available(macOS 15.0, *), let name = Self.aneProgramName(config) else { return false }
@@ -808,9 +823,142 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             omniPerfLog("ane: not available, text stays on the GPU")
             return false
         }
-        omniPerfLog(String(format: "ane: text on the Neural Engine (%.1f s to ready)", -t0.timeIntervalSinceNow))
+        backend.warm()
+        omniPerfLog(String(format: "ane: text on the Neural Engine (%.1f s to ready; longer lengths compile on first use)", -t0.timeIntervalSinceNow))
         aneLock.withLock { if _computeUnit == .neuralEngine { _aneText = backend } }
+        // The towers: their weights made into arrays now, each size compiled the first time an
+        // image, clip or recording needs it. An item a program cannot take runs the GPU path.
+        let prefix = name.replacingOccurrences(of: "_text", with: "")
+        if imageEncoder != nil, let vc = ANEBlocks.bundled(prefix + "_vision") {
+            do {
+                // The tower object computes the position table and rotary angles; it gets only the
+                // tensor that needs, so it holds no reference to the weights released below.
+                let pos = WeightStore(rawWeights: weightStore.weights.filter { $0.key == "vision_tower.pos_embed.weight" })
+                let vb = try ANEVisionBackend(compiled: vc, tower: OmniVisionTower(weights: pos, config: config), config: config,
+                                              weights: weightStore, buckets: ANEVisionBackend.defaultBuckets)
+                omniPerfLog(String(format: "ane: images and video on the Neural Engine (weights ready in %.1f s; each size compiles on first use)", -t0.timeIntervalSinceNow))
+                aneLock.withLock { if _computeUnit == .neuralEngine { _aneVision = vb } }
+            } catch {
+                omniPerfLog("ane: vision not loaded: \(error)")
+            }
+        }
+        if let audio = audioEncoder, let ac = ANEBlocks.bundled(prefix + "_audio") {
+            do {
+                let ab = try ANEAudioBackend(compiled: ac, positions: audio.anePositions, config: config, weights: weightStore,
+                                             batches: ANEAudioBackend.defaultBatches)
+                omniPerfLog(String(format: "ane: audio on the Neural Engine (weights ready in %.1f s; each size compiles on first use)", -t0.timeIntervalSinceNow))
+                aneLock.withLock { if _computeUnit == .neuralEngine { _aneAudio = ab } }
+            } catch {
+                omniPerfLog("ane: audio not loaded: \(error)")
+            }
+        }
+        // The GPU copies of the towers are dead weight now (Nano: 1.4 GB of footprint): every image,
+        // clip and recording goes through the programs, a sequence past the text program through
+        // the GPU backbone with the programs' tokens. Released once each program's smallest size
+        // has loaded, so a Mac whose Neural Engine refuses one keeps that tower on the GPU.
+        let (v, a) = aneLock.withLock { (_aneVision as? ANEVisionBackend, _aneAudio as? ANEAudioBackend) }
+        let releaseVision = v?.ready() ?? false, releaseAudio = a?.ready() ?? false
+        if releaseVision || releaseAudio {
+            run(highPriority: false) {
+                var w = weightStore.weights
+                if releaseVision {
+                    for k in Array(w.keys) where k.hasPrefix("vision_tower.") || k.hasPrefix("merger.") { w.removeValue(forKey: k) }
+                    imageEncoder = nil
+                }
+                if releaseAudio {
+                    for k in Array(w.keys) where k.hasPrefix("audio_tower.") || k.hasPrefix("audio_projector.") { w.removeValue(forKey: k) }
+                    audioEncoder = nil
+                }
+                weightStore = WeightStore(rawWeights: w)
+                // The text backbone holds the store it was built from, every tensor in it: built
+                // again from the one without the towers, or they stay resident (as in setTowers).
+                textEncoder = OmniTextEncoder(weights: weightStore, config: config, tokenizer: tokenizer)
+                MLX.Memory.clearCache()
+            }
+            aneLock.withLock { _gpuTowersReleased = true }
+            omniPerfLog("ane: GPU towers released (vision \(releaseVision), audio \(releaseAudio))")
+        }
         return neuralEngineActive
+    }
+
+    /// An image's - or a video clip's, its temporal slices in order - vector and, with a tagger,
+    /// its [2V] tag scores, on the Neural Engine: the tower, the backbone on the sequence the GPU
+    /// path builds, the tags from the image's hidden rows on the CPU. nil when the towers are not
+    /// loaded or a program cannot take this one: the caller runs the GPU path.
+    private func aneImage(_ raw: OmniVisionPreprocess.RawPatches, prefix: [Int], tagger: OmniTagger?) -> (vec: [Float], scores: [Float]?)? {
+        guard #available(macOS 15.0, *),
+              let vision = aneLock.withLock({ _aneVision }) as? ANEVisionBackend,
+              let (t, h, w) = raw.gridTHW.first, raw.gridTHW.count == 1 else { return nil }
+        let slice = h * w * raw.rowLen
+        var tokens: [Float] = [], count = 0
+        for k in 0 ..< t {
+            let part = OmniVisionPreprocess.RawPatches(pixels: Array(raw.pixels[k * slice ..< (k + 1) * slice]), gridTHW: [(1, h, w)])
+            guard let r = vision.encode(part) else {
+                omniPerfLog("ane-fallback image: \(h * w) patches a slice, not taken by the program")
+                return nil
+            }
+            tokens += r.tokens; count += r.count
+        }
+        let seq = textEncoder.mediaRows(.vision, tokens: tokens, count: count, prefixIds: prefix, suffixIds: mediaSuffix)
+        let text = aneLock.withLock({ _aneText }) as? ANETextBackend
+        guard let text, let out = text.encode(embeddings: seq.rows, count: seq.length, hidden: tagger != nil) else {
+            // The tower's tokens through the GPU backbone - no GPU tower needed: a video's sequence
+            // past the text program's longest length, or text back on the GPU while the app loads
+            // the towers again.
+            if text != nil { omniPerfLog("ane-fallback image: a sequence of \(seq.length), past the longest text bucket; backbone on the GPU") }
+            let enc = textEncoder
+            return run(highPriority: false) {
+                let r = enc.encodeMedia(.vision, tokens: tokens, count: count, prefixIds: prefix, suffixIds: mediaSuffix, tagger: tagger)
+                addTokens(enc.lastSequenceLength)
+                return r.vec.isEmpty ? nil : (r.vec, r.tagScores)
+            }
+        }
+        addTokens(seq.length)
+        guard let tagger, let rows = out.hidden else { return (out.vector, nil) }
+        let dim = rows.count / seq.length
+        let scores = Device.withDefaultDevice(.cpu) { () -> [Float] in
+            let patches = MLXArray(Array(rows[seq.mediaStart * dim ..< (seq.mediaStart + count) * dim]), [count, dim])
+            let s = tagger.scoreGraph(patches: patches, pooled: MLXArray(out.vector))
+            eval(s)
+            return s.asArray(Float.self)
+        }
+        return (out.vector, scores)
+    }
+
+    /// A recording's window on the Neural Engine, nil when its tower is not loaded or cannot take it.
+    private func aneAudioVector(mel: [Float], frames: Int, prefix: [Int]) -> [Float]? {
+        guard #available(macOS 15.0, *),
+              let audio = aneLock.withLock({ _aneAudio }) as? ANEAudioBackend else { return nil }
+        guard let r = audio.encode(mel: mel, frames: frames) else {
+            omniPerfLog("ane-fallback audio: \(frames) mel frames, not taken by the program")
+            return nil
+        }
+        let seq = textEncoder.mediaRows(.audio, tokens: r.tokens, count: r.count, prefixIds: prefix, suffixIds: mediaSuffix)
+        let text = aneLock.withLock({ _aneText }) as? ANETextBackend
+        guard let text, let out = text.encode(embeddings: seq.rows, count: seq.length) else {
+            if text != nil { omniPerfLog("ane-fallback audio: a sequence of \(seq.length), past the longest text bucket; backbone on the GPU") }
+            let enc = textEncoder
+            return run(highPriority: false) {
+                let v = enc.encodeMedia(.audio, tokens: r.tokens, count: r.count, prefixIds: prefix, suffixIds: mediaSuffix, tagger: nil).vec
+                addTokens(enc.lastSequenceLength)
+                return v.isEmpty ? nil : v
+            }
+        }
+        addTokens(seq.length)
+        return out.vector
+    }
+
+    /// Images on the Neural Engine one by one; nil when the towers are not loaded or one image
+    /// cannot be embedded (the caller then has no vectors for the batch, as on the GPU path).
+    private func aneImages(_ raws: [OmniVisionPreprocess.RawPatches], tagger: OmniTagger?) -> (vecs: [[Float]], scores: [[Float]]?)? {
+        guard aneLock.withLock({ _aneVision != nil }) else { return nil }
+        var vecs: [[Float]] = [], scores: [[Float]] = []
+        for raw in raws {
+            guard let r = aneImage(raw, prefix: docPrefix, tagger: tagger) else { return nil }
+            vecs.append(r.vec)
+            if let s = r.scores { scores.append(s) }
+        }
+        return (vecs, tagger == nil ? nil : scores)
     }
 
     /// The program for this model (Tools/ane/build_nano_text.py, build_small_text.py), nil for one
@@ -832,6 +980,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     private func aneOrGPU(_ ids: [[Int]], passage: Bool) -> [[Float]] {
         var out = ids.map { aneVector($0) }
         let rest = out.indices.filter { out[$0] == nil }
+        if !rest.isEmpty, neuralEngineActive {
+            omniPerfLog("ane-fallback text: \(rest.count) of \(ids.count), longest \(rest.map { ids[$0].count }.max() ?? 0) tokens")
+        }
         if !rest.isEmpty {
             let v = run(highPriority: !passage) { textEncoder.encodeTokenBatch(rest.map { ids[$0] }) }
             for (k, i) in rest.enumerated() where k < v.count { out[i] = v[k] }
@@ -1182,6 +1333,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
 
 
     public func embedImage(_ image: CGImage) -> [Float]? {
+        if let r = aneImage(OmniVisionPreprocess.preprocessRaw(image), prefix: docPrefix, tagger: nil) { return r.vec }
         guard let enc = imageEncoder else { return nil }
         return run(highPriority: false) { let v = enc.encode(image, prefixIds: docPrefix, suffixIds: mediaSuffix); addTokens(enc.lastSequenceLength); return v }
     }
@@ -1201,8 +1353,13 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// finalize against an empty prior stores permanent vocab-junk snippets (and marks the prior
     /// non-empty, skipping the seed). No-op when the prior is already seeded (persisted .prior).
     public func seedTaggerPrior(_ tagger: OmniTagger) {
-        guard tagger.needsSeed, let enc = imageEncoder else { return }
+        guard tagger.needsSeed else { return }
         let raws = OmniTagger.seedImages().map { OmniVisionPreprocess.preprocessRaw($0) }
+        if let r = aneImages(raws, tagger: tagger), let s = r.scores {
+            for x in s { _ = tagger.finalize(x) }
+            return
+        }
+        guard let enc = imageEncoder else { return }
         let scores = run(highPriority: false) { () -> [[Float]]? in
             let inputs: [OmniImageEncoder.Preprocessed] = raws.map { (pixelValues: $0.tensor(), gridTHW: $0.gridTHW) }
             let r = enc.encode(images: inputs, prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger)
@@ -1217,10 +1374,14 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// `tags[i]` is empty when tagging was unavailable for that image. Falls back to plain
     /// embedding (empty tags) when no tagger is set.
     public func embedImagesTagged(_ raws: [OmniVisionPreprocess.RawPatches]) -> (vecs: [[Float]], tags: [[String]])? {
-        guard let enc = imageEncoder, !raws.isEmpty else { return nil }
+        guard !raws.isEmpty else { return nil }
         guard let tagger else {
             return embedImages(raws).map { ($0, Array(repeating: [], count: $0.count)) }
         }
+        if let r = aneImages(raws, tagger: tagger), let s = r.scores, s.count == r.vecs.count {
+            return (r.vecs, s.map { tagger.finalize($0) })
+        }
+        guard let enc = imageEncoder else { return nil }
         var vecs: [[Float]] = []
         var scores: [[Float]] = []
         // Same interactive carve as embedImages: while the user is searching, ONE image per gate
@@ -1262,7 +1423,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// matrix - no finalize, no prior involvement. Powers the CWR crop scoring and the eval
     /// harness. Same low-priority gate as every other media embed.
     public func embedImagesTagScores(_ raws: [OmniVisionPreprocess.RawPatches], tagger: OmniTagger) -> [[Float]]? {
-        guard let enc = imageEncoder, !raws.isEmpty else { return nil }
+        guard !raws.isEmpty else { return nil }
+        if let r = aneImages(raws, tagger: tagger), let s = r.scores, s.count == raws.count { return s }
+        guard let enc = imageEncoder else { return nil }
         // ALWAYS one gate hold per input - not just while a search is active. This path serves
         // background tag refinement, where latency is free but a query must never wait behind a
         // multi-crop hold (a 15-crop hold is seconds on a low-end GPU, and the retag fires right
@@ -1290,7 +1453,21 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     public func embedImagesTaggedHQ(_ raws: [OmniVisionPreprocess.RawPatches],
                                     crops: [[OmniVisionPreprocess.RawPatches]]) -> (vecs: [[Float]], tags: [[String]])? {
         guard crops.contains(where: { !$0.isEmpty }), let tagger else { return embedImagesTagged(raws) }
-        guard let enc = imageEncoder, !raws.isEmpty, crops.count == raws.count else { return nil }
+        guard !raws.isEmpty, crops.count == raws.count else { return nil }
+        if let r = aneImages(raws, tagger: tagger), let main = r.scores, main.count == raws.count {
+            let flat = crops.flatMap { $0 }
+            let cropScores = flat.isEmpty ? [] : (embedImagesTagScores(flat, tagger: tagger) ?? [])
+            var off = 0
+            let tags: [[String]] = raws.indices.map { i in
+                let n = crops[i].count
+                defer { off += n }
+                let cropMax = n > 0 && off + n <= cropScores.count
+                    ? OmniTagger.cropMaxRow(cropScores[off ..< off + n], labelCount: tagger.labels.count) : nil
+                return tagger.finalize(main[i], cropMax: cropMax)
+            }
+            return (r.vecs, tags)
+        }
+        guard let enc = imageEncoder else { return nil }
         // ALWAYS one gate hold per image (crop scoring does the same inside
         // embedImagesTagScores): this is background refinement, and a query typed during a
         // retag flush must preempt after ~one forward, never wait out a batch hold.
@@ -1332,7 +1509,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// runs in the indexer's concurrent decode stage; this call only does the GPU tower+backbone.
     /// One block-diagonal vision forward per `patchBudget` chunk; returns one vector per input.
     public func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? {
-        guard let enc = imageEncoder, !raws.isEmpty else { return nil }
+        guard !raws.isEmpty else { return nil }
+        if let r = aneImages(raws, tagger: nil) { return r.vecs }
+        guard let enc = imageEncoder else { return nil }
         // While the user is searching, embed ONE image per gate hold so an interactive query preempts
         // after ~one image (~300ms) instead of waiting behind the whole batch - measured: an 8-image
         // batch is ~2.3s in a SINGLE gate hold, and a query (incl. at startup, when the catch-up pass
@@ -1368,12 +1547,13 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// (the temporal vision patches feed the same label matmul as image patches). Empty tags
     /// when no tagger is attached.
     public func embedVideoFramesTagged(_ frames: [CGImage]) -> (vec: [Float], tags: [String])? {
-        guard let enc = imageEncoder else { return nil }
         guard let tagger else { return embedVideoFrames(frames).map { ($0, []) } }
         // CPU patchify OFF the gate (measured 185ms per 32-frame segment held it): a waiting
         // query grabs the gate that much sooner during video indexing. Same graph as encodeVideo
         // (which is exactly preprocessRaw + tensor + encode), so vectors are bit-identical.
         guard let raw = OmniVideoPreprocess.preprocessRaw(frames) else { return nil }
+        if let a = aneImage(raw, prefix: docPrefix, tagger: tagger) { return (a.vec, a.scores.map { tagger.finalize($0) } ?? []) }
+        guard let enc = imageEncoder else { return nil }
         let r = run(highPriority: false) { () -> (vec: [Float], tagScores: [Float]?) in
             let r = enc.encode(pixelValues: raw.tensor(), gridTHW: raw.gridTHW,
                                prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger)
@@ -1384,9 +1564,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     }
 
     public func embedVideoFrames(_ frames: [CGImage]) -> [Float]? {
-        guard let enc = imageEncoder, !frames.isEmpty else { return nil }
+        guard !frames.isEmpty else { return nil }
         // Same off-gate CPU patchify as embedVideoFramesTagged.
         guard let raw = OmniVideoPreprocess.preprocessRaw(frames) else { return nil }
+        if let a = aneImage(raw, prefix: docPrefix, tagger: nil) { return a.vec }
+        guard let enc = imageEncoder else { return nil }
         return run(highPriority: false) {
             let v = enc.encode(pixelValues: raw.tensor(), gridTHW: raw.gridTHW, prefixIds: docPrefix, suffixIds: mediaSuffix)
             addTokens(enc.lastSequenceLength)
@@ -1395,11 +1577,13 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     }
 
     public func embedAudio(_ url: URL) -> [Float]? {
+        if let (mel, frames) = OmniAudioPreprocess.melFeatures(url: url), let v = aneAudioVector(mel: mel, frames: frames, prefix: docPrefix) { return v }
         guard let enc = audioEncoder else { return nil }
         return run(highPriority: false) { let v = enc.encode(url, prefixIds: docPrefix, suffixIds: mediaSuffix); addTokens(enc.lastSequenceLength); return v }
     }
 
     public func embedAudioMel(_ mel: [Float], frames: Int) -> [Float]? {
+        if let v = aneAudioVector(mel: mel, frames: frames, prefix: docPrefix) { return v }
         guard let enc = audioEncoder else { return nil }
         return run(highPriority: false) { let v = enc.encode(mel: mel, frames: frames, prefixIds: docPrefix, suffixIds: mediaSuffix); addTokens(enc.lastSequenceLength); return v }
     }
@@ -1407,7 +1591,12 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// Batch-N audio: embed several precomputed mels in one tower + one backbone forward.
     /// Returns one vector per clip, in input order. The caller bounds N by a frame budget.
     public func embedAudioMelBatch(_ mels: [[Float]], frames: [Int]) -> [[Float]]? {
-        guard let enc = audioEncoder, !mels.isEmpty else { return nil }
+        guard !mels.isEmpty else { return nil }
+        if aneLock.withLock({ _aneAudio != nil }) {
+            let v = zip(mels, frames).compactMap { m, f in aneAudioVector(mel: m, frames: f, prefix: docPrefix) ?? embedAudioMel(m, frames: f) }
+            return v.count == mels.count ? v : nil
+        }
+        guard let enc = audioEncoder else { return nil }
         // While the user is searching, embed ONE clip per gate hold so a query preempts after ~one
         // clip (~76ms measured) instead of waiting behind the whole cross-file batch - measured: a
         // ~16-clip audio batch holds the gate ~0.97s in a SINGLE forward. This is the audio analogue
@@ -1447,20 +1636,24 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     // high priority and skip addTokens() (queries are excluded from the indexing throughput counter).
 
     public func embedImageQuery(_ image: CGImage, asDocument: Bool = false) -> [Float]? {
-        guard let enc = imageEncoder else { return nil }
         let prefix = asDocument ? docPrefix : queryPrefix
+        if let r = aneImage(OmniVisionPreprocess.preprocessRaw(image), prefix: prefix, tagger: nil) { return r.vec }
+        guard let enc = imageEncoder else { return nil }
         return run(highPriority: true) { enc.encode(image, prefixIds: prefix, suffixIds: mediaSuffix) }
     }
 
     public func embedVideoQuery(_ frames: [CGImage], asDocument: Bool = false) -> [Float]? {
-        guard let enc = imageEncoder, !frames.isEmpty else { return nil }
+        guard !frames.isEmpty else { return nil }
         let prefix = asDocument ? docPrefix : queryPrefix
+        if let raw = OmniVideoPreprocess.preprocessRaw(frames), let r = aneImage(raw, prefix: prefix, tagger: nil) { return r.vec }
+        guard let enc = imageEncoder else { return nil }
         return run(highPriority: true) { enc.encodeVideo(frames, prefixIds: prefix, suffixIds: mediaSuffix) }
     }
 
     public func embedAudioQuery(_ url: URL, asDocument: Bool = false) -> [Float]? {
-        guard let enc = audioEncoder else { return nil }
         let prefix = asDocument ? docPrefix : queryPrefix
+        if let (mel, frames) = OmniAudioPreprocess.melFeatures(url: url), let v = aneAudioVector(mel: mel, frames: frames, prefix: prefix) { return v }
+        guard let enc = audioEncoder else { return nil }
         return run(highPriority: true) { enc.encode(url, prefixIds: prefix, suffixIds: mediaSuffix) }
     }
 

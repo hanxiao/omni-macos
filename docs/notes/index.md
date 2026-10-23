@@ -2352,7 +2352,91 @@ download; installs with an index keep the GPU. The facts shown are the ones true
 the GPU left to other apps, media on the GPU); speed is not, it depends on the Mac.
 
 NOT DONE YET, and why it matters: the program is held by the system outside Omni's memory (Nano
-~255 MB, Small ~1.06 GB fp16) ON TOP of the GPU backbone, which stays for media and the fallbacks.
-Dropping the GPU backbone in Neural Engine mode needs the media injection and the tag scores on the
-program (it takes embeddings already; it needs the hidden rows as an output) and the long-sequence
-fallback solved. The towers themselves (step 2) are not ported.
+~255 MB, Small ~1.06 GB fp16) ON TOP of the GPU backbone, which stays for the long-sequence fallback
+and the stamp probe. The towers and the tags moved to the Neural Engine on 2026-10-23 (next section).
+
+## The Neural Engine, all or nothing (2026-10-23)
+
+Han: the image and audio towers ported and tested before more UI; then "it will be all or nothing":
+Neural Engine mode never races the GPU, GPU mode races it at full speed; then "that one time build is
+way too slow... check what others do".
+
+THE TOWERS ARE BLOCK PROGRAMS, NOT BAKED GRAPHS. The first port baked every layer's weights into one
+graph per input size, like the text program. Measured on a quiet machine (Nano, fresh cache): first
+launch 15.6 min - text 43 s, vision 651 s (8 sizes; the 5,120-patch one 192 s), audio 241 s.
+ANECompilerService compiles on ONE core, for every process on the Mac, in one queue, and keeps
+compiling after its client dies (it runs as root; an abandoned compile held the queue ~40 min until
+`sudo killall ANECompilerService`). Compile time is linear in graph size: 12 x 15.8 s for one
+photo-size vision layer = the 192 s baked tower. Draw Things (2026-04) and oMLX (MLP only on the
+Neural Engine, attention on the GPU; first request 5.7 -> 69.6 s with its compile) both keep the
+Neural Engine's programs small. Measured, photo-size vision layer unless noted:
+
+    form                                   compile   per layer   note
+    baked weights (the old towers)         16 s/layer  33 ms     queries blocked at 128
+    WEIGHTS AS INPUTS, matmul    (kept)    15.8 s      38.7 ms   all 2,000 ops on the ANE
+    weights as inputs, 1x1 conv            15.8 s      45.1 ms   and refused at batch > 1 (audio)
+    all heads in one einsum                 4.4 s     100 ms     220 ops, 2.6x slower
+    scaled_dot_product_attention op          -           -       ANECCompile() FAILED on M3
+    weights as Core ML state                 -           -       ANE inference error 0x1d
+    12 layers' weights as inputs, text       -           -       Core ML cannot run it
+
+  The cost of weights as inputs is a copy per call (~13 GB/s; IOSurface-backed arrays 1.6 -> 1.4 ms
+  at 256 patches, so not the fix): nothing at photo size, 1.3-1.9 ms a layer at 32 tokens, which is
+  why TEXT STAYS BAKED (a Nano query 2.7 ms baked, ~16 ms as blocks; Small's 28 layers worse).
+
+  Queries per attention block: at most 128 for the towers (5,120 patches 750 -> 400 ms against 256;
+  512 no better), 256 for text (L2048 167 -> 102 ms, compile ~20 -> 52 s). Two simultaneous
+  requests on the Ultra's two Neural Engines: +15% (vision), +3% (text) - one at a time.
+
+EVERYTHING COMPILES ON FIRST USE (ANEBlocks.Functions): Neural Engine mode is ready when the text
+weights are written and the shortest length compiled - Nano 7.2 s, Small 27 s - and every other size
+compiles the first time an input needs it: Nano vision 5,120 patches 16.9 + 1.5 + 1.7 s, 1,024
+3.8 s, audio ~1 s a size; text L256 6.6, L512 12.3, L1024 19.9, L2048 52.8 s (Small 23-35 s a
+length). The towers ship COMPILED (Resources/ANE/*.mlmodelc, Nano 4.4 MB + 316 KB, no weights
+inside) and take the app's own weights as fp16 arrays: no weight file on the Mac, no recipe.
+
+SIZES: images 1,024 ... 5,120 patches (the preprocess's pixel range; a phone photo is always 5,120:
+13 of 19 photos on this Mac are past the cap); video slices to 8,192 (6 frames of 1568 px: 16:9 5,488,
+4:3 7,252, square 8,100); audio windows to 60 s (30 chunks of 2 s). NOT YET: a video's backbone
+sequence past 2,048 tokens (HD video reaches ~6,300) still runs on the GPU (`ane-fallback` in the
+perf log) - the next step is text blocks for the long lengths, which also measured faster there
+(L2048 124 ms as blocks against 167 baked).
+
+RESULTS, Nano, through the engine (omni-verify aneengine), against the GPU:
+
+    input                  vector cosine min / median   tags agree   GPU    Neural Engine
+    images 512 px x46      0.99681 / 0.99902            0.80          24 ms    84 ms
+    photos 1568 px x46     0.99356 / 0.99782            0.73         112 ms   625 ms (1,047 baked)
+    video x3 (small)       0.99862 / 0.99875            0.87          22 ms    87 ms
+    audio x11              0.98773 / 0.99855            -             85 ms   321 ms (172 baked)
+
+  Small: photos 0.99450 / 0.99801, 337 vs 2,035 ms; audio min 0.97449. Tag QUALITY (tageval, COCO-150,
+  mAP base / with crops): native size GPU 0.647 / 0.697, ANE 0.649 / 0.691; photo size GPU 0.672 /
+  0.694, ANE 0.663 / 0.692 - within noise. Search (440 queries, an index built entirely on the
+  Neural Engine against one built on the GPU): MRR 0.892 vs 0.889, images 0.812 vs 0.774, audio 0.849
+  vs 0.794, no fallback.
+  - Photo tokens are ~0.978 to fp32 on the Neural Engine in every form tried (baked, blocks, conv,
+    either LayerNorm): fp16 attention over ~5,000 keys. Small images 0.9975. It washes out by the
+    vector and the tags.
+  - Audio's weak tokens are loud passages (|h| ~500 in the last layers) where fp16 activations drift
+    from the GPU's fp32 (its bf16 weights promote against the fp32 mel, so the GPU path IS fp32): clip
+    3, token 115 at 0.659. Core ML's CPU run of the same program drifts the same way; the baked
+    program drifted more (0.622 vs 0.981 at that token). `omni-verify aneaudiotokens` shows it.
+  - Neural Engine outputs come back with the last axis padded (100 -> stride 128); fed back as the
+    next call's input they read correctly (a dense copy changed nothing).
+
+MEMORY: the towers' fp16 arrays first sat beside the GPU copies of the same towers - an isolated
+instance at 4,073 MB on the Neural Engine against 2,635 MB on the GPU. In Neural Engine mode the GPU
+towers are released once each program's smallest size loads (setComputeUnit; a Mac whose Neural
+Engine refuses one keeps that tower on the GPU): 3,657 MB, and 2,190 MB once the text encoder was
+built again from the store without them - Qwen3Backbone keeps the WeightStore it was made from,
+every tensor in it, as setTowers already knew. The vision program's helper tower gets only the
+position table for the same reason. A sequence past the text program (HD video) or text back on
+the GPU runs the programs' tokens through the GPU backbone (OmniTextEncoder.encodeMedia, the
+wrapper built once in Qwen3Backbone.mediaSequence); a switch back to the GPU loads the engine again
+(AppModel.reloadEngine) and the programs serve media until it is in. ANEModeTests holds all of it;
+its first run caught images returning nil in that switch.
+
+ALSO: Half rounds fp16 subnormals as numpy does (vImage was one step off on 29 of 488 audio blobs).
+Builders run from Tools/ane with coremltools' model load skipped: loading a converted model made
+ct.convert compile it for the Neural Engine, minutes per size, thrown away.

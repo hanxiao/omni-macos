@@ -22,9 +22,10 @@ public final class ANETextBackend: @unchecked Sendable {
     public static let defaultLengths = [32, 64, 128, 256, 512, 1024, 2048]
     public let lengths: [Int]
     public var maxLength: Int { lengths.last ?? 0 }
-    private let models: [Int: MLModel]
-    /// Seconds each function took to load, for the probe and the log.
-    public let loadSeconds: [Int: Double]
+    /// Each length compiles the first time a sequence needs it (ANEBlocks.Functions).
+    private let functions: ANEBlocks.Functions
+    /// Seconds each function took to load so far, for the probe and the log.
+    public var loadSeconds: [String: Double] { functions.seconds }
     private let hidden: Int
     private let headDim: Int
     /// The rotary tables' channels: the query heads (Small's 16 x 128 = 2048, Nano's 768).
@@ -45,17 +46,7 @@ public final class ANETextBackend: @unchecked Sendable {
         guard let t = weights.weights["language_model.embed_tokens.weight"] else {
             throw OmniError.store("no embedding table")
         }
-        var models: [Int: MLModel] = [:], secs: [Int: Double] = [:]
-        for L in lengths {
-            let cfg = MLModelConfiguration()
-            cfg.computeUnits = .cpuAndNeuralEngine
-            cfg.functionName = "L\(L)"
-            let t0 = Date()
-            models[L] = try MLModel(contentsOf: compiled, configuration: cfg)
-            secs[L] = -t0.timeIntervalSinceNow
-        }
-        self.models = models
-        loadSeconds = secs
+        functions = ANEBlocks.Functions(compiled)
         self.lengths = lengths.sorted()
         hidden = config.text.hiddenSize
         headDim = config.text.headDim
@@ -67,16 +58,30 @@ public final class ANETextBackend: @unchecked Sendable {
         rows = t.asData(access: .noCopyIfContiguous)
     }
 
+    /// Compile the shortest length now, so the first query does not wait for it.
+    public func warm() { _ = functions.model("L\(lengths[0])") }
+
+    /// The pooled, L2-normalized vector of a sequence given as its input rows (row-major [n, C]):
+    /// an image's or a recording's, its tokens from a tower between the wrapper's embeddings. With
+    /// `hidden`, also every position's final-normed hidden state, row-major [n, C] (the tags).
+    public func encode(embeddings rows: [Float], count n: Int, hidden wantHidden: Bool = false) -> (vector: [Float], hidden: [Float]?)? {
+        guard n > 0, rows.count == n * hidden else { return nil }
+        return run(n, wantHidden: wantHidden) { x, L in ANEVisionBackend.channelMajor(rows, rows: n, cols: hidden, into: x, length: L) }
+    }
+
     /// The pooled, L2-normalized vector of one token sequence, or nil past the longest bucket.
     public func encode(_ ids: [Int]) -> [Float]? {
-        let n = ids.count
-        guard n > 0, let L = lengths.first(where: { $0 >= n }), let model = models[L] else { return nil }
-        return lock.withLock { () -> [Float]? in
+        run(ids.count, wantHidden: false) { x, L in fillTokens(x, ids, L) }?.vector
+    }
+
+    private func run(_ n: Int, wantHidden: Bool, fill: (MLMultiArray, Int) -> Void) -> (vector: [Float], hidden: [Float]?)? {
+        guard n > 0, let L = lengths.first(where: { $0 >= n }), let model = functions.model("L\(L)") else { return nil }
+        return lock.withLock { () -> (vector: [Float], hidden: [Float]?)? in
             guard let (cos, sin) = rotary(L),
                   let x = try? MLMultiArray(shape: [1, NSNumber(value: hidden), 1, NSNumber(value: L)], dataType: .float16),
                   let mask = try? MLMultiArray(shape: [1, NSNumber(value: L), 1, 1], dataType: .float16),
                   let pick = try? MLMultiArray(shape: [1, 1, 1, NSNumber(value: L)], dataType: .float16) else { return nil }
-            fillTokens(x, ids, L)
+            fill(x, L)
             let ms = mask.strides[1].intValue, ps = pick.strides[3].intValue
             pick.withUnsafeMutableBytes { raw_p, _ in let p = raw_p.bindMemory(to: UInt16.self); for l in 0 ..< L { p[l * ps] = l == n - 1 ? Self.one : 0 } }
             var feed: [String: Any] = ["x": x, "cos": cos, "sin": sin, "pick": pick]
@@ -90,7 +95,7 @@ public final class ANETextBackend: @unchecked Sendable {
             }
             guard let input = try? MLDictionaryFeatureProvider(dictionary: feed),
                   let out = try? model.prediction(from: input),
-                  let name = out.featureNames.first, let y = out.featureValue(for: name)?.multiArrayValue else { return nil }
+                  let y = out.featureValue(for: "pooled")?.multiArrayValue else { return nil }
             let ys = y.strides[1].intValue
             var bits = [UInt16](repeating: 0, count: hidden)
             y.withUnsafeBytes { raw in let p = raw.bindMemory(to: UInt16.self); for c in 0 ..< hidden { bits[c] = p[c * ys] } }
@@ -99,7 +104,17 @@ public final class ANETextBackend: @unchecked Sendable {
             for e in v { norm += e * e }
             norm = norm.squareRoot()
             guard norm > 0, norm.isFinite else { return nil }
-            return v.map { $0 / norm }
+            var rowsOut: [Float]? = nil
+            if wantHidden, let hm = out.featureValue(for: "hidden")?.multiArrayValue {
+                let cs = hm.strides[1].intValue, ls = hm.strides[3].intValue
+                var b = [UInt16](repeating: 0, count: n * hidden)
+                hm.withUnsafeBytes { raw in
+                    let p = raw.bindMemory(to: UInt16.self)
+                    for l in 0 ..< n { for c in 0 ..< hidden { b[l * hidden + c] = p[c * cs + l * ls] } }
+                }
+                rowsOut = b.withUnsafeBufferPointer { Half.floats($0) }
+            }
+            return (v.map { $0 / norm }, rowsOut)
         }
     }
 
