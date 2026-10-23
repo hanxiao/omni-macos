@@ -2265,3 +2265,42 @@ happens in the field is not measured). Each fix has a test that fails without it
   width.
 - THE MODEL-STAMP PROBE is embedded once per encoder (`vectorSpaceProbe`): bootstrap, every pass
   and each Link connect asked for it, and Link kept a copy an encoder swap never cleared.
+
+## The Neural Engine, measured again from scratch (2026-10-22)
+
+Han's rule: September's numbers (ocr.md: the Small tower via CoreML at 0.16x, and "not on the ANE
+at all") do not count; measure again. Nano's backbone in the ANE shape (Tools/ane/build_nano_query.py,
+now with `--batch`) is all on the ANE at indexing shapes too. M3 Ultra (80 GPU cores, two 16-core
+Neural Engines), random token ids, no padding:
+
+| shape | ANE tok/s | GPU tok/s |
+|---|---|---|
+| L512 x1 | 35,267 | - |
+| L512 x8 | 27,315 | 98,568 |
+| L128 x8 | 41,051 | 104,594 |
+| L512 x8, two ANE streams | 27,367 | - |
+
+`omni-verify anebench <nano> <nano_L<L>_B<B>.mlpackage> gpu|ane <seconds> [streams]`. One program
+uses one Neural Engine (a second stream adds nothing). On this GPU the ANE indexes at 0.36x.
+
+ENERGY (Tools/ane/powerlog.swift: IOReport's Energy Model, sudoless; system-wide, read against an
+idle window of the same length): the GPU draws 145 W indexing, ~1,556 J per million tokens on the
+unit; the ANE 4.8 W, ~231 J per million (its window also holds ~7 s of model load). About 6.7x less
+energy per token, at a thirtieth of the power.
+
+CONTENTION, Han's question (another app on the GPU, e.g. a renderer): Tools/ane/gpuhog.swift, a
+separate process of back-to-back fp16 4096^3 MPS matmuls, 24.9 TFLOPS alone.
+
+| | the other app | Omni indexing |
+|---|---|---|
+| Omni on the GPU beside it | 24.9 -> 17.2 TFLOPS (-31%) | 98.5k -> 34.5k tok/s (-65%) |
+| Omni on the ANE beside it | 24.9 -> 24.7-24.8 (-0.7%) | 35.3k -> 35.2k (0%) |
+
+So with the GPU busy the ANE indexes faster than the GPU does, even here, and leaves the other app
+its GPU. On a base Mac (10 GPU cores, one 16-core ANE) the GPU would be about an eighth of this one
+if it scaled with cores and the ANE about this one's: not measured, no small Mac here.
+
+QUALITY ON PASSAGES is the open question: 200 chunks of the bed's documents, median 512 tokens,
+cosine to an fp32 encoder: ANE median 0.99830, min 0.99682; the shipped bf16 GPU path 0.99996 /
+0.99992 (`omni-verify anepassage`). Queries at 0.999 left retrieval unchanged; passages at 0.998
+must be judged with an index built on the ANE.

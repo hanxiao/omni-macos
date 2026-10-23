@@ -265,4 +265,73 @@ enum ANEQuery {
         let s = -t0.timeIntervalSinceNow, tokens = done.value * B * L
         print(String(format: "ANEBENCH ane L%d B%d x%d: %d tokens in %.2fs => %.0f tok/s", L, B, models.count, tokens, s, Double(tokens) / s))
     }
+
+    /// Passages of real documents through the L512 program against the GPU path and an fp32
+    /// encoder: omni-verify anepassage <nanoModelDir> <nano_L512_B1.mlpackage> <dir of .txt/.md>
+    static func passageParity(modelDir: URL, package: URL, docs: URL) async throws {
+        let cfg = try OmniConfig(modelDir: modelDir)
+        let ws = try WeightStore(modelDir: modelDir, loraScale: cfg.loraScale, keepVision: false, keepAudio: false)
+        let enc = try await OmniTextEncoder(modelDir: modelDir, weights: ws, config: cfg)
+        setenv("OMNI_BACKBONE_DTYPE", "fp32", 1); setenv("OMNI_BF16_COMPUTE", "0", 1)
+        let wsRef = try WeightStore(modelDir: modelDir, loraScale: cfg.loraScale, keepVision: false, keepAudio: false)
+        let ref = try await OmniTextEncoder(modelDir: modelDir, weights: wsRef, config: cfg)
+        unsetenv("OMNI_BACKBONE_DTYPE"); unsetenv("OMNI_BF16_COMPUTE")
+        guard let table = ws.weights["language_model.embed_tokens.weight"] else { return }
+        let compiled = try await MLModel.compileModel(at: package)
+        let c = MLModelConfiguration(); c.computeUnits = .cpuAndNeuralEngine
+        let model = try MLModel(contentsOf: compiled, configuration: c)
+        var texts: [String] = []
+        let it = FileManager.default.enumerator(at: docs, includingPropertiesForKeys: nil)
+        while let u = it?.nextObject() as? URL, texts.count < 200 {
+            guard ["txt", "md"].contains(u.pathExtension.lowercased()), let t = try? String(contentsOf: u, encoding: .utf8) else { continue }
+            var i = t.startIndex
+            while i < t.endIndex, texts.count < 200 {
+                let j = t.index(i, offsetBy: 1500, limitedBy: t.endIndex) ?? t.endIndex
+                let piece = String(t[i ..< j]); if piece.count > 200 { texts.append(piece) }
+                i = j
+            }
+        }
+        try runPassageParity(enc: enc, ref: ref, table: table, C: cfg.text.hiddenSize, model: model, texts: texts)
+    }
+
+    static func runPassageParity(enc: OmniTextEncoder, ref: OmniTextEncoder, table: MLXArray, C: Int, model: MLModel, texts: [String]) throws {
+        let L = 512
+        let raw = table.asData(access: .noCopyIfContiguous)
+        func rowValue(_ id: Int, _ c: Int) -> Float16 {
+            raw.data.withUnsafeBytes { b in
+                raw.dType == .bfloat16 ? Float16(Float(bitPattern: UInt32(b.load(fromByteOffset: (id * C + c) * 2, as: UInt16.self)) << 16))
+                    : b.load(fromByteOffset: (id * C + c) * 2, as: Float16.self)
+            }
+        }
+        func cos(_ a: [Float], _ b: [Float]) -> Float {
+            let d = zip(a, b).reduce(0) { $0 + $1.0 * $1.1 }
+            return d / (a.reduce(0) { $0 + $1 * $1 }.squareRoot() * b.reduce(0) { $0 + $1 * $1 }.squareRoot())
+        }
+        var aneRef: [Float] = [], gpuRef: [Float] = [], lens: [Int] = []
+        for t in texts {
+            let ids = Array(enc.tokenIds(t, .passage).prefix(L))
+            let n = ids.count
+            let x = try MLMultiArray(shape: [1, NSNumber(value: C), 1, NSNumber(value: L)], dataType: .float16)
+            let mask = try MLMultiArray(shape: [1, NSNumber(value: L), 1, 1], dataType: .float16)
+            let pick = try MLMultiArray(shape: [1, 1, 1, NSNumber(value: L)], dataType: .float16)
+            let xs = x.strides.map(\.intValue), ms = mask.strides.map(\.intValue), ps = pick.strides.map(\.intValue)
+            x.withUnsafeMutableBufferPointer(ofType: Float16.self) { p, _ in for c in 0 ..< C { for l in 0 ..< L { p[c * xs[1] + l * xs[3]] = l < n ? rowValue(ids[l], c) : 0 } } }
+            mask.withUnsafeMutableBufferPointer(ofType: Float16.self) { p, _ in for l in 0 ..< L { p[l * ms[1]] = l < n ? 0 : -30000 } }
+            pick.withUnsafeMutableBufferPointer(ofType: Float16.self) { p, _ in for l in 0 ..< L { p[l * ps[3]] = l == n - 1 ? 1 : 0 } }
+            let out = try model.prediction(from: MLDictionaryFeatureProvider(dictionary: ["x": x, "mask": mask, "pick": pick]))
+            guard let y = out.featureValue(for: out.featureNames.first!)?.multiArrayValue else { continue }
+            let ys = y.strides.map(\.intValue)
+            var v = [Float](repeating: 0, count: C)
+            y.withUnsafeBufferPointer(ofType: Float16.self) { p in for c in 0 ..< C { v[c] = Float(p[c * ys[1]]) } }
+            // The fp32 reference and the GPU path see the same truncated ids.
+            let r = ref.encodeTokenBatch([ids])[0], g = enc.encodeTokenBatch([ids])[0]
+            aneRef.append(cos(v, r)); gpuRef.append(cos(g, r)); lens.append(n)
+        }
+        func line(_ name: String, _ x: [Float]) {
+            let s = x.sorted()
+            print(String(format: "%-18@ n=%d  min %.5f  p1 %.5f  median %.5f", name as NSString, s.count, s.first ?? .nan, s[s.count / 100], s[s.count / 2]))
+        }
+        print("passages: \(lens.count), tokens median \(lens.sorted()[lens.count / 2]), max \(lens.max() ?? 0)")
+        line("ANE fp16 vs fp32", aneRef); line("GPU bf16 vs fp32", gpuRef)
+    }
 }
