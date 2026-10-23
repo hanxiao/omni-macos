@@ -2304,3 +2304,55 @@ QUALITY ON PASSAGES is the open question: 200 chunks of the bed's documents, med
 cosine to an fp32 encoder: ANE median 0.99830, min 0.99682; the shipped bf16 GPU path 0.99996 /
 0.99992 (`omni-verify anepassage`). Queries at 0.999 left retrieval unchanged; passages at 0.998
 must be judged with an index built on the ANE.
+
+## The Neural Engine in the app (2026-10-22)
+
+Han: Nano and Small on the Neural Engine, a choice in Settings > Performance (first) and on the screen
+after the model download, the Neural Engine the default for new installs.
+
+HOW IT RUNS. `ANETextBackend` runs the text backbone as one Core ML program per model, one fixed-shape
+function per length (32 ... 2048) sharing one copy of the weights. An enumerated-shape single function
+was measured and rejected: 51.5 s to load and every length at about half its fixed-shape speed (E5RT
+refuses inputs with known strides for flexible shapes). Inputs are the token rows read from the
+embedding table's memory, the rotary tables (positions 0 ..< L, inputs so media can use them too), a
+mask and a one-hot pick; output the final-normed pooled hidden.
+
+NO WEIGHTS SHIP. The app carries each program's graph (Resources/ANE/*.mlmodel: Nano 2.3 MB, Small
+11 MB) and a recipe; `ANEProgram` writes the weight file from the app's own WeightStore (each blob a
+tensor as is, scaled, rotated, tiled, or a graph constant: Tools/ane/extract_recipe.py), compiles it
+into Application Support/Omni/ane, and uses it ONLY if the file's SHA-256 is the recipe's - the bytes
+built and measured, or the GPU. bf16 widens to fp16 exactly, so building from the app's in-memory
+bf16 weights makes the two identical (ANEProgramTests). fp16 goes through vImage (`Half`): `Float16`
+does not exist in the universal app's x86_64 slice. The first load compiles for the Neural Engine
+(Nano 41 s, Small 195 s, in the background; text stays on the GPU meanwhile); after that 1.3 s.
+
+NANO: latency L32 2.7 ms, L128 3.0, L512 15.6 (32.7k tok/s), L1024 55.8, L2048 177. Cosine to fp32:
+queries 0.99901 median, passages 0.99835. An index built ENTIRELY on the Neural Engine, fresh, against
+one built on the GPU, same code: MRR 0.889 -> 0.890 over 440 queries, 9 of 479 ranks moved (5 up, 4
+down), every document tag identical. Not the norms: x / max|x| first (Small's fix below) measured the
+same parity and 30% slower at 32 tokens. Nano has no q/k norm, so its attention logits are large and
+fp16 arithmetic on them is where the 0.998 comes from; retrieval does not see it.
+
+SMALL: the first port read 0.99471 / 0.97473 on passages. Measured in MLX, not guessed: from layer 3
+the attention sink (token 0) carries |h| ~ 23,900, so the l2 of x/64 (Nano's RMSNorm) summed to
+~139,000 and overflowed fp16 in every later layer. Scaled out first (y = x / max|x|, then
+y / sqrt(mean(y^2)), exact for RMSNorm; per head for the q/k norms, by split maxima and indicator
+convolutions): queries 0.99990 / 0.99910, passages 0.99986 / 0.99939, against the GPU's 0.99994 /
+0.99996. MLX fp16 on the GPU (fp32 sums) reads 1.00000: fp16 storage is fine, the sums were not. Speed
+L32 10.3 ms, L128 9.7k tok/s, L512 6.5k (GPU 23.1k here). ANE-built index: MRR 0.932 -> 0.933, 5 of
+479 ranks moved, each by one place.
+
+IN THE ENGINE: `setComputeUnit(.neuralEngine)` routes queries, passages and indexing flushes to the
+backend, which takes no GPU gate. On the GPU still: the media towers and their injection, a sequence
+past 2,048 tokens, and the model-stamp probe (always written by the GPU path, so a stored stamp never
+reads as weights that moved). Headless tools: OMNI_COMPUTE=neuralEngine [OMNI_ANE_CACHE=dir].
+
+THE CHOICE: new installs (no index on disk) start on the Neural Engine and see one screen after the
+download; installs with an index keep the GPU. The facts shown are the ones true on every Mac (power,
+the GPU left to other apps, media on the GPU); speed is not, it depends on the Mac.
+
+NOT DONE YET, and why it matters: the program is held by the system outside Omni's memory (Nano
+~255 MB, Small ~1.06 GB fp16) ON TOP of the GPU backbone, which stays for media and the fallbacks.
+Dropping the GPU backbone in Neural Engine mode needs the media injection and the tag scores on the
+program (it takes embeddings already; it needs the hidden rows as an output) and the long-sequence
+fallback solved. The towers themselves (step 2) are not ported.

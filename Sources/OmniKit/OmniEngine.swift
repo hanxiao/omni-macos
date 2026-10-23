@@ -390,6 +390,17 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         self._audioEncoder = OmniAudioEncoder(weights: weights, config: config)
         self.dim = config.text.hiddenSize
         self.audioMelBins = config.audio.numMelBins
+        // Headless tools take the app's setting from the environment (the app calls setComputeUnit).
+        let env = ProcessInfo.processInfo.environment
+        if env["OMNI_COMPUTE"] == ComputeUnit.neuralEngine.rawValue {
+            _ = setComputeUnit(.neuralEngine, cache: env["OMNI_ANE_CACHE"].map { URL(fileURLWithPath: $0) } ?? Self.defaultANECache)
+        }
+    }
+
+    /// Beside the models: the compiled Neural Engine programs, rebuilt when their weights change.
+    public static var defaultANECache: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Omni/ane", isDirectory: true)
     }
 
     /// Build an engine whose media (image/audio/video) embedding path is verified NaN-free.
@@ -735,12 +746,20 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// first forces it. nil -> use embedQuery (classic two-sync path).
     public func queryVectorGraph(_ text: String) -> MLXArray? {
         markQuery()
+        if neuralEngineActive { return nil }   // the query runs on the Neural Engine: embedQuery
         return run(highPriority: true) { textEncoder.queryGraph(text, as: .query) }
     }
 
     public func embedQuery(_ text: String) -> [Float] {
         markQuery()   // signal the indexer to shrink/split its forwards while the user is searching
         if let v = cachedQueryVector(text) { return v }
+        if neuralEngineActive {
+            let generation = encoderGeneration
+            if let v = aneVector(textEncoder.tokenIds(text, .query)) {
+                rememberQueryVector(text, v, since: generation)
+                return v
+            }
+        }
         // Remembered under the gate, so a weight recovery (which swaps the encoder under it too)
         // can never be followed by a vector from the weights it replaced.
         return run(highPriority: true) {
@@ -748,6 +767,77 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             rememberQueryVector(text, v, since: encoderGeneration)
             return v
         }
+    }
+
+    // MARK: - The Neural Engine
+
+    /// Where the text backbone runs (Settings > Performance). The Neural Engine is a unit of its
+    /// own: text embedded there leaves the GPU to whatever else the Mac runs, at about a seventh of
+    /// the energy per token (index.md, "The Neural Engine, measured again"). Media towers stay on the
+    /// GPU; so does a sequence past the program's longest bucket, and the model-stamp probe.
+    public enum ComputeUnit: String, Sendable { case neuralEngine, gpu }
+
+    private let aneLock = NSLock()
+    private var _aneText: AnyObject?
+    private var _computeUnit: ComputeUnit = .gpu
+    public var computeUnit: ComputeUnit { aneLock.withLock { _computeUnit } }
+    /// This Mac (macOS 15) and this model (a program for it) can run text on the Neural Engine.
+    public var neuralEngineAvailable: Bool {
+        guard #available(macOS 15.0, *) else { return false }
+        return Self.aneProgramName(config) != nil
+    }
+    /// True once the Neural Engine program is loaded and text goes to it.
+    public var neuralEngineActive: Bool { aneLock.withLock { _aneText != nil } }
+
+    /// Run the text backbone on `unit`. The Neural Engine program is built from this engine's own
+    /// weights and compiled into `cache` the first time (ANEProgram, ~40 s for Nano), then loaded
+    /// (~1 s); text stays on the GPU until it is ready, and if it cannot be built at all. `ready`
+    /// reports whether the Neural Engine took over. Blocks: call off the main actor.
+    public func setComputeUnit(_ unit: ComputeUnit, cache: URL) -> Bool {
+        aneLock.withLock { _computeUnit = unit }
+        guard unit == .neuralEngine else {
+            aneLock.withLock { _aneText = nil }
+            return false
+        }
+        guard #available(macOS 15.0, *), let name = Self.aneProgramName(config) else { return false }
+        if neuralEngineActive { return true }
+        let t0 = Date()
+        guard let compiled = ANEProgram.compiled(name, weights: weightStore, cache: cache),
+              let backend = try? ANETextBackend(compiled: compiled, config: config, weights: weightStore,
+                                                lengths: ANETextBackend.defaultLengths) else {
+            omniPerfLog("ane: not available, text stays on the GPU")
+            return false
+        }
+        omniPerfLog(String(format: "ane: text on the Neural Engine (%.1f s to ready)", -t0.timeIntervalSinceNow))
+        aneLock.withLock { if _computeUnit == .neuralEngine { _aneText = backend } }
+        return neuralEngineActive
+    }
+
+    /// The program for this model (Tools/ane/build_nano_text.py, build_small_text.py), nil for one
+    /// that has none.
+    public static func aneProgramName(_ c: OmniConfig) -> String? {
+        if c.text.hiddenSize == 768, c.text.numLayers == 12, !c.text.isCausal { return "nano_text" }
+        if c.text.hiddenSize == 1024, c.text.numLayers == 28, c.text.isCausal { return "small_text" }
+        return nil
+    }
+
+    /// The Neural Engine's vector for these ids, nil when it is not active or the ids are longer
+    /// than its longest bucket - the caller runs the GPU path.
+    private func aneVector(_ ids: [Int]) -> [Float]? {
+        guard #available(macOS 15.0, *), let ane = aneLock.withLock({ _aneText }) as? ANETextBackend else { return nil }
+        return ane.encode(ids)
+    }
+
+    /// Token ids through the Neural Engine where it takes them, the rest in one GPU batch.
+    private func aneOrGPU(_ ids: [[Int]], passage: Bool) -> [[Float]] {
+        var out = ids.map { aneVector($0) }
+        let rest = out.indices.filter { out[$0] == nil }
+        if !rest.isEmpty {
+            let v = run(highPriority: !passage) { textEncoder.encodeTokenBatch(rest.map { ids[$0] }) }
+            for (k, i) in rest.enumerated() where k < v.count { out[i] = v[k] }
+        }
+        if passage { addTokens(ids.reduce(0) { $0 + $1.count }) }
+        return out.map { $0 ?? [] }
     }
 
     // MARK: - Query vectors, kept
@@ -810,7 +900,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     public func vectorSpaceProbe(_ text: String) -> [Float] {
         let generation = encoderGeneration
         if let k = queryVectorLock.withLock({ probeKept }), k.text == text { return k.vector }
-        let v = embedText(text, as: .passage)
+        // On the GPU path whichever unit embeds text: the stamp was always written by it, and a
+        // probe from the Neural Engine (cosine ~0.999 to it) would read as weights that moved.
+        let v = run(highPriority: false) { textEncoder.encode(text, as: .passage) }
         queryVectorLock.withLock { if generation == _encoderGeneration, !v.isEmpty { probeKept = (text, v) } }
         return v
     }
@@ -885,6 +977,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     // come through here, not embedQuery, and must engage adaptive batching the same way.
     public func embedText(_ text: String, as type: OmniInputType) -> [Float] {
         if type == .query { markQuery() }
+        if neuralEngineActive { return aneOrGPU([textEncoder.tokenIds(text, type)], passage: type != .query)[0] }
         return run(highPriority: type == .query) {
             let v = textEncoder.encode(text, as: type)
             if type != .query { addTokens(textEncoder.lastSequenceLength) }
@@ -894,6 +987,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
 
     public func embedTextBatch(_ texts: [String], as type: OmniInputType) -> [[Float]] {
         if type == .query { markQuery() }
+        if neuralEngineActive { return aneOrGPU(textEncoder.tokenizeParallel(texts, type), passage: type != .query) }
         return run(highPriority: type == .query) {
             let v = textEncoder.encodeBatch(texts, as: type)
             if type != .query { addTokens(textEncoder.lastSequenceLength) }
@@ -909,6 +1003,16 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     public func embedPassages(_ texts: [String], waiting: Bool) -> [[Float]] {
         guard !texts.isEmpty else { return [] }
         if waiting { markQuery() }
+        if neuralEngineActive {
+            let ids = textEncoder.tokenizeParallel(texts, .passage)
+            var out = ids.map { aneVector($0) }
+            let rest = out.indices.filter { out[$0] == nil }
+            if !rest.isEmpty {
+                let v = run(highPriority: waiting) { textEncoder.encodeTokenBatch(rest.map { ids[$0] }) }
+                for (k, i) in rest.enumerated() where k < v.count { out[i] = v[k] }
+            }
+            return out.map { $0 ?? [] }
+        }
         return run(highPriority: waiting) { textEncoder.encodeBatch(texts, as: .passage) }
     }
 
@@ -918,6 +1022,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// Tokenization runs in parallel up front, off the GPU path. Output order matches input.
     public func embedTextBatches(_ batches: [[String]], as type: OmniInputType) -> [[[Float]]] {
         if batches.isEmpty { return [] }
+        // On the Neural Engine an indexing flush takes no GPU gate at all: a query, an image, another
+        // app's GPU work never wait behind it.
+        if neuralEngineActive {
+            return batches.map { aneOrGPU(textEncoder.tokenizeParallel($0, type), passage: type != .query) }
+        }
         // TOKENIZE-AHEAD: for an indexing flush, a producer thread tokenizes batches in order
         // while the pipelined encode consumes them, so batch K+1's (all-core) BPE runs during
         // batch K's GPU forward and only batch 0's tokenization is paid on the wall. Measured

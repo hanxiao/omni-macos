@@ -216,6 +216,9 @@ struct OmniApp: App {
                 // The toggle is what loads and offloads the model: it is a 4.53 GB add-on that
                 // should not be resident while the user is searching.
                 .onChange(of: model.ocrMode) { _, on in on ? ocr.activate() : ocr.deactivate() }
+                // A test seam, the same shape: `-omni.openSettings <tab>` opens Settings at that pane
+                // (SettingsView reads the tab), so its screenshot needs no keystrokes sent across.
+                .modifier(OpenSettingsSeam())
                 // A test seam, not a feature. XCUITest passes `-omni.ocrOpen <path>[:<path>…]` so a
                 // UI test can put a document in front of the workspace without driving an open
                 // panel across a process boundary. Launch arguments land in NSUserDefaults'
@@ -1095,5 +1098,18 @@ enum UIProbe {
         }
         reset()
         return "  [" + parts.joined(separator: ", ") + "]"
+    }
+}
+
+/// `-omni.openSettings <tab>` (argument domain only, process-local): open the Settings window.
+private struct OpenSettingsSeam: ViewModifier {
+    @Environment(\.openSettings) private var openSettings
+    func body(content: Content) -> some View {
+        content.task {
+            let args = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+            guard (args["omni.openSettings"] as? String)?.isEmpty == false else { return }
+            try? await Task.sleep(for: .seconds(1))
+            openSettings()
+        }
     }
 }

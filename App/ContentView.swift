@@ -247,7 +247,8 @@ struct ContentView: View {
         case .indexNewer:
             IndexNewerView()
         case .ready:
-            ready
+            // A new install chooses where the model runs once it is in (ComputeChoiceView).
+            if model.computeChoicePending { ComputeChoiceView() } else { ready }
         }
     }
 

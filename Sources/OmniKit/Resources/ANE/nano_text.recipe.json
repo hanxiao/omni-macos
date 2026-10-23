@@ -1,0 +1,673 @@
+{
+"format": 2,
+"weightBytes": 254850944,
+"headDim": 64,
+"blobs": [
+{
+"tensor": "language_model.layers.0.input_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.0.self_attn.q_proj.weight",
+"op": "q",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.0.self_attn.q_proj.weight",
+"op": "qP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.0.self_attn.k_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.0.self_attn.k_proj.weight",
+"op": "kP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.0.self_attn.v_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.0.self_attn.o_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.0.post_attention_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.0.mlp.gate_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.0.mlp.up_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.0.mlp.down_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.1.input_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.1.self_attn.q_proj.weight",
+"op": "q",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.1.self_attn.q_proj.weight",
+"op": "qP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.1.self_attn.k_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.1.self_attn.k_proj.weight",
+"op": "kP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.1.self_attn.v_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.1.self_attn.o_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.1.post_attention_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.1.mlp.gate_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.1.mlp.up_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.1.mlp.down_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.2.input_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.2.self_attn.q_proj.weight",
+"op": "q",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.2.self_attn.q_proj.weight",
+"op": "qP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.2.self_attn.k_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.2.self_attn.k_proj.weight",
+"op": "kP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.2.self_attn.v_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.2.self_attn.o_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.2.post_attention_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.2.mlp.gate_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.2.mlp.up_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.2.mlp.down_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.3.input_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.3.self_attn.q_proj.weight",
+"op": "q",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.3.self_attn.q_proj.weight",
+"op": "qP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.3.self_attn.k_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.3.self_attn.k_proj.weight",
+"op": "kP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.3.self_attn.v_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.3.self_attn.o_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.3.post_attention_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.3.mlp.gate_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.3.mlp.up_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.3.mlp.down_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.4.input_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.4.self_attn.q_proj.weight",
+"op": "q",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.4.self_attn.q_proj.weight",
+"op": "qP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.4.self_attn.k_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.4.self_attn.k_proj.weight",
+"op": "kP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.4.self_attn.v_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.4.self_attn.o_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.4.post_attention_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.4.mlp.gate_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.4.mlp.up_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.4.mlp.down_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.5.input_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.5.self_attn.q_proj.weight",
+"op": "q",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.5.self_attn.q_proj.weight",
+"op": "qP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.5.self_attn.k_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.5.self_attn.k_proj.weight",
+"op": "kP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.5.self_attn.v_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.5.self_attn.o_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.5.post_attention_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.5.mlp.gate_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.5.mlp.up_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.5.mlp.down_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.6.input_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.6.self_attn.q_proj.weight",
+"op": "q",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.6.self_attn.q_proj.weight",
+"op": "qP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.6.self_attn.k_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.6.self_attn.k_proj.weight",
+"op": "kP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.6.self_attn.v_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.6.self_attn.o_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.6.post_attention_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.6.mlp.gate_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.6.mlp.up_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.6.mlp.down_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.7.input_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.7.self_attn.q_proj.weight",
+"op": "q",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.7.self_attn.q_proj.weight",
+"op": "qP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.7.self_attn.k_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.7.self_attn.k_proj.weight",
+"op": "kP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.7.self_attn.v_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.7.self_attn.o_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.7.post_attention_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.7.mlp.gate_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.7.mlp.up_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.7.mlp.down_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.8.input_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.8.self_attn.q_proj.weight",
+"op": "q",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.8.self_attn.q_proj.weight",
+"op": "qP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.8.self_attn.k_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.8.self_attn.k_proj.weight",
+"op": "kP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.8.self_attn.v_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.8.self_attn.o_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.8.post_attention_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.8.mlp.gate_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.8.mlp.up_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.8.mlp.down_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.9.input_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.9.self_attn.q_proj.weight",
+"op": "q",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.9.self_attn.q_proj.weight",
+"op": "qP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.9.self_attn.k_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.9.self_attn.k_proj.weight",
+"op": "kP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.9.self_attn.v_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.9.self_attn.o_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.9.post_attention_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.9.mlp.gate_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.9.mlp.up_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.9.mlp.down_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.10.input_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.10.self_attn.q_proj.weight",
+"op": "q",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.10.self_attn.q_proj.weight",
+"op": "qP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.10.self_attn.k_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.10.self_attn.k_proj.weight",
+"op": "kP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.10.self_attn.v_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.10.self_attn.o_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.10.post_attention_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.10.mlp.gate_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.10.mlp.up_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.10.mlp.down_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.11.input_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.11.self_attn.q_proj.weight",
+"op": "q",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.11.self_attn.q_proj.weight",
+"op": "qP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.11.self_attn.k_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.11.self_attn.k_proj.weight",
+"op": "kP",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.11.self_attn.v_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.11.self_attn.o_proj.weight",
+"op": "id",
+"bytes": 1179648
+},
+{
+"tensor": "language_model.layers.11.post_attention_layernorm.weight",
+"op": "id",
+"bytes": 1536
+},
+{
+"tensor": "language_model.layers.11.mlp.gate_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.11.mlp.up_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.layers.11.mlp.down_proj.weight",
+"op": "id",
+"bytes": 4718592
+},
+{
+"tensor": "language_model.norm.weight",
+"op": "id",
+"bytes": 1536
+}
+],
+"sha256": "a9084ec9e909cf811a4e7f7c72f09d2c71f67eeee9f6bab2a6e7e9a6be403238"
+}

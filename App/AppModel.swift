@@ -2143,6 +2143,74 @@ final class AppModel {
         return left.count == rs.count ? left.max() : nil
     }
 
+    // MARK: - Where the model runs
+
+    /// The Neural Engine or the GPU for the text model (OmniEngine.setComputeUnit). New installs
+    /// start on the Neural Engine and choose on the screen after the download; an install that
+    /// already has an index keeps the GPU it always had. Media towers run on the GPU either way.
+    var computeUnit: OmniEngine.ComputeUnit = .gpu {
+        didSet {
+            guard oldValue != computeUnit else { return }
+            OmniPrefs.set(computeUnit.rawValue, forKey: "omni.computeUnit")
+            applyComputeUnit()
+        }
+    }
+    enum NeuralEngineStatus: Equatable { case off, preparing, ready, unavailable }
+    private(set) var neuralEngineStatus: NeuralEngineStatus = .off
+    /// The choice screen after a first download, shown once.
+    private(set) var computeChoicePending = false
+    /// This Mac and this model can run the text model on the Neural Engine (macOS 15, a program
+    /// for the model).
+    var neuralEngineAvailable: Bool { engine?.neuralEngineAvailable ?? false }
+
+    /// The first launch with this setting: no choice stored yet. An index on disk means an install
+    /// from before it, which keeps the GPU; none means a new one, which starts on the Neural Engine
+    /// and is asked once the model is in.
+    private func loadComputeUnit() {
+        if let raw = UserDefaults.standard.string(forKey: "omni.computeUnit"), let u = OmniEngine.ComputeUnit(rawValue: raw) {
+            computeUnit = u
+            computeChoicePending = UserDefaults.standard.bool(forKey: "omni.computeChoicePending")
+            return
+        }
+        let existing = (try? Self.indexURL()).map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+        computeUnit = existing ? .gpu : .neuralEngine
+        computeChoicePending = !existing
+        OmniPrefs.set(computeUnit.rawValue, forKey: "omni.computeUnit")
+        OmniPrefs.set(computeChoicePending, forKey: "omni.computeChoicePending")
+    }
+
+    func finishComputeChoice(_ unit: OmniEngine.ComputeUnit) {
+        computeUnit = unit
+        computeChoicePending = false
+        OmniPrefs.set(false, forKey: "omni.computeChoicePending")
+    }
+
+    /// Hand the loaded engine its unit. The Neural Engine program is built from the engine's own
+    /// weights the first time (tens of seconds to a few minutes), off the main actor; text runs on
+    /// the GPU until it is ready.
+    func applyComputeUnit() {
+        guard let engine else { return }
+        let unit = computeUnit
+        guard unit == .neuralEngine else {
+            _ = engine.setComputeUnit(.gpu, cache: OmniEngine.defaultANECache)
+            neuralEngineStatus = .off
+            return
+        }
+        guard neuralEngineAvailable else { neuralEngineStatus = .unavailable; return }
+        if engine.neuralEngineActive { neuralEngineStatus = .ready; return }
+        neuralEngineStatus = .preparing
+        // An isolated run keeps its programs in scratch (-omni.ane.cache.dir), like the OCR cache.
+        let cache = UserDefaults.standard.string(forKey: "omni.ane.cache.dir").map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? OmniEngine.defaultANECache
+        Task.detached(priority: .utility) { [weak self] in
+            let ok = engine.setComputeUnit(.neuralEngine, cache: cache)
+            await MainActor.run {
+                guard let self, self.engine === engine, self.computeUnit == .neuralEngine else { return }
+                self.neuralEngineStatus = ok ? .ready : .unavailable
+            }
+        }
+    }
+
     /// Search-as-you-type (default). OFF = the search runs on Return only; typing still parses
     /// filters and offers suggestions. Kinder to low-end GPUs, where every keystroke's embed +
     /// scan is noticeable.
@@ -3671,6 +3739,7 @@ final class AppModel {
         let swapped = await withIndexingStopped {
             self.engine = loaded
             self.clearQueryEmbedCache()
+            self.applyComputeUnit()
             let indexer = Indexer(store: store, embedder: loaded)
             indexer.onPolicyFile = Self.policyFileReporter(self)
             self.indexer = indexer
@@ -3712,6 +3781,7 @@ final class AppModel {
     }
 
     private func loadPerf() {
+        loadComputeUnit()
         // See `isLoadingPerf`. The single write at the end is what still seeds a first launch, and
         // the one-time move from the old total cap to headroom.
         isLoadingPerf = true
@@ -4662,6 +4732,7 @@ final class AppModel {
             }
             self.store = store
             self.engine = engine
+            self.applyComputeUnit()
             // Tell the OCR batch planner what this model is holding. Metal's working set is a
             // device capability, not a live figure, so the planner would otherwise size a batch
             // as if these weights were not resident.

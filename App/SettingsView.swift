@@ -8,7 +8,10 @@ struct SettingsView: View {
     // Selection is BOUND, not left to the TabView, purely so the live memory sampler can be gated
     // on "Performance is the visible tab". A SwiftUI TabView keeps a pane alive once it has been
     // visited, so .onAppear/.task alone would keep sampling forever after one visit.
-    @State private var tab: SettingsTab = .files
+    // `-omni.openSettings <tab>`: a test seam in the launch arguments' domain (ContentView opens
+    // the window), so a screenshot of a pane needs no keystrokes sent to the app.
+    @State private var tab: SettingsTab = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)["omni.openSettings"]
+        .flatMap { ($0 as? String).flatMap(SettingsTab.init(rawValue:)) } ?? .files
 
     var body: some View {
         TabView(selection: $tab) {
@@ -642,6 +645,28 @@ private struct PerformanceTab: View {
     }
     var body: some View {
         Form {
+            // FIRST: where the model runs (Han, 2026-10-22). The facts, not prose: ComputeUnitGrid.
+            Section {
+                Picker("Run on", selection: Binding(get: { model.computeUnit }, set: { model.computeUnit = $0 })) {
+                    ForEach([OmniEngine.ComputeUnit.neuralEngine, .gpu], id: \.self) { Text(ComputeUnitFacts.name($0)).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                ComputeUnitGrid(selected: model.computeUnit)
+                switch model.neuralEngineStatus {
+                case .preparing:
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Preparing the Neural Engine").foregroundStyle(.secondary)
+                    }
+                case .unavailable:
+                    Text("Not available on this Mac").foregroundStyle(.secondary)
+                case .off, .ready:
+                    EmptyView()
+                }
+            } header: {
+                Text("Model")
+            }
+
             Section {
                 Toggle("Search as you type", isOn: Binding(
                     get: { model.instantSearchEnabled },

@@ -7880,26 +7880,17 @@ if args.count >= 2 && args[1] == "projab" {
                          inter: args.count >= 5 ? (Int(args[4]) ?? 3072) : 3072)
     exit(0)
 }
-// Real passages through the L512 ANE program: see ANEQuery.passageParity.
-if args.count >= 5 && args[1] == "anepassage" {
+// The Neural Engine program as the app builds it on the Mac: see ANEQuery.onDevice.
+if args.count >= 5 && args[1] == "aneprogram" {
     if #available(macOS 15.0, *) {
-        try await ANEQuery.passageParity(modelDir: URL(fileURLWithPath: args[2]), package: URL(fileURLWithPath: args[3]), docs: URL(fileURLWithPath: args[4]))
+        try await ANEQuery.onDevice(modelDir: URL(fileURLWithPath: args[2]), cache: URL(fileURLWithPath: args[3]), docs: URL(fileURLWithPath: args[4]))
     }
     exit(0)
 }
-// Indexing on the Neural Engine against the GPU, fixed time (for powerlog): see ANEQuery.indexBench.
-if args.count >= 6 && args[1] == "anebench" {
+// The app's Neural Engine text backend: see ANEQuery.textBackend.
+if args.count >= 5 && args[1] == "anetext" {
     if #available(macOS 15.0, *) {
-        try await ANEQuery.indexBench(modelDir: URL(fileURLWithPath: args[2]), package: URL(fileURLWithPath: args[3]), arm: args[4],
-                                      seconds: Double(args[5]) ?? 10, streams: args.count >= 7 ? (Int(args[6]) ?? 1) : 1)
-    }
-    exit(0)
-}
-// Nano's query encoder on the Neural Engine against the GPU path: see ANEQuery.
-if args.count >= 5 && args[1] == "anequery" {
-    if #available(macOS 15.0, *) {
-        try await ANEQuery.run(modelDir: URL(fileURLWithPath: args[2]), packages: URL(fileURLWithPath: args[3]),
-                               imageDir: URL(fileURLWithPath: args[4]))
+        try await ANEQuery.textBackend(modelDir: URL(fileURLWithPath: args[2]), package: URL(fileURLWithPath: args[3]), docs: URL(fileURLWithPath: args[4]))
     }
     exit(0)
 }

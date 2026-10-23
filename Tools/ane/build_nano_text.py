@@ -1,22 +1,16 @@
-"""Nano's text backbone as a Core ML query encoder for the Neural Engine, one program per bucket L.
+"""Nano's text backbone as ONE Core ML program for the Neural Engine (ANETextBackend), one
+fixed-shape function per sequence length, sharing one copy of the weights.
 
-ANE-shaped from the start (ml-ane-transformers recipe), because the 2026-09 Small port showed a
-reshape-to-(H, D, L) attention falls off the ANE:
-  - layout (1, C, 1, L), linears as 1x1 convs;
-  - heads by `split` on channels (keys transposed to (1, L, 1, C) first), attention per head as
-    the two einsums Apple's recipe uses, softmax over the key axis;
-  - RoPE folded into the projection: q = conv(x, Wq) * cos + conv(x, P Wq) * sin, where P is the
-    rotate-half permutation with signs, so no slicing or concat per head; the 1/sqrt(d) scale is
-    folded into q's tables;
-  - RMSNorm without an fp16 overflow: the l2 norm of x/64, then rescaled (LayerNorm of [x, -x],
-    ANEMLL's form, measured the same: median cosine 0.99903 to fp32 either way);
-  - inputs are the embedded tokens (the host gathers rows from the app's own table), an additive
-    key mask (B, L, 1, 1) and a one-hot pick (B, 1, 1, L) for each last real token. Output is the
-    final-normed pooled hidden (B, C, 1, 1); the host L2-normalizes in fp32. --batch B > 1 is the
-    indexing shape: B passages a call.
+ANE-shaped (ml-ane-transformers): (B, C, 1, L), linears as 1x1 convs, heads split on channels (keys
+transposed to (B, L, 1, C) first), attention per head as the two einsum forms coremltools accepts,
+softmax over the key axis. RoPE folded into the projections - q = conv(x, Wq) * cos + conv(x, P Wq)
+* sin, P the signed rotate-half permutation - with cos and sin INPUTS (positions 0 ..< L, written by
+the backend), and 1/sqrt(d) folded into Wq (a power of two: exact in fp16). RMSNorm as the l2 norm
+of x/64 (no fp16 overflow). Inputs x (B, C, 1, L), cos, sin (1, C, 1, L), mask (B, L, 1, 1), pick
+(B, 1, 1, L); output the final-normed hidden at the picked token (B, C, 1, 1).
+
 Weights: `omni-verify dumpbackbone` with OMNI_BACKBONE_DTYPE=fp16 (the app's merged tensors).
-  uv run --python 3.12 --with coremltools --with mlx Tools/ane/build_nano_query.py <weights> --out <dir>
-then `omni-verify anequery <nano> <dir> <imageDir>` (index.md, "The query that waited out the hold").
+  uv run --python 3.12 --with coremltools --with mlx Tools/ane/build_nano_text.py <weights> --out <dir>
 """
 import argparse
 import numpy as np
@@ -27,17 +21,6 @@ from coremltools.converters.mil.mil import types
 
 EPS, THETA, HEADS, HDIM, LAYERS, HID = 1e-5, 1_000_000.0, 12, 64, 12, 768
 PRECISION = "fp16"
-
-
-def rope_tables(L, scale):
-    half = HDIM // 2
-    inv = 1.0 / (THETA ** (np.arange(half, dtype=np.float64) * 2.0 / HDIM))
-    ang = np.outer(inv, np.arange(L, dtype=np.float64))                     # [half, L]
-    cos = np.concatenate([np.cos(ang), np.cos(ang)], 0)                     # [HDIM, L]
-    sin = np.concatenate([np.sin(ang), np.sin(ang)], 0)
-    cos = np.tile(cos, (HEADS, 1)) * scale                                  # [C, L]
-    sin = np.tile(sin, (HEADS, 1)) * scale
-    return cos[None, :, None, :].astype(np.float16), sin[None, :, None, :].astype(np.float16)
 
 
 def rotate_half_matrix():
@@ -55,8 +38,7 @@ def rotate_half_matrix():
 def build(W, L, B=1):
     f32 = {k: np.array(v.astype(mx.float32), copy=False) for k, v in W.items()}
     P = rotate_half_matrix()
-    cq, sq = rope_tables(L, HDIM ** -0.5)
-    ck, sk = rope_tables(L, 1.0)
+    Ls = L
 
     def cw(m):                                  # [out, in] -> (out, in, 1, 1) fp16
         return m.astype(np.float16)[:, :, None, None]
@@ -64,12 +46,17 @@ def build(W, L, B=1):
     def nw(name):
         return f32[name].astype(np.float16).reshape(1, HID, 1, 1)
 
-    @mb.program(input_specs=[mb.TensorSpec(shape=(B, HID, 1, L), dtype=types.fp16),
-                             mb.TensorSpec(shape=(B, L, 1, 1), dtype=types.fp16),
-                             mb.TensorSpec(shape=(B, 1, 1, L), dtype=types.fp16)],
+    @mb.program(input_specs=[mb.TensorSpec(shape=(B, HID, 1, Ls), dtype=types.fp16),
+                             mb.TensorSpec(shape=(1, HID, 1, Ls), dtype=types.fp16),
+                             mb.TensorSpec(shape=(1, HID, 1, Ls), dtype=types.fp16),
+                             mb.TensorSpec(shape=(B, Ls, 1, 1), dtype=types.fp16),
+                             mb.TensorSpec(shape=(B, 1, 1, Ls), dtype=types.fp16)],
                 opset_version=ct.target.macOS15)
-    def prog(x, mask, pick):
+    def prog(x, cos, sin, mask, pick):
+        cq, sq, ck, sk = cos, sin, cos, sin
         def rms(t, wname, tag):
+            # The l2 norm of x/64: Nano has no activation large enough to overflow it. Scaling by
+            # max|x| first (Small's fix) was measured here too: the same parity, 32 tokens 30% slower.
             n = mb.reduce_l2_norm(x=mb.mul(x=t, y=np.float16(1 / 64), name=f"{tag}_s"), axes=[1],
                                   keep_dims=True, name=f"{tag}_l2")
             inv = mb.real_div(x=np.float16(np.sqrt(HID) / 64), y=mb.add(x=n, y=np.float16(1e-4), name=f"{tag}_e"),
@@ -81,7 +68,7 @@ def build(W, L, B=1):
             p = f"language_model.layers.{i}."
             t = f"l{i}"
             xn = rms(h, p + "input_layernorm.weight", f"{t}_in")
-            wq, wk = f32[p + "self_attn.q_proj.weight"], f32[p + "self_attn.k_proj.weight"]
+            wq, wk = f32[p + "self_attn.q_proj.weight"] * HDIM ** -0.5, f32[p + "self_attn.k_proj.weight"]
             q = mb.add(x=mb.mul(x=mb.conv(x=xn, weight=cw(wq), name=f"{t}_q"), y=cq, name=f"{t}_qc"),
                        y=mb.mul(x=mb.conv(x=xn, weight=cw(P @ wq), name=f"{t}_qp"), y=sq, name=f"{t}_qs"),
                        name=f"{t}_qr")
@@ -118,14 +105,27 @@ def build(W, L, B=1):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("weights"); ap.add_argument("--lengths", default="16,32,64"); ap.add_argument("--out", required=True)
+    ap.add_argument("weights"); ap.add_argument("--lengths", default="32,64,128,256,512,1024,2048"); ap.add_argument("--out", required=True)
     ap.add_argument("--batch", type=int, default=1, help="sequences per call (indexing shapes)")
     ap.add_argument("--precision", default="fp16", help="fp32: the same program in fp32, a maths check on the CPU")
     a = ap.parse_args()
     PRECISION = a.precision
     W = mx.load(a.weights)
-    for L in map(int, a.lengths.split(",")):
-        m = build(W, L, a.batch)
-        path = f"{a.out}/nano_query_L{L}.mlpackage" if a.batch == 1 else f"{a.out}/nano_L{L}_B{a.batch}.mlpackage"
-        m.save(path)
-        print("saved", path)
+    # ONE FUNCTION PER LENGTH, ONE COPY OF THE WEIGHTS. Enumerated shapes in one function were
+    # measured and rejected: 51.5 s to load and every length at about half its fixed-shape speed
+    # (E5RT: "tensor_buffer has known strides while the model has FlexibleShapeInfo"). A
+    # multifunction package holds fixed-shape functions that share their weight blobs.
+    import os, shutil, tempfile
+    lengths = list(map(int, a.lengths.split(",")))
+    tmp = tempfile.mkdtemp()
+    desc = ct.utils.MultiFunctionDescriptor()
+    for L in lengths:
+        part = os.path.join(tmp, f"L{L}.mlpackage")
+        build(W, L, a.batch).save(part)
+        desc.add_function(part, src_function_name="main", target_function_name=f"L{L}")
+    desc.default_function_name = f"L{lengths[-1]}"
+    path = f"{a.out}/nano_text.mlpackage"
+    if os.path.exists(path): shutil.rmtree(path)
+    ct.utils.save_multifunction(desc, path)
+    shutil.rmtree(tmp)
+    print("saved", path)

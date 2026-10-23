@@ -36,7 +36,9 @@ let package = Package(
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXLinalg", package: "mlx-swift"),
                 .product(name: "Tokenizers", package: "swift-tokenizers"),
-            ]
+            ],
+            // The Neural Engine programs' graphs and recipes, never their weights (ANEProgram).
+            resources: [.copy("Resources/ANE")]
         ),
         // Linked Macs (docs/notes/link.md): identity, pairing, the TLS link and its messages. Apple
         // frameworks only - Network, Security, CryptoKit - and no dependency on the engine, so the
