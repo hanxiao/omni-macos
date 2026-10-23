@@ -2,24 +2,27 @@ import XCTest
 import CoreGraphics
 @testable import OmniKit
 
-/// Neural Engine mode end to end on Nano: everything an image, a recording or a query needs runs on
-/// the programs, the GPU copies of the towers are let go (Nano: 1.4 GB of footprint), and the
-/// vectors stay in the GPU path's space. A switch back to the GPU keeps media working on the
+/// Neural Engine mode end to end on Nano: everything an image, a recording, a query or a video
+/// segment past the baked text lengths needs runs on the programs, the GPU copies of the towers are
+/// let go (Nano: 1.4 GB of footprint), and the vectors stay in the GPU path's space. A switch back to the GPU keeps media working on the
 /// programs until the app loads the engine again.
 final class ANEModeTests: XCTestCase {
-    private func image(_ seed: Int) -> CGImage {
-        let side = 512
-        let ctx = CGContext(data: nil, width: side, height: side, bitsPerComponent: 8, bytesPerRow: 0,
+    /// Kept between runs: the one-time build is minutes, and its stamp makes every later run seconds.
+    static let cache = FileManager.default.temporaryDirectory.appendingPathComponent("omni-ane-tests", isDirectory: true)
+
+    private func image(_ seed: Int, width: Int = 512, height: Int = 512) -> CGImage {
+        let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                             space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
         for i in 0 ..< 12 {
             let v = CGFloat((seed * 37 + i * 53) % 100) / 100
             ctx.setFillColor(CGColor(red: v, green: 1 - v, blue: CGFloat(i) / 12, alpha: 1))
-            ctx.fill(CGRect(x: (i * 41 + seed * 13) % side, y: (i * 67) % side, width: 90 + i * 7, height: 60 + i * 5))
+            ctx.fill(CGRect(x: (i * 41 + seed * 13) % width, y: (i * 67) % height, width: (90 + i * 7) * width / 512,
+                            height: (60 + i * 5) * height / 512))
         }
         return ctx.makeImage()!
     }
 
-    private func cosine(_ a: [Float], _ b: [Float]) -> Float {
+    private static func cosine(_ a: [Float], _ b: [Float]) -> Float {
         var d: Float = 0, na: Float = 0, nb: Float = 0
         for (x, y) in zip(a, b) { d += x * y; na += x * x; nb += y * y }
         return d / (na.squareRoot() * nb.squareRoot())
@@ -33,8 +36,7 @@ final class ANEModeTests: XCTestCase {
         let modelDir = URL(fileURLWithPath: dir)
         let gpu = try await OmniEngine.loadValidated(modelDir: modelDir)
         let ane = try await OmniEngine.loadValidated(modelDir: modelDir)
-        let cache = FileManager.default.temporaryDirectory.appendingPathComponent("ane-mode-\(UUID().uuidString)")
-        defer { try? FileManager.default.removeItem(at: cache) }
+        let cache = Self.cache
         guard ane.setComputeUnit(.neuralEngine, cache: cache) else { throw XCTSkip("no Neural Engine") }
 
         XCTAssertTrue(ane.gpuTowersReleased)
@@ -42,15 +44,71 @@ final class ANEModeTests: XCTestCase {
         let imgs = [image(1), image(2)]
         for im in imgs {
             let g = try XCTUnwrap(gpu.embedImage(im)), a = try XCTUnwrap(ane.embedImage(im))
-            XCTAssertGreaterThan(cosine(g, a), 0.99)
+            XCTAssertGreaterThan(Self.cosine(g, a), 0.99)
         }
         let q = "a red square on a green field"
-        XCTAssertGreaterThan(cosine(try XCTUnwrap(gpu.embedQuery(q)), try XCTUnwrap(ane.embedQuery(q))), 0.99)
+        XCTAssertGreaterThan(Self.cosine(try XCTUnwrap(gpu.embedQuery(q)), try XCTUnwrap(ane.embedQuery(q))), 0.99)
+
+        // A 1080p video segment: six 1568 x 882 frames, ~4,130 tokens, past the baked text lengths.
+        // It runs layer by layer on the Neural Engine, never on the GPU.
+        let frames = (0 ..< 6).map { image($0 + 5, width: 1568, height: 882) }
+        let gv = try XCTUnwrap(gpu.embedVideoFrames(frames)), av = try XCTUnwrap(ane.embedVideoFrames(frames))
+        XCTAssertGreaterThan(Self.cosine(gv, av), 0.99)
+        XCTAssertEqual(ane.neuralEngineFallbacks, 0, "something went to the GPU in Neural Engine mode")
 
         // Back to the GPU: text there at once, images still on the programs until a reload.
         XCTAssertFalse(ane.setComputeUnit(.gpu, cache: cache))
         XCTAssertFalse(ane.neuralEngineActive)
         XCTAssertTrue(ane.supportsImages)
-        XCTAssertGreaterThan(cosine(try XCTUnwrap(gpu.embedImage(imgs[0])), try XCTUnwrap(ane.embedImage(imgs[0]))), 0.99)
+        XCTAssertGreaterThan(Self.cosine(try XCTUnwrap(gpu.embedImage(imgs[0])), try XCTUnwrap(ane.embedImage(imgs[0]))), 0.99)
     }
+
+    /// The switch flipped while another thread embeds: every image and query still gets a vector in
+    /// the GPU path's space, whichever unit answers it at that moment.
+    func testSwitchingUnderLoadNeverDropsAVector() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("needs macOS 15") }
+        guard let dir = ProcessInfo.processInfo.environment["OMNI_NANO_MODEL_DIR"], FileManager.default.fileExists(atPath: dir) else {
+            throw XCTSkip("OMNI_NANO_MODEL_DIR not set")
+        }
+        let modelDir = URL(fileURLWithPath: dir)
+        let ref = try await OmniEngine.loadValidated(modelDir: modelDir)
+        let engine = try await OmniEngine.loadValidated(modelDir: modelDir)
+        let cache = Self.cache
+        let imgs = [image(3), image(4)], qs = ["a blue circle", "quarterly budget notes", "a dog on a beach"]
+        let refImgs = imgs.map { ref.embedImage($0) ?? [] }, refQs = qs.map { ref.embedQuery($0) }
+
+        final class Tally: @unchecked Sendable {
+            let lock = NSLock(); var done = 0, missing = 0, worst: Float = 1
+            func add(_ c: Float?) { lock.withLock { done += 1; if let c { worst = min(worst, c) } else { missing += 1 } } }
+        }
+        let tally = Tally(), stop = ManagedAtomicFlag()
+        let worker = Thread {
+            var k = 0
+            while !stop.isSet {
+                let i = k % imgs.count, j = k % qs.count
+                tally.add(engine.embedImage(imgs[i]).map { Self.cosine($0, refImgs[i]) })
+                let v = engine.embedQuery(qs[j])
+                tally.add(v.isEmpty ? nil : Self.cosine(v, refQs[j]))
+                k += 1
+            }
+        }
+        worker.start()
+        for unit in [OmniEngine.ComputeUnit.neuralEngine, .gpu, .neuralEngine, .gpu, .neuralEngine] {
+            _ = engine.setComputeUnit(unit, cache: cache)
+            try await Task.sleep(for: .seconds(2))
+        }
+        stop.set()
+        while !worker.isFinished { try await Task.sleep(for: .milliseconds(50)) }
+        XCTAssertGreaterThan(tally.done, 10)
+        XCTAssertEqual(tally.missing, 0, "a vector went missing while the unit changed")
+        XCTAssertGreaterThan(tally.worst, 0.99)
+    }
+}
+
+/// A flag one thread sets and another polls.
+final class ManagedAtomicFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var on = false
+    var isSet: Bool { lock.withLock { on } }
+    func set() { lock.withLock { on = true } }
 }

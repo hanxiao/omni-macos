@@ -16,11 +16,18 @@ enum ComputeUnitFacts {
     static func symbol(_ u: OmniEngine.ComputeUnit) -> String { u == .neuralEngine ? "brain" : "cpu" }
 }
 
-/// The comparison under the picker in Settings: one column per unit, the chosen one in primary.
+/// The comparison under the switch in Settings: one column per unit, the chosen one in primary.
 struct ComputeUnitGrid: View {
     var selected: OmniEngine.ComputeUnit
     var body: some View {
         Grid(alignment: .leading, horizontalSpacing: 18, verticalSpacing: 4) {
+            GridRow {
+                Text("")
+                Text(ComputeUnitFacts.name(.neuralEngine)).fontWeight(.medium)
+                    .foregroundStyle(selected == .neuralEngine ? .primary : .secondary)
+                Text(ComputeUnitFacts.name(.gpu)).fontWeight(.medium)
+                    .foregroundStyle(selected == .gpu ? .primary : .secondary)
+            }
             ForEach(ComputeUnitFacts.rows, id: \.label) { row in
                 GridRow {
                     Text(row.label).foregroundStyle(.secondary)
@@ -85,5 +92,18 @@ struct ComputeChoiceView: View {
         .buttonStyle(.plain)
         .focusEffectDisabled()
         .accessibilityAddTraits(on ? .isSelected : [])
+    }
+}
+
+/// One Neural Engine build's cancel flag, read on the build's thread between compiles and set on the
+/// main actor when the setting changes (AppModel.applyComputeUnit).
+final class AneBuildGate: @unchecked Sendable {
+    let generation: Int
+    private let lock = NSLock()
+    private var _cancelled = false
+    init(_ generation: Int) { self.generation = generation }
+    var cancelled: Bool {
+        get { lock.withLock { _cancelled } }
+        set { lock.withLock { _cancelled = newValue } }
     }
 }

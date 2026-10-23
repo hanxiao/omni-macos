@@ -35,7 +35,7 @@ extension AppModel {
         // two clicks in the same runloop pass cannot both get through. The button is also disabled
         // while running and the progress sheet is modal - three independent locks, because the
         // second run would race the first one's levers on process-wide statics.
-        guard !isPaperRunning, phase == .ready, let engine = paperEngine else { return }
+        guard !isPaperRunning, phase == .ready, !neuralEngineBuilding, let engine = paperEngine else { return }
         // Captured on the main actor, before the detached work: the live family measures the user's
         // own corpus, and reaching for the store from the detached task would touch actor-isolated
         // state. nil when no index is open, which the live cases report rather than measure around.

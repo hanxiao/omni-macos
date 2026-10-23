@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import CoreGraphics
 import MLX
 import PDFKit
@@ -778,8 +779,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
 
     /// Where the text backbone runs (Settings > Performance). The Neural Engine is a unit of its
     /// own: text embedded there leaves the GPU to whatever else the Mac runs, at about a seventh of
-    /// the energy per token (index.md, "The Neural Engine, measured again"). Media towers stay on the
-    /// GPU; so does a sequence past the program's longest bucket, and the model-stamp probe.
+    /// the energy per token (index.md, "The Neural Engine, measured again"). In this mode the towers
+    /// and every sequence up to 6,400 tokens run there too (all or nothing); the GPU keeps only a
+    /// sequence past that, which no shipped input makes, and the model-stamp probe.
     public enum ComputeUnit: String, Sendable { case neuralEngine, gpu }
 
     private let aneLock = NSLock()
@@ -789,6 +791,14 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// Neural Engine mode released the GPU copies of the towers; a switch back to the GPU needs the
     /// engine loaded again (AppModel.reloadEngine).
     public var gpuTowersReleased: Bool { aneLock.withLock { _gpuTowersReleased } }
+    /// Inputs the Neural Engine mode handed to the GPU (each one also logged "ane-fallback"): zero
+    /// is the promise of the mode.
+    public var neuralEngineFallbacks: Int { aneLock.withLock { _fallbacks } }
+    private var _fallbacks = 0
+    private func fellBack(_ what: String) {
+        aneLock.withLock { _fallbacks += 1 }
+        omniPerfLog("ane-fallback " + what)
+    }
     private var _computeUnit: ComputeUnit = .gpu
     public var computeUnit: ComputeUnit { aneLock.withLock { _computeUnit } }
     /// This Mac (macOS 15) and this model (a program for it) can run text on the Neural Engine.
@@ -803,7 +813,8 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// weights and compiled into `cache` the first time (ANEProgram, ~40 s for Nano), then loaded
     /// (~1 s); text stays on the GPU until it is ready, and if it cannot be built at all. `ready`
     /// reports whether the Neural Engine took over. Blocks: call off the main actor.
-    public func setComputeUnit(_ unit: ComputeUnit, cache: URL) -> Bool {
+    public func setComputeUnit(_ unit: ComputeUnit, cache: URL, progress: ((Double) -> Void)? = nil,
+                               isCancelled: (() -> Bool)? = nil) -> Bool {
         aneLock.withLock { _computeUnit = unit }
         guard unit == .neuralEngine else {
             // With the GPU towers released, the programs stay the towers until the app loads the
@@ -815,49 +826,88 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             return false
         }
         guard #available(macOS 15.0, *), let name = Self.aneProgramName(config) else { return false }
-        if neuralEngineActive { return true }
+        if neuralEngineActive { progress?(1); return true }
         let t0 = Date()
+        // 1. The programs, their weights the app's own. Nothing changes for callers yet: the GPU
+        //    serves everything until step 4.
+        let prefix = name.replacingOccurrences(of: "_text", with: "")
         guard let compiled = ANEProgram.compiled(name, weights: weightStore, cache: cache),
-              let backend = try? ANETextBackend(compiled: compiled, config: config, weights: weightStore,
-                                                lengths: ANETextBackend.defaultLengths) else {
-            omniPerfLog("ane: not available, text stays on the GPU")
+              let text = try? ANETextBackend(compiled: compiled, config: config, weights: weightStore,
+                                             lengths: ANETextBackend.defaultLengths,
+                                             blocks: ANEBlocks.bundled(prefix + "_textblocks"), program: name) else {
+            omniPerfLog("ane: not available, everything stays on the GPU")
             return false
         }
-        backend.warm()
-        omniPerfLog(String(format: "ane: text on the Neural Engine (%.1f s to ready; longer lengths compile on first use)", -t0.timeIntervalSinceNow))
-        aneLock.withLock { if _computeUnit == .neuralEngine { _aneText = backend } }
-        // The towers: their weights made into arrays now, each size compiled the first time an
-        // image, clip or recording needs it. An item a program cannot take runs the GPU path.
-        let prefix = name.replacingOccurrences(of: "_text", with: "")
-        if imageEncoder != nil, let vc = ANEBlocks.bundled(prefix + "_vision") {
-            do {
-                // The tower object computes the position table and rotary angles; it gets only the
-                // tensor that needs, so it holds no reference to the weights released below.
-                let pos = WeightStore(rawWeights: weightStore.weights.filter { $0.key == "vision_tower.pos_embed.weight" })
-                let vb = try ANEVisionBackend(compiled: vc, tower: OmniVisionTower(weights: pos, config: config), config: config,
-                                              weights: weightStore, buckets: ANEVisionBackend.defaultBuckets)
-                omniPerfLog(String(format: "ane: images and video on the Neural Engine (weights ready in %.1f s; each size compiles on first use)", -t0.timeIntervalSinceNow))
-                aneLock.withLock { if _computeUnit == .neuralEngine { _aneVision = vb } }
-            } catch {
-                omniPerfLog("ane: vision not loaded: \(error)")
+        if text.blockLengths.isEmpty { omniPerfLog("ane: no layer program, a sequence past \(text.maxLength) tokens runs on the GPU") }
+        let visionProgram = imageEncoder != nil ? ANEBlocks.bundled(prefix + "_vision") : nil
+        let audioProgram = audioEncoder != nil ? ANEBlocks.bundled(prefix + "_audio") : nil
+        // 2. Every function compiled once on this Mac (the system keeps the result; a later launch
+        //    loads each in well under a second when first used), so nothing stalls a search or an
+        //    image afterwards. Skipped when this macOS has already compiled these exact programs.
+        //    The towers' programs need no weights to compile: their arrays are made after (step 3),
+        //    so the minutes of the build never hold the towers twice.
+        let stamp = cache.appendingPathComponent("\(prefix).prepared")
+        let key = Self.aneProgramsKey(prefix)
+        if (try? String(contentsOf: stamp, encoding: .utf8)) != key {
+            // Compiled and let go: a loaded function holds working buffers (ANEBlocks.Functions).
+            func compile(_ program: URL?, _ names: [(name: String, cost: Double)]) -> [(cost: Double, load: () -> Bool)] {
+                guard let program else { return [] }
+                let f = ANEBlocks.Functions(program)
+                return names.map { n in (n.cost, { defer { f.unload(n.name) }; return f.model(n.name) != nil }) }
             }
-        }
-        if let audio = audioEncoder, let ac = ANEBlocks.bundled(prefix + "_audio") {
-            do {
-                let ab = try ANEAudioBackend(compiled: ac, positions: audio.anePositions, config: config, weights: weightStore,
-                                             batches: ANEAudioBackend.defaultBatches)
-                omniPerfLog(String(format: "ane: audio on the Neural Engine (weights ready in %.1f s; each size compiles on first use)", -t0.timeIntervalSinceNow))
-                aneLock.withLock { if _computeUnit == .neuralEngine { _aneAudio = ab } }
-            } catch {
-                omniPerfLog("ane: audio not loaded: \(error)")
+            let jobs: [(cost: Double, load: () -> Bool)] =
+                text.functionNames.map { f in (f.cost, { defer { text.unload(f.name) }; return text.load(f.name) }) }
+                + compile(visionProgram, ANEVisionBackend.functionNames(ANEVisionBackend.defaultBuckets))
+                + compile(audioProgram, ANEAudioBackend.functionNames(ANEAudioBackend.defaultBatches))
+            let total = jobs.reduce(0) { $0 + $1.cost }
+            var done = 0.0
+            progress?(0)
+            for job in jobs {
+                if isCancelled?() == true { omniPerfLog("ane: build cancelled"); return false }
+                // A function the Neural Engine refuses is logged by the loader; its inputs then run
+                // the GPU path (text) or fail (a tower whose GPU copy was released).
+                _ = job.load()
+                done += job.cost
+                progress?(done / total)
             }
+            try? key.write(to: stamp, atomically: true, encoding: .utf8)
+            omniPerfLog(String(format: "ane: every program compiled (%.1f s)", -t0.timeIntervalSinceNow))
         }
+        // The query length loaded now, so a search never waits for a load.
+        _ = text.load("L\(ANETextBackend.defaultLengths[0])")
+        if isCancelled?() == true { return false }
+        // 3. The towers' arrays, from the app's own weights; a tower whose smallest size will not
+        //    load keeps its GPU copy.
+        var vision: ANEVisionBackend?, audio: ANEAudioBackend?
+        if let vc = visionProgram {
+            // The tower object computes the position table and rotary angles; it gets only the
+            // tensor that needs, so it holds no reference to the weights released below.
+            let pos = WeightStore(rawWeights: weightStore.weights.filter { $0.key == "vision_tower.pos_embed.weight" })
+            vision = try? ANEVisionBackend(compiled: vc, tower: OmniVisionTower(weights: pos, config: config), config: config,
+                                           weights: weightStore, buckets: ANEVisionBackend.defaultBuckets)
+        }
+        if let ac = audioProgram, let enc = audioEncoder {
+            audio = try? ANEAudioBackend(compiled: ac, positions: enc.anePositions, config: config, weights: weightStore,
+                                         batches: ANEAudioBackend.defaultBatches)
+        }
+        if let v = vision, !v.ready() { vision = nil }
+        if let a = audio, !a.ready() { audio = nil }
+        progress?(1)
+        if isCancelled?() == true { return false }
+        // 4. Everything at once.
+        aneLock.withLock {
+            guard _computeUnit == .neuralEngine else { return }
+            _aneText = text
+            if let vision { _aneVision = vision }
+            if let audio { _aneAudio = audio }
+        }
+        guard neuralEngineActive else { return false }
+        omniPerfLog(String(format: "ane: search and indexing on the Neural Engine (%.1f s; vision %@, audio %@)", -t0.timeIntervalSinceNow,
+                           vision == nil ? "GPU" : "ANE", audio == nil ? "GPU" : "ANE"))
         // The GPU copies of the towers are dead weight now (Nano: 1.4 GB of footprint): every image,
-        // clip and recording goes through the programs, a sequence past the text program through
-        // the GPU backbone with the programs' tokens. Released once each program's smallest size
-        // has loaded, so a Mac whose Neural Engine refuses one keeps that tower on the GPU.
-        let (v, a) = aneLock.withLock { (_aneVision as? ANEVisionBackend, _aneAudio as? ANEAudioBackend) }
-        let releaseVision = v?.ready() ?? false, releaseAudio = a?.ready() ?? false
+        // clip and recording goes through the programs (a sequence past their longest length through
+        // the GPU backbone with the programs' tokens).
+        let releaseVision = vision != nil, releaseAudio = audio != nil
         if releaseVision || releaseAudio {
             run(highPriority: false) {
                 var w = weightStore.weights
@@ -878,7 +928,19 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             aneLock.withLock { _gpuTowersReleased = true }
             omniPerfLog("ane: GPU towers released (vision \(releaseVision), audio \(releaseAudio))")
         }
-        return neuralEngineActive
+        return true
+    }
+
+    /// What a finished build covers: this macOS (the system's compiled form is per OS) and these
+    /// exact programs. A different key means compile again.
+    static func aneProgramsKey(_ prefix: String) -> String {
+        var h = SHA256()
+        h.update(data: Data(ProcessInfo.processInfo.operatingSystemVersionString.utf8))
+        for name in [prefix + "_text.mlmodel", prefix + "_text.recipe.json", prefix + "_textblocks.mlmodelc/model.mil",
+                     prefix + "_vision.mlmodelc/model.mil", prefix + "_audio.mlmodelc/model.mil"] {
+            if let u = Bundle.module.resourceURL?.appendingPathComponent("ANE/" + name), let d = try? Data(contentsOf: u) { h.update(data: d) }
+        }
+        return h.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
     /// An image's - or a video clip's, its temporal slices in order - vector and, with a tagger,
@@ -894,7 +956,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         for k in 0 ..< t {
             let part = OmniVisionPreprocess.RawPatches(pixels: Array(raw.pixels[k * slice ..< (k + 1) * slice]), gridTHW: [(1, h, w)])
             guard let r = vision.encode(part) else {
-                omniPerfLog("ane-fallback image: \(h * w) patches a slice, not taken by the program")
+                fellBack("image: \(h * w) patches a slice, not taken by the program")
                 return nil
             }
             tokens += r.tokens; count += r.count
@@ -902,10 +964,10 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         let seq = textEncoder.mediaRows(.vision, tokens: tokens, count: count, prefixIds: prefix, suffixIds: mediaSuffix)
         let text = aneLock.withLock({ _aneText }) as? ANETextBackend
         guard let text, let out = text.encode(embeddings: seq.rows, count: seq.length, hidden: tagger != nil) else {
-            // The tower's tokens through the GPU backbone - no GPU tower needed: a video's sequence
-            // past the text program's longest length, or text back on the GPU while the app loads
-            // the towers again.
-            if text != nil { omniPerfLog("ane-fallback image: a sequence of \(seq.length), past the longest text bucket; backbone on the GPU") }
+            // The tower's tokens through the GPU backbone - no GPU tower needed: a sequence past
+            // the text programs' longest length, or text back on the GPU while the app loads the
+            // towers again.
+            if text != nil { fellBack("image: a sequence of \(seq.length), not taken by the text programs; backbone on the GPU") }
             let enc = textEncoder
             return run(highPriority: false) {
                 let r = enc.encodeMedia(.vision, tokens: tokens, count: count, prefixIds: prefix, suffixIds: mediaSuffix, tagger: tagger)
@@ -930,13 +992,13 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         guard #available(macOS 15.0, *),
               let audio = aneLock.withLock({ _aneAudio }) as? ANEAudioBackend else { return nil }
         guard let r = audio.encode(mel: mel, frames: frames) else {
-            omniPerfLog("ane-fallback audio: \(frames) mel frames, not taken by the program")
+            fellBack("audio: \(frames) mel frames, not taken by the program")
             return nil
         }
         let seq = textEncoder.mediaRows(.audio, tokens: r.tokens, count: r.count, prefixIds: prefix, suffixIds: mediaSuffix)
         let text = aneLock.withLock({ _aneText }) as? ANETextBackend
         guard let text, let out = text.encode(embeddings: seq.rows, count: seq.length) else {
-            if text != nil { omniPerfLog("ane-fallback audio: a sequence of \(seq.length), past the longest text bucket; backbone on the GPU") }
+            if text != nil { fellBack("audio: a sequence of \(seq.length), not taken by the text programs; backbone on the GPU") }
             let enc = textEncoder
             return run(highPriority: false) {
                 let v = enc.encodeMedia(.audio, tokens: r.tokens, count: r.count, prefixIds: prefix, suffixIds: mediaSuffix, tagger: nil).vec
@@ -981,7 +1043,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         var out = ids.map { aneVector($0) }
         let rest = out.indices.filter { out[$0] == nil }
         if !rest.isEmpty, neuralEngineActive {
-            omniPerfLog("ane-fallback text: \(rest.count) of \(ids.count), longest \(rest.map { ids[$0].count }.max() ?? 0) tokens")
+            fellBack("text: \(rest.count) of \(ids.count), longest \(rest.map { ids[$0].count }.max() ?? 0) tokens")
         }
         if !rest.isEmpty {
             let v = run(highPriority: !passage) { textEncoder.encodeTokenBatch(rest.map { ids[$0] }) }

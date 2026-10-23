@@ -19,16 +19,33 @@ public enum ANEBlocks {
     /// under one), and most Macs never need most sizes, so nothing compiles before it is used. The
     /// system keeps the compiled form; later loads are fast. A function that fails to load is not
     /// tried again in this process.
+    ///
+    /// EVERY LOADED FUNCTION HOLDS THE NEURAL ENGINE RUNTIME'S WORKING BUFFERS, so a function unused
+    /// for `idleSeconds` is let go (the system keeps its compiled form: back in ~0.4 s), and the
+    /// one-time build lets each go as soon as it is compiled (`unload`).
     final class Functions: @unchecked Sendable {
         let compiled: URL
+        static let idleSeconds: TimeInterval = 120
         private var models: [String: MLModel] = [:], failed: Set<String> = []
+        private var lastUse: [String: Date] = [:]
         private(set) var seconds: [String: Double] = [:]
         private let lock = NSLock()
+        /// Never let go: the lengths a search uses, so no query waits for a load after a quiet spell.
+        let pinned: Set<String>
 
-        init(_ compiled: URL) { self.compiled = compiled }
+        init(_ compiled: URL, pinned: Set<String> = []) { self.compiled = compiled; self.pinned = pinned }
+
+        func unload(_ name: String) {
+            lock.withLock { if !pinned.contains(name) { models[name] = nil; lastUse[name] = nil } }
+        }
 
         func model(_ name: String) -> MLModel? {
             lock.withLock {
+                let now = Date()
+                for (n, t) in lastUse where n != name && !pinned.contains(n) && now.timeIntervalSince(t) > Self.idleSeconds {
+                    models[n] = nil; lastUse[n] = nil
+                }
+                lastUse[name] = now
                 if let m = models[name] { return m }
                 guard !failed.contains(name) else { return nil }
                 let c = MLModelConfiguration()
@@ -57,12 +74,26 @@ public enum ANEBlocks {
         return out.featureValue(for: "out")?.multiArrayValue
     }
 
-    /// A tensor's values as Float, on the CPU (the weights are read once, at load).
+    /// A tensor's values as Float, read from its own memory (fp16, bf16, fp32): no MLX buffer is
+    /// made for the copy, so none is left in MLX's allocator cache - a whole tower's fp32 copies
+    /// were, until the GPU towers' release cleared it.
     static func floats(_ t: MLXArray) -> [Float] {
         Device.withDefaultDevice(.cpu) {
-            let f = t.asType(.float32)
-            eval(f)
-            return f.asArray(Float.self)
+            let d = t.asData(access: .noCopyIfContiguous)
+            return d.data.withUnsafeBytes { raw -> [Float] in
+                switch d.dType {
+                case .float16:
+                    return Half.floats(raw.bindMemory(to: UInt16.self))
+                case .bfloat16:
+                    return raw.bindMemory(to: UInt16.self).map { Float(bitPattern: UInt32($0) << 16) }
+                case .float32:
+                    return Array(raw.bindMemory(to: Float.self))
+                default:
+                    let f = t.asType(.float32)
+                    eval(f)
+                    return f.asArray(Float.self)
+                }
+            }
         }
     }
 

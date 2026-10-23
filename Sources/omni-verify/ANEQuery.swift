@@ -275,6 +275,7 @@ enum ANEQuery {
             print(String(format: "%@ x%d: cosine min %.5f median %.5f | tags agree %.2f | ms median GPU %.0f ANE %.0f",
                          k, r.count, c.first!, c[c.count / 2], tags, tg[tg.count / 2], ta[ta.count / 2]))
         }
+        print("handed to the GPU: \(ane.neuralEngineFallbacks)")
         t0 = Date()
     }
 

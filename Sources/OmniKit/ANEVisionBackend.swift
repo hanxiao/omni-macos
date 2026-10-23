@@ -80,6 +80,12 @@ public final class ANEVisionBackend: @unchecked Sendable {
         inChannels = K
     }
 
+    /// Every function with its first compile in about seconds (Nano: a 5,120-patch block 17 s, its
+    /// embedding and merger ~1.6 s each), for the build's progress.
+    public static func functionNames(_ buckets: [Int]) -> [(name: String, cost: Double)] {
+        buckets.flatMap { N in [("E\(N)", 1.5), ("B\(N)", 1 + Double(N) / 300), ("M\(N)", 1.5)] }
+    }
+
     /// The smallest bucket's functions load on this Mac (compiling them the first time, ~3 s).
     public func ready() -> Bool {
         let N = buckets[0]

@@ -68,6 +68,11 @@ public final class ANEAudioBackend: @unchecked Sendable {
         ANEVisionBackend.channelMajor(pos, rows: config.audio.nWindow, cols: dModel, into: positions, length: config.audio.nWindow)
     }
 
+    /// Every function with its first compile in about seconds (each about a second on Nano).
+    public static func functionNames(_ batches: [Int]) -> [(name: String, cost: Double)] {
+        batches.flatMap { B in [("F\(B)", 0.2), ("B\(B)", 1), ("P\(B)", 0.2)] }
+    }
+
     /// The smallest chunk count's functions load on this Mac (compiling them the first time, ~1 s).
     public func ready() -> Bool {
         let B = batches[0]

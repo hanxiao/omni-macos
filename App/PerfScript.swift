@@ -351,6 +351,7 @@ enum PerfScript {
         case "memory": model.memoryHeadroomGB = Double(v) ?? model.memoryHeadroomGB   // headroom, GB
         case "group": model.groupNearDuplicates = on
         case "instant": model.instantSearchEnabled = on
+        case "ane": model.computeUnit = on ? .neuralEngine : .gpu   // the "Use the Neural Engine" switch
         case "maxImage": model.maxImageDimension = Int(v) ?? model.maxImageDimension
         case "maxFrames": model.maxVideoFrames = Int(v) ?? model.maxVideoFrames
         case "chunk": model.maxTextChunkChars = Int(v) ?? model.maxTextChunkChars

@@ -647,16 +647,19 @@ private struct PerformanceTab: View {
         Form {
             // FIRST: where the model runs (Han, 2026-10-22). The facts, not prose: ComputeUnitGrid.
             Section {
-                Picker("Run on", selection: Binding(get: { model.computeUnit }, set: { model.computeUnit = $0 })) {
-                    ForEach([OmniEngine.ComputeUnit.neuralEngine, .gpu], id: \.self) { Text(ComputeUnitFacts.name($0)).tag($0) }
-                }
-                .pickerStyle(.segmented)
+                Toggle("Use the Neural Engine", isOn: Binding(get: { model.computeUnit == .neuralEngine },
+                                                              set: { model.computeUnit = $0 ? .neuralEngine : .gpu }))
+                    .toggleStyle(.switch)
+                    // Not mid-benchmark: the run measures the unit it started on.
+                    .disabled(model.neuralEngineStatus == .unavailable || model.isPaperRunning)
                 ComputeUnitGrid(selected: model.computeUnit)
                 switch model.neuralEngineStatus {
-                case .preparing:
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Text("Preparing the Neural Engine").foregroundStyle(.secondary)
+                case .preparing(let p):
+                    // The one-time build: every program compiled for this Mac's Neural Engine.
+                    VStack(alignment: .leading, spacing: 4) {
+                        ProgressView(value: p)
+                        Text("Preparing the Neural Engine, once. The GPU runs until it is done.")
+                            .font(.callout).foregroundStyle(.secondary)
                     }
                 case .unavailable:
                     Text("Not available on this Mac").foregroundStyle(.secondary)
@@ -796,7 +799,8 @@ private struct PerformanceTab: View {
                             Task { await model.runPaperBenchmark() }
                         }
                         .controlSize(.small)
-                        .disabled(model.isPaperRunning || model.phase != .ready)
+                        // Not during the one-time Neural Engine build: it would be measured too.
+                        .disabled(model.isPaperRunning || model.phase != .ready || model.neuralEngineBuilding)
                     }
                 }
                 Toggle(isOn: Binding(get: { model.shareProfilingResults }, set: { model.shareProfilingResults = $0 })) {

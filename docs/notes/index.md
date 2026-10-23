@@ -2397,10 +2397,8 @@ inside) and take the app's own weights as fp16 arrays: no weight file on the Mac
 
 SIZES: images 1,024 ... 5,120 patches (the preprocess's pixel range; a phone photo is always 5,120:
 13 of 19 photos on this Mac are past the cap); video slices to 8,192 (6 frames of 1568 px: 16:9 5,488,
-4:3 7,252, square 8,100); audio windows to 60 s (30 chunks of 2 s). NOT YET: a video's backbone
-sequence past 2,048 tokens (HD video reaches ~6,300) still runs on the GPU (`ane-fallback` in the
-perf log) - the next step is text blocks for the long lengths, which also measured faster there
-(L2048 124 ms as blocks against 167 baked).
+4:3 7,252, square 8,100); audio windows to 60 s (30 chunks of 2 s). A video segment's backbone
+sequence past 2,048 tokens (HD video, to ~6,300) runs one layer a call: "The long sequences" below.
 
 RESULTS, Nano, through the engine (omni-verify aneengine), against the GPU:
 
@@ -2431,12 +2429,119 @@ towers are released once each program's smallest size loads (setComputeUnit; a M
 Engine refuses one keeps that tower on the GPU): 3,657 MB, and 2,190 MB once the text encoder was
 built again from the store without them - Qwen3Backbone keeps the WeightStore it was made from,
 every tensor in it, as setTowers already knew. The vision program's helper tower gets only the
-position table for the same reason. A sequence past the text program (HD video) or text back on
-the GPU runs the programs' tokens through the GPU backbone (OmniTextEncoder.encodeMedia, the
+position table for the same reason. A sequence past every text program (none that the app makes)
+or text back on the GPU runs the programs' tokens through the GPU backbone (OmniTextEncoder.encodeMedia, the
 wrapper built once in Qwen3Backbone.mediaSequence); a switch back to the GPU loads the engine again
 (AppModel.reloadEngine) and the programs serve media until it is in. ANEModeTests holds all of it;
 its first run caught images returning nil in that switch.
 
+THE SWITCH (Han, 2026-10-23: a toggle, a one-time build with progress, then everything on the
+Neural Engine). Settings > Performance > "Use the Neural Engine". Turning it on compiles EVERY
+function of the model's programs once, with a progress bar under the switch, while the GPU keeps
+serving; then text and towers switch over together and the GPU towers are released. A stamp
+(cache/<model>.prepared: macOS version + the programs' bytes) skips the build next time - a
+relaunch or a later switch-on is ready in ~2 s, each function loading from the system's compiled
+form in ~0.4 s when first used. Turning it off mid-build cancels between compiles (one in flight
+finishes - it cannot be interrupted); builds are single-flight, so a quick off-on never runs two
+writing one weight file. Off after a finished build reloads the engine (towers back on the GPU).
+The switch is locked while the benchmark runs, and the benchmark will not start during the build:
+either would measure the other.
+  - One-time build, Nano, measured in the app: text 113 s (L2048 56 s), vision ~3 min (11 sizes,
+    the photo size 18 s), audio ~10 s - about 5 minutes.
+  - Stress (isolated instance, the 226-file eval bed indexed from empty, a served search every
+    0.5 s, the switch flipped on / off / on / off 5 s into a build / on-off-on / off / on over 15
+    minutes): 1,373 searches all answered (p50 19 ms, p99 54, max 75), none empty, 226 of 226 files
+    indexed, no error, peak footprint 4.47 GB during the reload that brings the GPU towers back
+    (old and new engine both resident for a moment).
+
+THE BENCHMARK (Settings > Benchmark this Mac, `omni-verify bench`, full scale, M3 Ultra, each arm
+back to back with nothing else running; the report records `computeUnit`, part of its identity):
+
+    row                                     Nano GPU    Nano ANE    Small GPU   Small ANE
+    text indexing, tokens/s                 77,770      22,630      19,580      5,090
+    index one image, p50 ms                 13.4        42.0        46.0        130.2
+    whole pass, same files, s               7.2         26.9        29.1        126.0
+    image / audio / video query, p50 ms     27/72/80    85/317/192  66/83/131   256/372/431
+    text query, filtered query              equal (the engine's query cache answers both)
+    search while indexing, p50 / p95 ms     66 / 96     5.1 / 18    -           -
+    indexing lost, a GPU app running        18.1%       0%          19.4%       0.1%
+    peak memory, indexing every kind, MB    11,330      8,894*      9,949       7,440
+    at rest, model and index loaded, MB     9,083       8,382*      7,656       6,904
+    peak deleting and compacting, MB        10,200      8,998*      8,708       7,520
+
+  * with the fix below; before it 9,952 at rest and 10,450 / 10,540 at the peaks: every function
+    the one-time build had loaded stayed loaded, each holding the runtime's working buffers. The
+    build now lets each go once compiled, and a size unused for 2 minutes is released (the three
+    query lengths stay): the first use after costs a reload (image query max 809 ms, p95 93).
+    Small's one-time build: 760 s.
+
 ALSO: Half rounds fp16 subnormals as numpy does (vImage was one step off on 29 of 488 audio blobs).
 Builders run from Tools/ane with coremltools' model load skipped: loading a converted model made
 ct.convert compile it for the Neural Engine, minutes per size, thrown away.
+
+## The long sequences: HD video on the Neural Engine (2026-10-23)
+
+A video is embedded a 240 s segment at a time, six frames of up to 1568 px, three temporal slices:
+the backbone sequence is ~4,130 tokens for 1080p 16:9, ~5,450 for 4:3, ~6,090 square (the pixel
+budget caps any segment at 6,272 media tokens), ~2,100-2,800 for 720p. Past the baked program's
+2,048 those ran the GPU backbone - the one thing Neural Engine mode still sent there.
+
+BAKED LONG LENGTHS ARE OUT (measured, one at a time, each compile alone on the queue):
+
+    baked length         compile     per call
+    Nano 3,072           222 s       188 ms
+    Nano 4,608           363 s       600 ms
+    Nano 6,144           742 s       1,200 ms
+    Small 4,608          4,453 s     3,000 ms
+
+ONE LAYER AS A BLOCK (Tools/ane/build_text_blocks.py; anepar, zero inputs), per layer:
+
+    form                                 Nano 6,144         Small 6,144
+    queries in blocks of 256             7.8 s / 127 ms     13.0 s / 222 ms
+    blocks of 128               (kept)   17.3 s / 52 ms     -
+    128, causal keys sliced     (kept)   -                  30.0 s / 77 ms
+    256, causal keys sliced              -                  13.7 s / 107 ms
+    64 (sliced for Small)                53.2 s / 51 ms     89.8 s / 67 ms
+
+  At 3,072: Nano 4.1 s / 18.2 ms, Small 5.0 s / 36 ms (blocks of 256). The causal slice: a query
+  block reads only the keys up to its own end, the keys before it unmasked and its own block under a
+  128 x 128 triangle - half the attention, and no (L, L) mask input (82 MB at 6,400).
+
+THE WEIGHTS ARE THE BAKED PROGRAM'S OWN. Each layer's tensors are already in the compiled text
+program's weight file, fp16, scaled and rotated as the layer wants them; ANETextBackend maps that
+file (copy-on-write, nothing writes it), finds each blob from the file's own records in the
+recipe's order (ANEProgram.blobOffsets: any disagreement and there is no long path), and hands
+each layer MLMultiArrays over the mapping. No second copy, nothing converted per call; the copy
+Core ML makes per call is ~19 MB a Nano layer, ~38 MB a Small one. The final RMSNorm runs on the CPU
+in fp32 at the rows wanted (the last token for the vector, every row for the tags).
+
+Buckets 2,560, 3,072, 4,224, 4,992, 5,504, 6,400 (the shapes above plus margin). The one-time build
+compiles them with everything else: Nano +83 s (8.7 ... 18.9 s a size), Small +132 s (11.9 ... 33.4 s).
+
+RESULTS (omni-verify aneengine, 8 videos: generated 960x720, 1280x720, 1920x1080, 1620x1080,
+1440x1080, 1080x1080, 1080x1920, and a 1080p phone clip), against the GPU:
+
+    model   vector cosine min / median   a segment, GPU    Neural Engine   handed to the GPU
+    Nano    0.99656 / 0.99758            175 ms            1,767 ms        0
+    Small   0.99572 / 0.99735            430 ms            3,541 ms        0
+
+  OmniEngine.neuralEngineFallbacks counts every input the mode hands to the GPU (each also logged
+  `ane-fallback`); ANEModeTests asserts zero for a 1080p segment, at cosine > 0.99 to the GPU.
+
+IN THE APP the frames come from the settings (up to 32 distinct frames a segment at 1024 px), so any
+segment with motion is past 2,048 tokens and most reach the 6,400 bucket (16 slices, the pixel budget
+binding). Generated 64 s clips whose every frame differs, keyframe each (AVAssetImageGenerator takes
+the nearest keyframe: a clip with one returns one frame): 3 of them in 8.7 s on the Neural Engine
+against 1.7 s on the GPU, `B6400` used, nothing handed to the GPU, the footprint while they ran 3.2 GB
+against the GPU's peak of 4.2 (the tag scores over ~5,800 rows cost the same ~1.2 GB either way).
+
+THE TOWERS WERE HELD TWICE AROUND THE SWITCH. Footprint each second of a launch in Neural Engine
+mode: 5.3 GB at second 5, 2.9 a second later when the GPU towers went. Two causes: the towers' arrays
+were built before the one-time build (so its minutes held both copies; 3.87 GB in the Settings
+screenshot mid-build) and each tensor went through an MLX fp32 copy that MLX's allocator kept. Now
+the build compiles the towers' functions with no weights (they need none), the arrays are made after
+it, and ANEBlocks.floats reads each tensor's own memory (identical values: parity unchanged to the
+fifth decimal). Measured again, nothing to index: launch peak 4.5 GB for about a second (GPU mode's
+own launch peak 3.5), at rest 2.27 GB (GPU 2.47); a fresh one-time build start to finish peaked at
+3.09 GB and ended at 2.19. The second that remains is install-before-release: the GPU towers go only
+once the programs serve, so no image ever finds neither.

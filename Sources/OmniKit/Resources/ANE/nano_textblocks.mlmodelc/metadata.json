@@ -1,0 +1,1321 @@
+[
+  {
+    "metadataOutputVersion" : "3.0",
+    "outputSchema" : [
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 6400)",
+        "shortDescription" : "",
+        "shape" : "[1, 768, 1, 6400]",
+        "name" : "out",
+        "type" : "MultiArray"
+      }
+    ],
+    "modelParameters" : [
+
+    ],
+    "specificationVersion" : 9,
+    "functions" : [
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 2560)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 2560]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "B2560",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.matmul" : 9,
+          "Ios18.concat" : 13,
+          "Ios16.einsum" : 480,
+          "Ios18.add" : 246,
+          "Ios18.realDiv" : 2,
+          "Ios18.silu" : 1,
+          "Ios18.softmax" : 240,
+          "Ios18.transpose" : 1,
+          "Ios16.reduceL2Norm" : 2,
+          "Ios18.reshape" : 13,
+          "Split" : 15,
+          "Ios18.mul" : 11
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 2560)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 2560]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 2560)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 2560]",
+            "name" : "cos",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 2560)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 2560]",
+            "name" : "sin",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 2560 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 2560, 1, 1]",
+            "name" : "mask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 1]",
+            "name" : "g1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wqp",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wk",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wkp",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 1]",
+            "name" : "g2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 3072 × 768)",
+            "shortDescription" : "",
+            "shape" : "[3072, 768]",
+            "name" : "wg",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 3072 × 768)",
+            "shortDescription" : "",
+            "shape" : "[3072, 768]",
+            "name" : "wu",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 3072)",
+            "shortDescription" : "",
+            "shape" : "[768, 3072]",
+            "name" : "wd",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 3072)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 3072]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "B3072",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.matmul" : 9,
+          "Ios18.concat" : 13,
+          "Ios16.einsum" : 576,
+          "Ios18.add" : 294,
+          "Ios18.realDiv" : 2,
+          "Ios18.silu" : 1,
+          "Ios18.softmax" : 288,
+          "Ios18.transpose" : 1,
+          "Ios16.reduceL2Norm" : 2,
+          "Ios18.reshape" : 13,
+          "Split" : 15,
+          "Ios18.mul" : 11
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 3072)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 3072]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 3072)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 3072]",
+            "name" : "cos",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 3072)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 3072]",
+            "name" : "sin",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 3072 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 3072, 1, 1]",
+            "name" : "mask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 1]",
+            "name" : "g1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wqp",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wk",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wkp",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 1]",
+            "name" : "g2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 3072 × 768)",
+            "shortDescription" : "",
+            "shape" : "[3072, 768]",
+            "name" : "wg",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 3072 × 768)",
+            "shortDescription" : "",
+            "shape" : "[3072, 768]",
+            "name" : "wu",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 3072)",
+            "shortDescription" : "",
+            "shape" : "[768, 3072]",
+            "name" : "wd",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 4224)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 4224]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "B4224",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.matmul" : 9,
+          "Ios18.concat" : 13,
+          "Ios16.einsum" : 792,
+          "Ios18.add" : 402,
+          "Ios18.realDiv" : 2,
+          "Ios18.silu" : 1,
+          "Ios18.softmax" : 396,
+          "Ios18.transpose" : 1,
+          "Ios16.reduceL2Norm" : 2,
+          "Ios18.reshape" : 13,
+          "Split" : 15,
+          "Ios18.mul" : 11
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 4224)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 4224]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 4224)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 4224]",
+            "name" : "cos",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 4224)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 4224]",
+            "name" : "sin",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 4224 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 4224, 1, 1]",
+            "name" : "mask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 1]",
+            "name" : "g1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wqp",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wk",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wkp",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 1]",
+            "name" : "g2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 3072 × 768)",
+            "shortDescription" : "",
+            "shape" : "[3072, 768]",
+            "name" : "wg",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 3072 × 768)",
+            "shortDescription" : "",
+            "shape" : "[3072, 768]",
+            "name" : "wu",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 3072)",
+            "shortDescription" : "",
+            "shape" : "[768, 3072]",
+            "name" : "wd",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 4992)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 4992]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "B4992",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.matmul" : 9,
+          "Ios18.concat" : 13,
+          "Ios16.einsum" : 936,
+          "Ios18.add" : 474,
+          "Ios18.realDiv" : 2,
+          "Ios18.silu" : 1,
+          "Ios18.softmax" : 468,
+          "Ios18.transpose" : 1,
+          "Ios16.reduceL2Norm" : 2,
+          "Ios18.reshape" : 13,
+          "Split" : 15,
+          "Ios18.mul" : 11
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 4992)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 4992]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 4992)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 4992]",
+            "name" : "cos",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 4992)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 4992]",
+            "name" : "sin",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 4992 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 4992, 1, 1]",
+            "name" : "mask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 1]",
+            "name" : "g1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wqp",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wk",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wkp",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 1]",
+            "name" : "g2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 3072 × 768)",
+            "shortDescription" : "",
+            "shape" : "[3072, 768]",
+            "name" : "wg",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 3072 × 768)",
+            "shortDescription" : "",
+            "shape" : "[3072, 768]",
+            "name" : "wu",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 3072)",
+            "shortDescription" : "",
+            "shape" : "[768, 3072]",
+            "name" : "wd",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 5504)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 5504]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "B5504",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.matmul" : 9,
+          "Ios18.concat" : 13,
+          "Ios16.einsum" : 1032,
+          "Ios18.add" : 522,
+          "Ios18.realDiv" : 2,
+          "Ios18.silu" : 1,
+          "Ios18.softmax" : 516,
+          "Ios18.transpose" : 1,
+          "Ios16.reduceL2Norm" : 2,
+          "Ios18.reshape" : 13,
+          "Split" : 15,
+          "Ios18.mul" : 11
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 5504)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 5504]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 5504)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 5504]",
+            "name" : "cos",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 5504)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 5504]",
+            "name" : "sin",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 5504 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 5504, 1, 1]",
+            "name" : "mask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 1]",
+            "name" : "g1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wqp",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wk",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wkp",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 1]",
+            "name" : "g2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 3072 × 768)",
+            "shortDescription" : "",
+            "shape" : "[3072, 768]",
+            "name" : "wg",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 3072 × 768)",
+            "shortDescription" : "",
+            "shape" : "[3072, 768]",
+            "name" : "wu",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 3072)",
+            "shortDescription" : "",
+            "shape" : "[768, 3072]",
+            "name" : "wd",
+            "type" : "MultiArray"
+          }
+        ]
+      },
+      {
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 6400)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 6400]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "stateSchema" : [
+
+        ],
+        "name" : "B6400",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.matmul" : 9,
+          "Ios18.concat" : 13,
+          "Ios16.einsum" : 1200,
+          "Ios18.add" : 606,
+          "Ios18.realDiv" : 2,
+          "Ios18.silu" : 1,
+          "Ios18.softmax" : 600,
+          "Ios18.transpose" : 1,
+          "Ios16.reduceL2Norm" : 2,
+          "Ios18.reshape" : 13,
+          "Split" : 15,
+          "Ios18.mul" : 11
+        },
+        "inputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 6400)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 6400]",
+            "name" : "h",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 6400)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 6400]",
+            "name" : "cos",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 6400)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 6400]",
+            "name" : "sin",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 6400 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 6400, 1, 1]",
+            "name" : "mask",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 1]",
+            "name" : "g1",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wq",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wqp",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wk",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wkp",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wv",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 768)",
+            "shortDescription" : "",
+            "shape" : "[768, 768]",
+            "name" : "wo",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 1)",
+            "shortDescription" : "",
+            "shape" : "[1, 768, 1, 1]",
+            "name" : "g2",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 3072 × 768)",
+            "shortDescription" : "",
+            "shape" : "[3072, 768]",
+            "name" : "wg",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 3072 × 768)",
+            "shortDescription" : "",
+            "shape" : "[3072, 768]",
+            "name" : "wu",
+            "type" : "MultiArray"
+          },
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 768 × 3072)",
+            "shortDescription" : "",
+            "shape" : "[768, 3072]",
+            "name" : "wd",
+            "type" : "MultiArray"
+          }
+        ]
+      }
+    ],
+    "mlProgramOperationTypeHistogram" : {
+      "Ios18.matmul" : 9,
+      "Ios18.concat" : 13,
+      "Ios16.einsum" : 1200,
+      "Ios18.add" : 606,
+      "Ios18.realDiv" : 2,
+      "Ios18.silu" : 1,
+      "Ios18.softmax" : 600,
+      "Ios18.transpose" : 1,
+      "Ios16.reduceL2Norm" : 2,
+      "Ios18.reshape" : 13,
+      "Split" : 15,
+      "Ios18.mul" : 11
+    },
+    "isUpdatable" : "0",
+    "stateSchema" : [
+
+    ],
+    "availability" : {
+      "macOS" : "15.0",
+      "tvOS" : "18.0",
+      "visionOS" : "2.0",
+      "watchOS" : "11.0",
+      "iOS" : "18.0",
+      "macCatalyst" : "18.0"
+    },
+    "computePrecision" : "Mixed (Float16, Int32)",
+    "modelType" : {
+      "name" : "MLModelType_mlProgram"
+    },
+    "inputSchema" : [
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 6400)",
+        "shortDescription" : "",
+        "shape" : "[1, 768, 1, 6400]",
+        "name" : "h",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 6400)",
+        "shortDescription" : "",
+        "shape" : "[1, 768, 1, 6400]",
+        "name" : "cos",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 6400)",
+        "shortDescription" : "",
+        "shape" : "[1, 768, 1, 6400]",
+        "name" : "sin",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 1 × 6400 × 1 × 1)",
+        "shortDescription" : "",
+        "shape" : "[1, 6400, 1, 1]",
+        "name" : "mask",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 1)",
+        "shortDescription" : "",
+        "shape" : "[1, 768, 1, 1]",
+        "name" : "g1",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 768 × 768)",
+        "shortDescription" : "",
+        "shape" : "[768, 768]",
+        "name" : "wq",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 768 × 768)",
+        "shortDescription" : "",
+        "shape" : "[768, 768]",
+        "name" : "wqp",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 768 × 768)",
+        "shortDescription" : "",
+        "shape" : "[768, 768]",
+        "name" : "wk",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 768 × 768)",
+        "shortDescription" : "",
+        "shape" : "[768, 768]",
+        "name" : "wkp",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 768 × 768)",
+        "shortDescription" : "",
+        "shape" : "[768, 768]",
+        "name" : "wv",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 768 × 768)",
+        "shortDescription" : "",
+        "shape" : "[768, 768]",
+        "name" : "wo",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 1 × 768 × 1 × 1)",
+        "shortDescription" : "",
+        "shape" : "[1, 768, 1, 1]",
+        "name" : "g2",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 3072 × 768)",
+        "shortDescription" : "",
+        "shape" : "[3072, 768]",
+        "name" : "wg",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 3072 × 768)",
+        "shortDescription" : "",
+        "shape" : "[3072, 768]",
+        "name" : "wu",
+        "type" : "MultiArray"
+      },
+      {
+        "hasShapeFlexibility" : "0",
+        "isOptional" : "0",
+        "dataType" : "Float16",
+        "formattedType" : "MultiArray (Float16 768 × 3072)",
+        "shortDescription" : "",
+        "shape" : "[768, 3072]",
+        "name" : "wd",
+        "type" : "MultiArray"
+      }
+    ],
+    "defaultFunctionName" : "B6400",
+    "generatedClassName" : "nano_textblocks",
+    "userDefinedMetadata" : {
+
+    },
+    "method" : "predict"
+  }
+]

@@ -69,6 +69,9 @@ public struct PaperAppIdentity: Sendable, Codable {
     public let modelCheckpointBytes: Int?
     public let modelDim: Int
     public let visionTowerResident: Bool
+    /// Where the models ran: "neuralEngine" or "gpu" (nil in reports from before the setting). Part
+    /// of the identity: a Neural Engine row and a GPU row are different conditions, never merged.
+    public let computeUnit: String?
     /// FNV-1a-64 over the identity fields above. Deliberately NOT called a fingerprint: it identifies
     /// the CHECKPOINT and the build, it does not verify that the arithmetic is unchanged. OmniKit
     /// has no compute self-test hash to export, and a key called `fingerprint` would imply one.
@@ -76,14 +79,16 @@ public struct PaperAppIdentity: Sendable, Codable {
 
     public init(version: String, build: String, mlxVersion: String, embeddingVersion: String,
                 modelVariant: String, modelDirName: String, modelCheckpointBytes: Int?,
-                modelDim: Int, visionTowerResident: Bool) {
+                modelDim: Int, visionTowerResident: Bool, computeUnit: String? = nil) {
         self.version = version; self.build = build; self.mlxVersion = mlxVersion
         self.embeddingVersion = embeddingVersion; self.modelVariant = modelVariant
         self.modelDirName = modelDirName; self.modelCheckpointBytes = modelCheckpointBytes
         self.modelDim = modelDim; self.visionTowerResident = visionTowerResident
+        self.computeUnit = computeUnit
         self.identityFNV1a64 = PaperReport.fnv1a64Hex(
             [version, build, mlxVersion, embeddingVersion, modelVariant, modelDirName,
-             modelCheckpointBytes.map(String.init) ?? "?", String(modelDim)].joined(separator: "|"))
+             modelCheckpointBytes.map(String.init) ?? "?", String(modelDim)].joined(separator: "|")
+                + (computeUnit.map { "|" + $0 } ?? ""))
     }
 
     /// Collect from the live engine. `version` / `build` come from the app bundle when it has them;
@@ -103,7 +108,8 @@ public struct PaperAppIdentity: Sendable, Codable {
             modelDirName: safeDirName(dir),
             modelCheckpointBytes: checkpoint,
             modelDim: engine.dim,
-            visionTowerResident: engine.supportsImages)
+            visionTowerResident: engine.supportsImages,
+            computeUnit: engine.neuralEngineActive ? "neuralEngine" : "gpu")
     }
 
     /// The variant is read off the resolved directory rather than stored on the engine, and an

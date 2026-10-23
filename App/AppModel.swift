@@ -2156,8 +2156,10 @@ final class AppModel {
             applyComputeUnit()
         }
     }
-    enum NeuralEngineStatus: Equatable { case off, preparing, ready, unavailable }
+    /// `preparing(p)`: the one-time build on this Mac, p in 0...1; the GPU serves until it is done.
+    enum NeuralEngineStatus: Equatable { case off, preparing(Double), ready, unavailable }
     private(set) var neuralEngineStatus: NeuralEngineStatus = .off
+    var neuralEngineBuilding: Bool { if case .preparing = neuralEngineStatus { return true } else { return false } }
     /// The choice screen after a first download, shown once.
     private(set) var computeChoicePending = false
     /// This Mac and this model can run the text model on the Neural Engine (macOS 15, a program
@@ -2191,32 +2193,53 @@ final class AppModel {
     /// every other size compiles the first time something needs it.
     func applyComputeUnit() {
         guard let engine else { return }
+        aneBuildGeneration += 1   // a build still running for the other setting stops at its next step
         let unit = computeUnit
         guard unit == .neuralEngine else {
             let released = engine.gpuTowersReleased
             _ = engine.setComputeUnit(.gpu, cache: OmniEngine.defaultANECache)
             neuralEngineStatus = .off
-            // Neural Engine mode let go of the GPU towers: load them again (the old engine serves
-            // text meanwhile).
+            // Neural Engine mode let go of the GPU towers: load them again (the programs serve
+            // images and recordings meanwhile, text is on the GPU at once).
             if released { Task { await self.reloadEngine() } }
             return
         }
         guard neuralEngineAvailable else { neuralEngineStatus = .unavailable; return }
         if engine.neuralEngineActive { neuralEngineStatus = .ready; return }
-        neuralEngineStatus = .preparing
+        neuralEngineStatus = .preparing(0)
         // An isolated run keeps its programs in scratch (-omni.ane.cache.dir), like the OCR cache.
         let cache = UserDefaults.standard.string(forKey: "omni.ane.cache.dir").map { URL(fileURLWithPath: $0, isDirectory: true) }
             ?? OmniEngine.defaultANECache
-        Task.detached(priority: .utility) { [weak self] in
-            let ok = engine.setComputeUnit(.neuralEngine, cache: cache)
+        let generation = aneBuildGeneration
+        let gate = AneBuildGate(generation)
+        aneBuildGate = gate
+        // ONE BUILD AT A TIME: a build cannot stop inside a compile, and two writing one program's
+        // weight file at once would race. A new one waits for the last to wind down.
+        let previous = aneBuildTask
+        aneBuildTask = Task.detached(priority: .utility) { [weak self] in
+            await previous?.value
+            guard !gate.cancelled else { return }
+            var shown = -1
+            let ok = engine.setComputeUnit(.neuralEngine, cache: cache, progress: { p in
+                let pct = Int(p * 100)
+                guard pct != shown else { return }   // @Observable notifies on every write
+                shown = pct
+                Task { @MainActor in
+                    guard let self, self.aneBuildGate === gate, !gate.cancelled else { return }
+                    self.neuralEngineStatus = .preparing(Double(pct) / 100)
+                }
+            }, isCancelled: { gate.cancelled })
             await MainActor.run {
-                guard let self, self.engine === engine, self.computeUnit == .neuralEngine else { return }
+                guard let self, self.aneBuildGate === gate, self.engine === engine, self.computeUnit == .neuralEngine else { return }
                 self.neuralEngineStatus = ok ? .ready : .unavailable
                 self.supportsImages = engine.supportsImages
                 self.audioSupported = engine.supportsAudio
             }
         }
     }
+    private var aneBuildGeneration = 0 { didSet { aneBuildGate?.cancelled = true } }
+    private var aneBuildGate: AneBuildGate?
+    private var aneBuildTask: Task<Void, Never>?
 
     /// Search-as-you-type (default). OFF = the search runs on Return only; typing still parses
     /// filters and offers suggestions. Kinder to low-end GPUs, where every keystroke's embed +

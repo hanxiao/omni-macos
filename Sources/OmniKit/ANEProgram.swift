@@ -149,6 +149,29 @@ public enum ANEProgram {
         return Half.bits(v)
     }
 
+    /// Where each of the program's weights lies in its compiled weight file ("tensor|op" -> byte
+    /// offset and size), read from the file's own records in the recipe's order: the long-sequence
+    /// layers (ANETextBackend) take their weights from there. nil when the file and the recipe
+    /// disagree anywhere.
+    static func blobOffsets(_ name: String, weightFile: URL) -> [String: (offset: Int, bytes: Int)]? {
+        guard let recipeURL = Bundle.module.url(forResource: name + ".recipe", withExtension: "json", subdirectory: "ANE"),
+              let r = try? JSONDecoder().decode(Recipe.self, from: Data(contentsOf: recipeURL)),
+              let h = try? FileHandle(forReadingFrom: weightFile) else { return nil }
+        defer { try? h.close() }
+        var out: [String: (offset: Int, bytes: Int)] = [:]
+        var at = 64
+        for b in r.blobs {
+            guard (try? h.seek(toOffset: UInt64(at))) != nil, let rec = try? h.read(upToCount: 64), rec.count == 64 else { return nil }
+            let magic = rec.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt32.self) }
+            let size = Int(rec.withUnsafeBytes { $0.load(fromByteOffset: 8, as: UInt64.self) })
+            let offset = Int(rec.withUnsafeBytes { $0.load(fromByteOffset: 16, as: UInt64.self) })
+            guard magic == 0xDEADBEEF, size == b.bytes, offset == at + 64 else { return nil }
+            if !b.tensor.isEmpty { out["\(b.tensor)|\(b.op)"] = (offset, size) }
+            at = offset + size + (64 - (offset + size) % 64) % 64
+        }
+        return at == r.weightBytes ? out : nil
+    }
+
     /// Constants of the graph, not of the weights: head indicators and broadcast epsilons.
     static func constant(_ b: Recipe.Blob, headDim: Int) -> [UInt16]? {
         switch b.op {
