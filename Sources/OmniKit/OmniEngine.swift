@@ -803,8 +803,13 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     public var computeUnit: ComputeUnit { aneLock.withLock { _computeUnit } }
     /// This Mac (macOS 15) and this model (a program for it) can run text on the Neural Engine.
     public var neuralEngineAvailable: Bool {
+        // An Intel Mac has none: Core ML would run every program on its CPU.
+        #if arch(arm64)
         guard #available(macOS 15.0, *) else { return false }
         return Self.aneProgramName(config) != nil
+        #else
+        return false
+        #endif
     }
     /// True once the Neural Engine program is loaded and text goes to it.
     public var neuralEngineActive: Bool { aneLock.withLock { _aneText != nil } }

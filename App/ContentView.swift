@@ -247,8 +247,9 @@ struct ContentView: View {
         case .indexNewer:
             IndexNewerView()
         case .ready:
-            // A new install chooses where the model runs once it is in (ComputeChoiceView).
-            if model.computeChoicePending { ComputeChoiceView() } else { ready }
+            // A new install chooses where the model runs once it is in (ComputeChoiceView); a Mac
+            // with no Neural Engine to run it on (Intel, macOS 14) has nothing to choose.
+            if model.computeChoicePending && model.neuralEngineAvailable { ComputeChoiceView() } else { ready }
         }
     }
 

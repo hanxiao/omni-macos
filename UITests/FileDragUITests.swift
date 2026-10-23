@@ -45,7 +45,7 @@ final class FileDragUITests: XCTestCase {
             "-omni.dbDir", scratchDB.path,
             "-omni.addedFolders", "(\"\(corpus.path)\")",
             "-omni.roots", "(\"\(corpus.path)\")",
-            "-omni.ephemeralUIState", "YES",
+            "-omni.ephemeralUIState", "YES", "-omni.computeChoicePending", "NO",
             "-omni.serving.enabled", "NO",
         ]
         app.launch()

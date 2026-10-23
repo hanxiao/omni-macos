@@ -103,7 +103,7 @@ final class PerfTourUITests: XCTestCase {
         let folders: [String] = browse ?? corpusFolders
         app.launchArguments = roots + extra + [
             "-omni.dbDir", db,
-            "-omni.ephemeralUIState", "YES",
+            "-omni.ephemeralUIState", "YES", "-omni.computeChoicePending", "NO",
             "-omni.serving.enabled", "NO",
             "-omni.hangwatch", "YES",
             "-omni.hangwatchMs", env["OMNI_PERF_HANG_MS"] ?? "50",
@@ -197,7 +197,7 @@ final class PerfTourUITests: XCTestCase {
             "-omni.dbDir", env["OMNI_PERF_DB"]!,
             "-omni.addedFolders", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
             "-omni.roots", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
-            "-omni.ephemeralUIState", "YES", "-omni.serving.enabled", "NO",
+            "-omni.ephemeralUIState", "YES", "-omni.computeChoicePending", "NO", "-omni.serving.enabled", "NO",
         ]
         app.launch()
         defer { app.terminate() }

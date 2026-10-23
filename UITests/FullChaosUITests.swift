@@ -586,7 +586,7 @@ final class FullChaosUITests: XCTestCase {
             "-omni.dbDir", env["OMNI_PERF_DB"]!,
             "-omni.addedFolders", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
             "-omni.roots", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
-            "-omni.ephemeralUIState", "YES", "-omni.serving.enabled", "NO",
+            "-omni.ephemeralUIState", "YES", "-omni.computeChoicePending", "NO", "-omni.serving.enabled", "NO",
             "-omni.hangwatch", "YES", "-omni.hangwatchMs", "250",
             "-omni.hangwatchFile", env["OMNI_PERF_HANG"] ?? "/tmp/omni-chaos-hang.log",
         ]
@@ -620,7 +620,7 @@ final class FullChaosUITests: XCTestCase {
             "-omni.dbDir", env["OMNI_PERF_DB"]!,
             "-omni.addedFolders", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
             "-omni.roots", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
-            "-omni.ephemeralUIState", "YES", "-omni.serving.enabled", "NO",
+            "-omni.ephemeralUIState", "YES", "-omni.computeChoicePending", "NO", "-omni.serving.enabled", "NO",
             "-omni.hangwatch", "YES", "-omni.hangwatchMs", "250",
             "-omni.hangwatchFile", env["OMNI_PERF_HANG"] ?? "/tmp/omni-chaos-hang.log",
         ]
@@ -664,7 +664,7 @@ final class FullChaosUITests: XCTestCase {
             "-omni.dbDir", env["OMNI_PERF_DB"]!,
             "-omni.addedFolders", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
             "-omni.roots", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
-            "-omni.ephemeralUIState", "YES", "-omni.serving.enabled", "NO",
+            "-omni.ephemeralUIState", "YES", "-omni.computeChoicePending", "NO", "-omni.serving.enabled", "NO",
         ]
         app.launch()
         defer { app.terminate() }
@@ -717,7 +717,7 @@ final class FullChaosUITests: XCTestCase {
             "-omni.dbDir", env["OMNI_PERF_DB"]!,
             "-omni.addedFolders", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
             "-omni.roots", "(\"\(env["OMNI_PERF_CORPUS"]!)\")",
-            "-omni.ephemeralUIState", "YES",
+            "-omni.ephemeralUIState", "YES", "-omni.computeChoicePending", "NO",
             // Not 51299: a user may well have configured that port for their own Omni.
             "-omni.serving.port", "51399",
             "-omni.clipboard.enabled", "YES",

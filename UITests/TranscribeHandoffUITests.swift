@@ -111,7 +111,7 @@ final class TranscribeHandoffUITests: XCTestCase {
             // Search history and photo sources are SAVED blobs, not launch arguments, so the
             // argument domain cannot isolate them: without this flag a run reads the real install's
             // history into its sidebar and appends its own test queries to it.
-            "-omni.ephemeralUIState", "YES",
+            "-omni.ephemeralUIState", "YES", "-omni.computeChoicePending", "NO",
             "-omni.serving.enabled", "NO",
             "-omni.uiChaos", "YES",
             "-omni.query", query,

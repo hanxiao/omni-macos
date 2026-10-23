@@ -650,8 +650,9 @@ private struct PerformanceTab: View {
                 Toggle("Use the Neural Engine (ANE)", isOn: Binding(get: { model.computeUnit == .neuralEngine },
                                                                     set: { model.computeUnit = $0 ? .neuralEngine : .gpu }))
                     .toggleStyle(.switch)
-                    // Not mid-benchmark: the run measures the unit it started on.
-                    .disabled(model.neuralEngineStatus == .unavailable || model.isPaperRunning)
+                    // Not mid-benchmark: the run measures the unit it started on. Never on where there
+                    // is no Neural Engine; always off, even after a build that failed.
+                    .disabled(model.isPaperRunning || (model.computeUnit == .gpu && !model.neuralEngineAvailable))
                 switch model.neuralEngineStatus {
                 case .preparing(let build):
                     // The one-time build: every program compiled for this Mac's Neural Engine.
@@ -663,7 +664,7 @@ private struct PerformanceTab: View {
                 case .unavailable:
                     Text("Not available on this Mac").foregroundStyle(.secondary)
                 case .off, .ready:
-                    EmptyView()
+                    if model.phase == .ready && !model.neuralEngineAvailable { Text("Not available on this Mac").foregroundStyle(.secondary) }
                 }
             } header: {
                 Text("Model")

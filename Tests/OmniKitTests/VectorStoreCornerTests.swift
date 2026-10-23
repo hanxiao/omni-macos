@@ -55,7 +55,10 @@ final class VectorStoreCornerTests: XCTestCase {
                 if batch.count == 2000 { try store.replaceMany(batch); batch.removeAll(keepingCapacity: true) } }
             try store.replaceMany(batch)
             let folded = store.search(q, topK: 20).map { $0.path }
-            // reload identical data into a fresh store (no fold history) and compare
+            // reload identical data into a fresh store (no fold history) and compare. Closed first,
+            // as the app does: a second open while this one holds the vector file's lock is
+            // refused ("Another copy of Omni has the index open") once the split has run.
+            store.close()
             let fresh = try VectorStore(dbURL: url)
             let reloaded = fresh.search(q, topK: 20).map { $0.path }
             XCTAssertEqual(folded, reloaded, "folded base must match a freshly-built base over identical data")
