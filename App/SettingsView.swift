@@ -674,6 +674,7 @@ private struct PerformanceTab: View {
                     // Not mid-benchmark: the run measures the unit it started on. Never on where there
                     // is no Neural Engine; always off, even after a build that failed.
                     .disabled(model.isPaperRunning || (model.computeUnit == .gpu && !model.neuralEngineAvailable))
+                    .accessibilityIdentifier("ane.switch")
                 switch model.neuralEngineStatus {
                 case .preparing(let build):
                     // The one-time build: every program compiled for this Mac's Neural Engine.
@@ -682,6 +683,8 @@ private struct PerformanceTab: View {
                         Text(ComputeUnitFacts.buildLine(build))
                             .font(.callout).foregroundStyle(.secondary).monospacedDigit()
                     }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityIdentifier("ane.preparing")
                 case .unavailable:
                     Text("Not available on this Mac").foregroundStyle(.secondary)
                 case .off, .ready:

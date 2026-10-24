@@ -937,8 +937,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         }
         guard neuralEngineActive else { return false }
         OmniCompute.offGPU = true   // the store and the map leave the GPU too
+        // Where the towers run now: an engine whose GPU towers went at an earlier switch keeps their
+        // programs and builds none (it logged "GPU" for them, which they were not).
+        let towersOnANE = aneLock.withLock { (_aneVision != nil, _aneAudio != nil) }
         omniPerfLog(String(format: "ane: search and indexing on the Neural Engine (%.1f s; vision %@, audio %@)", -t0.timeIntervalSinceNow,
-                           vision == nil ? "GPU" : "ANE", audio == nil ? "GPU" : "ANE"))
+                           towersOnANE.0 ? "ANE" : "GPU", towersOnANE.1 ? "ANE" : "GPU"))
         // The GPU copies of the towers are dead weight now (Nano: 1.4 GB of footprint): every image,
         // clip and recording goes through the programs (a sequence past their longest length through
         // the GPU backbone with the programs' tokens).
@@ -1073,9 +1076,16 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         return ane.encode(ids)
     }
 
+    /// Many sequences through the Neural Engine in batches (`ANETextBackend.encode(batch:)`); nil
+    /// where it does not take one.
+    private func aneVectors(_ ids: [[Int]]) -> [[Float]?] {
+        guard #available(macOS 15.0, *), let ane = aneLock.withLock({ _aneText }) as? ANETextBackend else { return ids.map { _ in nil } }
+        return ane.encode(batch: ids)
+    }
+
     /// Token ids through the Neural Engine where it takes them, the rest in one GPU batch.
     private func aneOrGPU(_ ids: [[Int]], passage: Bool) -> [[Float]] {
-        var out = ids.map { aneVector($0) }
+        var out = aneVectors(ids)
         let rest = out.indices.filter { out[$0] == nil }
         if !rest.isEmpty, neuralEngineActive {
             fellBack("text: \(rest.count) of \(ids.count), longest \(rest.map { ids[$0].count }.max() ?? 0) tokens")
@@ -1253,7 +1263,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         if waiting { markQuery() }
         if neuralEngineActive {
             let ids = textEncoder.tokenizeParallel(texts, .passage)
-            var out = ids.map { aneVector($0) }
+            var out = aneVectors(ids)
             let rest = out.indices.filter { out[$0] == nil }
             if !rest.isEmpty {
                 let v = run(highPriority: waiting) { textEncoder.encodeTokenBatch(rest.map { ids[$0] }) }

@@ -47,6 +47,7 @@ struct ComputeChoiceView: View {
             Text("Change it in Settings > Performance.")
                 .font(.callout).foregroundStyle(.secondary)
             Button("Continue") { model.finishComputeChoice(choice) }
+                .accessibilityIdentifier("compute.continue")
                 .controlSize(.large).buttonStyle(.borderedProminent)
                 .keyboardShortcut(.defaultAction)
                 .focusEffectDisabled()
@@ -79,6 +80,7 @@ struct ComputeChoiceView: View {
         .buttonStyle(.plain)
         .focusEffectDisabled()
         .accessibilityAddTraits(on ? .isSelected : [])
+        .accessibilityIdentifier("compute.card.\(unit.rawValue)")
     }
 }
 

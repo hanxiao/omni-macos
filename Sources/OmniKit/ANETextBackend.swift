@@ -1,5 +1,6 @@
 import CoreML
 import Foundation
+import os
 import MLX
 
 /// THE TEXT BACKBONE ON THE NEURAL ENGINE. The same network as Qwen3Backbone - the app's own merged
@@ -152,40 +153,175 @@ public final class ANETextBackend: @unchecked Sendable {
 
     /// The pooled, L2-normalized vector of one token sequence, or nil past the longest bucket.
     public func encode(_ ids: [Int]) -> [Float]? {
-        run(ids.count, wantHidden: false) { x, L in fillTokens(x, ids, L) }?.vector
+        waiting.withLock { $0 += 1 }
+        defer { waiting.withLock { $0 -= 1 } }
+        return run(ids.count, wantHidden: false) { x, L in fillTokens(x, ids, L) }?.vector
+    }
+
+    /// Single sequences (a query) waiting for `lock`. A batch loop lets them in before it takes the
+    /// lock again: NSLock is not fair, and the loop that just let go won it straight back, so a query
+    /// on Small waited out batch after batch (search while indexing p99 27.7 -> 40.4 ms).
+    private let waiting = OSAllocatedUnfairLock(initialState: 0)
+    private func letQueriesIn() { while waiting.withLock({ $0 }) > 0 { usleep(100) } }
+
+    /// Many token sequences, each its pooled vector (nil where `encode` would give nil). The ones of
+    /// a baked length go to the Neural Engine together, as one batch per `batchTokens` of that
+    /// length: a call per sequence paid Core ML's round trip every time, 2.8 ms for a label of a
+    /// few tokens, so the tag vocabulary's ~25k took 70 s on Nano (31 s batched; Small's 253 s, 12.7 s
+    /// batched and packed). A query waits behind one batch at most (`batchTokens`).
+    public func encode(batch ids: [[Int]]) -> [[Float]?] {
+        var out = [[Float]?](repeating: nil, count: ids.count)
+        var rest = Array(ids.indices)
+        if causal, let L = lengths.first, let model = functions.model("L\(L)") {
+            // Short sequences share a call: Small's program takes its mask whole, so a block-diagonal
+            // one keeps each to its own tokens and the rotary positions restart at each - every one
+            // computed as if alone, its vector the final-normed state at its last token (what
+            // `pooled` picks). Eight labels of four tokens in one L32 call.
+            let short = rest.filter { !ids[$0].isEmpty && ids[$0].count <= L / 2 }
+            rest = rest.filter { ids[$0].isEmpty || ids[$0].count > L / 2 }
+            var calls: [[Int]] = [], cur: [Int] = [], used = 0
+            for i in short {
+                if used + ids[i].count > L { calls.append(cur); cur = []; used = 0 }
+                cur.append(i); used += ids[i].count
+            }
+            if !cur.isEmpty { calls.append(cur) }
+            let per = max(1, Self.batchTokens / L)
+            for start in stride(from: 0, to: calls.count, by: per) {
+                let group = calls[start ..< min(start + per, calls.count)]
+                letQueriesIn()
+                let vectors = lock.withLock { () -> [[[Float]?]] in
+                    let feeds = group.compactMap { packedInputs($0.map { ids[$0] }, L) }
+                    guard feeds.count == group.count,
+                          let res = try? model.predictions(from: MLArrayBatchProvider(array: feeds), options: MLPredictionOptions()),
+                          res.count == group.count else { return [] }
+                    return group.enumerated().map { k, call in
+                        var end = -1
+                        return call.map { end += ids[$0].count; return hiddenVector(res.features(at: k), at: end) }
+                    }
+                }
+                for (k, call) in group.enumerated() where k < vectors.count {
+                    for (j, i) in call.enumerated() { out[i] = vectors[k][j] }
+                }
+            }
+        }
+        var byLength: [Int: [Int]] = [:]
+        for i in rest {
+            let s = ids[i]
+            if !s.isEmpty, let L = lengths.first(where: { $0 >= s.count }), L < Self.batchTokens { byLength[L, default: []].append(i) }
+            else { out[i] = run(s.count, wantHidden: false) { x, L in fillTokens(x, s, L) }?.vector }
+        }
+        for (L, members) in byLength.sorted(by: { $0.key < $1.key }) {
+            guard let model = functions.model("L\(L)") else { continue }
+            let per = Self.batchTokens / L
+            for start in stride(from: 0, to: members.count, by: per) {
+                let group = members[start ..< min(start + per, members.count)]
+                letQueriesIn()
+                let vectors = lock.withLock { () -> [[Float]?] in
+                    let feeds = group.compactMap { i in inputs(ids[i].count, L) { x, L in fillTokens(x, ids[i], L) } }
+                    guard feeds.count == group.count,
+                          let res = try? model.predictions(from: MLArrayBatchProvider(array: feeds), options: MLPredictionOptions()),
+                          res.count == group.count else { return [] }
+                    return (0 ..< res.count).map { pooled(res.features(at: $0)) }
+                }
+                for (k, i) in group.enumerated() where k < vectors.count { out[i] = vectors[k] }
+            }
+        }
+        return out
+    }
+    /// Tokens in one batch call: 32 labels at L32, 2 chunks at L512, longer ones one at a time. Past
+    /// 16 labels a call the batch gains nothing more (Nano: 4,000 labels 4.92 s at 16, 4.86 s at 256).
+    /// A batch holds the lock about as long as one L512 call alone did (Nano 17 vs 22 ms, Small 81 vs
+    /// 80 ms), so a query waits no longer behind indexing than it did behind one long chunk; at 256
+    /// Small's L256 and L512 batches were single calls again and gained nothing.
+    public static let batchTokens = 1024
+
+    /// Short sequences packed into one call of a causal program: each attends only to itself, and
+    /// its rotary positions start at 0 (under `lock`: the tables are shared).
+    private func packedInputs(_ seqs: [[Int]], _ L: Int) -> MLDictionaryFeatureProvider? {
+        guard let (cos, sin) = rotary(L),
+              let x = try? MLMultiArray(shape: [1, NSNumber(value: hidden), 1, NSNumber(value: L)], dataType: .float16),
+              let pc = try? MLMultiArray(shape: [1, NSNumber(value: ropeChannels), 1, NSNumber(value: L)], dataType: .float16),
+              let psn = try? MLMultiArray(shape: [1, NSNumber(value: ropeChannels), 1, NSNumber(value: L)], dataType: .float16),
+              let mask = try? MLMultiArray(shape: [1, NSNumber(value: L), 1, NSNumber(value: L)], dataType: .float16),
+              let pick = try? MLMultiArray(shape: [1, 1, 1, NSNumber(value: L)], dataType: .float16) else { return nil }
+        fillTokens(x, seqs.flatMap { $0 }, L)
+        var seg = [Int](repeating: -1, count: L), off = [Int](repeating: 0, count: L), c = 0
+        for (k, s) in seqs.enumerated() { for j in s.indices { seg[c] = k; off[c] = j; c += 1 } }
+        for (src, dst) in [(cos, pc), (sin, psn)] {
+            let ss = src.strides[1].intValue, sl = src.strides[3].intValue, ds = dst.strides[1].intValue, dl = dst.strides[3].intValue
+            src.withUnsafeBytes { raw in
+                let a = raw.bindMemory(to: UInt16.self)
+                dst.withUnsafeMutableBytes { raw_d, _ in
+                    let d = raw_d.bindMemory(to: UInt16.self)
+                    for ch in 0 ..< ropeChannels { for l in 0 ..< L { d[ch * ds + l * dl] = a[ch * ss + off[l] * sl] } }
+                }
+            }
+        }
+        // Keys on axis 1, queries on axis 3, as `causalMask`.
+        let ks = mask.strides[1].intValue, qs = mask.strides[3].intValue, ps = pick.strides[3].intValue
+        mask.withUnsafeMutableBytes { raw_p, _ in let p = raw_p.bindMemory(to: UInt16.self)
+            for k in 0 ..< L { for q in 0 ..< L { p[k * ks + q * qs] = k <= q && seg[k] == seg[q] ? 0 : Self.masked } }
+        }
+        pick.withUnsafeMutableBytes { raw_p, _ in let p = raw_p.bindMemory(to: UInt16.self); for l in 0 ..< L { p[l * ps] = l == c - 1 ? Self.one : 0 } }
+        return try? MLDictionaryFeatureProvider(dictionary: ["x": x, "cos": pc, "sin": psn, "cmask": mask, "pick": pick])
+    }
+
+    /// The final-normed hidden state at one position, L2-normalized: a packed sequence's vector.
+    private func hiddenVector(_ out: MLFeatureProvider, at l: Int) -> [Float]? {
+        guard let hm = out.featureValue(for: "hidden")?.multiArrayValue else { return nil }
+        let cs = hm.strides[1].intValue, ls = hm.strides[3].intValue
+        var bits = [UInt16](repeating: 0, count: hidden)
+        hm.withUnsafeBytes { raw in let p = raw.bindMemory(to: UInt16.self); for c in 0 ..< hidden { bits[c] = p[c * cs + l * ls] } }
+        let v = bits.withUnsafeBufferPointer { Half.floats($0) }
+        var norm: Float = 0
+        for e in v { norm += e * e }
+        norm = norm.squareRoot()
+        guard norm > 0, norm.isFinite else { return nil }
+        return v.map { $0 / norm }
+    }
+
+    /// One sequence's inputs at length L (under `lock`: the rotary tables and masks are shared).
+    private func inputs(_ n: Int, _ L: Int, fill: (MLMultiArray, Int) -> Void) -> MLDictionaryFeatureProvider? {
+        guard let (cos, sin) = rotary(L),
+              let x = try? MLMultiArray(shape: [1, NSNumber(value: hidden), 1, NSNumber(value: L)], dataType: .float16),
+              let pick = try? MLMultiArray(shape: [1, 1, 1, NSNumber(value: L)], dataType: .float16) else { return nil }
+        fill(x, L)
+        let ps = pick.strides[3].intValue
+        pick.withUnsafeMutableBytes { raw_p, _ in let p = raw_p.bindMemory(to: UInt16.self); for l in 0 ..< L { p[l * ps] = l == n - 1 ? Self.one : 0 } }
+        var feed: [String: Any] = ["x": x, "cos": cos, "sin": sin, "pick": pick]
+        if causal {
+            // Keys past a query are masked; the padding after the last real token is never seen.
+            guard let m = causalMask(L) else { return nil }
+            feed["cmask"] = m
+        } else {
+            guard let mask = try? MLMultiArray(shape: [1, NSNumber(value: L), 1, 1], dataType: .float16) else { return nil }
+            let ms = mask.strides[1].intValue
+            mask.withUnsafeMutableBytes { raw_p, _ in let p = raw_p.bindMemory(to: UInt16.self); for l in 0 ..< L { p[l * ms] = l < n ? 0 : Self.masked } }
+            feed["mask"] = mask
+        }
+        return try? MLDictionaryFeatureProvider(dictionary: feed)
+    }
+
+    /// A prediction's pooled vector, L2-normalized; nil when it is not finite.
+    private func pooled(_ out: MLFeatureProvider) -> [Float]? {
+        guard let y = out.featureValue(for: "pooled")?.multiArrayValue else { return nil }
+        let ys = y.strides[1].intValue
+        var bits = [UInt16](repeating: 0, count: hidden)
+        y.withUnsafeBytes { raw in let p = raw.bindMemory(to: UInt16.self); for c in 0 ..< hidden { bits[c] = p[c * ys] } }
+        let v = bits.withUnsafeBufferPointer { Half.floats($0) }
+        var norm: Float = 0
+        for e in v { norm += e * e }
+        norm = norm.squareRoot()
+        guard norm > 0, norm.isFinite else { return nil }
+        return v.map { $0 / norm }
     }
 
     private func run(_ n: Int, wantHidden: Bool, fill: (MLMultiArray, Int) -> Void) -> (vector: [Float], hidden: [Float]?)? {
         if n > (lengths.last ?? 0) { return runLayers(n, wantHidden: wantHidden, fill: fill) }
         guard n > 0, let L = lengths.first(where: { $0 >= n }), let model = functions.model("L\(L)") else { return nil }
         return lock.withLock { () -> (vector: [Float], hidden: [Float]?)? in
-            guard let (cos, sin) = rotary(L),
-                  let x = try? MLMultiArray(shape: [1, NSNumber(value: hidden), 1, NSNumber(value: L)], dataType: .float16),
-                  let mask = try? MLMultiArray(shape: [1, NSNumber(value: L), 1, 1], dataType: .float16),
-                  let pick = try? MLMultiArray(shape: [1, 1, 1, NSNumber(value: L)], dataType: .float16) else { return nil }
-            fill(x, L)
-            let ms = mask.strides[1].intValue, ps = pick.strides[3].intValue
-            pick.withUnsafeMutableBytes { raw_p, _ in let p = raw_p.bindMemory(to: UInt16.self); for l in 0 ..< L { p[l * ps] = l == n - 1 ? Self.one : 0 } }
-            var feed: [String: Any] = ["x": x, "cos": cos, "sin": sin, "pick": pick]
-            if causal {
-                // Keys past a query are masked; the padding after the last real token is never seen.
-                guard let m = causalMask(L) else { return nil }
-                feed["cmask"] = m
-            } else {
-                mask.withUnsafeMutableBytes { raw_p, _ in let p = raw_p.bindMemory(to: UInt16.self); for l in 0 ..< L { p[l * ms] = l < n ? 0 : Self.masked } }
-                feed["mask"] = mask
-            }
-            guard let input = try? MLDictionaryFeatureProvider(dictionary: feed),
-                  let out = try? model.prediction(from: input),
-                  let y = out.featureValue(for: "pooled")?.multiArrayValue else { return nil }
-            let ys = y.strides[1].intValue
-            var bits = [UInt16](repeating: 0, count: hidden)
-            y.withUnsafeBytes { raw in let p = raw.bindMemory(to: UInt16.self); for c in 0 ..< hidden { bits[c] = p[c * ys] } }
-            let v = bits.withUnsafeBufferPointer { Half.floats($0) }
-            var norm: Float = 0
-            for e in v { norm += e * e }
-            norm = norm.squareRoot()
-            guard norm > 0, norm.isFinite else { return nil }
+            guard let input = inputs(n, L, fill: fill), let out = try? model.prediction(from: input),
+                  let v = pooled(out) else { return nil }
             var rowsOut: [Float]? = nil
             if wantHidden, let hm = out.featureValue(for: "hidden")?.multiArrayValue {
                 let cs = hm.strides[1].intValue, ls = hm.strides[3].intValue
@@ -196,7 +332,7 @@ public final class ANETextBackend: @unchecked Sendable {
                 }
                 rowsOut = b.withUnsafeBufferPointer { Half.floats($0) }
             }
-            return (v.map { $0 / norm }, rowsOut)
+            return (v, rowsOut)
         }
     }
 

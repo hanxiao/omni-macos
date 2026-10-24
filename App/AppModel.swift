@@ -2219,7 +2219,7 @@ final class AppModel {
             neuralEngineStatus = .off
             // Neural Engine mode let go of the GPU towers: load them again (the programs serve
             // images and recordings meanwhile, text is on the GPU at once).
-            if released { Task { await self.reloadEngine() } }
+            if released { Task { await self.reloadEngine(forGPUTowers: true) } }
             return
         }
         guard neuralEngineAvailable else { setStoreOffGPU(false); neuralEngineStatus = .unavailable; return }
@@ -3789,8 +3789,12 @@ final class AppModel {
     /// Search keeps answering on the old engine while the new one loads.
     private var engineReloading = false
     @discardableResult
-    private func reloadEngine() async -> Bool {
-        guard !engineReloading, let store, !modelPath.isEmpty else { return false }
+    private func reloadEngine(forGPUTowers: Bool = false) async -> Bool {
+        // A reload for the GPU towers that a switch back to the Neural Engine overtook: the engine in
+        // hand still has the programs as its towers, and a second model would only be loaded, checked
+        // on the GPU and set up for the Neural Engine again (Small: longer than a quick switch back).
+        func overtaken() -> Bool { forGPUTowers && computeUnit == .neuralEngine }
+        guard !overtaken(), !engineReloading, let store, !modelPath.isEmpty else { return false }
         engineReloading = true
         defer { engineReloading = false }
         let dir = URL(fileURLWithPath: modelPath)
@@ -3803,6 +3807,7 @@ final class AppModel {
             omniPerfLog("engine reload failed: \(error)")
             return false   // the old engine keeps working
         }
+        if overtaken() { omniPerfLog("engine reload dropped: back on the Neural Engine"); return false }
         // The swap happens only if the writers stopped. Reporting a reload that was not installed
         // sent the reconcile loop round again against the engine it had meant to replace.
         let swapped = await withIndexingStopped {

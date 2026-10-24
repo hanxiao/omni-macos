@@ -755,3 +755,24 @@ watchdog). Three modes of `Tools/agenteval/agenteval.py`, stdlib only:
     is pixel-identical in results, cleared, folder, Recents and search-after-Recents (the caret aside).
   - LEFT AS IT WAS: switching grid and list (~110 ms, both builds alike) and an occasional Find
     Similar, arrow key or browse just over 100 ms.
+
+## The Neural Engine switch through XCUITest (2026-10-23, Scripts/compute-unit-ui.sh)
+
+- UITests/ComputeUnitUITests: six short tests, each launching a renamed copy (OMNI_CHAOS_APP) on its
+  own scratch index - GPU to ANE to GPU to ANE from Settings, six flips a second apart, the switch
+  during the first pass, one index opened on each unit in turn, the first-run card, the switch off
+  during a cold build - and each asserts a search answers after every change. The switch, its
+  progress block and the first-run cards carry identifiers (`ane.switch`, `ane.preparing`,
+  `compute.card.<unit>`, `compute.continue`); a Form row can take a click on its label, so the test
+  clicks the switch's trailing edge when the centre does not move it.
+- The driver runs one test per `xcodebuild test-without-building`, with the copy's own GPU time every
+  second (gpuq.py), a 20 GB footprint watchdog and its crash reports; each STEP the test prints carries
+  a timestamp, and Tools/ane/modestress/uisteps.py lines the GPU samples up against them.
+- THE AUTOMATION PASSWORD, ONCE: `nohup Scripts/automation-window.sh 1440 sleep 86400 & disown` puts
+  the prompt up for 60 s; unanswered it is gone and the holder exits. A loop that starts the window
+  again until the state file appears (every ~80 s) is what got it answered by someone not watching
+  the screen at that minute.
+- A RENAMED COPY HAS NONE OF THE REAL APP'S GRANTS. Its model and corpus must be on the internal
+  disk: Small on /Volumes/han2tb put up "OmniChaos would like to access files on a removable volume",
+  the app sat behind it at "model 0%" (footprint 48 MB) and three tests failed on the 240 s timeout.
+  Never answer it; copy the model.

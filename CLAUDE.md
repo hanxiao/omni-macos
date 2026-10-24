@@ -146,7 +146,9 @@ codebase were already measured there, and many were rejected.
   gpuhog.swift. Where the work really runs: `Tools/ane/modestress/stress.sh <run> <model> <ane cache>`
   (an isolated instance from ANE to GPU and back under indexing, UI, REST, MCP and CLI load; per phase
   its own GPU time, power by unit, footprint, every answer; `analyze.py <run>`), and `benchgoal.sh`
-  / `benchcases.py` (the benchmark per arm with the same attribution, per case).
+  / `benchcases.py` (the benchmark per arm with the same attribution, per case). The switch through the
+  real UI: `Scripts/compute-unit-ui.sh` (UITests/ComputeUnitUITests on a renamed copy, its GPU per step;
+  testing.md); the ANE text path one call per sequence against batched: `omni-verify anebatch <model> <cache>`.
 - Image indexing end to end on a scratch store: `omni-verify imgindex <model> <imageDir>`.
 - Model-free probes for MLX regressions: `ocr-verify x --probe-qmm | --probe-gather |
   --probe-rowexact [--causal-sweep]`. Re-run them on any MLX or toolchain change.
@@ -213,7 +215,9 @@ codebase were already measured there, and many were rejected.
   `-omni.link.name`, `-omni.link.bonjour NO`.
 - NEVER ANSWER A TCC OR FOLDER PROMPT FOR THE USER. Test files live outside the XCUITest runner's
   sandbox container, and UI/chaos suites drive a renamed copy (`Scripts/chaos-app.sh`,
-  `io.hanxiao.omni.chaos`): by the real bundle id, `launch()` quits the user's Omni.
+  `io.hanxiao.omni.chaos`): by the real bundle id, `launch()` quits the user's Omni. The copy has none
+  of the app's grants: its model and corpus go on the internal disk, or a removable-volume prompt
+  holds it at "model 0%".
 - A REAL INDEX IS BENCHMARKED ON AN APFS CLONE (`cp -c -R`) taken with the app quit; a live one
   clones inconsistent. /Volumes/han2tb/bench-index is the standing one.
 - @Observable NOTIFIES ON EVERY WRITE, EQUAL OR NOT. Guard writes, store derived Bools, and keep
@@ -306,7 +310,9 @@ codebase were already measured there, and many were rejected.
   Neural Engine measured again and in the app (programs written on the Mac, the choice, the evals),
   all or nothing (towers as block programs, compiles on first use, GPU towers released), the
   long sequences (HD video's backbone one layer a call on the baked program's weights), and the mode
-  under stress (where work really runs, search on the CPU, the stand-down, the four-arm table).
+  under stress (where work really runs, search on the CPU, the stand-down, the four-arm table), and the
+  switch through the real UI (the label vocabulary one call at a time; the ANE text path batched,
+  Small's short sequences packed, queries let in between batches).
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
   and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names, Shortcuts,

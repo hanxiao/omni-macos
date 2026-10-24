@@ -7917,6 +7917,11 @@ if args.count >= 5 && args[1] == "aneprogram" {
     }
     exit(0)
 }
+// One call per sequence against a batch on the Neural Engine: see ANEBatchAB.
+if args.count >= 4 && args[1] == "anebatch" {
+    if #available(macOS 15.0, *) { try await ANEBatchAB.run(modelDir: URL(fileURLWithPath: args[2]), cache: URL(fileURLWithPath: args[3])) }
+    exit(0)
+}
 // The app's Neural Engine text backend: see ANEQuery.textBackend.
 if args.count >= 5 && args[1] == "anetext" {
     if #available(macOS 15.0, *) {

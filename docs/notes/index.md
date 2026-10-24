@@ -2683,3 +2683,73 @@ DRAM 2.8 W):
     their working buffers (released after 2 minutes idle). The app itself, Small, at rest after
     indexing the HD clips (the long-sequence layer) and Documents: 4.20 GB on the Neural Engine, 4.25
     on the GPU.
+
+## The switch through the real UI, and the labels one call at a time (2026-10-23, night)
+
+- WHAT RAN. UITests/ComputeUnitUITests through Scripts/compute-unit-ui.sh, inside one automation
+  window (the password entered once; the window holds 24 h), on a renamed copy, a 27-file folder
+  (text, PDFs, HEIC, voice memos, MP4): GPU to ANE to GPU to ANE from Settings; six flips a second
+  apart; the switch during the first pass; one index opened on the ANE, the GPU, the ANE; the
+  first-run card; the switch turned off during a cold build. 12 to 110 s a test. Nano twice: 12 of 12
+  passed. Small: 4 of 5 (below). After the fixes, on the final build: Nano 6 of 6, Small 5 of 5 (the
+  cold build left out: its compile outlives the test and holds the Mac's one compiler queue).
+- WHERE IT RAN, per step (the copy's own GPU time every second, Tools/ane/modestress/uisteps.py):
+  every search and indexing step in Neural Engine mode 0-3 ms (UI drawing); in GPU mode 0.7-8 s
+  (indexing, the launch's media check). A count that falls is a GPU client closing (the towers let
+  go), not negative work.
+- THE ONE FAILURE: a fresh index opened straight into Neural Engine mode showed nothing for 93 s on
+  Nano and over 240 s on Small. The launch pass waits for the tag vocabulary (`ensureTagger`: images
+  tag on the way in, with no second embed), and in this mode its ~25k labels went to the ANE one
+  prediction each: 2.8 ms a label on Nano (70 s), 10.4 ms on Small (253 s). It is once per model per
+  install - a first install that chose the ANE, a model switch in that mode (which holds indexing
+  stopped for it) - but then it is the first minute, or four, of Omni.
+- THE FIX IS IN THE BACKEND, FOR EVERY CALLER: `ANETextBackend.encode(batch:)`.
+  - A call per sequence paid Core ML's round trip every time. `predictions(from: MLBatchProvider)`
+    takes the sequences of one length together, up to 1,024 tokens a call.
+  - Small's program takes its causal mask whole (`cmask`, L x L) and its rotary tables as inputs,
+    and every other op in it is per token, so short sequences share a call: a block-diagonal mask,
+    positions restarting at 0 for each, the vector read from `hidden` at each one's last token (what
+    `pooled` picks). Exact: a masked score is -30000, which the softmax sends to 0 in fp16. Nano's
+    program takes one key mask for every query, so it cannot pack.
+  - omni-verify anebatch (same programs, interleaved): 4,000 labels, Nano 10.97 -> 4.92 s, Small
+    40.9 -> 2.12 s packed. The whole vocabulary: Nano 31.3 s (from ~70), Small 12.7 s (from 253).
+    Worst cosine against one at a time 0.999996. Past 16 labels a call Nano gains nothing more (4.92 s
+    at 16, 4.86 at 256): its L32 is compute-bound at 1.2 ms a label; a shorter length would need a new
+    program and a rebuild on every Mac, not done.
+  - THE LOCK. A batch holds the backend's lock about as long as one L512 call alone did (Nano 17 vs
+    22 ms, Small 81 vs 80 ms), so a query waits no longer behind indexing than it did behind one long
+    chunk. At 256 tokens a call Small's L256 and L512 batches were single calls again and gained
+    nothing.
+- INDEXING GAINS TOO (omni-verify bench --only index_text,store_build,search_while_indexing in
+  Neural Engine mode, batching off and on interleaved, the switch removed after):
+
+      row                                Nano off      Nano on              Small off    Small on
+      text indexing, tokens/s            22,042 21,846 37,692 36,976 36,416 4,782 4,791  8,788 8,738 8,796
+      search while indexing p50, ms      15.6 16.1     15.9 15.7 16.3       19.9 19.0    20.3 19.2 19.2
+      ... p99, ms                        22.8 23.5     24.3 24.1 25.1       27.7 30.4    40.4 30.9 27.5
+      ... max, ms                        94 40         820 51 27.5          68.7 39.9    49.6 34.9 31.8
+      indexing lost to shaping           -0.4 0.0%     6.2 5.7 2.8%         2.0 1.6%     3.1 4.3 4.4%
+
+  Text indexing on the Neural Engine +69% on Nano, +83% on Small. Small's first batched run had p99
+  40.4 ms: NSLock is not fair, and the loop that had just let go won the lock straight back from a
+  waiting query, batch after batch. A query (`encode(_ ids:)`) now counts itself waiting, and a batch
+  loop lets it in before taking the lock again (`letQueriesIn`); the runs after it (Small's second
+  and third, Nano's third) are level with batching off. The 820 ms was one search in Nano's first
+  batched run and did not come back. Shaping (the indexer handing over to a query) costs 3-6% now:
+  there is more indexing to give up.
+- IN THE APP AFTER THE FIX, a fresh index opened in Neural Engine mode: the labels 31.4 s on Nano,
+  13.1 s on Small (`[tags] label cache built`); the first result at 48.5 s (93 before) and 25.3 s
+  (over 240).
+- A RELOAD THE SWITCH BACK OVERTOOK. GPU mode after Neural Engine mode reloads the engine for its GPU
+  towers (they were let go). Small's reload takes longer than a quick switch back: the second switch to
+  the ANE ran on the engine in hand - correct, its programs are still the towers - but the reload,
+  still running, would then swap in a second model, check it on the GPU and set the ANE up again, in
+  Neural Engine mode. `reloadEngine(forGPUTowers:)` drops itself when the unit is the ANE again,
+  before it loads and before it swaps. The second switch also logged "vision GPU, audio GPU" for
+  towers that were on the ANE (it reported the towers it built, none); it reports where they are now.
+  Small's second switch: 14.6 s -> 1.2 s.
+- A HARNESS TRAP, NOT THE APP: the first Small round failed all three tests with the model never
+  loading (footprint 48 MB, "model 0%"). The model was on /Volumes/han2tb, and the renamed copy
+  (io.hanxiao.omni.chaos) has no removable-volume grant: macOS asked "OmniChaos would like to access
+  files on a removable volume" and the app waited behind it. Left unanswered; the model copied to the
+  internal disk.

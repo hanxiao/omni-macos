@@ -387,3 +387,54 @@ enum ANEQuery {
         }
     }
 }
+
+/// One call per sequence against `encode(batch:)` on the Neural Engine, interleaved: the tag
+/// vocabulary (the label cache's build), then random sequences per length, with the vectors'
+/// agreement and the longest single batch call (what a query can wait behind).
+///   omni-verify anebatch <modelDir> <aneCache>
+@available(macOS 15.0, *)
+enum ANEBatchAB {
+    static func run(modelDir: URL, cache: URL) async throws {
+        let cfg = try OmniConfig(modelDir: modelDir)
+        let ws = try WeightStore(modelDir: modelDir, loraScale: cfg.loraScale, keepVision: false, keepAudio: false)
+        let enc = try await OmniTextEncoder(modelDir: modelDir, weights: ws, config: cfg)
+        guard let name = OmniEngine.aneProgramName(cfg), let compiled = ANEProgram.compiled(name, weights: ws, cache: cache) else {
+            print("no program"); return
+        }
+        let ane = try ANETextBackend(compiled: compiled, config: cfg, weights: ws, lengths: ANETextBackend.defaultLengths)
+        let labels = OmniTagger.gatedLabels(modelDir: modelDir)
+        let ids = enc.tokenizeParallel(labels, .passage)
+        let lens = ids.map(\.count).sorted()
+        print("labels \(ids.count), tokens p50 \(lens[lens.count / 2]) max \(lens.last ?? 0)")
+        _ = ane.encode(batch: Array(ids.prefix(64))); _ = ids.prefix(64).map { ane.encode($0) }
+        func cosine(_ a: [Float]?, _ b: [Float]?) -> Float {
+            guard let a, let b, a.count == b.count else { return -1 }
+            return zip(a, b).reduce(0) { $0 + $1.0 * $1.1 }
+        }
+        let sample = Array(ids.prefix(4000))
+        var serialS: [Double] = [], batchS: [Double] = []
+        var worst: Float = 1
+        for _ in 0 ..< 2 {
+            var t = Date(); let s = sample.map { ane.encode($0) }; serialS.append(-t.timeIntervalSinceNow)
+            t = Date(); let b = ane.encode(batch: sample); batchS.append(-t.timeIntervalSinceNow)
+            worst = min(worst, zip(s, b).map { cosine($0, $1) }.min() ?? -1)
+        }
+        print(String(format: "4,000 labels: one call each %.2f / %.2f s, batched %.2f / %.2f s; worst cosine %.6f",
+                     serialS[0], serialS[1], batchS[0], batchS[1], worst))
+        for L in [64, 128, 256, 512] {   // first use of each length loads it: not in the A/B below
+            _ = ane.encode((0 ..< L * 3 / 4).map { _ in 1000 })
+        }
+        var t = Date(); let all = ane.encode(batch: ids)
+        print(String(format: "every label batched: %.1f s, %d of %d vectors", -t.timeIntervalSinceNow, all.filter { $0 != nil }.count, ids.count))
+        var rng = SystemRandomNumberGenerator()
+        for L in [64, 128, 256, 512] {
+            let seqs = (0 ..< 64).map { _ in (0 ..< (L * 3 / 4)).map { _ in Int.random(in: 1000 ..< 100_000, using: &rng) } }
+            t = Date(); let s = seqs.map { ane.encode($0) }; let st = -t.timeIntervalSinceNow
+            t = Date(); let b = ane.encode(batch: seqs); let bt = -t.timeIntervalSinceNow
+            let per = max(1, ANETextBackend.batchTokens / L)
+            t = Date(); _ = ane.encode(batch: Array(seqs.prefix(per))); let hold = -t.timeIntervalSinceNow
+            print(String(format: "L%-4d 64 seqs: one call each %.0f ms, batched %.0f ms; one batch of %d %.1f ms; worst cosine %.6f",
+                         L, st * 1000, bt * 1000, per, hold * 1000, zip(s, b).map { cosine($0, $1) }.min() ?? -1))
+        }
+    }
+}

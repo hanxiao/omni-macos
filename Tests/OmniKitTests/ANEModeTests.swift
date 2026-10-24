@@ -51,6 +51,15 @@ final class ANEModeTests: XCTestCase {
         }
         let q = "a red square on a green field"
         XCTAssertGreaterThan(Self.cosine(try XCTUnwrap(gpu.embedQuery(q)), try XCTUnwrap(ane.embedQuery(q))), 0.99)
+        // Sequences go to the Neural Engine in batches (ANETextBackend.encode(batch:)): the same
+        // vectors as each alone, and in the GPU path's space.
+        let texts = ["harbor", "a quiet harbor at dawn", "quarterly budget", String(repeating: "budget review notes ", count: 20)]
+        let together = ane.embedTextBatch(texts, as: .passage), onGPU = gpu.embedTextBatch(texts, as: .passage)
+        for (i, t) in texts.enumerated() {
+            let alone = try XCTUnwrap(ane.embedTextBatch([t], as: .passage).first)
+            XCTAssertGreaterThan(Self.cosine(together[i], alone), 0.9999, t)
+            XCTAssertGreaterThan(Self.cosine(together[i], onGPU[i]), 0.99, t)
+        }
 
         // A 1080p video segment: six 1568 x 882 frames, ~4,130 tokens, past the baked text lengths.
         // It runs layer by layer on the Neural Engine, never on the GPU.
