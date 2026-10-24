@@ -8,8 +8,10 @@ What Small adds over Nano, each kept on convolutions the Neural Engine runs nati
   - PER-HEAD q/k NORM by indicator convolutions: the sum of a head's squares is a 1x1 conv against a
     (heads, C) matrix of ones, and the per-head scale goes back out through its transpose.
   - RoPE through the norm: rotate-half permutes channels inside a head, which leaves the head's RMS
-    alone, so rope(norm(q)) = (q * (w * cos) + (P q) * (w[perm] * sin)) / rms(q), with P q its own
-    conv (P W) and w, w[perm] the norm weight tiled over heads (x 1/sqrt(d) for q).
+    alone, so rope(norm(q)) = (q * (w * cos) + (P q) * (w[perm] * sin)) / rms(q), with P q a grouped
+    1x1 conv of q (one signed 128 x 128 permutation per head: exact) and w, w[perm] the norm weight
+    tiled over heads (x 1/sqrt(d) for q). P q was a second conv of x against P W until 2026-10-24:
+    15% of the weights; as a permutation L32 10.34 -> 9.25 ms, L512 75.3 -> 71.7, bit-identical.
   - GROUPED-QUERY ATTENTION: query head h reads key-value head h // 2.
   - CAUSAL: an input mask (1, L, 1, L) of 0 and -30000, keys on axis 1. Right padding needs no mask
     of its own under it, and the last real token is picked.
@@ -29,13 +31,14 @@ EPS, HEADS, KV, HDIM, LAYERS, HID = 1e-6, 16, 8, 128, 28, 1024
 QC, KC = HEADS * HDIM, KV * HDIM
 
 
-def rotate_half_rows(m, heads):
-    o = np.empty_like(m); half = HDIM // 2
+def rotate_groups(heads):
+    """rotate_half per head, [-x2, x1], as a grouped 1x1 conv's weight (heads * d, d, 1, 1)."""
+    R = np.zeros((heads * HDIM, HDIM, 1, 1), dtype=np.float16); half = HDIM // 2
     for h in range(heads):
-        a = h * HDIM
-        o[a:a + half] = -m[a + half:a + HDIM]
-        o[a + half:a + HDIM] = m[a:a + half]
-    return o
+        for j in range(half):
+            R[h * HDIM + j, half + j] = -1
+            R[h * HDIM + half + j, j] = 1
+    return R
 
 
 def perm(v, heads):
@@ -59,6 +62,7 @@ def build(W, L):
     cw = lambda m: m.astype(np.float16)[:, :, None, None]
     col = lambda v: v.astype(np.float16).reshape(1, -1, 1, 1)
     Iq, Ik = indicator(HEADS), indicator(KV)
+    Rq, Rk = rotate_groups(HEADS), rotate_groups(KV)
     scale = HDIM ** -0.5
 
     @mb.program(input_specs=[mb.TensorSpec(shape=(1, HID, 1, L), dtype=types.fp16),
@@ -113,9 +117,10 @@ def build(W, L):
             p = f"language_model.layers.{i}."; t = f"l{i}"
             xn = rms(h, f32[p + "input_layernorm.weight"], HID, f"{t}_in")
             wq, wk = f32[p + "self_attn.q_proj.weight"], f32[p + "self_attn.k_proj.weight"]
-            q = head_rope(mb.conv(x=xn, weight=cw(wq), name=f"{t}_q"), mb.conv(x=xn, weight=cw(rotate_half_rows(wq, HEADS)), name=f"{t}_qp"),
+            q0, k0 = mb.conv(x=xn, weight=cw(wq), name=f"{t}_q"), mb.conv(x=xn, weight=cw(wk), name=f"{t}_k")
+            q = head_rope(q0, mb.conv(x=q0, weight=Rq, groups=HEADS, name=f"{t}_qp"),
                           Iq, f32[p + "self_attn.q_norm.weight"], HEADS, scale, f"{t}_qr")
-            k = head_rope(mb.conv(x=xn, weight=cw(wk), name=f"{t}_k"), mb.conv(x=xn, weight=cw(rotate_half_rows(wk, KV)), name=f"{t}_kp"),
+            k = head_rope(k0, mb.conv(x=k0, weight=Rk, groups=KV, name=f"{t}_kp"),
                           Ik, f32[p + "self_attn.k_norm.weight"], KV, 1.0, f"{t}_kr")
             v = mb.conv(x=xn, weight=cw(f32[p + "self_attn.v_proj.weight"]), name=f"{t}_v")
             qs = mb.split(x=q, num_splits=HEADS, axis=1, name=f"{t}_qsplit")

@@ -861,13 +861,13 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         guard let compiled = ANEProgram.compiled(name, weights: weightStore, cache: cache),
               let text = try? ANETextBackend(compiled: compiled, config: config, weights: weightStore,
                                              lengths: ANETextBackend.defaultLengths,
-                                             blocks: ANEBlocks.bundled(prefix + "_textblocks"), program: name) else {
+                                             blocks: ANEBlocks.settled(prefix + "_textblocks", cache: cache), program: name) else {
             omniPerfLog("ane: not available, everything stays on the GPU")
             return false
         }
         if text.blockLengths.isEmpty { omniPerfLog("ane: no layer program, a sequence past \(text.maxLength) tokens runs on the GPU") }
-        let visionProgram = imageEncoder != nil ? ANEBlocks.bundled(prefix + "_vision") : nil
-        let audioProgram = audioEncoder != nil ? ANEBlocks.bundled(prefix + "_audio") : nil
+        let visionProgram = imageEncoder != nil ? ANEBlocks.settled(prefix + "_vision", cache: cache) : nil
+        let audioProgram = audioEncoder != nil ? ANEBlocks.settled(prefix + "_audio", cache: cache) : nil
         // 2. Every function compiled once on this Mac (the system keeps the result; a later launch
         //    loads each in well under a second when first used), so nothing stalls a search or an
         //    image afterwards. Skipped when this macOS has already compiled these exact programs.
@@ -1078,14 +1078,16 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
 
     /// Many sequences through the Neural Engine in batches (`ANETextBackend.encode(batch:)`); nil
     /// where it does not take one.
-    private func aneVectors(_ ids: [[Int]]) -> [[Float]?] {
+    /// `urgent`: someone waits on these (ANETextBackend.encode(batch:urgent:)), where the GPU path
+    /// takes the high-priority gate.
+    private func aneVectors(_ ids: [[Int]], urgent: Bool) -> [[Float]?] {
         guard #available(macOS 15.0, *), let ane = aneLock.withLock({ _aneText }) as? ANETextBackend else { return ids.map { _ in nil } }
-        return ane.encode(batch: ids)
+        return ane.encode(batch: ids, urgent: urgent)
     }
 
     /// Token ids through the Neural Engine where it takes them, the rest in one GPU batch.
     private func aneOrGPU(_ ids: [[Int]], passage: Bool) -> [[Float]] {
-        var out = aneVectors(ids)
+        var out = aneVectors(ids, urgent: !passage)
         let rest = out.indices.filter { out[$0] == nil }
         if !rest.isEmpty, neuralEngineActive {
             fellBack("text: \(rest.count) of \(ids.count), longest \(rest.map { ids[$0].count }.max() ?? 0) tokens")
@@ -1263,7 +1265,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         if waiting { markQuery() }
         if neuralEngineActive {
             let ids = textEncoder.tokenizeParallel(texts, .passage)
-            var out = aneVectors(ids)
+            var out = aneVectors(ids, urgent: waiting)
             let rest = out.indices.filter { out[$0] == nil }
             if !rest.isEmpty {
                 let v = run(highPriority: waiting) { textEncoder.encodeTokenBatch(rest.map { ids[$0] }) }

@@ -43,7 +43,7 @@ public final class ANEVisionBackend: @unchecked Sendable {
             peR[oc * K + ((i * T + tt) * P + p) * Q + q] = pe[(((oc * T + tt) * P + p) * Q + q) * I + i]
         } } } } }
         embedW = ["w": try feature(ANEBlocks.matrix(peR, C, K)), "b": try feature(ANEBlocks.column(try t("vision_tower.patch_embed.proj.bias")))]
-        // per layer: q (scaled by 1/sqrt(d), exact for d = 64) and k with their rotated copies, v
+        // per layer: q (scaled by 1/sqrt(d), exact for d = 64), k, v; the program rotates q and k itself
         let s = Float(1 / Double(D).squareRoot())
         layerW = try (0 ..< config.vision.depth).map { i in
             let p = "vision_tower.blocks.\(i)."
@@ -52,14 +52,10 @@ public final class ANEVisionBackend: @unchecked Sendable {
             return [
                 "g1": try feature(ANEBlocks.column(try t(p + "norm1.weight"))), "b1": try feature(ANEBlocks.column(try t(p + "norm1.bias"))),
                 "wq": try feature(ANEBlocks.matrix(ANEBlocks.rows(w, cols: C, 0 ..< C, scale: s), C, C)),
-                "wqp": try feature(ANEBlocks.matrix(ANEBlocks.rows(w, cols: C, 0 ..< C, scale: s, rotate: D), C, C)),
                 "wk": try feature(ANEBlocks.matrix(ANEBlocks.rows(w, cols: C, C ..< 2 * C), C, C)),
-                "wkp": try feature(ANEBlocks.matrix(ANEBlocks.rows(w, cols: C, C ..< 2 * C, rotate: D), C, C)),
                 "wv": try feature(ANEBlocks.matrix(ANEBlocks.rows(w, cols: C, 2 * C ..< 3 * C), C, C)),
                 "bq": try feature(ANEBlocks.column(ANEBlocks.rows(b, cols: 1, 0 ..< C, scale: s))),
-                "bqp": try feature(ANEBlocks.column(ANEBlocks.rows(b, cols: 1, 0 ..< C, scale: s, rotate: D))),
                 "bk": try feature(ANEBlocks.column(ANEBlocks.rows(b, cols: 1, C ..< 2 * C))),
-                "bkp": try feature(ANEBlocks.column(ANEBlocks.rows(b, cols: 1, C ..< 2 * C, rotate: D))),
                 "bv": try feature(ANEBlocks.column(ANEBlocks.rows(b, cols: 1, 2 * C ..< 3 * C))),
                 "wo": try feature(ANEBlocks.matrix(try t(p + "attn.proj.weight"), C, C)), "bo": try feature(ANEBlocks.column(try t(p + "attn.proj.bias"))),
                 "g2": try feature(ANEBlocks.column(try t(p + "norm2.weight"))), "b2": try feature(ANEBlocks.column(try t(p + "norm2.bias"))),

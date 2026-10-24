@@ -104,9 +104,9 @@ public enum ANEProgram {
     }
 
     /// A tensor as the program holds it, fp16 row-major: as it is (`id`), times 1/sqrt(head_dim)
-    /// (`q`), rotated (`rot`, `kP`, and `qP` both), or a per-head norm weight tiled over the heads
-    /// (`tile`, scaled for q) and permuted as the rotated channels see it (`tileP`). Computed in fp32
-    /// and rounded once, as numpy does in Tools/ane/extract_recipe.py; the SHA-256 check proves it.
+    /// (`q`), or a per-head norm weight tiled over the heads (`tile`, scaled for q) and permuted as
+    /// the rotated channels see it (`tileP`). Computed in fp32 and rounded once, as numpy does in
+    /// Tools/ane/extract_recipe.py; the SHA-256 check proves it.
     static func transformed(_ t: MLXArray, _ b: Recipe.Blob, headDim: Int) -> [UInt16] {
         let f = t.asType(.float32)
         eval(f)
@@ -114,28 +114,13 @@ public enum ANEProgram {
         let scale = Float(1 / Double(headDim).squareRoot())
         let half = headDim / 2
         switch b.op {
-        case "q", "qP":
+        case "q":
             for i in v.indices { v[i] *= scale }
         case "tile", "tileP":
             var tiled = [Float](); tiled.reserveCapacity(v.count * (b.heads ?? 1))
             for _ in 0 ..< (b.heads ?? 1) { tiled.append(contentsOf: v) }
             v = b.scaled == true ? tiled.map { $0 * scale } : tiled
         default: break
-        }
-        if ["qP", "kP", "rot"].contains(b.op) {
-            // P @ m per head: row j <- -row (j + half), row (j + half) <- row j.
-            let cols = t.dim(1)
-            var o = v
-            for head in 0 ..< t.dim(0) / headDim {
-                let a = head * headDim
-                for j in 0 ..< half {
-                    for c in 0 ..< cols {
-                        o[(a + j) * cols + c] = -v[(a + half + j) * cols + c]
-                        o[(a + half + j) * cols + c] = v[(a + j) * cols + c]
-                    }
-                }
-            }
-            v = o
         }
         if b.op == "tileP" {
             // The halves of each head swapped, no sign: the sign is in the rotated projection.
@@ -172,7 +157,9 @@ public enum ANEProgram {
         return at == r.weightBytes ? out : nil
     }
 
-    /// Constants of the graph, not of the weights: head indicators and broadcast epsilons.
+    /// Constants of the graph, not of the weights: head indicators, broadcast epsilons, and
+    /// rotate-half per head as a grouped conv's weight ((heads x d) x d: row j of a head -1 at
+    /// column j + d/2, row j + d/2 +1 at column j).
     static func constant(_ b: Recipe.Blob, headDim: Int) -> [UInt16]? {
         switch b.op {
         case "indicator":
@@ -187,6 +174,17 @@ public enum ANEProgram {
             return m
         case "fill":
             return [UInt16](repeating: Half.bits(Float(b.value ?? 0)), count: b.count ?? 0)
+        case "rotate":
+            guard let heads = b.heads else { return nil }
+            let half = headDim / 2, one = Half.bits(Float(1)), minus = Half.bits(Float(-1))
+            var m = [UInt16](repeating: 0, count: heads * headDim * headDim)
+            for h in 0 ..< heads {
+                for j in 0 ..< half {
+                    m[(h * headDim + j) * headDim + half + j] = minus
+                    m[(h * headDim + half + j) * headDim + j] = one
+                }
+            }
+            return m
         default:
             return nil
         }

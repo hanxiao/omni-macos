@@ -15,8 +15,9 @@ import MLX
 ///
 /// Inputs are built here: the token rows read straight from the embedding table's memory (an MLX
 /// gather would queue on the GPU behind whatever runs there), the rotary tables for positions
-/// 0 ..< L, a key mask for the padding, a one-hot at the last real token. One sequence a call: the
-/// Neural Engine runs one request at a time, and B = 1 measured fastest at 512 tokens.
+/// 0 ..< L, a mask (the padding's keys, or whole: causal, or one block per sequence when short ones
+/// share a call), a one-hot at the last real token. B = 1 a call, the fastest at 512 tokens; many
+/// calls go to Core ML as one batch (`encode(batch:)`).
 ///
 /// PAST THE LONGEST LENGTH (a video segment: ~2,100 to ~6,300 tokens) the backbone runs one layer a
 /// call (Tools/ane/build_text_blocks.py), each layer's weights read where they lie in the baked
@@ -46,7 +47,8 @@ public final class ANETextBackend: @unchecked Sendable {
     private let headDim: Int
     /// The rotary tables' channels: the query heads (Small's 16 x 128 = 2048, Nano's 768).
     private let ropeChannels: Int
-    /// Small is causal: its program takes a (1, L, 1, L) mask; Nano's a key mask for the padding.
+    /// Small is causal; Nano attends both ways. Small's every length and Nano's shortest take a whole
+    /// (1, L, 1, L) mask (`cmask`, `takesWholeMask`); Nano's longer ones a key mask for the padding.
     private let causal: Bool
     private var causalMasks: [Int: MLMultiArray] = [:]
     private let theta: Double
@@ -99,13 +101,11 @@ public final class ANETextBackend: @unchecked Sendable {
         guard let base = mmap(nil, size, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0), base != MAP_FAILED else { return nil }
         let t = config.text, C = t.hiddenSize, QC = t.numHeads * t.headDim, KC = t.numKVHeads * t.headDim, F = t.intermediateSize
         // (tensor in the layer, the recipe's transform) -> the layer program's input and shape.
-        // Nano carries 1/sqrt(d) in q ("q", "qP"); Small in its tiled q norm ("tile", scaled).
+        // Nano carries 1/sqrt(d) in q ("q"); Small in its tiled q norm ("tile", scaled).
         let inputs: [String: (String, [Int])] = [
             "input_layernorm.weight|id": ("g1", [1, C, 1, 1]), "post_attention_layernorm.weight|id": ("g2", [1, C, 1, 1]),
-            "self_attn.q_proj.weight|q": ("wq", [QC, C]), "self_attn.q_proj.weight|qP": ("wqp", [QC, C]),
-            "self_attn.q_proj.weight|id": ("wq", [QC, C]), "self_attn.q_proj.weight|rot": ("wqp", [QC, C]),
-            "self_attn.k_proj.weight|id": ("wk", [KC, C]), "self_attn.k_proj.weight|kP": ("wkp", [KC, C]),
-            "self_attn.k_proj.weight|rot": ("wkp", [KC, C]),
+            "self_attn.q_proj.weight|q": ("wq", [QC, C]), "self_attn.q_proj.weight|id": ("wq", [QC, C]),
+            "self_attn.k_proj.weight|id": ("wk", [KC, C]),
             "self_attn.q_norm.weight|tile": ("qn", [1, QC, 1, 1]), "self_attn.q_norm.weight|tileP": ("qnp", [1, QC, 1, 1]),
             "self_attn.k_norm.weight|tile": ("kn", [1, KC, 1, 1]), "self_attn.k_norm.weight|tileP": ("knp", [1, KC, 1, 1]),
             "self_attn.v_proj.weight|id": ("wv", [KC, C]), "self_attn.o_proj.weight|id": ("wo", [C, QC]),
@@ -123,7 +123,7 @@ public final class ANETextBackend: @unchecked Sendable {
                                                 strides: strides.map { NSNumber(value: $0) }) else { munmap(base, size); return nil }
                 w[name] = MLFeatureValue(multiArray: a)
             }
-            guard w.count == (t.isCausal ? 15 : 11) else { munmap(base, size); return nil }
+            guard w.count == (t.isCausal ? 13 : 9) else { munmap(base, size); return nil }
             layers.append(w)
         }
         guard let (offset, bytes) = blobs["language_model.norm.weight|id"], bytes == C * 2 else { munmap(base, size); return nil }
@@ -158,9 +158,10 @@ public final class ANETextBackend: @unchecked Sendable {
         return run(ids.count, wantHidden: false) { x, L in fillTokens(x, ids, L) }?.vector
     }
 
-    /// Single sequences (a query) waiting for `lock`. A batch loop lets them in before it takes the
-    /// lock again: NSLock is not fair, and the loop that just let go won it straight back, so a query
-    /// on Small waited out batch after batch (search while indexing p99 27.7 -> 40.4 ms).
+    /// Calls someone waits on (a query, an urgent batch) waiting for `lock`. A batch loop that is not
+    /// urgent lets them in before it takes the lock again: NSLock is not fair, and the loop that just
+    /// let go won it straight back, so a query on Small waited out batch after batch (search while
+    /// indexing p99 27.7 -> 40.4 ms).
     private let waiting = OSAllocatedUnfairLock(initialState: 0)
     private func letQueriesIn() { while waiting.withLock({ $0 }) > 0 { usleep(100) } }
 
@@ -168,15 +169,19 @@ public final class ANETextBackend: @unchecked Sendable {
     /// a baked length go to the Neural Engine together, as one batch per `batchTokens` of that
     /// length: a call per sequence paid Core ML's round trip every time, 2.8 ms for a label of a
     /// few tokens, so the tag vocabulary's ~25k took 70 s on Nano (31 s batched; Small's 253 s, 12.7 s
-    /// batched and packed). A query waits behind one batch at most (`batchTokens`).
-    public func encode(batch ids: [[Int]]) -> [[Float]?] {
+    /// batched and packed). A query waits behind one batch at most (`batchTokens`). `urgent`: someone
+    /// waits on these (a query's, a served search's passages) - indexing's batches let them in.
+    public func encode(batch ids: [[Int]], urgent: Bool = false) -> [[Float]?] {
+        if urgent { waiting.withLock { $0 += 1 } }
+        defer { if urgent { waiting.withLock { $0 -= 1 } } }
+        func yieldToQueries() { if !urgent { letQueriesIn() } }
         var out = [[Float]?](repeating: nil, count: ids.count)
         var rest = Array(ids.indices)
-        if causal, let L = lengths.first, let model = functions.model("L\(L)") {
-            // Short sequences share a call: Small's program takes its mask whole, so a block-diagonal
-            // one keeps each to its own tokens and the rotary positions restart at each - every one
-            // computed as if alone, its vector the final-normed state at its last token (what
-            // `pooled` picks). Eight labels of four tokens in one L32 call.
+        if let L = lengths.first, let model = functions.model("L\(L)"), Self.takesWholeMask(model) {
+            // Short sequences share a call: the shortest length takes its mask whole, so a
+            // block-diagonal one keeps each to its own tokens and the rotary positions restart at
+            // each - every one computed as if alone, its vector the final-normed state at its last
+            // token (what `pooled` picks). Eight labels of four tokens in one L32 call.
             let short = rest.filter { !ids[$0].isEmpty && ids[$0].count <= L / 2 }
             rest = rest.filter { ids[$0].isEmpty || ids[$0].count > L / 2 }
             var calls: [[Int]] = [], cur: [Int] = [], used = 0
@@ -188,7 +193,7 @@ public final class ANETextBackend: @unchecked Sendable {
             let per = max(1, Self.batchTokens / L)
             for start in stride(from: 0, to: calls.count, by: per) {
                 let group = calls[start ..< min(start + per, calls.count)]
-                letQueriesIn()
+                yieldToQueries()
                 let vectors = lock.withLock { () -> [[[Float]?]] in
                     let feeds = group.compactMap { packedInputs($0.map { ids[$0] }, L) }
                     guard feeds.count == group.count,
@@ -212,12 +217,12 @@ public final class ANETextBackend: @unchecked Sendable {
         }
         for (L, members) in byLength.sorted(by: { $0.key < $1.key }) {
             guard let model = functions.model("L\(L)") else { continue }
-            let per = Self.batchTokens / L
+            let whole = Self.takesWholeMask(model), per = Self.batchTokens / L
             for start in stride(from: 0, to: members.count, by: per) {
                 let group = members[start ..< min(start + per, members.count)]
-                letQueriesIn()
+                yieldToQueries()
                 let vectors = lock.withLock { () -> [[Float]?] in
-                    let feeds = group.compactMap { i in inputs(ids[i].count, L) { x, L in fillTokens(x, ids[i], L) } }
+                    let feeds = group.compactMap { i in inputs(ids[i].count, L, whole: whole) { x, L in fillTokens(x, ids[i], L) } }
                     guard feeds.count == group.count,
                           let res = try? model.predictions(from: MLArrayBatchProvider(array: feeds), options: MLPredictionOptions()),
                           res.count == group.count else { return [] }
@@ -235,8 +240,12 @@ public final class ANETextBackend: @unchecked Sendable {
     /// Small's L256 and L512 batches were single calls again and gained nothing.
     public static let batchTokens = 1024
 
-    /// Short sequences packed into one call of a causal program: each attends only to itself, and
-    /// its rotary positions start at 0 (under `lock`: the tables are shared).
+    /// Whether a function takes its mask whole (`cmask`, keys on axis 1, queries on axis 3).
+    private static func takesWholeMask(_ m: MLModel) -> Bool { m.modelDescription.inputDescriptionsByName["cmask"] != nil }
+
+    /// Short sequences packed into one call of a function that takes its mask whole: each attends
+    /// only to itself (and, causal, to what came before), and its rotary positions start at 0
+    /// (under `lock`: the tables are shared).
     private func packedInputs(_ seqs: [[Int]], _ L: Int) -> MLDictionaryFeatureProvider? {
         guard let (cos, sin) = rotary(L),
               let x = try? MLMultiArray(shape: [1, NSNumber(value: hidden), 1, NSNumber(value: L)], dataType: .float16),
@@ -260,7 +269,7 @@ public final class ANETextBackend: @unchecked Sendable {
         // Keys on axis 1, queries on axis 3, as `causalMask`.
         let ks = mask.strides[1].intValue, qs = mask.strides[3].intValue, ps = pick.strides[3].intValue
         mask.withUnsafeMutableBytes { raw_p, _ in let p = raw_p.bindMemory(to: UInt16.self)
-            for k in 0 ..< L { for q in 0 ..< L { p[k * ks + q * qs] = k <= q && seg[k] == seg[q] ? 0 : Self.masked } }
+            for k in 0 ..< L { for q in 0 ..< L { p[k * ks + q * qs] = (!causal || k <= q) && seg[k] == seg[q] ? 0 : Self.masked } }
         }
         pick.withUnsafeMutableBytes { raw_p, _ in let p = raw_p.bindMemory(to: UInt16.self); for l in 0 ..< L { p[l * ps] = l == c - 1 ? Self.one : 0 } }
         return try? MLDictionaryFeatureProvider(dictionary: ["x": x, "cos": pc, "sin": psn, "cmask": mask, "pick": pick])
@@ -281,7 +290,8 @@ public final class ANETextBackend: @unchecked Sendable {
     }
 
     /// One sequence's inputs at length L (under `lock`: the rotary tables and masks are shared).
-    private func inputs(_ n: Int, _ L: Int, fill: (MLMultiArray, Int) -> Void) -> MLDictionaryFeatureProvider? {
+    /// `whole`: the function takes its mask whole (`takesWholeMask`).
+    private func inputs(_ n: Int, _ L: Int, whole: Bool, fill: (MLMultiArray, Int) -> Void) -> MLDictionaryFeatureProvider? {
         guard let (cos, sin) = rotary(L),
               let x = try? MLMultiArray(shape: [1, NSNumber(value: hidden), 1, NSNumber(value: L)], dataType: .float16),
               let pick = try? MLMultiArray(shape: [1, 1, 1, NSNumber(value: L)], dataType: .float16) else { return nil }
@@ -292,6 +302,14 @@ public final class ANETextBackend: @unchecked Sendable {
         if causal {
             // Keys past a query are masked; the padding after the last real token is never seen.
             guard let m = causalMask(L) else { return nil }
+            feed["cmask"] = m
+        } else if whole {
+            // The padding's keys masked for every query.
+            guard let m = try? MLMultiArray(shape: [1, NSNumber(value: L), 1, NSNumber(value: L)], dataType: .float16) else { return nil }
+            let ks = m.strides[1].intValue, qs = m.strides[3].intValue
+            m.withUnsafeMutableBytes { raw_p, _ in let p = raw_p.bindMemory(to: UInt16.self)
+                for k in 0 ..< L { for q in 0 ..< L { p[k * ks + q * qs] = k < n ? 0 : Self.masked } }
+            }
             feed["cmask"] = m
         } else {
             guard let mask = try? MLMultiArray(shape: [1, NSNumber(value: L), 1, 1], dataType: .float16) else { return nil }
@@ -319,8 +337,9 @@ public final class ANETextBackend: @unchecked Sendable {
     private func run(_ n: Int, wantHidden: Bool, fill: (MLMultiArray, Int) -> Void) -> (vector: [Float], hidden: [Float]?)? {
         if n > (lengths.last ?? 0) { return runLayers(n, wantHidden: wantHidden, fill: fill) }
         guard n > 0, let L = lengths.first(where: { $0 >= n }), let model = functions.model("L\(L)") else { return nil }
+        let whole = Self.takesWholeMask(model)
         return lock.withLock { () -> (vector: [Float], hidden: [Float]?)? in
-            guard let input = inputs(n, L, fill: fill), let out = try? model.prediction(from: input),
+            guard let input = inputs(n, L, whole: whole, fill: fill), let out = try? model.prediction(from: input),
                   let v = pooled(out) else { return nil }
             var rowsOut: [Float]? = nil
             if wantHidden, let hm = out.featureValue(for: "hidden")?.multiArrayValue {

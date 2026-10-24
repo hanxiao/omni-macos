@@ -1,7 +1,7 @@
 program(1.3)
 [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3500.32.1"}})]
 {
-    func B1024<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bkp, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bqp, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 1024]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 1024]> h, tensor<fp16, [1, 1024, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 1024]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wkp, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wqp, tensor<fp16, [1024, 1024]> wv) {
+    func B1024<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 1024]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 1024]> h, tensor<fp16, [1, 1024, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 1024]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wv) {
             tensor<fp16, [1, 1024, 1, 1024]> n1_abs = abs(x = h)[name = string("n1_abs")];
             tensor<int32, [1]> n1_max_axes_0 = const()[name = string("n1_max_axes_0"), val = tensor<int32, [1]>([1])];
             bool n1_max_keep_dims_0 = const()[name = string("n1_max_keep_dims_0"), val = bool(true)];
@@ -23,13 +23,14 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 1024]> q_rb = reshape(shape = q_rb_shape_0, x = q_mm)[name = string("q_rb")];
             tensor<fp16, [1, 1024, 1, 1024]> q_b = add(x = q_rb, y = bq)[name = string("q_b")];
             tensor<fp16, [1, 1024, 1, 1024]> q_c = mul(x = q_b, y = cos)[name = string("q_c")];
-            bool qp_mm_transpose_x_0 = const()[name = string("qp_mm_transpose_x_0"), val = bool(false)];
-            bool qp_mm_transpose_y_0 = const()[name = string("qp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 1024]> qp_mm = matmul(transpose_x = qp_mm_transpose_x_0, transpose_y = qp_mm_transpose_y_0, x = wqp, y = q_r)[name = string("qp_mm")];
-            tensor<int32, [4]> qp_rb_shape_0 = const()[name = string("qp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 1024])];
-            tensor<fp16, [1, 1024, 1, 1024]> qp_rb = reshape(shape = qp_rb_shape_0, x = qp_mm)[name = string("qp_rb")];
-            tensor<fp16, [1, 1024, 1, 1024]> qp_b = add(x = qp_rb, y = bqp)[name = string("qp_b")];
-            tensor<fp16, [1, 1024, 1, 1024]> q_s = mul(x = qp_b, y = sin)[name = string("q_s")];
+            tensor<fp16, [1024, 64, 1, 1]> qp_weight_0 = const()[name = string("qp_weight_0"), val = tensor<fp16, [1024, 64, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+            int32 qp_groups_0 = const()[name = string("qp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> qp_strides_0 = const()[name = string("qp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string qp_pad_type_0 = const()[name = string("qp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> qp_pad_0 = const()[name = string("qp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> qp_dilations_0 = const()[name = string("qp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 1024]> qp = conv(dilations = qp_dilations_0, groups = qp_groups_0, pad = qp_pad_0, pad_type = qp_pad_type_0, strides = qp_strides_0, weight = qp_weight_0, x = q_b)[name = string("qp")];
+            tensor<fp16, [1, 1024, 1, 1024]> q_s = mul(x = qp, y = sin)[name = string("q_s")];
             tensor<fp16, [1, 1024, 1, 1024]> q_r_1 = add(x = q_c, y = q_s)[name = string("q_r_1")];
             bool k_mm_transpose_x_0 = const()[name = string("k_mm_transpose_x_0"), val = bool(false)];
             bool k_mm_transpose_y_0 = const()[name = string("k_mm_transpose_y_0"), val = bool(false)];
@@ -38,13 +39,13 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 1024]> k_rb = reshape(shape = k_rb_shape_0, x = k_mm)[name = string("k_rb")];
             tensor<fp16, [1, 1024, 1, 1024]> k_b = add(x = k_rb, y = bk)[name = string("k_b")];
             tensor<fp16, [1, 1024, 1, 1024]> k_c = mul(x = k_b, y = cos)[name = string("k_c")];
-            bool kp_mm_transpose_x_0 = const()[name = string("kp_mm_transpose_x_0"), val = bool(false)];
-            bool kp_mm_transpose_y_0 = const()[name = string("kp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 1024]> kp_mm = matmul(transpose_x = kp_mm_transpose_x_0, transpose_y = kp_mm_transpose_y_0, x = wkp, y = q_r)[name = string("kp_mm")];
-            tensor<int32, [4]> kp_rb_shape_0 = const()[name = string("kp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 1024])];
-            tensor<fp16, [1, 1024, 1, 1024]> kp_rb = reshape(shape = kp_rb_shape_0, x = kp_mm)[name = string("kp_rb")];
-            tensor<fp16, [1, 1024, 1, 1024]> kp_b = add(x = kp_rb, y = bkp)[name = string("kp_b")];
-            tensor<fp16, [1, 1024, 1, 1024]> k_s = mul(x = kp_b, y = sin)[name = string("k_s")];
+            int32 kp_groups_0 = const()[name = string("kp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> kp_strides_0 = const()[name = string("kp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string kp_pad_type_0 = const()[name = string("kp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> kp_pad_0 = const()[name = string("kp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> kp_dilations_0 = const()[name = string("kp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 1024]> kp = conv(dilations = kp_dilations_0, groups = kp_groups_0, pad = kp_pad_0, pad_type = kp_pad_type_0, strides = kp_strides_0, weight = qp_weight_0, x = k_b)[name = string("kp")];
+            tensor<fp16, [1, 1024, 1, 1024]> k_s = mul(x = kp, y = sin)[name = string("k_s")];
             tensor<fp16, [1, 1024, 1, 1024]> k_r = add(x = k_c, y = k_s)[name = string("k_r")];
             bool v_mm_transpose_x_0 = const()[name = string("v_mm_transpose_x_0"), val = bool(false)];
             bool v_mm_transpose_y_0 = const()[name = string("v_mm_transpose_y_0"), val = bool(false)];
@@ -1099,7 +1100,7 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 1024]> f2_b = add(x = f2_rb, y = bf2)[name = string("f2_b")];
             tensor<fp16, [1, 1024, 1, 1024]> out = add(x = r1, y = f2_b)[name = string("out")];
         } -> (out);
-    func B1600<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bkp, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bqp, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 1600]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 1600]> h, tensor<fp16, [1, 1600, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 1600]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wkp, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wqp, tensor<fp16, [1024, 1024]> wv) {
+    func B1600<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 1600]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 1600]> h, tensor<fp16, [1, 1600, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 1600]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wv) {
             tensor<fp16, [1, 1024, 1, 1600]> n1_abs = abs(x = h)[name = string("n1_abs")];
             tensor<int32, [1]> n1_max_axes_0 = const()[name = string("n1_max_axes_0"), val = tensor<int32, [1]>([1])];
             bool n1_max_keep_dims_0 = const()[name = string("n1_max_keep_dims_0"), val = bool(true)];
@@ -1121,13 +1122,14 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 1600]> q_rb = reshape(shape = q_rb_shape_0, x = q_mm)[name = string("q_rb")];
             tensor<fp16, [1, 1024, 1, 1600]> q_b = add(x = q_rb, y = bq)[name = string("q_b")];
             tensor<fp16, [1, 1024, 1, 1600]> q_c = mul(x = q_b, y = cos)[name = string("q_c")];
-            bool qp_mm_transpose_x_0 = const()[name = string("qp_mm_transpose_x_0"), val = bool(false)];
-            bool qp_mm_transpose_y_0 = const()[name = string("qp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 1600]> qp_mm = matmul(transpose_x = qp_mm_transpose_x_0, transpose_y = qp_mm_transpose_y_0, x = wqp, y = q_r)[name = string("qp_mm")];
-            tensor<int32, [4]> qp_rb_shape_0 = const()[name = string("qp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 1600])];
-            tensor<fp16, [1, 1024, 1, 1600]> qp_rb = reshape(shape = qp_rb_shape_0, x = qp_mm)[name = string("qp_rb")];
-            tensor<fp16, [1, 1024, 1, 1600]> qp_b = add(x = qp_rb, y = bqp)[name = string("qp_b")];
-            tensor<fp16, [1, 1024, 1, 1600]> q_s = mul(x = qp_b, y = sin)[name = string("q_s")];
+            tensor<fp16, [1024, 64, 1, 1]> qp_weight_0 = const()[name = string("qp_weight_0"), val = tensor<fp16, [1024, 64, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+            int32 qp_groups_0 = const()[name = string("qp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> qp_strides_0 = const()[name = string("qp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string qp_pad_type_0 = const()[name = string("qp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> qp_pad_0 = const()[name = string("qp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> qp_dilations_0 = const()[name = string("qp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 1600]> qp = conv(dilations = qp_dilations_0, groups = qp_groups_0, pad = qp_pad_0, pad_type = qp_pad_type_0, strides = qp_strides_0, weight = qp_weight_0, x = q_b)[name = string("qp")];
+            tensor<fp16, [1, 1024, 1, 1600]> q_s = mul(x = qp, y = sin)[name = string("q_s")];
             tensor<fp16, [1, 1024, 1, 1600]> q_r_1 = add(x = q_c, y = q_s)[name = string("q_r_1")];
             bool k_mm_transpose_x_0 = const()[name = string("k_mm_transpose_x_0"), val = bool(false)];
             bool k_mm_transpose_y_0 = const()[name = string("k_mm_transpose_y_0"), val = bool(false)];
@@ -1136,13 +1138,13 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 1600]> k_rb = reshape(shape = k_rb_shape_0, x = k_mm)[name = string("k_rb")];
             tensor<fp16, [1, 1024, 1, 1600]> k_b = add(x = k_rb, y = bk)[name = string("k_b")];
             tensor<fp16, [1, 1024, 1, 1600]> k_c = mul(x = k_b, y = cos)[name = string("k_c")];
-            bool kp_mm_transpose_x_0 = const()[name = string("kp_mm_transpose_x_0"), val = bool(false)];
-            bool kp_mm_transpose_y_0 = const()[name = string("kp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 1600]> kp_mm = matmul(transpose_x = kp_mm_transpose_x_0, transpose_y = kp_mm_transpose_y_0, x = wkp, y = q_r)[name = string("kp_mm")];
-            tensor<int32, [4]> kp_rb_shape_0 = const()[name = string("kp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 1600])];
-            tensor<fp16, [1, 1024, 1, 1600]> kp_rb = reshape(shape = kp_rb_shape_0, x = kp_mm)[name = string("kp_rb")];
-            tensor<fp16, [1, 1024, 1, 1600]> kp_b = add(x = kp_rb, y = bkp)[name = string("kp_b")];
-            tensor<fp16, [1, 1024, 1, 1600]> k_s = mul(x = kp_b, y = sin)[name = string("k_s")];
+            int32 kp_groups_0 = const()[name = string("kp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> kp_strides_0 = const()[name = string("kp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string kp_pad_type_0 = const()[name = string("kp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> kp_pad_0 = const()[name = string("kp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> kp_dilations_0 = const()[name = string("kp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 1600]> kp = conv(dilations = kp_dilations_0, groups = kp_groups_0, pad = kp_pad_0, pad_type = kp_pad_type_0, strides = kp_strides_0, weight = qp_weight_0, x = k_b)[name = string("kp")];
+            tensor<fp16, [1, 1024, 1, 1600]> k_s = mul(x = kp, y = sin)[name = string("k_s")];
             tensor<fp16, [1, 1024, 1, 1600]> k_r = add(x = k_c, y = k_s)[name = string("k_r")];
             bool v_mm_transpose_x_0 = const()[name = string("v_mm_transpose_x_0"), val = bool(false)];
             bool v_mm_transpose_y_0 = const()[name = string("v_mm_transpose_y_0"), val = bool(false)];
@@ -4101,7 +4103,7 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 1600]> f2_b = add(x = f2_rb, y = bf2)[name = string("f2_b")];
             tensor<fp16, [1, 1024, 1, 1600]> out = add(x = r1, y = f2_b)[name = string("out")];
         } -> (out);
-    func B2304<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bkp, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bqp, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 2304]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 2304]> h, tensor<fp16, [1, 2304, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 2304]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wkp, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wqp, tensor<fp16, [1024, 1024]> wv) {
+    func B2304<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 2304]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 2304]> h, tensor<fp16, [1, 2304, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 2304]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wv) {
             tensor<fp16, [1, 1024, 1, 2304]> n1_abs = abs(x = h)[name = string("n1_abs")];
             tensor<int32, [1]> n1_max_axes_0 = const()[name = string("n1_max_axes_0"), val = tensor<int32, [1]>([1])];
             bool n1_max_keep_dims_0 = const()[name = string("n1_max_keep_dims_0"), val = bool(true)];
@@ -4123,13 +4125,14 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 2304]> q_rb = reshape(shape = q_rb_shape_0, x = q_mm)[name = string("q_rb")];
             tensor<fp16, [1, 1024, 1, 2304]> q_b = add(x = q_rb, y = bq)[name = string("q_b")];
             tensor<fp16, [1, 1024, 1, 2304]> q_c = mul(x = q_b, y = cos)[name = string("q_c")];
-            bool qp_mm_transpose_x_0 = const()[name = string("qp_mm_transpose_x_0"), val = bool(false)];
-            bool qp_mm_transpose_y_0 = const()[name = string("qp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 2304]> qp_mm = matmul(transpose_x = qp_mm_transpose_x_0, transpose_y = qp_mm_transpose_y_0, x = wqp, y = q_r)[name = string("qp_mm")];
-            tensor<int32, [4]> qp_rb_shape_0 = const()[name = string("qp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 2304])];
-            tensor<fp16, [1, 1024, 1, 2304]> qp_rb = reshape(shape = qp_rb_shape_0, x = qp_mm)[name = string("qp_rb")];
-            tensor<fp16, [1, 1024, 1, 2304]> qp_b = add(x = qp_rb, y = bqp)[name = string("qp_b")];
-            tensor<fp16, [1, 1024, 1, 2304]> q_s = mul(x = qp_b, y = sin)[name = string("q_s")];
+            tensor<fp16, [1024, 64, 1, 1]> qp_weight_0 = const()[name = string("qp_weight_0"), val = tensor<fp16, [1024, 64, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+            int32 qp_groups_0 = const()[name = string("qp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> qp_strides_0 = const()[name = string("qp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string qp_pad_type_0 = const()[name = string("qp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> qp_pad_0 = const()[name = string("qp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> qp_dilations_0 = const()[name = string("qp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 2304]> qp = conv(dilations = qp_dilations_0, groups = qp_groups_0, pad = qp_pad_0, pad_type = qp_pad_type_0, strides = qp_strides_0, weight = qp_weight_0, x = q_b)[name = string("qp")];
+            tensor<fp16, [1, 1024, 1, 2304]> q_s = mul(x = qp, y = sin)[name = string("q_s")];
             tensor<fp16, [1, 1024, 1, 2304]> q_r_1 = add(x = q_c, y = q_s)[name = string("q_r_1")];
             bool k_mm_transpose_x_0 = const()[name = string("k_mm_transpose_x_0"), val = bool(false)];
             bool k_mm_transpose_y_0 = const()[name = string("k_mm_transpose_y_0"), val = bool(false)];
@@ -4138,13 +4141,13 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 2304]> k_rb = reshape(shape = k_rb_shape_0, x = k_mm)[name = string("k_rb")];
             tensor<fp16, [1, 1024, 1, 2304]> k_b = add(x = k_rb, y = bk)[name = string("k_b")];
             tensor<fp16, [1, 1024, 1, 2304]> k_c = mul(x = k_b, y = cos)[name = string("k_c")];
-            bool kp_mm_transpose_x_0 = const()[name = string("kp_mm_transpose_x_0"), val = bool(false)];
-            bool kp_mm_transpose_y_0 = const()[name = string("kp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 2304]> kp_mm = matmul(transpose_x = kp_mm_transpose_x_0, transpose_y = kp_mm_transpose_y_0, x = wkp, y = q_r)[name = string("kp_mm")];
-            tensor<int32, [4]> kp_rb_shape_0 = const()[name = string("kp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 2304])];
-            tensor<fp16, [1, 1024, 1, 2304]> kp_rb = reshape(shape = kp_rb_shape_0, x = kp_mm)[name = string("kp_rb")];
-            tensor<fp16, [1, 1024, 1, 2304]> kp_b = add(x = kp_rb, y = bkp)[name = string("kp_b")];
-            tensor<fp16, [1, 1024, 1, 2304]> k_s = mul(x = kp_b, y = sin)[name = string("k_s")];
+            int32 kp_groups_0 = const()[name = string("kp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> kp_strides_0 = const()[name = string("kp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string kp_pad_type_0 = const()[name = string("kp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> kp_pad_0 = const()[name = string("kp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> kp_dilations_0 = const()[name = string("kp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 2304]> kp = conv(dilations = kp_dilations_0, groups = kp_groups_0, pad = kp_pad_0, pad_type = kp_pad_type_0, strides = kp_strides_0, weight = qp_weight_0, x = k_b)[name = string("kp")];
+            tensor<fp16, [1, 1024, 1, 2304]> k_s = mul(x = kp, y = sin)[name = string("k_s")];
             tensor<fp16, [1, 1024, 1, 2304]> k_r = add(x = k_c, y = k_s)[name = string("k_r")];
             bool v_mm_transpose_x_0 = const()[name = string("v_mm_transpose_x_0"), val = bool(false)];
             bool v_mm_transpose_y_0 = const()[name = string("v_mm_transpose_y_0"), val = bool(false)];
@@ -6319,7 +6322,7 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 2304]> f2_b = add(x = f2_rb, y = bf2)[name = string("f2_b")];
             tensor<fp16, [1, 1024, 1, 2304]> out = add(x = r1, y = f2_b)[name = string("out")];
         } -> (out);
-    func B256<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bkp, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bqp, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 256]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 256]> h, tensor<fp16, [1, 256, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 256]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wkp, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wqp, tensor<fp16, [1024, 1024]> wv) {
+    func B256<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 256]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 256]> h, tensor<fp16, [1, 256, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 256]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wv) {
             tensor<fp16, [1, 1024, 1, 256]> n1_abs = abs(x = h)[name = string("n1_abs")];
             tensor<int32, [1]> n1_max_axes_0 = const()[name = string("n1_max_axes_0"), val = tensor<int32, [1]>([1])];
             bool n1_max_keep_dims_0 = const()[name = string("n1_max_keep_dims_0"), val = bool(true)];
@@ -6341,13 +6344,14 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 256]> q_rb = reshape(shape = q_rb_shape_0, x = q_mm)[name = string("q_rb")];
             tensor<fp16, [1, 1024, 1, 256]> q_b = add(x = q_rb, y = bq)[name = string("q_b")];
             tensor<fp16, [1, 1024, 1, 256]> q_c = mul(x = q_b, y = cos)[name = string("q_c")];
-            bool qp_mm_transpose_x_0 = const()[name = string("qp_mm_transpose_x_0"), val = bool(false)];
-            bool qp_mm_transpose_y_0 = const()[name = string("qp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 256]> qp_mm = matmul(transpose_x = qp_mm_transpose_x_0, transpose_y = qp_mm_transpose_y_0, x = wqp, y = q_r)[name = string("qp_mm")];
-            tensor<int32, [4]> qp_rb_shape_0 = const()[name = string("qp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 256])];
-            tensor<fp16, [1, 1024, 1, 256]> qp_rb = reshape(shape = qp_rb_shape_0, x = qp_mm)[name = string("qp_rb")];
-            tensor<fp16, [1, 1024, 1, 256]> qp_b = add(x = qp_rb, y = bqp)[name = string("qp_b")];
-            tensor<fp16, [1, 1024, 1, 256]> q_s = mul(x = qp_b, y = sin)[name = string("q_s")];
+            tensor<fp16, [1024, 64, 1, 1]> qp_weight_0 = const()[name = string("qp_weight_0"), val = tensor<fp16, [1024, 64, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+            int32 qp_groups_0 = const()[name = string("qp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> qp_strides_0 = const()[name = string("qp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string qp_pad_type_0 = const()[name = string("qp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> qp_pad_0 = const()[name = string("qp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> qp_dilations_0 = const()[name = string("qp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 256]> qp = conv(dilations = qp_dilations_0, groups = qp_groups_0, pad = qp_pad_0, pad_type = qp_pad_type_0, strides = qp_strides_0, weight = qp_weight_0, x = q_b)[name = string("qp")];
+            tensor<fp16, [1, 1024, 1, 256]> q_s = mul(x = qp, y = sin)[name = string("q_s")];
             tensor<fp16, [1, 1024, 1, 256]> q_r_1 = add(x = q_c, y = q_s)[name = string("q_r_1")];
             bool k_mm_transpose_x_0 = const()[name = string("k_mm_transpose_x_0"), val = bool(false)];
             bool k_mm_transpose_y_0 = const()[name = string("k_mm_transpose_y_0"), val = bool(false)];
@@ -6356,13 +6360,13 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 256]> k_rb = reshape(shape = k_rb_shape_0, x = k_mm)[name = string("k_rb")];
             tensor<fp16, [1, 1024, 1, 256]> k_b = add(x = k_rb, y = bk)[name = string("k_b")];
             tensor<fp16, [1, 1024, 1, 256]> k_c = mul(x = k_b, y = cos)[name = string("k_c")];
-            bool kp_mm_transpose_x_0 = const()[name = string("kp_mm_transpose_x_0"), val = bool(false)];
-            bool kp_mm_transpose_y_0 = const()[name = string("kp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 256]> kp_mm = matmul(transpose_x = kp_mm_transpose_x_0, transpose_y = kp_mm_transpose_y_0, x = wkp, y = q_r)[name = string("kp_mm")];
-            tensor<int32, [4]> kp_rb_shape_0 = const()[name = string("kp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 256])];
-            tensor<fp16, [1, 1024, 1, 256]> kp_rb = reshape(shape = kp_rb_shape_0, x = kp_mm)[name = string("kp_rb")];
-            tensor<fp16, [1, 1024, 1, 256]> kp_b = add(x = kp_rb, y = bkp)[name = string("kp_b")];
-            tensor<fp16, [1, 1024, 1, 256]> k_s = mul(x = kp_b, y = sin)[name = string("k_s")];
+            int32 kp_groups_0 = const()[name = string("kp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> kp_strides_0 = const()[name = string("kp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string kp_pad_type_0 = const()[name = string("kp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> kp_pad_0 = const()[name = string("kp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> kp_dilations_0 = const()[name = string("kp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 256]> kp = conv(dilations = kp_dilations_0, groups = kp_groups_0, pad = kp_pad_0, pad_type = kp_pad_type_0, strides = kp_strides_0, weight = qp_weight_0, x = k_b)[name = string("kp")];
+            tensor<fp16, [1, 1024, 1, 256]> k_s = mul(x = kp, y = sin)[name = string("k_s")];
             tensor<fp16, [1, 1024, 1, 256]> k_r = add(x = k_c, y = k_s)[name = string("k_r")];
             bool v_mm_transpose_x_0 = const()[name = string("v_mm_transpose_x_0"), val = bool(false)];
             bool v_mm_transpose_y_0 = const()[name = string("v_mm_transpose_y_0"), val = bool(false)];
@@ -6745,7 +6749,7 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 256]> f2_b = add(x = f2_rb, y = bf2)[name = string("f2_b")];
             tensor<fp16, [1, 1024, 1, 256]> out = add(x = r1, y = f2_b)[name = string("out")];
         } -> (out);
-    func B3136<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bkp, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bqp, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 3136]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 3136]> h, tensor<fp16, [1, 3136, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 3136]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wkp, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wqp, tensor<fp16, [1024, 1024]> wv) {
+    func B3136<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 3136]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 3136]> h, tensor<fp16, [1, 3136, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 3136]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wv) {
             tensor<fp16, [1, 1024, 1, 3136]> n1_abs = abs(x = h)[name = string("n1_abs")];
             tensor<int32, [1]> n1_max_axes_0 = const()[name = string("n1_max_axes_0"), val = tensor<int32, [1]>([1])];
             bool n1_max_keep_dims_0 = const()[name = string("n1_max_keep_dims_0"), val = bool(true)];
@@ -6767,13 +6771,14 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 3136]> q_rb = reshape(shape = q_rb_shape_0, x = q_mm)[name = string("q_rb")];
             tensor<fp16, [1, 1024, 1, 3136]> q_b = add(x = q_rb, y = bq)[name = string("q_b")];
             tensor<fp16, [1, 1024, 1, 3136]> q_c = mul(x = q_b, y = cos)[name = string("q_c")];
-            bool qp_mm_transpose_x_0 = const()[name = string("qp_mm_transpose_x_0"), val = bool(false)];
-            bool qp_mm_transpose_y_0 = const()[name = string("qp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 3136]> qp_mm = matmul(transpose_x = qp_mm_transpose_x_0, transpose_y = qp_mm_transpose_y_0, x = wqp, y = q_r)[name = string("qp_mm")];
-            tensor<int32, [4]> qp_rb_shape_0 = const()[name = string("qp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 3136])];
-            tensor<fp16, [1, 1024, 1, 3136]> qp_rb = reshape(shape = qp_rb_shape_0, x = qp_mm)[name = string("qp_rb")];
-            tensor<fp16, [1, 1024, 1, 3136]> qp_b = add(x = qp_rb, y = bqp)[name = string("qp_b")];
-            tensor<fp16, [1, 1024, 1, 3136]> q_s = mul(x = qp_b, y = sin)[name = string("q_s")];
+            tensor<fp16, [1024, 64, 1, 1]> qp_weight_0 = const()[name = string("qp_weight_0"), val = tensor<fp16, [1024, 64, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+            int32 qp_groups_0 = const()[name = string("qp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> qp_strides_0 = const()[name = string("qp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string qp_pad_type_0 = const()[name = string("qp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> qp_pad_0 = const()[name = string("qp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> qp_dilations_0 = const()[name = string("qp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 3136]> qp = conv(dilations = qp_dilations_0, groups = qp_groups_0, pad = qp_pad_0, pad_type = qp_pad_type_0, strides = qp_strides_0, weight = qp_weight_0, x = q_b)[name = string("qp")];
+            tensor<fp16, [1, 1024, 1, 3136]> q_s = mul(x = qp, y = sin)[name = string("q_s")];
             tensor<fp16, [1, 1024, 1, 3136]> q_r_1 = add(x = q_c, y = q_s)[name = string("q_r_1")];
             bool k_mm_transpose_x_0 = const()[name = string("k_mm_transpose_x_0"), val = bool(false)];
             bool k_mm_transpose_y_0 = const()[name = string("k_mm_transpose_y_0"), val = bool(false)];
@@ -6782,13 +6787,13 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 3136]> k_rb = reshape(shape = k_rb_shape_0, x = k_mm)[name = string("k_rb")];
             tensor<fp16, [1, 1024, 1, 3136]> k_b = add(x = k_rb, y = bk)[name = string("k_b")];
             tensor<fp16, [1, 1024, 1, 3136]> k_c = mul(x = k_b, y = cos)[name = string("k_c")];
-            bool kp_mm_transpose_x_0 = const()[name = string("kp_mm_transpose_x_0"), val = bool(false)];
-            bool kp_mm_transpose_y_0 = const()[name = string("kp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 3136]> kp_mm = matmul(transpose_x = kp_mm_transpose_x_0, transpose_y = kp_mm_transpose_y_0, x = wkp, y = q_r)[name = string("kp_mm")];
-            tensor<int32, [4]> kp_rb_shape_0 = const()[name = string("kp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 3136])];
-            tensor<fp16, [1, 1024, 1, 3136]> kp_rb = reshape(shape = kp_rb_shape_0, x = kp_mm)[name = string("kp_rb")];
-            tensor<fp16, [1, 1024, 1, 3136]> kp_b = add(x = kp_rb, y = bkp)[name = string("kp_b")];
-            tensor<fp16, [1, 1024, 1, 3136]> k_s = mul(x = kp_b, y = sin)[name = string("k_s")];
+            int32 kp_groups_0 = const()[name = string("kp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> kp_strides_0 = const()[name = string("kp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string kp_pad_type_0 = const()[name = string("kp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> kp_pad_0 = const()[name = string("kp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> kp_dilations_0 = const()[name = string("kp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 3136]> kp = conv(dilations = kp_dilations_0, groups = kp_groups_0, pad = kp_pad_0, pad_type = kp_pad_type_0, strides = kp_strides_0, weight = qp_weight_0, x = k_b)[name = string("kp")];
+            tensor<fp16, [1, 1024, 1, 3136]> k_s = mul(x = kp, y = sin)[name = string("k_s")];
             tensor<fp16, [1, 1024, 1, 3136]> k_r = add(x = k_c, y = k_s)[name = string("k_r")];
             bool v_mm_transpose_x_0 = const()[name = string("v_mm_transpose_x_0"), val = bool(false)];
             bool v_mm_transpose_y_0 = const()[name = string("v_mm_transpose_y_0"), val = bool(false)];
@@ -12435,7 +12440,7 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 3136]> f2_b = add(x = f2_rb, y = bf2)[name = string("f2_b")];
             tensor<fp16, [1, 1024, 1, 3136]> out = add(x = r1, y = f2_b)[name = string("out")];
         } -> (out);
-    func B4096<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bkp, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bqp, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 4096]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 4096]> h, tensor<fp16, [1, 4096, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 4096]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wkp, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wqp, tensor<fp16, [1024, 1024]> wv) {
+    func B4096<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 4096]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 4096]> h, tensor<fp16, [1, 4096, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 4096]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wv) {
             tensor<fp16, [1, 1024, 1, 4096]> n1_abs = abs(x = h)[name = string("n1_abs")];
             tensor<int32, [1]> n1_max_axes_0 = const()[name = string("n1_max_axes_0"), val = tensor<int32, [1]>([1])];
             bool n1_max_keep_dims_0 = const()[name = string("n1_max_keep_dims_0"), val = bool(true)];
@@ -12457,13 +12462,14 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 4096]> q_rb = reshape(shape = q_rb_shape_0, x = q_mm)[name = string("q_rb")];
             tensor<fp16, [1, 1024, 1, 4096]> q_b = add(x = q_rb, y = bq)[name = string("q_b")];
             tensor<fp16, [1, 1024, 1, 4096]> q_c = mul(x = q_b, y = cos)[name = string("q_c")];
-            bool qp_mm_transpose_x_0 = const()[name = string("qp_mm_transpose_x_0"), val = bool(false)];
-            bool qp_mm_transpose_y_0 = const()[name = string("qp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 4096]> qp_mm = matmul(transpose_x = qp_mm_transpose_x_0, transpose_y = qp_mm_transpose_y_0, x = wqp, y = q_r)[name = string("qp_mm")];
-            tensor<int32, [4]> qp_rb_shape_0 = const()[name = string("qp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 4096])];
-            tensor<fp16, [1, 1024, 1, 4096]> qp_rb = reshape(shape = qp_rb_shape_0, x = qp_mm)[name = string("qp_rb")];
-            tensor<fp16, [1, 1024, 1, 4096]> qp_b = add(x = qp_rb, y = bqp)[name = string("qp_b")];
-            tensor<fp16, [1, 1024, 1, 4096]> q_s = mul(x = qp_b, y = sin)[name = string("q_s")];
+            tensor<fp16, [1024, 64, 1, 1]> qp_weight_0 = const()[name = string("qp_weight_0"), val = tensor<fp16, [1024, 64, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+            int32 qp_groups_0 = const()[name = string("qp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> qp_strides_0 = const()[name = string("qp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string qp_pad_type_0 = const()[name = string("qp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> qp_pad_0 = const()[name = string("qp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> qp_dilations_0 = const()[name = string("qp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 4096]> qp = conv(dilations = qp_dilations_0, groups = qp_groups_0, pad = qp_pad_0, pad_type = qp_pad_type_0, strides = qp_strides_0, weight = qp_weight_0, x = q_b)[name = string("qp")];
+            tensor<fp16, [1, 1024, 1, 4096]> q_s = mul(x = qp, y = sin)[name = string("q_s")];
             tensor<fp16, [1, 1024, 1, 4096]> q_r_1 = add(x = q_c, y = q_s)[name = string("q_r_1")];
             bool k_mm_transpose_x_0 = const()[name = string("k_mm_transpose_x_0"), val = bool(false)];
             bool k_mm_transpose_y_0 = const()[name = string("k_mm_transpose_y_0"), val = bool(false)];
@@ -12472,13 +12478,13 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 4096]> k_rb = reshape(shape = k_rb_shape_0, x = k_mm)[name = string("k_rb")];
             tensor<fp16, [1, 1024, 1, 4096]> k_b = add(x = k_rb, y = bk)[name = string("k_b")];
             tensor<fp16, [1, 1024, 1, 4096]> k_c = mul(x = k_b, y = cos)[name = string("k_c")];
-            bool kp_mm_transpose_x_0 = const()[name = string("kp_mm_transpose_x_0"), val = bool(false)];
-            bool kp_mm_transpose_y_0 = const()[name = string("kp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 4096]> kp_mm = matmul(transpose_x = kp_mm_transpose_x_0, transpose_y = kp_mm_transpose_y_0, x = wkp, y = q_r)[name = string("kp_mm")];
-            tensor<int32, [4]> kp_rb_shape_0 = const()[name = string("kp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 4096])];
-            tensor<fp16, [1, 1024, 1, 4096]> kp_rb = reshape(shape = kp_rb_shape_0, x = kp_mm)[name = string("kp_rb")];
-            tensor<fp16, [1, 1024, 1, 4096]> kp_b = add(x = kp_rb, y = bkp)[name = string("kp_b")];
-            tensor<fp16, [1, 1024, 1, 4096]> k_s = mul(x = kp_b, y = sin)[name = string("k_s")];
+            int32 kp_groups_0 = const()[name = string("kp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> kp_strides_0 = const()[name = string("kp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string kp_pad_type_0 = const()[name = string("kp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> kp_pad_0 = const()[name = string("kp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> kp_dilations_0 = const()[name = string("kp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 4096]> kp = conv(dilations = kp_dilations_0, groups = kp_groups_0, pad = kp_pad_0, pad_type = kp_pad_type_0, strides = kp_strides_0, weight = qp_weight_0, x = k_b)[name = string("kp")];
+            tensor<fp16, [1, 1024, 1, 4096]> k_s = mul(x = kp, y = sin)[name = string("k_s")];
             tensor<fp16, [1, 1024, 1, 4096]> k_r = add(x = k_c, y = k_s)[name = string("k_r")];
             bool v_mm_transpose_x_0 = const()[name = string("v_mm_transpose_x_0"), val = bool(false)];
             bool v_mm_transpose_y_0 = const()[name = string("v_mm_transpose_y_0"), val = bool(false)];
@@ -16221,7 +16227,7 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 4096]> f2_b = add(x = f2_rb, y = bf2)[name = string("f2_b")];
             tensor<fp16, [1, 1024, 1, 4096]> out = add(x = r1, y = f2_b)[name = string("out")];
         } -> (out);
-    func B5120<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bkp, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bqp, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 5120]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 5120]> h, tensor<fp16, [1, 5120, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 5120]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wkp, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wqp, tensor<fp16, [1024, 1024]> wv) {
+    func B5120<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 5120]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 5120]> h, tensor<fp16, [1, 5120, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 5120]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wv) {
             tensor<fp16, [1, 1024, 1, 5120]> n1_abs = abs(x = h)[name = string("n1_abs")];
             tensor<int32, [1]> n1_max_axes_0 = const()[name = string("n1_max_axes_0"), val = tensor<int32, [1]>([1])];
             bool n1_max_keep_dims_0 = const()[name = string("n1_max_keep_dims_0"), val = bool(true)];
@@ -16243,13 +16249,14 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 5120]> q_rb = reshape(shape = q_rb_shape_0, x = q_mm)[name = string("q_rb")];
             tensor<fp16, [1, 1024, 1, 5120]> q_b = add(x = q_rb, y = bq)[name = string("q_b")];
             tensor<fp16, [1, 1024, 1, 5120]> q_c = mul(x = q_b, y = cos)[name = string("q_c")];
-            bool qp_mm_transpose_x_0 = const()[name = string("qp_mm_transpose_x_0"), val = bool(false)];
-            bool qp_mm_transpose_y_0 = const()[name = string("qp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 5120]> qp_mm = matmul(transpose_x = qp_mm_transpose_x_0, transpose_y = qp_mm_transpose_y_0, x = wqp, y = q_r)[name = string("qp_mm")];
-            tensor<int32, [4]> qp_rb_shape_0 = const()[name = string("qp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 5120])];
-            tensor<fp16, [1, 1024, 1, 5120]> qp_rb = reshape(shape = qp_rb_shape_0, x = qp_mm)[name = string("qp_rb")];
-            tensor<fp16, [1, 1024, 1, 5120]> qp_b = add(x = qp_rb, y = bqp)[name = string("qp_b")];
-            tensor<fp16, [1, 1024, 1, 5120]> q_s = mul(x = qp_b, y = sin)[name = string("q_s")];
+            tensor<fp16, [1024, 64, 1, 1]> qp_weight_0 = const()[name = string("qp_weight_0"), val = tensor<fp16, [1024, 64, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+            int32 qp_groups_0 = const()[name = string("qp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> qp_strides_0 = const()[name = string("qp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string qp_pad_type_0 = const()[name = string("qp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> qp_pad_0 = const()[name = string("qp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> qp_dilations_0 = const()[name = string("qp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 5120]> qp = conv(dilations = qp_dilations_0, groups = qp_groups_0, pad = qp_pad_0, pad_type = qp_pad_type_0, strides = qp_strides_0, weight = qp_weight_0, x = q_b)[name = string("qp")];
+            tensor<fp16, [1, 1024, 1, 5120]> q_s = mul(x = qp, y = sin)[name = string("q_s")];
             tensor<fp16, [1, 1024, 1, 5120]> q_r_1 = add(x = q_c, y = q_s)[name = string("q_r_1")];
             bool k_mm_transpose_x_0 = const()[name = string("k_mm_transpose_x_0"), val = bool(false)];
             bool k_mm_transpose_y_0 = const()[name = string("k_mm_transpose_y_0"), val = bool(false)];
@@ -16258,13 +16265,13 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 5120]> k_rb = reshape(shape = k_rb_shape_0, x = k_mm)[name = string("k_rb")];
             tensor<fp16, [1, 1024, 1, 5120]> k_b = add(x = k_rb, y = bk)[name = string("k_b")];
             tensor<fp16, [1, 1024, 1, 5120]> k_c = mul(x = k_b, y = cos)[name = string("k_c")];
-            bool kp_mm_transpose_x_0 = const()[name = string("kp_mm_transpose_x_0"), val = bool(false)];
-            bool kp_mm_transpose_y_0 = const()[name = string("kp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 5120]> kp_mm = matmul(transpose_x = kp_mm_transpose_x_0, transpose_y = kp_mm_transpose_y_0, x = wkp, y = q_r)[name = string("kp_mm")];
-            tensor<int32, [4]> kp_rb_shape_0 = const()[name = string("kp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 5120])];
-            tensor<fp16, [1, 1024, 1, 5120]> kp_rb = reshape(shape = kp_rb_shape_0, x = kp_mm)[name = string("kp_rb")];
-            tensor<fp16, [1, 1024, 1, 5120]> kp_b = add(x = kp_rb, y = bkp)[name = string("kp_b")];
-            tensor<fp16, [1, 1024, 1, 5120]> k_s = mul(x = kp_b, y = sin)[name = string("k_s")];
+            int32 kp_groups_0 = const()[name = string("kp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> kp_strides_0 = const()[name = string("kp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string kp_pad_type_0 = const()[name = string("kp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> kp_pad_0 = const()[name = string("kp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> kp_dilations_0 = const()[name = string("kp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 5120]> kp = conv(dilations = kp_dilations_0, groups = kp_groups_0, pad = kp_pad_0, pad_type = kp_pad_type_0, strides = kp_strides_0, weight = qp_weight_0, x = k_b)[name = string("kp")];
+            tensor<fp16, [1, 1024, 1, 5120]> k_s = mul(x = kp, y = sin)[name = string("k_s")];
             tensor<fp16, [1, 1024, 1, 5120]> k_r = add(x = k_c, y = k_s)[name = string("k_r")];
             bool v_mm_transpose_x_0 = const()[name = string("v_mm_transpose_x_0"), val = bool(false)];
             bool v_mm_transpose_y_0 = const()[name = string("v_mm_transpose_y_0"), val = bool(false)];
@@ -20903,7 +20910,7 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 5120]> f2_b = add(x = f2_rb, y = bf2)[name = string("f2_b")];
             tensor<fp16, [1, 1024, 1, 5120]> out = add(x = r1, y = f2_b)[name = string("out")];
         } -> (out);
-    func B5632<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bkp, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bqp, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 5632]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 5632]> h, tensor<fp16, [1, 5632, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 5632]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wkp, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wqp, tensor<fp16, [1024, 1024]> wv) {
+    func B5632<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 5632]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 5632]> h, tensor<fp16, [1, 5632, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 5632]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wv) {
             tensor<fp16, [1, 1024, 1, 5632]> n1_abs = abs(x = h)[name = string("n1_abs")];
             tensor<int32, [1]> n1_max_axes_0 = const()[name = string("n1_max_axes_0"), val = tensor<int32, [1]>([1])];
             bool n1_max_keep_dims_0 = const()[name = string("n1_max_keep_dims_0"), val = bool(true)];
@@ -20925,13 +20932,14 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 5632]> q_rb = reshape(shape = q_rb_shape_0, x = q_mm)[name = string("q_rb")];
             tensor<fp16, [1, 1024, 1, 5632]> q_b = add(x = q_rb, y = bq)[name = string("q_b")];
             tensor<fp16, [1, 1024, 1, 5632]> q_c = mul(x = q_b, y = cos)[name = string("q_c")];
-            bool qp_mm_transpose_x_0 = const()[name = string("qp_mm_transpose_x_0"), val = bool(false)];
-            bool qp_mm_transpose_y_0 = const()[name = string("qp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 5632]> qp_mm = matmul(transpose_x = qp_mm_transpose_x_0, transpose_y = qp_mm_transpose_y_0, x = wqp, y = q_r)[name = string("qp_mm")];
-            tensor<int32, [4]> qp_rb_shape_0 = const()[name = string("qp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 5632])];
-            tensor<fp16, [1, 1024, 1, 5632]> qp_rb = reshape(shape = qp_rb_shape_0, x = qp_mm)[name = string("qp_rb")];
-            tensor<fp16, [1, 1024, 1, 5632]> qp_b = add(x = qp_rb, y = bqp)[name = string("qp_b")];
-            tensor<fp16, [1, 1024, 1, 5632]> q_s = mul(x = qp_b, y = sin)[name = string("q_s")];
+            tensor<fp16, [1024, 64, 1, 1]> qp_weight_0 = const()[name = string("qp_weight_0"), val = tensor<fp16, [1024, 64, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+            int32 qp_groups_0 = const()[name = string("qp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> qp_strides_0 = const()[name = string("qp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string qp_pad_type_0 = const()[name = string("qp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> qp_pad_0 = const()[name = string("qp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> qp_dilations_0 = const()[name = string("qp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 5632]> qp = conv(dilations = qp_dilations_0, groups = qp_groups_0, pad = qp_pad_0, pad_type = qp_pad_type_0, strides = qp_strides_0, weight = qp_weight_0, x = q_b)[name = string("qp")];
+            tensor<fp16, [1, 1024, 1, 5632]> q_s = mul(x = qp, y = sin)[name = string("q_s")];
             tensor<fp16, [1, 1024, 1, 5632]> q_r_1 = add(x = q_c, y = q_s)[name = string("q_r_1")];
             bool k_mm_transpose_x_0 = const()[name = string("k_mm_transpose_x_0"), val = bool(false)];
             bool k_mm_transpose_y_0 = const()[name = string("k_mm_transpose_y_0"), val = bool(false)];
@@ -20940,13 +20948,13 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 5632]> k_rb = reshape(shape = k_rb_shape_0, x = k_mm)[name = string("k_rb")];
             tensor<fp16, [1, 1024, 1, 5632]> k_b = add(x = k_rb, y = bk)[name = string("k_b")];
             tensor<fp16, [1, 1024, 1, 5632]> k_c = mul(x = k_b, y = cos)[name = string("k_c")];
-            bool kp_mm_transpose_x_0 = const()[name = string("kp_mm_transpose_x_0"), val = bool(false)];
-            bool kp_mm_transpose_y_0 = const()[name = string("kp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 5632]> kp_mm = matmul(transpose_x = kp_mm_transpose_x_0, transpose_y = kp_mm_transpose_y_0, x = wkp, y = q_r)[name = string("kp_mm")];
-            tensor<int32, [4]> kp_rb_shape_0 = const()[name = string("kp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 5632])];
-            tensor<fp16, [1, 1024, 1, 5632]> kp_rb = reshape(shape = kp_rb_shape_0, x = kp_mm)[name = string("kp_rb")];
-            tensor<fp16, [1, 1024, 1, 5632]> kp_b = add(x = kp_rb, y = bkp)[name = string("kp_b")];
-            tensor<fp16, [1, 1024, 1, 5632]> k_s = mul(x = kp_b, y = sin)[name = string("k_s")];
+            int32 kp_groups_0 = const()[name = string("kp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> kp_strides_0 = const()[name = string("kp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string kp_pad_type_0 = const()[name = string("kp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> kp_pad_0 = const()[name = string("kp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> kp_dilations_0 = const()[name = string("kp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 5632]> kp = conv(dilations = kp_dilations_0, groups = kp_groups_0, pad = kp_pad_0, pad_type = kp_pad_type_0, strides = kp_strides_0, weight = qp_weight_0, x = k_b)[name = string("kp")];
+            tensor<fp16, [1, 1024, 1, 5632]> k_s = mul(x = kp, y = sin)[name = string("k_s")];
             tensor<fp16, [1, 1024, 1, 5632]> k_r = add(x = k_c, y = k_s)[name = string("k_r")];
             bool v_mm_transpose_x_0 = const()[name = string("v_mm_transpose_x_0"), val = bool(false)];
             bool v_mm_transpose_y_0 = const()[name = string("v_mm_transpose_y_0"), val = bool(false)];
@@ -26033,7 +26041,7 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 5632]> f2_b = add(x = f2_rb, y = bf2)[name = string("f2_b")];
             tensor<fp16, [1, 1024, 1, 5632]> out = add(x = r1, y = f2_b)[name = string("out")];
         } -> (out);
-    func B576<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bkp, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bqp, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 576]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 576]> h, tensor<fp16, [1, 576, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 576]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wkp, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wqp, tensor<fp16, [1024, 1024]> wv) {
+    func B576<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 576]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 576]> h, tensor<fp16, [1, 576, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 576]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wv) {
             tensor<fp16, [1, 1024, 1, 576]> n1_abs = abs(x = h)[name = string("n1_abs")];
             tensor<int32, [1]> n1_max_axes_0 = const()[name = string("n1_max_axes_0"), val = tensor<int32, [1]>([1])];
             bool n1_max_keep_dims_0 = const()[name = string("n1_max_keep_dims_0"), val = bool(true)];
@@ -26055,13 +26063,14 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 576]> q_rb = reshape(shape = q_rb_shape_0, x = q_mm)[name = string("q_rb")];
             tensor<fp16, [1, 1024, 1, 576]> q_b = add(x = q_rb, y = bq)[name = string("q_b")];
             tensor<fp16, [1, 1024, 1, 576]> q_c = mul(x = q_b, y = cos)[name = string("q_c")];
-            bool qp_mm_transpose_x_0 = const()[name = string("qp_mm_transpose_x_0"), val = bool(false)];
-            bool qp_mm_transpose_y_0 = const()[name = string("qp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 576]> qp_mm = matmul(transpose_x = qp_mm_transpose_x_0, transpose_y = qp_mm_transpose_y_0, x = wqp, y = q_r)[name = string("qp_mm")];
-            tensor<int32, [4]> qp_rb_shape_0 = const()[name = string("qp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 576])];
-            tensor<fp16, [1, 1024, 1, 576]> qp_rb = reshape(shape = qp_rb_shape_0, x = qp_mm)[name = string("qp_rb")];
-            tensor<fp16, [1, 1024, 1, 576]> qp_b = add(x = qp_rb, y = bqp)[name = string("qp_b")];
-            tensor<fp16, [1, 1024, 1, 576]> q_s = mul(x = qp_b, y = sin)[name = string("q_s")];
+            tensor<fp16, [1024, 64, 1, 1]> qp_weight_0 = const()[name = string("qp_weight_0"), val = tensor<fp16, [1024, 64, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+            int32 qp_groups_0 = const()[name = string("qp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> qp_strides_0 = const()[name = string("qp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string qp_pad_type_0 = const()[name = string("qp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> qp_pad_0 = const()[name = string("qp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> qp_dilations_0 = const()[name = string("qp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 576]> qp = conv(dilations = qp_dilations_0, groups = qp_groups_0, pad = qp_pad_0, pad_type = qp_pad_type_0, strides = qp_strides_0, weight = qp_weight_0, x = q_b)[name = string("qp")];
+            tensor<fp16, [1, 1024, 1, 576]> q_s = mul(x = qp, y = sin)[name = string("q_s")];
             tensor<fp16, [1, 1024, 1, 576]> q_r_1 = add(x = q_c, y = q_s)[name = string("q_r_1")];
             bool k_mm_transpose_x_0 = const()[name = string("k_mm_transpose_x_0"), val = bool(false)];
             bool k_mm_transpose_y_0 = const()[name = string("k_mm_transpose_y_0"), val = bool(false)];
@@ -26070,13 +26079,13 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 576]> k_rb = reshape(shape = k_rb_shape_0, x = k_mm)[name = string("k_rb")];
             tensor<fp16, [1, 1024, 1, 576]> k_b = add(x = k_rb, y = bk)[name = string("k_b")];
             tensor<fp16, [1, 1024, 1, 576]> k_c = mul(x = k_b, y = cos)[name = string("k_c")];
-            bool kp_mm_transpose_x_0 = const()[name = string("kp_mm_transpose_x_0"), val = bool(false)];
-            bool kp_mm_transpose_y_0 = const()[name = string("kp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 576]> kp_mm = matmul(transpose_x = kp_mm_transpose_x_0, transpose_y = kp_mm_transpose_y_0, x = wkp, y = q_r)[name = string("kp_mm")];
-            tensor<int32, [4]> kp_rb_shape_0 = const()[name = string("kp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 576])];
-            tensor<fp16, [1, 1024, 1, 576]> kp_rb = reshape(shape = kp_rb_shape_0, x = kp_mm)[name = string("kp_rb")];
-            tensor<fp16, [1, 1024, 1, 576]> kp_b = add(x = kp_rb, y = bkp)[name = string("kp_b")];
-            tensor<fp16, [1, 1024, 1, 576]> k_s = mul(x = kp_b, y = sin)[name = string("k_s")];
+            int32 kp_groups_0 = const()[name = string("kp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> kp_strides_0 = const()[name = string("kp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string kp_pad_type_0 = const()[name = string("kp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> kp_pad_0 = const()[name = string("kp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> kp_dilations_0 = const()[name = string("kp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 576]> kp = conv(dilations = kp_dilations_0, groups = kp_groups_0, pad = kp_pad_0, pad_type = kp_pad_type_0, strides = kp_strides_0, weight = qp_weight_0, x = k_b)[name = string("kp")];
+            tensor<fp16, [1, 1024, 1, 576]> k_s = mul(x = kp, y = sin)[name = string("k_s")];
             tensor<fp16, [1, 1024, 1, 576]> k_r = add(x = k_c, y = k_s)[name = string("k_r")];
             bool v_mm_transpose_x_0 = const()[name = string("v_mm_transpose_x_0"), val = bool(false)];
             bool v_mm_transpose_y_0 = const()[name = string("v_mm_transpose_y_0"), val = bool(false)];
@@ -26907,7 +26916,7 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 576]> f2_b = add(x = f2_rb, y = bf2)[name = string("f2_b")];
             tensor<fp16, [1, 1024, 1, 576]> out = add(x = r1, y = f2_b)[name = string("out")];
         } -> (out);
-    func B7296<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bkp, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bqp, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 7296]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 7296]> h, tensor<fp16, [1, 7296, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 7296]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wkp, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wqp, tensor<fp16, [1024, 1024]> wv) {
+    func B7296<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 7296]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 7296]> h, tensor<fp16, [1, 7296, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 7296]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wv) {
             tensor<fp16, [1, 1024, 1, 7296]> n1_abs = abs(x = h)[name = string("n1_abs")];
             tensor<int32, [1]> n1_max_axes_0 = const()[name = string("n1_max_axes_0"), val = tensor<int32, [1]>([1])];
             bool n1_max_keep_dims_0 = const()[name = string("n1_max_keep_dims_0"), val = bool(true)];
@@ -26929,13 +26938,14 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 7296]> q_rb = reshape(shape = q_rb_shape_0, x = q_mm)[name = string("q_rb")];
             tensor<fp16, [1, 1024, 1, 7296]> q_b = add(x = q_rb, y = bq)[name = string("q_b")];
             tensor<fp16, [1, 1024, 1, 7296]> q_c = mul(x = q_b, y = cos)[name = string("q_c")];
-            bool qp_mm_transpose_x_0 = const()[name = string("qp_mm_transpose_x_0"), val = bool(false)];
-            bool qp_mm_transpose_y_0 = const()[name = string("qp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 7296]> qp_mm = matmul(transpose_x = qp_mm_transpose_x_0, transpose_y = qp_mm_transpose_y_0, x = wqp, y = q_r)[name = string("qp_mm")];
-            tensor<int32, [4]> qp_rb_shape_0 = const()[name = string("qp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 7296])];
-            tensor<fp16, [1, 1024, 1, 7296]> qp_rb = reshape(shape = qp_rb_shape_0, x = qp_mm)[name = string("qp_rb")];
-            tensor<fp16, [1, 1024, 1, 7296]> qp_b = add(x = qp_rb, y = bqp)[name = string("qp_b")];
-            tensor<fp16, [1, 1024, 1, 7296]> q_s = mul(x = qp_b, y = sin)[name = string("q_s")];
+            tensor<fp16, [1024, 64, 1, 1]> qp_weight_0 = const()[name = string("qp_weight_0"), val = tensor<fp16, [1024, 64, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+            int32 qp_groups_0 = const()[name = string("qp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> qp_strides_0 = const()[name = string("qp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string qp_pad_type_0 = const()[name = string("qp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> qp_pad_0 = const()[name = string("qp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> qp_dilations_0 = const()[name = string("qp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 7296]> qp = conv(dilations = qp_dilations_0, groups = qp_groups_0, pad = qp_pad_0, pad_type = qp_pad_type_0, strides = qp_strides_0, weight = qp_weight_0, x = q_b)[name = string("qp")];
+            tensor<fp16, [1, 1024, 1, 7296]> q_s = mul(x = qp, y = sin)[name = string("q_s")];
             tensor<fp16, [1, 1024, 1, 7296]> q_r_1 = add(x = q_c, y = q_s)[name = string("q_r_1")];
             bool k_mm_transpose_x_0 = const()[name = string("k_mm_transpose_x_0"), val = bool(false)];
             bool k_mm_transpose_y_0 = const()[name = string("k_mm_transpose_y_0"), val = bool(false)];
@@ -26944,13 +26954,13 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 7296]> k_rb = reshape(shape = k_rb_shape_0, x = k_mm)[name = string("k_rb")];
             tensor<fp16, [1, 1024, 1, 7296]> k_b = add(x = k_rb, y = bk)[name = string("k_b")];
             tensor<fp16, [1, 1024, 1, 7296]> k_c = mul(x = k_b, y = cos)[name = string("k_c")];
-            bool kp_mm_transpose_x_0 = const()[name = string("kp_mm_transpose_x_0"), val = bool(false)];
-            bool kp_mm_transpose_y_0 = const()[name = string("kp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 7296]> kp_mm = matmul(transpose_x = kp_mm_transpose_x_0, transpose_y = kp_mm_transpose_y_0, x = wkp, y = q_r)[name = string("kp_mm")];
-            tensor<int32, [4]> kp_rb_shape_0 = const()[name = string("kp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 7296])];
-            tensor<fp16, [1, 1024, 1, 7296]> kp_rb = reshape(shape = kp_rb_shape_0, x = kp_mm)[name = string("kp_rb")];
-            tensor<fp16, [1, 1024, 1, 7296]> kp_b = add(x = kp_rb, y = bkp)[name = string("kp_b")];
-            tensor<fp16, [1, 1024, 1, 7296]> k_s = mul(x = kp_b, y = sin)[name = string("k_s")];
+            int32 kp_groups_0 = const()[name = string("kp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> kp_strides_0 = const()[name = string("kp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string kp_pad_type_0 = const()[name = string("kp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> kp_pad_0 = const()[name = string("kp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> kp_dilations_0 = const()[name = string("kp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 7296]> kp = conv(dilations = kp_dilations_0, groups = kp_groups_0, pad = kp_pad_0, pad_type = kp_pad_type_0, strides = kp_strides_0, weight = qp_weight_0, x = k_b)[name = string("kp")];
+            tensor<fp16, [1, 1024, 1, 7296]> k_s = mul(x = kp, y = sin)[name = string("k_s")];
             tensor<fp16, [1, 1024, 1, 7296]> k_r = add(x = k_c, y = k_s)[name = string("k_r")];
             bool v_mm_transpose_x_0 = const()[name = string("v_mm_transpose_x_0"), val = bool(false)];
             bool v_mm_transpose_y_0 = const()[name = string("v_mm_transpose_y_0"), val = bool(false)];
@@ -33493,7 +33503,7 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 7296]> f2_b = add(x = f2_rb, y = bf2)[name = string("f2_b")];
             tensor<fp16, [1, 1024, 1, 7296]> out = add(x = r1, y = f2_b)[name = string("out")];
         } -> (out);
-    func B8192<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bkp, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bqp, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 8192]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 8192]> h, tensor<fp16, [1, 8192, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 8192]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wkp, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wqp, tensor<fp16, [1024, 1024]> wv) {
+    func B8192<ios18>(tensor<fp16, [1, 1024, 1, 1]> b1, tensor<fp16, [1, 1024, 1, 1]> b2, tensor<fp16, [1, 4096, 1, 1]> bf1, tensor<fp16, [1, 1024, 1, 1]> bf2, tensor<fp16, [1, 1024, 1, 1]> bk, tensor<fp16, [1, 1024, 1, 1]> bo, tensor<fp16, [1, 1024, 1, 1]> bq, tensor<fp16, [1, 1024, 1, 1]> bv, tensor<fp16, [1, 1024, 1, 8192]> cos, tensor<fp16, [1, 1024, 1, 1]> g1, tensor<fp16, [1, 1024, 1, 1]> g2, tensor<fp16, [1, 1024, 1, 8192]> h, tensor<fp16, [1, 8192, 1, 1]> mask, tensor<fp16, [1, 1024, 1, 8192]> sin, tensor<fp16, [4096, 1024]> w1, tensor<fp16, [1024, 4096]> w2, tensor<fp16, [1024, 1024]> wk, tensor<fp16, [1024, 1024]> wo, tensor<fp16, [1024, 1024]> wq, tensor<fp16, [1024, 1024]> wv) {
             tensor<fp16, [1, 1024, 1, 8192]> n1_abs = abs(x = h)[name = string("n1_abs")];
             tensor<int32, [1]> n1_max_axes_0 = const()[name = string("n1_max_axes_0"), val = tensor<int32, [1]>([1])];
             bool n1_max_keep_dims_0 = const()[name = string("n1_max_keep_dims_0"), val = bool(true)];
@@ -33515,13 +33525,14 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 8192]> q_rb = reshape(shape = q_rb_shape_0, x = q_mm)[name = string("q_rb")];
             tensor<fp16, [1, 1024, 1, 8192]> q_b = add(x = q_rb, y = bq)[name = string("q_b")];
             tensor<fp16, [1, 1024, 1, 8192]> q_c = mul(x = q_b, y = cos)[name = string("q_c")];
-            bool qp_mm_transpose_x_0 = const()[name = string("qp_mm_transpose_x_0"), val = bool(false)];
-            bool qp_mm_transpose_y_0 = const()[name = string("qp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 8192]> qp_mm = matmul(transpose_x = qp_mm_transpose_x_0, transpose_y = qp_mm_transpose_y_0, x = wqp, y = q_r)[name = string("qp_mm")];
-            tensor<int32, [4]> qp_rb_shape_0 = const()[name = string("qp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 8192])];
-            tensor<fp16, [1, 1024, 1, 8192]> qp_rb = reshape(shape = qp_rb_shape_0, x = qp_mm)[name = string("qp_rb")];
-            tensor<fp16, [1, 1024, 1, 8192]> qp_b = add(x = qp_rb, y = bqp)[name = string("qp_b")];
-            tensor<fp16, [1, 1024, 1, 8192]> q_s = mul(x = qp_b, y = sin)[name = string("q_s")];
+            tensor<fp16, [1024, 64, 1, 1]> qp_weight_0 = const()[name = string("qp_weight_0"), val = tensor<fp16, [1024, 64, 1, 1]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(64)))];
+            int32 qp_groups_0 = const()[name = string("qp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> qp_strides_0 = const()[name = string("qp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string qp_pad_type_0 = const()[name = string("qp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> qp_pad_0 = const()[name = string("qp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> qp_dilations_0 = const()[name = string("qp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 8192]> qp = conv(dilations = qp_dilations_0, groups = qp_groups_0, pad = qp_pad_0, pad_type = qp_pad_type_0, strides = qp_strides_0, weight = qp_weight_0, x = q_b)[name = string("qp")];
+            tensor<fp16, [1, 1024, 1, 8192]> q_s = mul(x = qp, y = sin)[name = string("q_s")];
             tensor<fp16, [1, 1024, 1, 8192]> q_r_1 = add(x = q_c, y = q_s)[name = string("q_r_1")];
             bool k_mm_transpose_x_0 = const()[name = string("k_mm_transpose_x_0"), val = bool(false)];
             bool k_mm_transpose_y_0 = const()[name = string("k_mm_transpose_y_0"), val = bool(false)];
@@ -33530,13 +33541,13 @@ program(1.3)
             tensor<fp16, [1, 1024, 1, 8192]> k_rb = reshape(shape = k_rb_shape_0, x = k_mm)[name = string("k_rb")];
             tensor<fp16, [1, 1024, 1, 8192]> k_b = add(x = k_rb, y = bk)[name = string("k_b")];
             tensor<fp16, [1, 1024, 1, 8192]> k_c = mul(x = k_b, y = cos)[name = string("k_c")];
-            bool kp_mm_transpose_x_0 = const()[name = string("kp_mm_transpose_x_0"), val = bool(false)];
-            bool kp_mm_transpose_y_0 = const()[name = string("kp_mm_transpose_y_0"), val = bool(false)];
-            tensor<fp16, [1024, 8192]> kp_mm = matmul(transpose_x = kp_mm_transpose_x_0, transpose_y = kp_mm_transpose_y_0, x = wkp, y = q_r)[name = string("kp_mm")];
-            tensor<int32, [4]> kp_rb_shape_0 = const()[name = string("kp_rb_shape_0"), val = tensor<int32, [4]>([1, 1024, 1, 8192])];
-            tensor<fp16, [1, 1024, 1, 8192]> kp_rb = reshape(shape = kp_rb_shape_0, x = kp_mm)[name = string("kp_rb")];
-            tensor<fp16, [1, 1024, 1, 8192]> kp_b = add(x = kp_rb, y = bkp)[name = string("kp_b")];
-            tensor<fp16, [1, 1024, 1, 8192]> k_s = mul(x = kp_b, y = sin)[name = string("k_s")];
+            int32 kp_groups_0 = const()[name = string("kp_groups_0"), val = int32(16)];
+            tensor<int32, [2]> kp_strides_0 = const()[name = string("kp_strides_0"), val = tensor<int32, [2]>([1, 1])];
+            string kp_pad_type_0 = const()[name = string("kp_pad_type_0"), val = string("valid")];
+            tensor<int32, [4]> kp_pad_0 = const()[name = string("kp_pad_0"), val = tensor<int32, [4]>([0, 0, 0, 0])];
+            tensor<int32, [2]> kp_dilations_0 = const()[name = string("kp_dilations_0"), val = tensor<int32, [2]>([1, 1])];
+            tensor<fp16, [1, 1024, 1, 8192]> kp = conv(dilations = kp_dilations_0, groups = kp_groups_0, pad = kp_pad_0, pad_type = kp_pad_type_0, strides = kp_strides_0, weight = qp_weight_0, x = k_b)[name = string("kp")];
+            tensor<fp16, [1, 1024, 1, 8192]> k_s = mul(x = kp, y = sin)[name = string("k_s")];
             tensor<fp16, [1, 1024, 1, 8192]> k_r = add(x = k_c, y = k_s)[name = string("k_r")];
             bool v_mm_transpose_x_0 = const()[name = string("v_mm_transpose_x_0"), val = bool(false)];
             bool v_mm_transpose_y_0 = const()[name = string("v_mm_transpose_y_0"), val = bool(false)];

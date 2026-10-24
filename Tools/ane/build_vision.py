@@ -4,10 +4,11 @@ weights, which it passes in:
   E{N}  patch embedding: px (1, 1536, 1, N) -> W (C, 1536) @ + b + pos (1, C, 1, N). W is the
         checkpoint's [C, t, p, p, c] weight with its columns in the raw pixel order (c, t, p, p), so
         OmniVisionPreprocess's patches go in as they are.
-  B{N}  one ViT block, called once per layer: LayerNorm (eps 1e-6); q, k with 2D RoPE folded in
-        (rope(Wx + b) = (Wx + b) * cos + (PWx + Pb) * sin, P the signed rotate-half per head, so the
-        app passes W and PW) and 1/sqrt(d) folded into q; v; attention over the bucket with a key
-        mask for its padding; proj; LayerNorm, fc1, GELU (tanh), fc2.
+  B{N}  one ViT block, called once per layer: LayerNorm (eps 1e-6); q, k with 2D RoPE (rope(y) =
+        y * cos + (P y) * sin, P the signed rotate-half per head as a grouped 1x1 conv, a constant:
+        exact, where the app passed a rotated copy of each weight and bias until 2026-10-24) and
+        1/sqrt(d) folded into q; v; attention over the bucket with a key mask for its padding;
+        proj; LayerNorm, fc1, GELU (tanh), fc2.
   M{N}  the merger: LayerNorm, the 2x2 merge (the patches arrive merge-block-major, so four
         neighbours are four consecutive positions: (C, N) -> (4C, N/4) in fc1's (j, c) order), fc1,
         GELU (erf), fc2 -> (1, D, 1, N/4), the image's tokens for the backbone.
@@ -17,6 +18,7 @@ Read the GPU path first (Sources/OmniKit/OmniVisionTower.swift); the app side is
       --out <dir> [--name nano_vision] [--buckets ...]
 """
 import argparse, json
+import numpy as np
 from coremltools.converters.mil import Builder as mb
 from anelib import spec, program, lin, layer_norm, attention, save_multifunction
 
@@ -30,18 +32,32 @@ def embed(N, C, K):
                    lambda px, pos, w, b: mb.add(x=lin(px, w, b, C, N, "pe"), y=pos, name="out"))
 
 
+def rotate_groups(heads, d):
+    """rotate_half per head, [-y2, y1], as a grouped 1x1 conv's weight (heads * d, d, 1, 1)."""
+    R = np.zeros((heads * d, d, 1, 1), dtype=np.float16); half = d // 2
+    for h in range(heads):
+        for j in range(half):
+            R[h * d + j, half + j] = -1
+            R[h * d + half + j, j] = 1
+    return R
+
+
 def block(N, C, H, F):
     vec = lambda c=C: spec(1, c, 1, 1)
     specs = dict(h=spec(1, C, 1, N), cos=spec(1, C, 1, N), sin=spec(1, C, 1, N), mask=spec(1, N, 1, 1),
-                 g1=vec(), b1=vec(), wq=spec(C, C), bq=vec(), wqp=spec(C, C), bqp=vec(), wk=spec(C, C), bk=vec(),
-                 wkp=spec(C, C), bkp=vec(), wv=spec(C, C), bv=vec(), wo=spec(C, C), bo=vec(), g2=vec(), b2=vec(),
+                 g1=vec(), b1=vec(), wq=spec(C, C), bq=vec(), wk=spec(C, C), bk=vec(),
+                 wv=spec(C, C), bv=vec(), wo=spec(C, C), bo=vec(), g2=vec(), b2=vec(),
                  w1=spec(F, C), bf1=vec(F), w2=spec(C, F), bf2=vec())
+    R = rotate_groups(H, C // H)
 
-    def body(h, cos, sin, mask, g1, b1, wq, bq, wqp, bqp, wk, bk, wkp, bkp, wv, bv, wo, bo, g2, b2, w1, bf1, w2, bf2):
+    def body(h, cos, sin, mask, g1, b1, wq, bq, wk, bk, wv, bv, wo, bo, g2, b2, w1, bf1, w2, bf2):
         xn = layer_norm(h, g1, b1, 1e-6, "n1")
-        roped = lambda w, b, wp, bp, t: mb.add(x=mb.mul(x=lin(xn, w, b, C, N, t), y=cos, name=f"{t}_c"),
-                                               y=mb.mul(x=lin(xn, wp, bp, C, N, t + "p"), y=sin, name=f"{t}_s"), name=f"{t}_r")
-        q, k = roped(wq, bq, wqp, bqp, "q"), roped(wk, bk, wkp, bkp, "k")
+
+        def roped(w, b, t):
+            y = lin(xn, w, b, C, N, t)
+            return mb.add(x=mb.mul(x=y, y=cos, name=f"{t}_c"),
+                          y=mb.mul(x=mb.conv(x=y, weight=R, groups=H, name=f"{t}p"), y=sin, name=f"{t}_s"), name=f"{t}_r")
+        q, k = roped(wq, bq, "q"), roped(wk, bk, "k")
         v = lin(xn, wv, bv, C, N, "v")
         h = mb.add(x=h, y=lin(attention(q, k, v, mask, H, N, "at"), wo, bo, C, N, "o"), name="r1")
         g = mb.gelu(x=lin(layer_norm(h, g2, b2, 1e-6, "n2"), w1, bf1, F, N, "f1"), mode="TANH_APPROXIMATION", name="g")

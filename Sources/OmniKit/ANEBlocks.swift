@@ -14,6 +14,37 @@ public enum ANEBlocks {
         Bundle.module.url(forResource: name, withExtension: "mlmodelc", subdirectory: "ANE")
     }
 
+    /// The bundled program as loaded: a copy of it in `cache`, made when the bundle's differs. THE
+    /// SYSTEM KEEPS A FUNCTION'S COMPILED FORM BY THE PROGRAM'S PATH: the same program copied
+    /// elsewhere loaded in 8.5 s (a compile) against 0.4 s, so an app moved after its one-time build
+    /// - or run from Downloads, which macOS translocates to a new path every launch - compiled every
+    /// tower function again on first use while the build's stamp said there was nothing to do.
+    public static func settled(_ name: String, cache: URL) -> URL? {
+        guard let src = bundled(name) else { return nil }
+        let dst = cache.appendingPathComponent(name + ".mlmodelc", isDirectory: true)
+        let fm = FileManager.default
+        func files(_ root: URL) -> [String: Data] {
+            var out: [String: Data] = [:]
+            for sub in (try? fm.subpathsOfDirectory(atPath: root.path)) ?? [] {
+                if let d = fm.contents(atPath: root.appendingPathComponent(sub).path) { out[sub] = d }
+            }
+            return out
+        }
+        let want = files(src)
+        if fm.fileExists(atPath: dst.path), files(dst) == want { return dst }
+        let tmp = cache.appendingPathComponent(".\(name)-\(UUID().uuidString).mlmodelc", isDirectory: true)
+        do {
+            try fm.createDirectory(at: cache, withIntermediateDirectories: true)
+            try fm.copyItem(at: src, to: tmp)
+            if fm.fileExists(atPath: dst.path) { _ = try fm.replaceItemAt(dst, withItemAt: tmp) } else { try fm.moveItem(at: tmp, to: dst) }
+            return dst
+        } catch {
+            try? fm.removeItem(at: tmp)
+            omniPerfLog("ane: \(name) not copied to the cache (\(error.localizedDescription)); loading it from the app")
+            return src
+        }
+    }
+
     /// A program's functions, each loaded for the Neural Engine the FIRST TIME it is asked for: the
     /// compile of one function is seconds (a photo-size vision block ~16 s, a query-length one well
     /// under one), and most Macs never need most sizes, so nothing compiles before it is used. The
@@ -124,23 +155,10 @@ public enum ANEBlocks {
     static func matrix(_ v: [Float], _ rows: Int, _ cols: Int) -> MLFeatureValue? { array(v, [rows, cols]) }
     static func column(_ v: [Float]) -> MLFeatureValue? { array(v, [1, v.count, 1, 1]) }
 
-    /// Rows `range` of a [rows, cols] matrix (or of a vector, cols 1), times `scale`, and with
-    /// `rotate` the signed rotate-half within each head of `headDim` rows - the P W that folds RoPE
-    /// into a projection: rope(Wx) = (Wx) * cos + (P W x) * sin.
-    static func rows(_ v: [Float], cols: Int, _ range: Range<Int>, scale: Float = 1, rotate headDim: Int? = nil) -> [Float] {
+    /// Rows `range` of a [rows, cols] matrix (or of a vector, cols 1), times `scale`.
+    static func rows(_ v: [Float], cols: Int, _ range: Range<Int>, scale: Float = 1) -> [Float] {
         var o = Array(v[range.lowerBound * cols ..< range.upperBound * cols])
         if scale != 1 { for i in o.indices { o[i] *= scale } }
-        guard let d = headDim else { return o }
-        let src = o, half = d / 2
-        for head in 0 ..< range.count / d {
-            let a = head * d
-            for j in 0 ..< half {
-                for c in 0 ..< cols {
-                    o[(a + j) * cols + c] = -src[(a + half + j) * cols + c]
-                    o[(a + half + j) * cols + c] = src[(a + j) * cols + c]
-                }
-            }
-        }
         return o
     }
 }

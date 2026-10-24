@@ -2802,3 +2802,99 @@ mode (OmniCompute), and MLX's CPU kernels are generic: on the benchmark's 946k-r
   A search on the CPU is now 1.2-1.4x the GPU's at a million rows and 1.4-1.6x at 46k, from 4x and 5x.
   GPU mode is level.
 
+
+## The programs without their rotated copies, Nano's labels packed (2026-10-24)
+
+A LEAD FROM THE SEARCH (Apple's "Deploying Transformers on the Apple Neural Engine": short sequences
+are bound by the weights' bytes): every program carried a SECOND COPY of q's and k's projection, P W
+with P the signed rotate-half per head, so RoPE needed no permutation in the graph - 11% of Nano's
+text weights, 17% of Small's, two of a vision layer's six C x C matrices. As a grouped 1x1 conv of q
+itself (one signed d x d permutation per head, a constant of the graph) the same values come out:
+
+    function (anepair: the same function of both builds, the same random inputs)   before    after
+    Nano text L32                                                                  2.70 ms   2.49   bit-identical
+    Nano text L512                                                                 14.66     14.07  bit-identical
+    Small text L32                                                                 10.34     9.25   bit-identical
+    Small text L512                                                                75.3      71.7   bit-identical
+    Nano vision layer, 1,024 patches (anehint, random inputs)                      4.50      4.20
+    Nano vision layer, 5,120 patches                                               39.2      38.1
+
+  The text programs bake their weights into convs, and a row of P W against x is a row of W against x,
+  so their outputs are the same bits. The vision layer takes its weights as inputs to a matmul, and
+  there the rotated copy did not come out of the ANE row for row: image vectors move in the fifth
+  decimal (eval bed, 46 images, cosine to the GPU min / median: 0.99806 / 0.99914 -> 0.99816 /
+  0.99912, photos 0.99730 / 0.99912 -> 0.99730 / 0.99907, screenshots 0.99681 / 0.99788 -> 0.99677 /
+  0.99782; tags agree 1.00 both). The new form rotates the values the reference rotates.
+  Small, the same 46 images: 0.99871 / 0.99912 -> 0.99876 / 0.99911, photos 0.99743 / 0.99928 ->
+  0.99710 / 0.99931, screenshots 0.99392 / 0.99772 -> 0.99371 / 0.99781, video 0.99871 / 0.99897 ->
+  0.99873 / 0.99904; tags agree 1.00; an image 259 -> 243 ms, a screenshot 1,228 -> 1,132, a clip 437
+  -> 410 (aneengine).
+  The weight files the Mac writes (and the system holds): Nano 254.9 -> 226.6 MB, Small 1,058 -> 882.
+
+NANO'S LABELS PACKED. Nano's program took one key mask for every query, so short sequences could not
+share a call; its shortest length (L32) takes a whole (L, L) mask now (`cmask`, as Small's every
+length), as fast (2.49 vs 2.49 ms), and the backend packs every function that takes one, bidirectional
+blocks for Nano. Longer lengths keep the key mask: a whole one at L2048 is read once per head and
+layer (~1 GB a call). The tag vocabulary on the Neural Engine, Nano: 4,000 labels 4.92 -> 0.64 s,
+all 25,465 31.3 -> 4.0 s, worst cosine to one at a time 0.999997.
+
+A BATCH SOMEONE WAITS ON WAITED OUT INDEXING. Only a single query counted itself waiting; a served
+search's passage windows go as a batch, and an indexing loop won the backend's lock back from it
+batch after batch: 16 windows beside indexing (anebatch) p50 528 ms. `encode(batch:urgent:)` counts
+such a batch waiting (queries' and served passages', where the GPU path takes the high-priority
+gate): p50 24-28 ms, p90 31.
+
+THE TOKENIZER CUTS EVERY TEXT AT 512 TOKENS (both models' tokenizer.json: truncation max_length 512).
+So the text paths past 512 tokens only ever see media, and a long document sent to /v1/embeddings is
+embedded from its first 512 tokens in either mode - not changed here.
+
+ONE REBUILD. Every program a Mac compiled changes, so the stamp (aneProgramsKey) runs the one-time
+build again on the first launch in Neural Engine mode: Nano text 115 s, layers 86 s, vision 195 s,
+audio 2.5 s (as before); Small 1,010 s (text 579, layers 139, vision 293). The build before, Small, on
+a fresh cache the same afternoon: text 615 s, layers 154 (vision 66: most of its functions were
+already compiled at that path), function for function the same (L2048 304 vs 303 s, L512 55 vs 55).
+Everything that belonged in the programs is in this one. The update in the app (the Release build,
+an isolated instance in Neural Engine mode on a copy of last version's prepared cache, Nano, the
+corpus indexed first on the GPU): the weights written again (the old ones' SHA is not the recipe's),
+every function compiled, the Neural Engine serving at 396 s; a served search every 2 s answered 219
+times, none empty, through the whole build.
+
+A COMPILED FUNCTION IS KEPT BY ITS PROGRAM'S PATH. The tower and layer programs loaded from inside
+the app's bundle; the same program copied to another path loaded in 8.5 s (a compile) against 0.4.
+An app moved after its one-time build, or run from Downloads (macOS translocates it to a new path
+every launch), compiled every tower function again on first use - a photo-size image ~17 s - while
+the build's stamp said nothing was left to do; the benchmark found it as one video query at 11.8 s.
+Copies at a new path compiled 3 times of 3 (3.1, 8.5, 8.7 s); new contents at the same path compiled
+the new program (3.1 s), so an update never runs a stale one. (One copy of the old program did load
+at once: the key is not the path alone. It does not matter here.)
+The programs are copied into the Neural Engine cache now (ANEBlocks.settled, once per content) and
+loaded from there, as the text program always was: first run 9 functions 12.1 s (compiling at the
+new path), the next 1.8 s, none over 0.3.
+
+THE BENCHMARK, Nano, the programs before (the build before, its warm cache) and after, interleaved,
+two rounds:
+
+    row                                  before            after
+    text indexing, tokens/s              37,247 37,348     38,646 38,545
+    index one image, p50 ms              42.7 42.1         40.3 40.1
+    image query, p50 ms                  97.2 97.1         80.4 81.4
+    audio query, p50 ms                  328 330           317 317    (audio's program unchanged)
+    video query, p50 ms                  201 205           205 194
+    search while indexing, p50 / p99 ms  15.6/39.2 15.5/21.2  5.8/8.3 5.8/8.7   (and the CPU search)
+
+  Small, the same:
+
+    row                                  before            after
+    text indexing, tokens/s              8,771 8,654       9,090 9,096
+    index one image, p50 ms              133.1 134.4       125.2 124.5
+    a text query not cached (p99), ms    11.4 11.3         10.0 10.6
+    image query, p50 ms                  282 293           260 258
+    video query, p50 ms                  460 472           432 437
+    audio query, p50 ms                  396 406           391 385
+    search while indexing, p50 / p99 ms  20.2/185 18.8/30.9  6.7/49.8 6.1/16.1
+
+CORE ML'S OWN KNOBS, measured (anehint, one function, interleaved, the same random inputs, outputs
+identical): `optimizationHints.specializationStrategy = .fastPrediction` recompiles every function
+(Nano L32 7 s, L512 15 s, Small L32 30 s) and is Nano L32 -1%, Nano L512 +5.5% (slower), Small L32
+-1.2%: not taken. Preallocated outputs (`outputBackings`) save ~60 us a call (Nano L32 2.66 -> 2.59
+ms): not worth the code.

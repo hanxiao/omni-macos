@@ -3,12 +3,17 @@ fixed-shape function per sequence length, sharing one copy of the weights.
 
 ANE-shaped (ml-ane-transformers): (B, C, 1, L), linears as 1x1 convs, heads split on channels (keys
 transposed to (B, L, 1, C) first), attention per head as the two einsum forms coremltools accepts,
-softmax over the key axis. RoPE folded into the projections - q = conv(x, Wq) * cos + conv(x, P Wq)
-* sin, P the signed rotate-half permutation - with cos and sin INPUTS (positions 0 ..< L, written by
-the backend), and 1/sqrt(d) folded into Wq (a power of two: exact in fp16). RMSNorm as the l2 norm
-of x/64 (no fp16 overflow). Inputs x (B, C, 1, L), cos, sin (1, C, 1, L), mask (B, L, 1, 1), pick
-(B, 1, 1, L); outputs `pooled`, the final-normed hidden at the picked token (B, C, 1, 1), and
-`hidden`, every position final-normed (B, C, 1, L), for the tags of an image or a clip.
+softmax over the key axis. RoPE as q * cos + (R q) * sin, R the signed rotate-half permutation per
+head as a grouped 1x1 conv (one 64 x 64 per head: exact, and 11% fewer weights and FLOPs than a
+second copy of Wq and Wk rotated, which this was until 2026-10-24: L32 2.70 -> 2.49 ms, L512 14.66
+-> 14.07, outputs bit-identical), with cos and sin INPUTS (positions 0 ..< L, written by the
+backend), and 1/sqrt(d) folded into Wq (a power of two: exact in fp16). RMSNorm as the l2 norm of
+x/64 (no fp16 overflow). Inputs x (B, C, 1, L), cos, sin (1, C, 1, L), mask (B, L, 1, 1) - at the
+SHORTEST length a whole mask, cmask (B, L, 1, L), keys on axis 1, so short sequences share a call
+(ANETextBackend packs the tag labels: Small's way; as fast at L32, and longer lengths keep the key
+mask, whose (L, L) form would be read once per head and layer) - and pick (B, 1, 1, L); outputs
+`pooled`, the final-normed hidden at the picked token (B, C, 1, 1), and `hidden`, every position
+final-normed (B, C, 1, L), for the tags of an image or a clip.
 
 Weights: `omni-verify dumpbackbone` with OMNI_BACKBONE_DTYPE=fp16 (the app's merged tensors).
   uv run --python 3.12 --with coremltools --with mlx Tools/ane/build_nano_text.py <weights> --out <dir>
@@ -25,16 +30,15 @@ EPS, THETA, HEADS, HDIM, LAYERS, HID = 1e-5, 1_000_000.0, 12, 64, 12, 768
 PRECISION = "fp16"
 
 
-def rotate_half_matrix():
-    # rotate_half(x) = [-x2, x1] per head, as y = P x
-    P = np.zeros((HID, HID), dtype=np.float32)
-    half = HDIM // 2
-    for h in range(HEADS):
-        o = h * HDIM
+def rotate_groups(heads=HEADS, d=HDIM):
+    """rotate_half(x) = [-x2, x1] per head, as a grouped 1x1 conv's weight (heads * d, d, 1, 1)."""
+    R = np.zeros((heads * d, d, 1, 1), dtype=np.float16)
+    half = d // 2
+    for h in range(heads):
         for j in range(half):
-            P[o + j, o + half + j] = -1.0
-            P[o + half + j, o + j] = 1.0
-    return P
+            R[h * d + j, half + j] = -1
+            R[h * d + half + j, j] = 1
+    return R
 
 
 # Queries in blocks of 256 (anelib.query_block): L2048 102 ms against 167 in one block, its first
@@ -42,9 +46,9 @@ def rotate_half_matrix():
 QBLOCK = 256
 
 
-def build(W, L, B=1):
+def build(W, L, B=1, full_mask=False):
     f32 = {k: np.array(v.astype(mx.float32), copy=False) for k, v in W.items()}
-    P = rotate_half_matrix()
+    R = rotate_groups()
     Ls = L
 
     def cw(m):                                  # [out, in] -> (out, in, 1, 1) fp16
@@ -53,13 +57,13 @@ def build(W, L, B=1):
     def nw(name):
         return f32[name].astype(np.float16).reshape(1, HID, 1, 1)
 
-    @mb.program(input_specs=[mb.TensorSpec(shape=(B, HID, 1, Ls), dtype=types.fp16),
-                             mb.TensorSpec(shape=(1, HID, 1, Ls), dtype=types.fp16),
-                             mb.TensorSpec(shape=(1, HID, 1, Ls), dtype=types.fp16),
-                             mb.TensorSpec(shape=(B, Ls, 1, 1), dtype=types.fp16),
-                             mb.TensorSpec(shape=(B, 1, 1, Ls), dtype=types.fp16)],
-                opset_version=ct.target.macOS15)
-    def prog(x, cos, sin, mask, pick):
+    specs = [mb.TensorSpec(shape=(B, HID, 1, Ls), dtype=types.fp16),
+             mb.TensorSpec(shape=(1, HID, 1, Ls), dtype=types.fp16),
+             mb.TensorSpec(shape=(1, HID, 1, Ls), dtype=types.fp16),
+             mb.TensorSpec(shape=(B, Ls, 1, Ls) if full_mask else (B, Ls, 1, 1), dtype=types.fp16),
+             mb.TensorSpec(shape=(B, 1, 1, Ls), dtype=types.fp16)]
+
+    def body(x, cos, sin, mask, pick):
         cq, sq, ck, sk = cos, sin, cos, sin
         def rms(t, wname, tag):
             # The l2 norm of x/64: Nano has no activation large enough to overflow it. Scaling by
@@ -76,12 +80,11 @@ def build(W, L, B=1):
             t = f"l{i}"
             xn = rms(h, p + "input_layernorm.weight", f"{t}_in")
             wq, wk = f32[p + "self_attn.q_proj.weight"] * HDIM ** -0.5, f32[p + "self_attn.k_proj.weight"]
-            q = mb.add(x=mb.mul(x=mb.conv(x=xn, weight=cw(wq), name=f"{t}_q"), y=cq, name=f"{t}_qc"),
-                       y=mb.mul(x=mb.conv(x=xn, weight=cw(P @ wq), name=f"{t}_qp"), y=sq, name=f"{t}_qs"),
-                       name=f"{t}_qr")
-            k = mb.add(x=mb.mul(x=mb.conv(x=xn, weight=cw(wk), name=f"{t}_k"), y=ck, name=f"{t}_kc"),
-                       y=mb.mul(x=mb.conv(x=xn, weight=cw(P @ wk), name=f"{t}_kp"), y=sk, name=f"{t}_ks"),
-                       name=f"{t}_kr")
+            q0, k0 = mb.conv(x=xn, weight=cw(wq), name=f"{t}_q"), mb.conv(x=xn, weight=cw(wk), name=f"{t}_k")
+            q = mb.add(x=mb.mul(x=q0, y=cq, name=f"{t}_qc"),
+                       y=mb.mul(x=mb.conv(x=q0, weight=R, groups=HEADS, name=f"{t}_qp"), y=sq, name=f"{t}_qs"), name=f"{t}_qr")
+            k = mb.add(x=mb.mul(x=k0, y=ck, name=f"{t}_kc"),
+                       y=mb.mul(x=mb.conv(x=k0, weight=R, groups=HEADS, name=f"{t}_kp"), y=sk, name=f"{t}_ks"), name=f"{t}_kr")
             v = mb.conv(x=xn, weight=cw(f32[p + "self_attn.v_proj.weight"]), name=f"{t}_v")
             qs = mb.split(x=q, num_splits=HEADS, axis=1, name=f"{t}_qsplit")
             kT = mb.transpose(x=k, perm=[0, 3, 2, 1], name=f"{t}_kT")                 # (B, L, 1, C)
@@ -89,11 +92,12 @@ def build(W, L, B=1):
             vs = mb.split(x=v, num_splits=HEADS, axis=1, name=f"{t}_vsplit")
             outs = []
             nb = L // query_block(L, QBLOCK)
+            masks = [mask] if nb == 1 or not full_mask else mb.split(x=mask, num_splits=nb, axis=3, name=f"{t}_mqb")
             for hd in range(HEADS):
                 parts = []
                 for j, qp in enumerate([qs[hd]] if nb == 1 else mb.split(x=qs[hd], num_splits=nb, axis=3, name=f"{t}_h{hd}_qb")):
                     s = mb.einsum(values=(ks[hd], qp), equation="bkhc,bchq->bkhq", name=f"{t}_h{hd}_{j}_qk")
-                    s = mb.add(x=s, y=mask, name=f"{t}_h{hd}_{j}_m")
+                    s = mb.add(x=s, y=masks[j] if full_mask else mask, name=f"{t}_h{hd}_{j}_m")
                     a = mb.softmax(x=s, axis=1, name=f"{t}_h{hd}_{j}_sm")
                     parts.append(mb.einsum(values=(vs[hd], a), equation="bchk,bkhq->bchq", name=f"{t}_h{hd}_{j}_av"))
                 outs.append(parts[0] if nb == 1 else mb.concat(values=parts, axis=3, name=f"{t}_h{hd}_cat"))
@@ -111,6 +115,13 @@ def build(W, L, B=1):
         pooled = mb.reduce_sum(x=mb.mul(x=hn, y=pick, name="pick"), axes=[3], keep_dims=True, name="pooled")
         return pooled, mb.identity(x=hn, name="hidden")
 
+    # The backend tells the two forms apart by the input's name.
+    if full_mask:
+        @mb.program(input_specs=specs, opset_version=ct.target.macOS15)
+        def prog(x, cos, sin, cmask, pick): return body(x, cos, sin, cmask, pick)
+    else:
+        @mb.program(input_specs=specs, opset_version=ct.target.macOS15)
+        def prog(x, cos, sin, mask, pick): return body(x, cos, sin, mask, pick)
     return ct.convert(prog, minimum_deployment_target=ct.target.macOS15,
                       compute_precision=ct.precision.FLOAT32 if PRECISION == "fp32" else ct.precision.FLOAT16,
                       compute_units=ct.ComputeUnit.CPU_AND_NE, skip_model_load=True)
@@ -134,7 +145,7 @@ if __name__ == "__main__":
     desc = ct.utils.MultiFunctionDescriptor()
     for L in lengths:
         part = os.path.join(tmp, f"L{L}.mlpackage")
-        build(W, L, a.batch).save(part)
+        build(W, L, a.batch, full_mask=L == min(lengths)).save(part)
         desc.add_function(part, src_function_name="main", target_function_name=f"L{L}")
     desc.default_function_name = f"L{lengths[-1]}"
     path = f"{a.out}/nano_text.mlpackage"

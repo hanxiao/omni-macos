@@ -436,5 +436,151 @@ enum ANEBatchAB {
             print(String(format: "L%-4d 64 seqs: one call each %.0f ms, batched %.0f ms; one batch of %d %.1f ms; worst cosine %.6f",
                          L, st * 1000, bt * 1000, per, hold * 1000, zip(s, b).map { cosine($0, $1) }.min() ?? -1))
         }
+        // A batch someone waits on (a served search's passage windows, 16 of ~48 tokens) while
+        // indexing's batches run on another thread: what it waits, urgent and not, interleaved.
+        let chunks = (0 ..< 64).map { _ in (0 ..< 400).map { _ in Int.random(in: 1000 ..< 100_000, using: &rng) } }
+        let windows = (0 ..< 16).map { _ in (0 ..< 48).map { _ in Int.random(in: 1000 ..< 100_000, using: &rng) } }
+        final class Stop: @unchecked Sendable { let l = NSLock(); var on = false
+            var isSet: Bool { l.withLock { on } }; func set() { l.withLock { on = true } } }
+        let stop = Stop()
+        let indexer = Thread { while !stop.isSet { _ = ane.encode(batch: chunks) } }
+        indexer.start()
+        usleep(500_000)
+        for _ in 0 ..< 2 {
+            for urgent in [false, true] {
+                var ms: [Double] = []
+                for _ in 0 ..< 40 {
+                    let t0 = Date(); _ = ane.encode(batch: windows, urgent: urgent); ms.append(-t0.timeIntervalSinceNow * 1000)
+                    usleep(20_000)
+                }
+                ms.sort()
+                print(String(format: "served windows while indexing, urgent %@: p50 %.1f p90 %.1f max %.1f ms",
+                             urgent ? "yes" : "no ", ms[ms.count / 2], ms[ms.count * 9 / 10], ms.last ?? 0))
+            }
+        }
+        stop.set()
+        while !indexer.isFinished { usleep(10_000) }
+    }
+}
+
+/// Core ML's own knobs on one Neural Engine function, interleaved on the same random inputs: the
+/// default load against `optimizationHints.specializationStrategy = .fastPrediction`, and each with
+/// preallocated outputs (`outputBackings`). Load (compile) time per arm, ms a call, and the largest
+/// output difference against the default.
+///   omni-verify anehint <program.mlmodelc> <function> [seconds]
+@available(macOS 15.0, *)
+enum ANEHintAB {
+    static func run(compiled: URL, function: String, seconds: Double) throws {
+        func load(_ fast: Bool) throws -> MLModel {
+            let c = MLModelConfiguration(); c.computeUnits = .cpuAndNeuralEngine; c.functionName = function
+            if fast { c.optimizationHints.specializationStrategy = .fastPrediction }
+            let t0 = Date()
+            let m = try MLModel(contentsOf: compiled, configuration: c)
+            print(String(format: "load %@ %.2f s", fast ? "fastPrediction" : "default", -t0.timeIntervalSinceNow))
+            return m
+        }
+        let models = [try load(false), try load(true)]
+        _ = try load(false); _ = try load(true)   // a second load of each: the system's compiled form
+        var rng = SystemRandomNumberGenerator()
+        var d: [String: MLFeatureValue] = [:]
+        for (name, desc) in models[0].modelDescription.inputDescriptionsByName {
+            guard let c = desc.multiArrayConstraint else { continue }
+            let a = try MLMultiArray(shape: c.shape, dataType: .float16)
+            let n = c.shape.reduce(1) { $0 * $1.intValue }
+            let v = (0 ..< n).map { _ in Float.random(in: -1 ... 1, using: &rng) }
+            a.withUnsafeMutableBytes { raw, _ in
+                let p = raw.bindMemory(to: UInt16.self)
+                for i in 0 ..< n { p[i] = Float16(v[i]).bitPattern }
+            }
+            d[name] = MLFeatureValue(multiArray: a)
+        }
+        let feed = try MLDictionaryFeatureProvider(dictionary: d)
+        func backings(_ m: MLModel) -> MLPredictionOptions {
+            let o = MLPredictionOptions()
+            var b: [String: Any] = [:]
+            for (name, desc) in m.modelDescription.outputDescriptionsByName {
+                guard let c = desc.multiArrayConstraint, let a = try? MLMultiArray(shape: c.shape, dataType: .float16) else { continue }
+                b[name] = a
+            }
+            o.outputBackings = b
+            return o
+        }
+        func values(_ out: MLFeatureProvider) -> [String: [Float]] {
+            var r: [String: [Float]] = [:]
+            for name in out.featureNames {
+                guard let a = out.featureValue(for: name)?.multiArrayValue else { continue }
+                r[name] = (0 ..< a.count).map { a[$0].floatValue }
+            }
+            return r
+        }
+        let ref = values(try models[0].prediction(from: feed))
+        let arms: [(String, MLModel, MLPredictionOptions)] = [
+            ("default", models[0], MLPredictionOptions()), ("fastPrediction", models[1], MLPredictionOptions()),
+            ("default+backings", models[0], backings(models[0])), ("fastPrediction+backings", models[1], backings(models[1])),
+        ]
+        for (name, m, o) in arms {
+            let v = values(try m.prediction(from: feed, options: o))
+            let diff = ref.map { k, a in zip(a, v[k] ?? []).map { abs($0 - $1) }.max() ?? .nan }.max() ?? .nan
+            print("\(name): max output difference \(diff)")
+        }
+        var ms: [String: [Double]] = [:]
+        for _ in 0 ..< 4 {
+            for (name, m, o) in arms {
+                var calls = 0
+                let t0 = Date(), end = t0.addingTimeInterval(seconds)
+                while Date() < end { _ = try m.prediction(from: feed, options: o); calls += 1 }
+                ms[name, default: []].append(-t0.timeIntervalSinceNow * 1000 / Double(calls))
+            }
+        }
+        for (name, _, _) in arms {
+            print("\(name): " + ms[name, default: []].map { String(format: "%.3f", $0) }.joined(separator: " ") + " ms a call")
+        }
+    }
+
+    /// The same function of two builds of a program, on the same random inputs: the largest output
+    /// difference and ms a call, interleaved.
+    ///   omni-verify anepair <a.mlmodelc> <b.mlmodelc> <function> [seconds]
+    static func pair(_ a: URL, _ b: URL, function: String, seconds: Double) throws {
+        func load(_ u: URL) throws -> MLModel {
+            let c = MLModelConfiguration(); c.computeUnits = .cpuAndNeuralEngine; c.functionName = function
+            let t0 = Date()
+            let m = try MLModel(contentsOf: u, configuration: c)
+            print(String(format: "load %@ %.1f s", u.deletingLastPathComponent().lastPathComponent, -t0.timeIntervalSinceNow))
+            return m
+        }
+        let models = [try load(a), try load(b)]
+        var rng = SystemRandomNumberGenerator()
+        var d: [String: MLFeatureValue] = [:]
+        for (name, desc) in models[0].modelDescription.inputDescriptionsByName {
+            guard let c = desc.multiArrayConstraint else { continue }
+            let arr = try MLMultiArray(shape: c.shape, dataType: .float16)
+            let n = c.shape.reduce(1) { $0 * $1.intValue }
+            // A real-looking feed: unit-scale rows, a causal mask, cos/sin in range, a one-hot pick.
+            arr.withUnsafeMutableBytes { raw, _ in
+                let p = raw.bindMemory(to: UInt16.self)
+                for i in 0 ..< n { p[i] = Float16(Float.random(in: -1 ... 1, using: &rng)).bitPattern }
+                if name == "cmask" { let L = c.shape[1].intValue; for k in 0 ..< L { for q in 0 ..< L { p[k * L + q] = Float16(k <= q ? 0 : -30000).bitPattern } } }
+                if name == "pick" { for i in 0 ..< n { p[i] = Float16(i == n - 1 ? 1 : 0).bitPattern } }
+            }
+            d[name] = MLFeatureValue(multiArray: arr)
+        }
+        let feed = try MLDictionaryFeatureProvider(dictionary: d)
+        let outs = try models.map { try $0.prediction(from: feed) }
+        for name in outs[0].featureNames {
+            guard let x = outs[0].featureValue(for: name)?.multiArrayValue, let y = outs[1].featureValue(for: name)?.multiArrayValue else { continue }
+            var diff: Float = 0, mag: Float = 0
+            for i in 0 ..< x.count { diff = max(diff, abs(x[i].floatValue - y[i].floatValue)); mag = max(mag, abs(x[i].floatValue)) }
+            print("\(name): max difference \(diff) (max |a| \(mag))")
+        }
+        var ms: [[Double]] = [[], []]
+        for _ in 0 ..< 4 {
+            for k in 0 ..< 2 {
+                var calls = 0
+                let t0 = Date(), end = t0.addingTimeInterval(seconds)
+                while Date() < end { _ = try models[k].prediction(from: feed); calls += 1 }
+                ms[k].append(-t0.timeIntervalSinceNow * 1000 / Double(calls))
+            }
+        }
+        for k in 0 ..< 2 { print(["a", "b"][k] + ": " + ms[k].map { String(format: "%.3f", $0) }.joined(separator: " ") + " ms a call") }
     }
 }

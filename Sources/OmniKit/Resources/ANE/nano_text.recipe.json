@@ -1,6 +1,6 @@
 {
 "format": 2,
-"weightBytes": 254850944,
+"weightBytes": 226636224,
 "headDim": 64,
 "blobs": [
 {
@@ -14,19 +14,15 @@
 "bytes": 1179648
 },
 {
-"tensor": "language_model.layers.0.self_attn.q_proj.weight",
-"op": "qP",
-"bytes": 1179648
-},
-{
 "tensor": "language_model.layers.0.self_attn.k_proj.weight",
 "op": "id",
 "bytes": 1179648
 },
 {
-"tensor": "language_model.layers.0.self_attn.k_proj.weight",
-"op": "kP",
-"bytes": 1179648
+"tensor": "",
+"op": "rotate",
+"heads": 12,
+"bytes": 98304
 },
 {
 "tensor": "language_model.layers.0.self_attn.v_proj.weight",
@@ -69,18 +65,8 @@
 "bytes": 1179648
 },
 {
-"tensor": "language_model.layers.1.self_attn.q_proj.weight",
-"op": "qP",
-"bytes": 1179648
-},
-{
 "tensor": "language_model.layers.1.self_attn.k_proj.weight",
 "op": "id",
-"bytes": 1179648
-},
-{
-"tensor": "language_model.layers.1.self_attn.k_proj.weight",
-"op": "kP",
 "bytes": 1179648
 },
 {
@@ -124,18 +110,8 @@
 "bytes": 1179648
 },
 {
-"tensor": "language_model.layers.2.self_attn.q_proj.weight",
-"op": "qP",
-"bytes": 1179648
-},
-{
 "tensor": "language_model.layers.2.self_attn.k_proj.weight",
 "op": "id",
-"bytes": 1179648
-},
-{
-"tensor": "language_model.layers.2.self_attn.k_proj.weight",
-"op": "kP",
 "bytes": 1179648
 },
 {
@@ -179,18 +155,8 @@
 "bytes": 1179648
 },
 {
-"tensor": "language_model.layers.3.self_attn.q_proj.weight",
-"op": "qP",
-"bytes": 1179648
-},
-{
 "tensor": "language_model.layers.3.self_attn.k_proj.weight",
 "op": "id",
-"bytes": 1179648
-},
-{
-"tensor": "language_model.layers.3.self_attn.k_proj.weight",
-"op": "kP",
 "bytes": 1179648
 },
 {
@@ -234,18 +200,8 @@
 "bytes": 1179648
 },
 {
-"tensor": "language_model.layers.4.self_attn.q_proj.weight",
-"op": "qP",
-"bytes": 1179648
-},
-{
 "tensor": "language_model.layers.4.self_attn.k_proj.weight",
 "op": "id",
-"bytes": 1179648
-},
-{
-"tensor": "language_model.layers.4.self_attn.k_proj.weight",
-"op": "kP",
 "bytes": 1179648
 },
 {
@@ -289,18 +245,8 @@
 "bytes": 1179648
 },
 {
-"tensor": "language_model.layers.5.self_attn.q_proj.weight",
-"op": "qP",
-"bytes": 1179648
-},
-{
 "tensor": "language_model.layers.5.self_attn.k_proj.weight",
 "op": "id",
-"bytes": 1179648
-},
-{
-"tensor": "language_model.layers.5.self_attn.k_proj.weight",
-"op": "kP",
 "bytes": 1179648
 },
 {
@@ -344,18 +290,8 @@
 "bytes": 1179648
 },
 {
-"tensor": "language_model.layers.6.self_attn.q_proj.weight",
-"op": "qP",
-"bytes": 1179648
-},
-{
 "tensor": "language_model.layers.6.self_attn.k_proj.weight",
 "op": "id",
-"bytes": 1179648
-},
-{
-"tensor": "language_model.layers.6.self_attn.k_proj.weight",
-"op": "kP",
 "bytes": 1179648
 },
 {
@@ -399,18 +335,8 @@
 "bytes": 1179648
 },
 {
-"tensor": "language_model.layers.7.self_attn.q_proj.weight",
-"op": "qP",
-"bytes": 1179648
-},
-{
 "tensor": "language_model.layers.7.self_attn.k_proj.weight",
 "op": "id",
-"bytes": 1179648
-},
-{
-"tensor": "language_model.layers.7.self_attn.k_proj.weight",
-"op": "kP",
 "bytes": 1179648
 },
 {
@@ -454,18 +380,8 @@
 "bytes": 1179648
 },
 {
-"tensor": "language_model.layers.8.self_attn.q_proj.weight",
-"op": "qP",
-"bytes": 1179648
-},
-{
 "tensor": "language_model.layers.8.self_attn.k_proj.weight",
 "op": "id",
-"bytes": 1179648
-},
-{
-"tensor": "language_model.layers.8.self_attn.k_proj.weight",
-"op": "kP",
 "bytes": 1179648
 },
 {
@@ -509,18 +425,8 @@
 "bytes": 1179648
 },
 {
-"tensor": "language_model.layers.9.self_attn.q_proj.weight",
-"op": "qP",
-"bytes": 1179648
-},
-{
 "tensor": "language_model.layers.9.self_attn.k_proj.weight",
 "op": "id",
-"bytes": 1179648
-},
-{
-"tensor": "language_model.layers.9.self_attn.k_proj.weight",
-"op": "kP",
 "bytes": 1179648
 },
 {
@@ -564,18 +470,8 @@
 "bytes": 1179648
 },
 {
-"tensor": "language_model.layers.10.self_attn.q_proj.weight",
-"op": "qP",
-"bytes": 1179648
-},
-{
 "tensor": "language_model.layers.10.self_attn.k_proj.weight",
 "op": "id",
-"bytes": 1179648
-},
-{
-"tensor": "language_model.layers.10.self_attn.k_proj.weight",
-"op": "kP",
 "bytes": 1179648
 },
 {
@@ -619,18 +515,8 @@
 "bytes": 1179648
 },
 {
-"tensor": "language_model.layers.11.self_attn.q_proj.weight",
-"op": "qP",
-"bytes": 1179648
-},
-{
 "tensor": "language_model.layers.11.self_attn.k_proj.weight",
 "op": "id",
-"bytes": 1179648
-},
-{
-"tensor": "language_model.layers.11.self_attn.k_proj.weight",
-"op": "kP",
 "bytes": 1179648
 },
 {
@@ -669,5 +555,5 @@
 "bytes": 1536
 }
 ],
-"sha256": "a9084ec9e909cf811a4e7f7c72f09d2c71f67eeee9f6bab2a6e7e9a6be403238"
+"sha256": "298109ff424bbc0a86544bea309954cfc31b2ae43a3455323b8ae34d9b07ef8d"
 }

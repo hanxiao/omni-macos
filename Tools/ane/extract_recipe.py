@@ -9,8 +9,10 @@ built and measured here, byte for byte, or the script fails.
     uv run --python 3.12 --with coremltools --with mlx Tools/ane/extract_recipe.py \
         <weights.safetensors (dumpbackbone, the app's own bf16)> <nano_text.mlpackage> <out.json>
 
-Transforms (Tools/ane/build_nano_text.py): `id`, `q` (x 1/sqrt(head_dim), folded scale), `qP` (the
-signed rotate-half permutation of q), `kP` (of k). Every blob is fp16, row-major [out, in].
+Transforms (Tools/ane/build_nano_text.py): `id`, `q` (x 1/sqrt(head_dim), folded scale); Small's
+`tile` / `tileP` (a per-head norm weight tiled over the heads, and as the rotated channels see it);
+graph constants `indicator`, `fill` and `rotate` (rotate-half per head, a grouped conv's weight).
+Every blob is fp16, row-major [out, in].
 """
 import hashlib, json, struct, sys
 import numpy as np
@@ -22,17 +24,6 @@ hidden = W["language_model.norm.weight"].shape[0]
 small = hidden == 1024                             # Small: 16 x 128 (q), 8 x 128 (kv), q/k norms
 head_dim = 128 if small else 64
 q_heads, kv_heads = (16, 8) if small else (12, 12)
-
-
-def rot(m):
-    """P @ m, P the signed rotate-half per head: row j of a head <- -row (j + half), and back."""
-    o = np.empty_like(m)
-    half = head_dim // 2
-    for h in range(m.shape[0] // head_dim):
-        a = h * head_dim
-        o[a:a + half] = -m[a + half:a + head_dim]
-        o[a + half:a + head_dim] = m[a:a + half]
-    return o
 
 
 def perm(v):
@@ -59,10 +50,8 @@ for k, v in W.items():
         continue
     add(k, "id", v)
     if small:
-        # Small: the projections plain, their rotations, and the per-head norm weights tiled over the
-        # heads (times 1/sqrt(d) for q), each also as the rotated channels see it (build_small_text.py).
-        if k.endswith("q_proj.weight"): add(k, "rot", rot(v))
-        if k.endswith("k_proj.weight"): add(k, "rot", rot(v))
+        # Small: the projections plain, and the per-head norm weights tiled over the heads (times
+        # 1/sqrt(d) for q), each also as the rotated channels see it (build_small_text.py).
         if k.endswith("q_norm.weight"):
             t = np.tile(v, q_heads) * head_dim ** -0.5
             add(k, "tile", t, heads=q_heads, scaled=True); add(k, "tileP", perm(t), heads=q_heads, scaled=True)
@@ -71,10 +60,7 @@ for k, v in W.items():
             add(k, "tile", t, heads=kv_heads, scaled=False); add(k, "tileP", perm(t), heads=kv_heads, scaled=False)
         continue
     if k.endswith("q_proj.weight"):
-        q = v * head_dim ** -0.5
-        add(k, "q", q); add(k, "qP", rot(q))
-    if k.endswith("k_proj.weight"):
-        add(k, "kP", rot(v))
+        add(k, "q", v * head_dim ** -0.5)
 # Constants of the graph, not of the weights: the head indicators (a head's channels summed, or its
 # scale sent back out), named by shape, never embedded.
 for heads in sorted({q_heads, kv_heads}):
@@ -84,6 +70,11 @@ for heads in sorted({q_heads, kv_heads}):
     add("", "indicator", I.T.copy(), heads=heads, transpose=True, value=1.0)
     for eps in (1e-5, 1e-4):   # an epsilon the compiler broadcast over the heads
         add("", "fill", np.full(heads, eps, dtype=np.float32), count=heads, value=eps)
+    R = np.zeros((heads * head_dim, head_dim), dtype=np.float32); half = head_dim // 2
+    for h in range(heads):
+        for j in range(half):
+            R[h * head_dim + j, half + j] = -1; R[h * head_dim + half + j, j] = 1
+    add("", "rotate", R, heads=heads)
 
 blob = open(f"{package}/Data/com.apple.CoreML/weights/weight.bin", "rb").read()
 count, version = struct.unpack("<II", blob[:8])

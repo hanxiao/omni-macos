@@ -85,39 +85,6 @@
         ]
       },
       {
-        "computePrecision" : "Mixed (Float16, Int32)",
-        "outputSchema" : [
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 256)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 256]",
-            "name" : "out",
-            "type" : "MultiArray"
-          }
-        ],
-        "stateSchema" : [
-
-        ],
-        "name" : "B256",
-        "mlProgramOperationTypeHistogram" : {
-          "Ios18.matmul" : 8,
-          "Ios18.gelu" : 1,
-          "Ios18.concat" : 17,
-          "Ios16.einsum" : 64,
-          "Ios18.add" : 48,
-          "Ios18.realDiv" : 2,
-          "Ios18.abs" : 2,
-          "Ios18.softmax" : 32,
-          "Ios18.layerNorm" : 2,
-          "Ios18.transpose" : 1,
-          "Ios16.reduceMax" : 2,
-          "Ios18.reshape" : 12,
-          "Split" : 19,
-          "Ios18.mul" : 6
-        },
         "inputSchema" : [
           {
             "hasShapeFlexibility" : "0",
@@ -206,26 +173,6 @@
             "formattedType" : "MultiArray (Float16 1024 × 1024)",
             "shortDescription" : "",
             "shape" : "[1024, 1024]",
-            "name" : "wqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
             "name" : "wk",
             "type" : "MultiArray"
           },
@@ -237,26 +184,6 @@
             "shortDescription" : "",
             "shape" : "[1, 1024, 1, 1]",
             "name" : "bk",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
-            "name" : "wkp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bkp",
             "type" : "MultiArray"
           },
           {
@@ -359,7 +286,42 @@
             "name" : "bf2",
             "type" : "MultiArray"
           }
-        ]
+        ],
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "storagePrecision" : "Float16",
+        "stateSchema" : [
+
+        ],
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 256)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 256]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "name" : "B256",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.conv" : 2,
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 17,
+          "Ios16.einsum" : 64,
+          "Ios18.add" : 46,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 32,
+          "Ios18.transpose" : 1,
+          "Ios18.layerNorm" : 2,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 19,
+          "Ios18.mul" : 6
+        }
       },
       {
         "computePrecision" : "Mixed (Float16, Int32)",
@@ -532,39 +494,6 @@
         ]
       },
       {
-        "computePrecision" : "Mixed (Float16, Int32)",
-        "outputSchema" : [
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 576)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 576]",
-            "name" : "out",
-            "type" : "MultiArray"
-          }
-        ],
-        "stateSchema" : [
-
-        ],
-        "name" : "B576",
-        "mlProgramOperationTypeHistogram" : {
-          "Ios18.matmul" : 8,
-          "Ios18.gelu" : 1,
-          "Ios18.concat" : 17,
-          "Ios16.einsum" : 192,
-          "Ios18.add" : 112,
-          "Ios18.realDiv" : 2,
-          "Ios18.abs" : 2,
-          "Ios18.softmax" : 96,
-          "Ios18.layerNorm" : 2,
-          "Ios18.transpose" : 1,
-          "Ios16.reduceMax" : 2,
-          "Ios18.reshape" : 12,
-          "Split" : 19,
-          "Ios18.mul" : 6
-        },
         "inputSchema" : [
           {
             "hasShapeFlexibility" : "0",
@@ -653,26 +582,6 @@
             "formattedType" : "MultiArray (Float16 1024 × 1024)",
             "shortDescription" : "",
             "shape" : "[1024, 1024]",
-            "name" : "wqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
             "name" : "wk",
             "type" : "MultiArray"
           },
@@ -684,26 +593,6 @@
             "shortDescription" : "",
             "shape" : "[1, 1024, 1, 1]",
             "name" : "bk",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
-            "name" : "wkp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bkp",
             "type" : "MultiArray"
           },
           {
@@ -806,7 +695,42 @@
             "name" : "bf2",
             "type" : "MultiArray"
           }
-        ]
+        ],
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "storagePrecision" : "Float16",
+        "stateSchema" : [
+
+        ],
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 576)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 576]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "name" : "B576",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.conv" : 2,
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 17,
+          "Ios16.einsum" : 192,
+          "Ios18.add" : 110,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 96,
+          "Ios18.transpose" : 1,
+          "Ios18.layerNorm" : 2,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 19,
+          "Ios18.mul" : 6
+        }
       },
       {
         "computePrecision" : "Mixed (Float16, Int32)",
@@ -979,39 +903,6 @@
         ]
       },
       {
-        "computePrecision" : "Mixed (Float16, Int32)",
-        "outputSchema" : [
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1024]",
-            "name" : "out",
-            "type" : "MultiArray"
-          }
-        ],
-        "stateSchema" : [
-
-        ],
-        "name" : "B1024",
-        "mlProgramOperationTypeHistogram" : {
-          "Ios18.matmul" : 8,
-          "Ios18.gelu" : 1,
-          "Ios18.concat" : 17,
-          "Ios16.einsum" : 256,
-          "Ios18.add" : 144,
-          "Ios18.realDiv" : 2,
-          "Ios18.abs" : 2,
-          "Ios18.softmax" : 128,
-          "Ios18.layerNorm" : 2,
-          "Ios18.transpose" : 1,
-          "Ios16.reduceMax" : 2,
-          "Ios18.reshape" : 12,
-          "Split" : 19,
-          "Ios18.mul" : 6
-        },
         "inputSchema" : [
           {
             "hasShapeFlexibility" : "0",
@@ -1100,26 +991,6 @@
             "formattedType" : "MultiArray (Float16 1024 × 1024)",
             "shortDescription" : "",
             "shape" : "[1024, 1024]",
-            "name" : "wqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
             "name" : "wk",
             "type" : "MultiArray"
           },
@@ -1131,26 +1002,6 @@
             "shortDescription" : "",
             "shape" : "[1, 1024, 1, 1]",
             "name" : "bk",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
-            "name" : "wkp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bkp",
             "type" : "MultiArray"
           },
           {
@@ -1253,7 +1104,42 @@
             "name" : "bf2",
             "type" : "MultiArray"
           }
-        ]
+        ],
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "storagePrecision" : "Float16",
+        "stateSchema" : [
+
+        ],
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1024)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 1024]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "name" : "B1024",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.conv" : 2,
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 17,
+          "Ios16.einsum" : 256,
+          "Ios18.add" : 142,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 128,
+          "Ios18.transpose" : 1,
+          "Ios18.layerNorm" : 2,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 19,
+          "Ios18.mul" : 6
+        }
       },
       {
         "computePrecision" : "Mixed (Float16, Int32)",
@@ -1426,39 +1312,6 @@
         ]
       },
       {
-        "computePrecision" : "Mixed (Float16, Int32)",
-        "outputSchema" : [
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1600)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1600]",
-            "name" : "out",
-            "type" : "MultiArray"
-          }
-        ],
-        "stateSchema" : [
-
-        ],
-        "name" : "B1600",
-        "mlProgramOperationTypeHistogram" : {
-          "Ios18.matmul" : 8,
-          "Ios18.gelu" : 1,
-          "Ios18.concat" : 17,
-          "Ios16.einsum" : 800,
-          "Ios18.add" : 416,
-          "Ios18.realDiv" : 2,
-          "Ios18.abs" : 2,
-          "Ios18.softmax" : 400,
-          "Ios18.layerNorm" : 2,
-          "Ios18.transpose" : 1,
-          "Ios16.reduceMax" : 2,
-          "Ios18.reshape" : 12,
-          "Split" : 19,
-          "Ios18.mul" : 6
-        },
         "inputSchema" : [
           {
             "hasShapeFlexibility" : "0",
@@ -1547,26 +1400,6 @@
             "formattedType" : "MultiArray (Float16 1024 × 1024)",
             "shortDescription" : "",
             "shape" : "[1024, 1024]",
-            "name" : "wqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
             "name" : "wk",
             "type" : "MultiArray"
           },
@@ -1578,26 +1411,6 @@
             "shortDescription" : "",
             "shape" : "[1, 1024, 1, 1]",
             "name" : "bk",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
-            "name" : "wkp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bkp",
             "type" : "MultiArray"
           },
           {
@@ -1700,7 +1513,42 @@
             "name" : "bf2",
             "type" : "MultiArray"
           }
-        ]
+        ],
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "storagePrecision" : "Float16",
+        "stateSchema" : [
+
+        ],
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1600)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 1600]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "name" : "B1600",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.conv" : 2,
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 17,
+          "Ios16.einsum" : 800,
+          "Ios18.add" : 414,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 400,
+          "Ios18.transpose" : 1,
+          "Ios18.layerNorm" : 2,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 19,
+          "Ios18.mul" : 6
+        }
       },
       {
         "computePrecision" : "Mixed (Float16, Int32)",
@@ -1873,39 +1721,6 @@
         ]
       },
       {
-        "computePrecision" : "Mixed (Float16, Int32)",
-        "outputSchema" : [
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 2304)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 2304]",
-            "name" : "out",
-            "type" : "MultiArray"
-          }
-        ],
-        "stateSchema" : [
-
-        ],
-        "name" : "B2304",
-        "mlProgramOperationTypeHistogram" : {
-          "Ios18.matmul" : 8,
-          "Ios18.gelu" : 1,
-          "Ios18.concat" : 17,
-          "Ios16.einsum" : 576,
-          "Ios18.add" : 304,
-          "Ios18.realDiv" : 2,
-          "Ios18.abs" : 2,
-          "Ios18.softmax" : 288,
-          "Ios18.layerNorm" : 2,
-          "Ios18.transpose" : 1,
-          "Ios16.reduceMax" : 2,
-          "Ios18.reshape" : 12,
-          "Split" : 19,
-          "Ios18.mul" : 6
-        },
         "inputSchema" : [
           {
             "hasShapeFlexibility" : "0",
@@ -1994,26 +1809,6 @@
             "formattedType" : "MultiArray (Float16 1024 × 1024)",
             "shortDescription" : "",
             "shape" : "[1024, 1024]",
-            "name" : "wqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
             "name" : "wk",
             "type" : "MultiArray"
           },
@@ -2025,26 +1820,6 @@
             "shortDescription" : "",
             "shape" : "[1, 1024, 1, 1]",
             "name" : "bk",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
-            "name" : "wkp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bkp",
             "type" : "MultiArray"
           },
           {
@@ -2147,7 +1922,42 @@
             "name" : "bf2",
             "type" : "MultiArray"
           }
-        ]
+        ],
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "storagePrecision" : "Float16",
+        "stateSchema" : [
+
+        ],
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 2304)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 2304]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "name" : "B2304",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.conv" : 2,
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 17,
+          "Ios16.einsum" : 576,
+          "Ios18.add" : 302,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 288,
+          "Ios18.transpose" : 1,
+          "Ios18.layerNorm" : 2,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 19,
+          "Ios18.mul" : 6
+        }
       },
       {
         "computePrecision" : "Mixed (Float16, Int32)",
@@ -2320,39 +2130,6 @@
         ]
       },
       {
-        "computePrecision" : "Mixed (Float16, Int32)",
-        "outputSchema" : [
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 3136)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 3136]",
-            "name" : "out",
-            "type" : "MultiArray"
-          }
-        ],
-        "stateSchema" : [
-
-        ],
-        "name" : "B3136",
-        "mlProgramOperationTypeHistogram" : {
-          "Ios18.matmul" : 8,
-          "Ios18.gelu" : 1,
-          "Ios18.concat" : 17,
-          "Ios16.einsum" : 1568,
-          "Ios18.add" : 800,
-          "Ios18.realDiv" : 2,
-          "Ios18.abs" : 2,
-          "Ios18.softmax" : 784,
-          "Ios18.layerNorm" : 2,
-          "Ios18.transpose" : 1,
-          "Ios16.reduceMax" : 2,
-          "Ios18.reshape" : 12,
-          "Split" : 19,
-          "Ios18.mul" : 6
-        },
         "inputSchema" : [
           {
             "hasShapeFlexibility" : "0",
@@ -2441,26 +2218,6 @@
             "formattedType" : "MultiArray (Float16 1024 × 1024)",
             "shortDescription" : "",
             "shape" : "[1024, 1024]",
-            "name" : "wqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
             "name" : "wk",
             "type" : "MultiArray"
           },
@@ -2472,26 +2229,6 @@
             "shortDescription" : "",
             "shape" : "[1, 1024, 1, 1]",
             "name" : "bk",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
-            "name" : "wkp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bkp",
             "type" : "MultiArray"
           },
           {
@@ -2594,7 +2331,42 @@
             "name" : "bf2",
             "type" : "MultiArray"
           }
-        ]
+        ],
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "storagePrecision" : "Float16",
+        "stateSchema" : [
+
+        ],
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 3136)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 3136]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "name" : "B3136",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.conv" : 2,
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 17,
+          "Ios16.einsum" : 1568,
+          "Ios18.add" : 798,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 784,
+          "Ios18.transpose" : 1,
+          "Ios18.layerNorm" : 2,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 19,
+          "Ios18.mul" : 6
+        }
       },
       {
         "computePrecision" : "Mixed (Float16, Int32)",
@@ -2767,39 +2539,6 @@
         ]
       },
       {
-        "computePrecision" : "Mixed (Float16, Int32)",
-        "outputSchema" : [
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 4096)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 4096]",
-            "name" : "out",
-            "type" : "MultiArray"
-          }
-        ],
-        "stateSchema" : [
-
-        ],
-        "name" : "B4096",
-        "mlProgramOperationTypeHistogram" : {
-          "Ios18.matmul" : 8,
-          "Ios18.gelu" : 1,
-          "Ios18.concat" : 17,
-          "Ios16.einsum" : 1024,
-          "Ios18.add" : 528,
-          "Ios18.realDiv" : 2,
-          "Ios18.abs" : 2,
-          "Ios18.softmax" : 512,
-          "Ios18.layerNorm" : 2,
-          "Ios18.transpose" : 1,
-          "Ios16.reduceMax" : 2,
-          "Ios18.reshape" : 12,
-          "Split" : 19,
-          "Ios18.mul" : 6
-        },
         "inputSchema" : [
           {
             "hasShapeFlexibility" : "0",
@@ -2888,26 +2627,6 @@
             "formattedType" : "MultiArray (Float16 1024 × 1024)",
             "shortDescription" : "",
             "shape" : "[1024, 1024]",
-            "name" : "wqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
             "name" : "wk",
             "type" : "MultiArray"
           },
@@ -2919,26 +2638,6 @@
             "shortDescription" : "",
             "shape" : "[1, 1024, 1, 1]",
             "name" : "bk",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
-            "name" : "wkp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bkp",
             "type" : "MultiArray"
           },
           {
@@ -3041,7 +2740,42 @@
             "name" : "bf2",
             "type" : "MultiArray"
           }
-        ]
+        ],
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "storagePrecision" : "Float16",
+        "stateSchema" : [
+
+        ],
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 4096)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 4096]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "name" : "B4096",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.conv" : 2,
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 17,
+          "Ios16.einsum" : 1024,
+          "Ios18.add" : 526,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 512,
+          "Ios18.transpose" : 1,
+          "Ios18.layerNorm" : 2,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 19,
+          "Ios18.mul" : 6
+        }
       },
       {
         "computePrecision" : "Mixed (Float16, Int32)",
@@ -3214,39 +2948,6 @@
         ]
       },
       {
-        "computePrecision" : "Mixed (Float16, Int32)",
-        "outputSchema" : [
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 5120)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 5120]",
-            "name" : "out",
-            "type" : "MultiArray"
-          }
-        ],
-        "stateSchema" : [
-
-        ],
-        "name" : "B5120",
-        "mlProgramOperationTypeHistogram" : {
-          "Ios18.matmul" : 8,
-          "Ios18.gelu" : 1,
-          "Ios18.concat" : 17,
-          "Ios16.einsum" : 1280,
-          "Ios18.add" : 656,
-          "Ios18.realDiv" : 2,
-          "Ios18.abs" : 2,
-          "Ios18.softmax" : 640,
-          "Ios18.layerNorm" : 2,
-          "Ios18.transpose" : 1,
-          "Ios16.reduceMax" : 2,
-          "Ios18.reshape" : 12,
-          "Split" : 19,
-          "Ios18.mul" : 6
-        },
         "inputSchema" : [
           {
             "hasShapeFlexibility" : "0",
@@ -3335,26 +3036,6 @@
             "formattedType" : "MultiArray (Float16 1024 × 1024)",
             "shortDescription" : "",
             "shape" : "[1024, 1024]",
-            "name" : "wqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
             "name" : "wk",
             "type" : "MultiArray"
           },
@@ -3366,26 +3047,6 @@
             "shortDescription" : "",
             "shape" : "[1, 1024, 1, 1]",
             "name" : "bk",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
-            "name" : "wkp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bkp",
             "type" : "MultiArray"
           },
           {
@@ -3488,7 +3149,42 @@
             "name" : "bf2",
             "type" : "MultiArray"
           }
-        ]
+        ],
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "storagePrecision" : "Float16",
+        "stateSchema" : [
+
+        ],
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 5120)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 5120]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "name" : "B5120",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.conv" : 2,
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 17,
+          "Ios16.einsum" : 1280,
+          "Ios18.add" : 654,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 640,
+          "Ios18.transpose" : 1,
+          "Ios18.layerNorm" : 2,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 19,
+          "Ios18.mul" : 6
+        }
       },
       {
         "computePrecision" : "Mixed (Float16, Int32)",
@@ -3661,39 +3357,6 @@
         ]
       },
       {
-        "computePrecision" : "Mixed (Float16, Int32)",
-        "outputSchema" : [
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 5632)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 5632]",
-            "name" : "out",
-            "type" : "MultiArray"
-          }
-        ],
-        "stateSchema" : [
-
-        ],
-        "name" : "B5632",
-        "mlProgramOperationTypeHistogram" : {
-          "Ios18.matmul" : 8,
-          "Ios18.gelu" : 1,
-          "Ios18.concat" : 17,
-          "Ios16.einsum" : 1408,
-          "Ios18.add" : 720,
-          "Ios18.realDiv" : 2,
-          "Ios18.abs" : 2,
-          "Ios18.softmax" : 704,
-          "Ios18.layerNorm" : 2,
-          "Ios18.transpose" : 1,
-          "Ios16.reduceMax" : 2,
-          "Ios18.reshape" : 12,
-          "Split" : 19,
-          "Ios18.mul" : 6
-        },
         "inputSchema" : [
           {
             "hasShapeFlexibility" : "0",
@@ -3782,26 +3445,6 @@
             "formattedType" : "MultiArray (Float16 1024 × 1024)",
             "shortDescription" : "",
             "shape" : "[1024, 1024]",
-            "name" : "wqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
             "name" : "wk",
             "type" : "MultiArray"
           },
@@ -3813,26 +3456,6 @@
             "shortDescription" : "",
             "shape" : "[1, 1024, 1, 1]",
             "name" : "bk",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
-            "name" : "wkp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bkp",
             "type" : "MultiArray"
           },
           {
@@ -3935,7 +3558,42 @@
             "name" : "bf2",
             "type" : "MultiArray"
           }
-        ]
+        ],
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "storagePrecision" : "Float16",
+        "stateSchema" : [
+
+        ],
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 5632)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 5632]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "name" : "B5632",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.conv" : 2,
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 17,
+          "Ios16.einsum" : 1408,
+          "Ios18.add" : 718,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 704,
+          "Ios18.transpose" : 1,
+          "Ios18.layerNorm" : 2,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 19,
+          "Ios18.mul" : 6
+        }
       },
       {
         "computePrecision" : "Mixed (Float16, Int32)",
@@ -4108,39 +3766,6 @@
         ]
       },
       {
-        "computePrecision" : "Mixed (Float16, Int32)",
-        "outputSchema" : [
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 7296)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 7296]",
-            "name" : "out",
-            "type" : "MultiArray"
-          }
-        ],
-        "stateSchema" : [
-
-        ],
-        "name" : "B7296",
-        "mlProgramOperationTypeHistogram" : {
-          "Ios18.matmul" : 8,
-          "Ios18.gelu" : 1,
-          "Ios18.concat" : 17,
-          "Ios16.einsum" : 1824,
-          "Ios18.add" : 928,
-          "Ios18.realDiv" : 2,
-          "Ios18.abs" : 2,
-          "Ios18.softmax" : 912,
-          "Ios18.layerNorm" : 2,
-          "Ios18.transpose" : 1,
-          "Ios16.reduceMax" : 2,
-          "Ios18.reshape" : 12,
-          "Split" : 19,
-          "Ios18.mul" : 6
-        },
         "inputSchema" : [
           {
             "hasShapeFlexibility" : "0",
@@ -4229,26 +3854,6 @@
             "formattedType" : "MultiArray (Float16 1024 × 1024)",
             "shortDescription" : "",
             "shape" : "[1024, 1024]",
-            "name" : "wqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
             "name" : "wk",
             "type" : "MultiArray"
           },
@@ -4260,26 +3865,6 @@
             "shortDescription" : "",
             "shape" : "[1, 1024, 1, 1]",
             "name" : "bk",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
-            "name" : "wkp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bkp",
             "type" : "MultiArray"
           },
           {
@@ -4382,7 +3967,42 @@
             "name" : "bf2",
             "type" : "MultiArray"
           }
-        ]
+        ],
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "storagePrecision" : "Float16",
+        "stateSchema" : [
+
+        ],
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 7296)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 7296]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "name" : "B7296",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.conv" : 2,
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 17,
+          "Ios16.einsum" : 1824,
+          "Ios18.add" : 926,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 912,
+          "Ios18.transpose" : 1,
+          "Ios18.layerNorm" : 2,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 19,
+          "Ios18.mul" : 6
+        }
       },
       {
         "computePrecision" : "Mixed (Float16, Int32)",
@@ -4555,39 +4175,6 @@
         ]
       },
       {
-        "computePrecision" : "Mixed (Float16, Int32)",
-        "outputSchema" : [
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 8192)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 8192]",
-            "name" : "out",
-            "type" : "MultiArray"
-          }
-        ],
-        "stateSchema" : [
-
-        ],
-        "name" : "B8192",
-        "mlProgramOperationTypeHistogram" : {
-          "Ios18.matmul" : 8,
-          "Ios18.gelu" : 1,
-          "Ios18.concat" : 17,
-          "Ios16.einsum" : 2048,
-          "Ios18.add" : 1040,
-          "Ios18.realDiv" : 2,
-          "Ios18.abs" : 2,
-          "Ios18.softmax" : 1024,
-          "Ios18.layerNorm" : 2,
-          "Ios18.transpose" : 1,
-          "Ios16.reduceMax" : 2,
-          "Ios18.reshape" : 12,
-          "Split" : 19,
-          "Ios18.mul" : 6
-        },
         "inputSchema" : [
           {
             "hasShapeFlexibility" : "0",
@@ -4676,26 +4263,6 @@
             "formattedType" : "MultiArray (Float16 1024 × 1024)",
             "shortDescription" : "",
             "shape" : "[1024, 1024]",
-            "name" : "wqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bqp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
             "name" : "wk",
             "type" : "MultiArray"
           },
@@ -4707,26 +4274,6 @@
             "shortDescription" : "",
             "shape" : "[1, 1024, 1, 1]",
             "name" : "bk",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1024 × 1024)",
-            "shortDescription" : "",
-            "shape" : "[1024, 1024]",
-            "name" : "wkp",
-            "type" : "MultiArray"
-          },
-          {
-            "hasShapeFlexibility" : "0",
-            "isOptional" : "0",
-            "dataType" : "Float16",
-            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 1)",
-            "shortDescription" : "",
-            "shape" : "[1, 1024, 1, 1]",
-            "name" : "bkp",
             "type" : "MultiArray"
           },
           {
@@ -4829,7 +4376,42 @@
             "name" : "bf2",
             "type" : "MultiArray"
           }
-        ]
+        ],
+        "computePrecision" : "Mixed (Float16, Int32)",
+        "storagePrecision" : "Float16",
+        "stateSchema" : [
+
+        ],
+        "outputSchema" : [
+          {
+            "hasShapeFlexibility" : "0",
+            "isOptional" : "0",
+            "dataType" : "Float16",
+            "formattedType" : "MultiArray (Float16 1 × 1024 × 1 × 8192)",
+            "shortDescription" : "",
+            "shape" : "[1, 1024, 1, 8192]",
+            "name" : "out",
+            "type" : "MultiArray"
+          }
+        ],
+        "name" : "B8192",
+        "mlProgramOperationTypeHistogram" : {
+          "Ios18.conv" : 2,
+          "Ios18.matmul" : 6,
+          "Ios18.gelu" : 1,
+          "Ios18.concat" : 17,
+          "Ios16.einsum" : 2048,
+          "Ios18.add" : 1038,
+          "Ios18.realDiv" : 2,
+          "Ios18.abs" : 2,
+          "Ios18.softmax" : 1024,
+          "Ios18.transpose" : 1,
+          "Ios18.layerNorm" : 2,
+          "Ios16.reduceMax" : 2,
+          "Ios18.reshape" : 10,
+          "Split" : 19,
+          "Ios18.mul" : 6
+        }
       },
       {
         "computePrecision" : "Mixed (Float16, Int32)",

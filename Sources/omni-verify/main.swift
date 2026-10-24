@@ -7917,6 +7917,21 @@ if args.count >= 5 && args[1] == "aneprogram" {
     }
     exit(0)
 }
+// One function of two builds of a program: see ANEHintAB.pair.
+if args.count >= 5 && args[1] == "anepair" {
+    if #available(macOS 15.0, *) {
+        try ANEHintAB.pair(URL(fileURLWithPath: args[2]), URL(fileURLWithPath: args[3]), function: args[4],
+                           seconds: args.count > 5 ? Double(args[5]) ?? 3 : 3)
+    }
+    exit(0)
+}
+// Core ML's load and prediction options on one function: see ANEHintAB.
+if args.count >= 4 && args[1] == "anehint" {
+    if #available(macOS 15.0, *) {
+        try ANEHintAB.run(compiled: URL(fileURLWithPath: args[2]), function: args[3], seconds: args.count > 4 ? Double(args[4]) ?? 3 : 3)
+    }
+    exit(0)
+}
 // One call per sequence against a batch on the Neural Engine: see ANEBatchAB.
 if args.count >= 4 && args[1] == "anebatch" {
     if #available(macOS 15.0, *) { try await ANEBatchAB.run(modelDir: URL(fileURLWithPath: args[2]), cache: URL(fileURLWithPath: args[3])) }

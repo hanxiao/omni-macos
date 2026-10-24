@@ -3,7 +3,7 @@ segment makes (a 1080p clip ~4,130 tokens, square ~6,090): ONE LAYER as a block 
 inside (anelib.py), called once per layer with that layer's weights, which ANETextBackend reads from
 the baked program's own weight file (the same fp16 tensors, already scaled and rotated: no copy).
 The layer is the baked one's (build_nano_text.py, build_small_text.py) with every weight an input
-and the linears as matmuls. Output `out`, the layer's hidden (1, C, 1, L); the final norm and the
+and the linears as matmuls; rotate-half its grouped conv, a constant of the graph. Output `out`, the layer's hidden (1, C, 1, L); the final norm and the
 pick are done on the CPU.
 
 Measured at 6,144 tokens (index.md, "The long sequences"): baked, Nano took 742 s to compile and
@@ -26,24 +26,38 @@ LENGTHS = "2560,3072,4224,4992,5504,6400"
 QBLOCK = 128
 
 
+def rotate_groups(heads, d):
+    """rotate_half per head as a grouped 1x1 conv's weight: the baked programs' (exact)."""
+    R = np.zeros((heads * d, d, 1, 1), dtype=np.float16); half = d // 2
+    for h in range(heads):
+        for j in range(half):
+            R[h * d + j, half + j] = -1
+            R[h * d + half + j, j] = 1
+    return R
+
+
 def nano_layer(L, C=768, H=12, F=3072):
     """build_nano_text.py's layer: RMSNorm as the l2 norm of x/64, RoPE folded into q and k (Wq
     carries 1/sqrt(d)), bidirectional attention with a key mask for the padding."""
     vec = lambda c=C: spec(1, c, 1, 1)
     specs = dict(h=spec(1, C, 1, L), cos=spec(1, C, 1, L), sin=spec(1, C, 1, L), mask=spec(1, L, 1, 1),
-                 g1=vec(), wq=spec(C, C), wqp=spec(C, C), wk=spec(C, C), wkp=spec(C, C), wv=spec(C, C), wo=spec(C, C),
+                 g1=vec(), wq=spec(C, C), wk=spec(C, C), wv=spec(C, C), wo=spec(C, C),
                  g2=vec(), wg=spec(F, C), wu=spec(F, C), wd=spec(C, F))
+    R = rotate_groups(H, C // H)
 
     def rms(t, g, tag):
         n = mb.reduce_l2_norm(x=mb.mul(x=t, y=np.float16(1 / 64), name=f"{tag}_s"), axes=[1], keep_dims=True, name=f"{tag}_l2")
         inv = mb.real_div(x=np.float16(np.sqrt(C) / 64), y=mb.add(x=n, y=np.float16(1e-4), name=f"{tag}_e"), name=f"{tag}_inv")
         return mb.mul(x=mb.mul(x=t, y=inv, name=f"{tag}_n"), y=g, name=f"{tag}_w")
 
-    def body(h, cos, sin, mask, g1, wq, wqp, wk, wkp, wv, wo, g2, wg, wu, wd):
+    def body(h, cos, sin, mask, g1, wq, wk, wv, wo, g2, wg, wu, wd):
         xn = rms(h, g1, "n1")
-        rope = lambda w, wp, t: mb.add(x=mb.mul(x=lin(xn, w, None, C, L, t), y=cos, name=f"{t}_c"),
-                                       y=mb.mul(x=lin(xn, wp, None, C, L, t + "p"), y=sin, name=f"{t}_s"), name=f"{t}_r")
-        q, k, v = rope(wq, wqp, "q"), rope(wk, wkp, "k"), lin(xn, wv, None, C, L, "v")
+
+        def rope(w, t):
+            y = lin(xn, w, None, C, L, t)
+            return mb.add(x=mb.mul(x=y, y=cos, name=f"{t}_c"),
+                          y=mb.mul(x=mb.conv(x=y, weight=R, groups=H, name=f"{t}p"), y=sin, name=f"{t}_s"), name=f"{t}_r")
+        q, k, v = rope(wq, "q"), rope(wk, "k"), lin(xn, wv, None, C, L, "v")
         h = mb.add(x=h, y=lin(attention(q, k, v, mask, H, L, "at", most=QBLOCK), wo, None, C, L, "o"), name="r1")
         xn2 = rms(h, g2, "n2")
         g = lin(xn2, wg, None, F, L, "g")
@@ -66,7 +80,7 @@ def small_layer(L, C=1024, H=16, KV=8, D=128, F=3072):
         return I
     Iq, Ik = indicator(H), indicator(KV)
     specs = dict(h=spec(1, C, 1, L), cos=spec(1, QC, 1, L), sin=spec(1, QC, 1, L),
-                 g1=vec(), wq=spec(QC, C), wqp=spec(QC, C), wk=spec(KC, C), wkp=spec(KC, C), wv=spec(KC, C),
+                 g1=vec(), wq=spec(QC, C), wk=spec(KC, C), wv=spec(KC, C),
                  qn=vec(QC), qnp=vec(QC), kn=vec(KC), knp=vec(KC), wo=spec(C, QC),
                  g2=vec(), wg=spec(F, C), wu=spec(F, C), wd=spec(C, F))
 
@@ -100,14 +114,17 @@ def small_layer(L, C=1024, H=16, KV=8, D=128, F=3072):
                      y=mb.mul(x=mb.mul(x=yP, y=wnp, name=f"{tag}_pw"), y=s, name=f"{tag}_ps"), name=f"{tag}_num")
         return mb.mul(x=num, y=invc, name=f"{tag}_rot")
 
-    def body(h, cos, sin, g1, wq, wqp, wk, wkp, wv, qn, qnp, kn, knp, wo, g2, wg, wu, wd):
+    Rq, Rk = rotate_groups(H, D), rotate_groups(KV, D)
+
+    def body(h, cos, sin, g1, wq, wk, wv, qn, qnp, kn, knp, wo, g2, wg, wu, wd):
         bq = query_block(L, QBLOCK)
         NB = L // bq
         # A query block sees the keys before it unmasked and its own block under the triangle.
         tri = np.where(np.arange(bq)[:, None] <= np.arange(bq)[None, :], 0, -30000).astype(np.float16).reshape(1, bq, 1, bq)
         xn = rms(h, g1, "n1")
-        q = head_rope(lin(xn, wq, None, QC, L, "q"), lin(xn, wqp, None, QC, L, "qp"), Iq, qn, qnp, H, cos, sin, "qr")
-        k = head_rope(lin(xn, wk, None, KC, L, "k"), lin(xn, wkp, None, KC, L, "kp"), Ik, kn, knp, KV, cos, sin, "kr")
+        q0, k0 = lin(xn, wq, None, QC, L, "q"), lin(xn, wk, None, KC, L, "k")
+        q = head_rope(q0, mb.conv(x=q0, weight=Rq, groups=H, name="qp"), Iq, qn, qnp, H, cos, sin, "qr")
+        k = head_rope(k0, mb.conv(x=k0, weight=Rk, groups=KV, name="kp"), Ik, kn, knp, KV, cos, sin, "kr")
         v = lin(xn, wv, None, KC, L, "v")
         qs = mb.split(x=q, num_splits=H, axis=1, name="qsplit")
         ks = mb.split(x=mb.transpose(x=k, perm=[0, 3, 2, 1], name="kT"), num_splits=KV, axis=3, name="ksplit")

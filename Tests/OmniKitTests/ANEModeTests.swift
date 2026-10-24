@@ -75,6 +75,32 @@ final class ANEModeTests: XCTestCase {
         XCTAssertGreaterThan(Self.cosine(try XCTUnwrap(gpu.embedImage(imgs[0])), try XCTUnwrap(ane.embedImage(imgs[0]))), 0.99)
     }
 
+    /// One batch that takes every route a text takes through `encode(batch:)` at once - labels packed
+    /// into the shortest length (Nano's too, since its L32 takes a whole mask) and lengths batched up
+    /// to 512, where the tokenizer cuts every text (its tokenizer.json; the longer routes are a video
+    /// segment's, testNeuralEngineModeReleasesTheGPUTowersAndKeepsTheSpace) - each vector as alone and
+    /// in the GPU path's space, nothing handed to the GPU.
+    func testEveryTextRouteInOneBatch() async throws {
+        guard #available(macOS 15.0, *) else { throw XCTSkip("needs macOS 15") }
+        guard let dir = ProcessInfo.processInfo.environment["OMNI_NANO_MODEL_DIR"], FileManager.default.fileExists(atPath: dir) else {
+            throw XCTSkip("OMNI_NANO_MODEL_DIR not set")
+        }
+        let modelDir = URL(fileURLWithPath: dir)
+        let gpu = try await OmniEngine.loadValidated(modelDir: modelDir)
+        let ane = try await OmniEngine.loadValidated(modelDir: modelDir)
+        guard ane.setComputeUnit(.neuralEngine, cache: Self.cache) else { throw XCTSkip("no Neural Engine") }
+        let words = ["harbor", "budget", "review", "notes", "quiet", "dawn", "invoice", "travel"]
+        func text(_ n: Int) -> String { (0 ..< n).map { words[($0 * 7 + n) % words.count] }.joined(separator: " ") }
+        let texts = ["cat", "dog", "red car", "sunset over the sea", "a", text(40), text(100), text(300), text(3_000)]
+        let together = ane.embedTextBatch(texts, as: .passage), onGPU = gpu.embedTextBatch(texts, as: .passage)
+        XCTAssertEqual(ane.neuralEngineFallbacks, 0, "a text went to the GPU in Neural Engine mode")
+        for (i, t) in texts.enumerated() {
+            let alone = try XCTUnwrap(ane.embedTextBatch([t], as: .passage).first)
+            XCTAssertGreaterThan(Self.cosine(together[i], alone), 0.9999, "\(t.prefix(20)) (\(t.count) chars)")
+            XCTAssertGreaterThan(Self.cosine(together[i], onGPU[i]), 0.99, "\(t.prefix(20)) (\(t.count) chars)")
+        }
+    }
+
     /// The switch flipped while another thread embeds: every image and query still gets a vector in
     /// the GPU path's space, whichever unit answers it at that moment.
     func testSwitchingUnderLoadNeverDropsAVector() async throws {

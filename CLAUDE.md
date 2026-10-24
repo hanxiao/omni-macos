@@ -148,7 +148,12 @@ codebase were already measured there, and many were rejected.
   its own GPU time, power by unit, footprint, every answer; `analyze.py <run>`), and `benchgoal.sh`
   / `benchcases.py` (the benchmark per arm with the same attribution, per case). The switch through the
   real UI: `Scripts/compute-unit-ui.sh` (UITests/ComputeUnitUITests on a renamed copy, its GPU per step;
-  testing.md); the ANE text path one call per sequence against batched: `omni-verify anebatch <model> <cache>`.
+  testing.md); the ANE text path one call per sequence against batched, and a waited-on batch beside
+  indexing: `omni-verify anebatch <model> <cache>`. Core ML's own knobs on one function (fastPrediction,
+  output backings): `anehint <mlmodelc> <function>`; one function of two builds, outputs and speed:
+  `anepair <a> <b> <function>`.
+- Search on the CPU (Neural Engine mode): `OMNI_COMPUTE=neuralEngine omni-verify bench <nano> --only
+  store_build,queries` with `OMNI_SEARCH_TIMING=1` for the phases (index.md, "Search on the CPU").
 - Image indexing end to end on a scratch store: `omni-verify imgindex <model> <imageDir>`.
 - Model-free probes for MLX regressions: `ocr-verify x --probe-qmm | --probe-gather |
   --probe-rowexact [--causal-sweep]`. Re-run them on any MLX or toolchain change.
@@ -312,7 +317,10 @@ codebase were already measured there, and many were rejected.
   long sequences (HD video's backbone one layer a call on the baked program's weights), and the mode
   under stress (where work really runs, search on the CPU, the stand-down, the four-arm table), and the
   switch through the real UI (the label vocabulary one call at a time; the ANE text path batched,
-  Small's short sequences packed, queries let in between batches).
+  Small's short sequences packed, queries let in between batches), search on the CPU (native scans,
+  selection and rescore; ties by file id), and the programs without their rotated copies (Nano's
+  labels packed, waited-on batches let in, programs loaded from the cache: compiled forms follow the
+  path).
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
   and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names, Shortcuts,
