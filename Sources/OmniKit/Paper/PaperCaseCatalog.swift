@@ -230,11 +230,14 @@ public enum PaperCaseCatalog {
     /// report names it, so a partial run is never mistaken for the full table. nil runs them all.
     nonisolated(unsafe) public static var onlyCases: Set<PaperCaseID>? = nil
 
-    public static func specs(memoryBytes: Int, scale: Double = 1.0) -> [PaperCaseSpec] {
+    /// `modelDim`: the engine's width. The shared store the query and write rows search with the
+    /// engine's own query vectors is built at it; at a fixed 768 every Small search (1,024) was a
+    /// dimension mismatch answered empty at once, and Small's query rows read 0.01 ms.
+    public static func specs(memoryBytes: Int, scale: Double = 1.0, modelDim: Int = 768) -> [PaperCaseSpec] {
         // What a user sees first, then what the paper's ablations need: indexing, the store every
         // query and write row runs on, queries, search under load, then the mechanisms.
         let all = [canary(scale), indexPass(scale), coverage(scale), indexImage(scale), saveEdit(scale),
-                   storeBuild(scale), queries(scale), searchWhileIndexing(scale),
+                   storeBuild(scale, dim: modelDim), queries(scale), searchWhileIndexing(scale),
                    searchUnderWrites(scale), gpuApp(scale), memoryTrace(scale),
                    textLever(scale), sdpa(scale), gate(scale), scan(memoryBytes, scale),
                    recall(memoryBytes, scale), recallScale(scale), select(memoryBytes, scale), compact(scale),
@@ -571,10 +574,10 @@ public enum PaperCaseCatalog {
     /// The store every query and write row runs on, built once per run from seeded vectors. Its
     /// shape is a personal index's: many small files, a few very long ones, images among them, a
     /// share of passages repeated across files, and a folder tree to remove a branch of.
-    private static func storeBuild(_ scale: Double) -> PaperCaseSpec {
+    private static func storeBuild(_ scale: Double, dim: Int) -> PaperCaseSpec {
         let p = PaperParams([
             PaperParameter("files", .int(250_000), scaling: .scaled(minimum: 4_000)),
-            PaperParameter("dim", .int(768)),
+            PaperParameter("dim", .int(dim)),
             PaperParameter("image_every", .int(8)),
             PaperParameter("long_every", .int(5_000)),
             PaperParameter("long_rows", .int(3_000)),

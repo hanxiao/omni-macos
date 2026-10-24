@@ -4,6 +4,7 @@
 // is compared against an idle one of the same length.
 //   powerlog <seconds>                 energy over an idle window
 //   powerlog -- <command> [args...]    energy over the command's run
+//   powerlog --stream [seconds]        "<unix time> cpuW gpuW aneW dramW" each interval, until killed
 import Foundation
 typealias CopyGroup = @convention(c) (CFString?, CFString?, UInt64, UInt64, UInt64) -> Unmanaged<CFMutableDictionary>?
 typealias CreateSub = @convention(c) (UnsafeMutableRawPointer?, CFMutableDictionary, UnsafeMutablePointer<Unmanaged<CFMutableDictionary>?>, UInt64, CFTypeRef?) -> OpaquePointer?
@@ -35,6 +36,23 @@ func joules(_ a: CFDictionary, _ b: CFDictionary) -> [String: Double] {
     return out
 }
 let args = Array(CommandLine.arguments.dropFirst())
+// The per-die and per-unit totals, not their parts (summing both counted every core twice).
+func units(_ e: [String: Double]) -> (cpu: Double, gpu: Double, ane: Double, dram: Double) {
+    func sum(_ f: (String) -> Bool) -> Double { e.filter { f($0.key) }.values.reduce(0, +) }
+    return (sum { $0.hasSuffix("CPU Energy") }, e["GPU Energy"] ?? sum { $0.hasPrefix("GPU") && !$0.contains("SRAM") && !$0.contains("CS") },
+            e["ANE Energy"] ?? sum { $0.hasPrefix("ANE") }, sum { $0.hasPrefix("DRAM") })
+}
+if args.first == "--stream" {
+    setvbuf(stdout, nil, _IOLBF, 0)
+    let every = Double(args.dropFirst().first ?? "1") ?? 1
+    var prev = sample(), tPrev = Date()
+    while true {
+        Thread.sleep(forTimeInterval: every)
+        let now = sample(), t = Date(), secs = t.timeIntervalSince(tPrev), u = units(joules(prev, now))
+        print(String(format: "%.3f %.3f %.3f %.4f %.3f", t.timeIntervalSince1970, u.cpu / secs, u.gpu / secs, u.ane / secs, u.dram / secs))
+        prev = now; tPrev = t
+    }
+}
 let t0 = Date(), s0 = sample()
 if args.first == "--" {
     let p = Process(); p.executableURL = URL(fileURLWithPath: args[1]); p.arguments = Array(args.dropFirst(2))
@@ -43,10 +61,7 @@ if args.first == "--" {
     Thread.sleep(forTimeInterval: Double(args.first ?? "10") ?? 10)
 }
 let secs = -t0.timeIntervalSinceNow, e = joules(s0, sample())
-func sum(_ f: (String) -> Bool) -> Double { e.filter { f($0.key) }.values.reduce(0, +) }
-// The per-die and per-unit totals, not their parts (summing both counted every core twice).
-let cpu = sum { $0.hasSuffix("CPU Energy") }, gpu = e["GPU Energy"] ?? sum { $0.hasPrefix("GPU") && !$0.contains("SRAM") && !$0.contains("CS") }
-let ane = e["ANE Energy"] ?? sum { $0.hasPrefix("ANE") }, dram = sum { $0.hasPrefix("DRAM") }
+let (cpu, gpu, ane, dram) = units(e)
 print(String(format: "POWERLOG %.2fs  CPU %.1f J (%.2f W)  GPU %.1f J (%.2f W)  ANE %.2f J (%.3f W)  DRAM %.1f J (%.2f W)",
              secs, cpu, cpu / secs, gpu, gpu / secs, ane, ane / secs, dram, dram / secs))
 if ProcessInfo.processInfo.environment["POWERLOG_CHANNELS"] != nil {

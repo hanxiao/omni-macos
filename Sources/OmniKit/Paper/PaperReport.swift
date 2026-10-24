@@ -383,7 +383,7 @@ public struct PaperReport: Sendable, Codable {
 
     private func appendCases(_ b: inout PaperLineBuffer) {
         let specs = Dictionary(uniqueKeysWithValues:
-            PaperCaseCatalog.specs(memoryBytes: statics.memoryBytes, scale: result.scale)
+            PaperCaseCatalog.specs(memoryBytes: statics.memoryBytes, scale: result.scale, modelDim: app.modelDim)
                 .map { ($0.id.rawValue, $0) })
 
         for c in result.cases {

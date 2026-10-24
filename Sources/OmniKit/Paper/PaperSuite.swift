@@ -285,7 +285,7 @@ public enum PaperSuite {
                            onProgress: @escaping @Sendable (PaperProgress) -> Void = { _ in }) -> PaperSuiteResult {
         let memoryBytes = Int(ProcessInfo.processInfo.physicalMemory)
         let capClass = PaperCapClass.forMachine(memoryBytes: memoryBytes)
-        let specs = PaperCaseCatalog.specs(memoryBytes: memoryBytes, scale: config.scale)
+        let specs = PaperCaseCatalog.specs(memoryBytes: memoryBytes, scale: config.scale, modelDim: engine.dim)
 
         // The invocation plan: every case once, plus the canary's closing invocation.
         var plan: [(spec: PaperCaseSpec, repetition: PaperRepetition)] =
