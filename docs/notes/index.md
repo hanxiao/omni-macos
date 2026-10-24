@@ -2753,3 +2753,52 @@ DRAM 2.8 W):
   (io.hanxiao.omni.chaos) has no removable-volume grant: macOS asked "OmniChaos would like to access
   files on a removable volume" and the app waited behind it. Left unanswered; the model copied to the
   internal disk.
+
+## Search on the CPU, faster (2026-10-24)
+
+Han: keep testing corner cases and pushing the Neural Engine's speed with no loss of quality, every
+feature that works on the GPU working there, and any GPU win found on the way taken.
+
+SEARCH IN NEURAL ENGINE MODE WAS MLX'S CPU BACKEND. The store's queue runs its MLX on the CPU in this
+mode (OmniCompute), and MLX's CPU kernels are generic: on the benchmark's 946k-row store a search took
+14-19 ms against 3.9 on the GPU. By phase (OMNI_SEARCH_TIMING=1):
+
+    phase (946k rows, one-bit funnel)      MLX on the CPU   now
+    one-bit scan                           3.8 ms           1.0   SIMD popcounts, 16 bytes a step
+    top-C selection (C = 7,680)            5.3-10.5         0.9   on the host, two-level
+    candidates' exact rescore              1.2              0.3   SIMD bf16 dot, the gather fused in
+    best chunk per file                    1.7              1.2   candidates in slot order
+    top K of the files                     0.4              0.1   unique keys, K picked then sorted
+
+  - The scan is integer arithmetic (popcounts weighted by powers of two), so any order gives the
+    Metal kernel's floats to the bit: alone, 3.4 -> 0.7 ms.
+  - The selection keeps topCIndices' two-level argument over unique keys (the score's order high,
+    the row low): exact, an equal score to the lower row. MLX's CPU partition over a million scores
+    was most of the search.
+  - The exact scan (full precision, under 125k rows) is OmniCompute.bf16Scores: bf16 rows against the
+    query rounded to bf16, fp32 sums rounded to bf16, which is what MLX's bf16 matmul returns. On the
+    CPU the host reducer beats MLX's scatter-reduce (6.3 -> 4.2 ms with MLX's matmul), so this mode
+    takes it.
+  - Candidates in slot order: each one reads arrays as long as the index (its vector, its rows, their
+    files), and in partition order those were scattered misses. The GPU path takes it too.
+  - TIES. The host reducer ordered equal scores by path, every other reducer by file id: the same
+    files in a different order on the CPU (OffGPUSearchTests caught it at the 9th place), and at the
+    K-th place its min-heap could keep either of two equal files. Every reducer orders ties by the
+    lower file id now, the reference too (VectorStoreReducerTests).
+  - Measured and reverted, no gain: the store's arrays hoisted into locals, a per-file slot table for
+    the dictionary, a row visitor for the iterator (offers 1.4-2.1 ms whichever).
+
+  omni-verify bench --only store_build,queries, the build before and after, interleaved, two rounds,
+  p50 ms:
+
+      row                    946k rows                                   46k rows (exact scan)
+                             GPU before / after   ANE before / after     GPU before / after   ANE before / after
+      text query, search     4.12 3.85 / 4.12 3.82  16.06 15.83 / 5.00 4.87   1.22 1.19 / 1.27 1.28  6.85 6.35 / 1.84 1.82
+      filename query         4.34 4.21 / 4.51 4.25  14.58 14.37 / 5.15 5.11   1.38 1.50 / 1.49 1.43  6.48 6.08 / 1.91 1.93
+      filtered query         3.97 3.84 / 3.91 3.99  10.07 10.17 / 5.31 5.22   1.14 1.20 / 1.14 1.06  6.77 6.81 / 1.54 1.43
+      find similar           3.94 3.81 / 3.95 3.88  17.32 15.28 / 4.82 4.77   1.08 1.18 / 1.14 1.04  6.33 6.12 / 1.75 1.55
+      identifier query       7.43 7.20 / 7.27 7.13  20.80 20.66 / 9.30 9.06   4.17 4.43 / 4.45 4.13  10.85 10.78 / 5.30 5.43
+
+  A search on the CPU is now 1.2-1.4x the GPU's at a million rows and 1.4-1.6x at 46k, from 4x and 5x.
+  GPU mode is level.
+

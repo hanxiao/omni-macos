@@ -29,6 +29,44 @@ final class OffGPUSearchTests: XCTestCase {
         XCTAssertEqual(VectorStore.quantBitsFor(baseBytes: 100_000 * 768 * 2, rowCount: 100_000), 0, "below 125k, exact on the CPU too")
     }
 
+    /// The host selection is the top C exactly, ties to the lower row, with -inf, NaN and a C past
+    /// the tiles' bound; the SIMD scan is a scalar fp32 sum rounded to bf16, at the models' widths and
+    /// an odd one, every row and a pick.
+    func testTheCPUKernelsAgainstPlainLoops() {
+        var rng = XorShift(5)
+        for (n, C) in [(1_000, 1_200), (5_000, 100), (300_000, 7_680), (40_000, 7_680)] {
+            var s = (0 ..< n).map { _ in Float(Int(rng.f() * 500)) * 0.01 }   // coarse values: many ties
+            for i in stride(from: 3, to: n, by: 11) { s[i] = -.infinity }
+            if n > 10 { s[7] = .nan }
+            let got = s.withUnsafeBufferPointer { VectorStore.topCIndicesHost($0, C: C) }
+            let want = s.indices.sorted { a, b in
+                let x = s[a].isNaN ? -Float.infinity : s[a], y = s[b].isNaN ? -Float.infinity : s[b]
+                return x != y ? x > y : (s[a].isNaN != s[b].isNaN ? !s[a].isNaN : a < b)
+            }.prefix(C).map { Int32($0) }
+            XCTAssertEqual(Set(got), Set(want), "n \(n) C \(C)")
+            XCTAssertEqual(got.count, min(C, n))
+        }
+        for dim in [768, 1024, 100] {
+            let rows = 3_000
+            let base = (0 ..< rows * dim).map { _ in UInt16(truncatingIfNeeded: Float(rng.f() * 2 - 1).bitPattern >> 16) }
+            let q = rvec(dim, &rng)
+            let qb = q.map { Float(bitPattern: OmniCompute.bf16Round($0.bitPattern)) }
+            let want = (0 ..< rows).map { i -> Float in
+                var acc: Float = 0
+                for j in 0 ..< dim { acc += Float(bitPattern: UInt32(base[i * dim + j]) << 16) * qb[j] }
+                return Float(bitPattern: OmniCompute.bf16Round(acc.bitPattern))
+            }
+            let pick: [Int32] = [2_999, 0, 17, 17, 1_500]
+            base.withUnsafeBufferPointer { b in
+                let all = OmniCompute.bf16Scores(b.baseAddress!, rows: rows, dim: dim, query: q)
+                let some = OmniCompute.bf16Scores(b.baseAddress!, rows: rows, dim: dim, query: q, pick: pick)
+                // fp32 sums in another order: equal to the bf16 ulp, which is what MLX's scores carry.
+                for i in 0 ..< rows { XCTAssertEqual(all[i], want[i], accuracy: abs(want[i]) / 128 + 1e-6, "dim \(dim) row \(i)") }
+                for (k, r) in pick.enumerated() { XCTAssertEqual(some[k], all[Int(r)]) }
+            }
+        }
+    }
+
     func testEveryResidentFormAnswersTheSameOnTheCPU() throws {
         let dim = 768, files = 6_000
         for bits in [0, 1, 3] {

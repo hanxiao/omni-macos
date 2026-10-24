@@ -6867,8 +6867,11 @@ public final class VectorStore: @unchecked Sendable {
                 // mask is a per-file mask.
                 if let r = coarseFastPathLocked(baseScore) { return r }
             } else {
-                baseScore = patchScoresLocked(maskDeadLocked(gemvSafe(mlxBase!, qv, rows: baseRows)), qv: qv)
+                baseScore = patchScoresLocked(maskDeadLocked(OmniCompute.offGPU ? cpuScoresLocked(mlxBase!, query: query)
+                                                                                : gemvSafe(mlxBase!, qv, rows: baseRows)), qv: qv)
                 // PLAIN-QUERY FAST PATH (full mode): best-chunk-per-file reduction ON the GPU.
+                // Not on the CPU (Neural Engine mode): there MLX's scatter-reduce is slower than the
+                // host reducer below (a 46k-row store, 6.3 -> 4.2 ms a search).
                 // The scores are already resident post-matmul; reading all N back and scanning
                 // them on the host was ~4ms of a ~9.5ms query at 2M rows. Delta rows (bounded by
                 // foldThreshold) are scored and merged on the host. A kind-only filter rides this
@@ -6876,7 +6879,7 @@ public final class VectorStore: @unchecked Sendable {
                 // still fall to the host reducer below.
                 // Through the builder, for the same reason as the fused path above: the stored
                 // array can be sized to a different occurrence prefix than the reduce will gather.
-                if onlyKindFiltered(filter), Self.gpuReduce, let fid = fileIDGPULocked(), baseRows > 0,
+                if !OmniCompute.offGPU, onlyKindFiltered(filter), Self.gpuReduce, let fid = fileIDGPULocked(), baseRows > 0,
                    filter.kinds.isEmpty || kindCodeGPULocked() != nil {
                     var deltaGraph: MLXArray? = nil
                     if n > baseRows {
@@ -6903,15 +6906,23 @@ public final class VectorStore: @unchecked Sendable {
             // the delta array is owned and safe to eval after the closure returns.
             if n > baseRows {
                 let deltaCount = n - baseRows
-                let ds: MLXArray = flat16.withUnsafeBytes { raw in
-                    let p = raw.baseAddress!.advanced(by: baseRows * dim * MemoryLayout<UInt16>.size)
-                    let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: p),
-                                    count: deltaCount * dim * MemoryLayout<UInt16>.size, deallocator: .none)
-                    return MLX.matmul(MLXArray(data, [deltaCount, dim], dtype: .bfloat16), qv)
+                if OmniCompute.offGPU {
+                    MLX.eval(baseScore)
+                    scores = baseScore.reshaped([baseRows]).asType(.float32).asArray(Float.self)
+                    scores.append(contentsOf: flat16.withUnsafeBufferPointer { fb in
+                        OmniCompute.bf16Scores(fb.baseAddress! + baseRows * dim, rows: deltaCount, dim: dim, query: query)
+                    })
+                } else {
+                    let ds: MLXArray = flat16.withUnsafeBytes { raw in
+                        let p = raw.baseAddress!.advanced(by: baseRows * dim * MemoryLayout<UInt16>.size)
+                        let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: p),
+                                        count: deltaCount * dim * MemoryLayout<UInt16>.size, deallocator: .none)
+                        return MLX.matmul(MLXArray(data, [deltaCount, dim], dtype: .bfloat16), qv)
+                    }
+                    MLX.eval(baseScore, ds)   // one fused GPU sync for both matmuls (was two)
+                    scores = baseScore.reshaped([baseRows]).asType(.float32).asArray(Float.self)
+                    scores.append(contentsOf: ds.reshaped([deltaCount]).asType(.float32).asArray(Float.self))
                 }
-                MLX.eval(baseScore, ds)   // one fused GPU sync for both matmuls (was two)
-                scores = baseScore.reshaped([baseRows]).asType(.float32).asArray(Float.self)
-                scores.append(contentsOf: ds.reshaped([deltaCount]).asType(.float32).asArray(Float.self))
                 // maskDeadLocked covered [0, baseRows) on the GPU; the delta was just appended raw.
                 // Now that a tombstone can sit in the delta, mask that half here - a scatter over
                 // the dead rows alone, which is empty on the overwhelmingly common path.
@@ -6981,6 +6992,16 @@ public final class VectorStore: @unchecked Sendable {
     /// Slices are offset views of a row-major array, so this copies nothing; the concatenate joins
     /// one scalar per row per span. Below the limit it is the original single call, unchanged.
     /// OMNI_GEMV_SLICE=0 restores the unsliced call for A/B.
+    /// The full-precision base's scores on the CPU (Neural Engine mode): OmniCompute.bf16Scores over
+    /// the resident rows, as gemvSafe's [rows, 1].
+    private func cpuScoresLocked(_ mat: MLXArray, query: [Float]) -> MLXArray {
+        let d = mat.asData(access: .noCopyIfContiguous)
+        let s = d.data.withUnsafeBytes { raw in
+            OmniCompute.bf16Scores(raw.bindMemory(to: UInt16.self).baseAddress!, rows: baseRows, dim: dim, query: query)
+        }
+        return MLXArray(s, [baseRows, 1])
+    }
+
     private func gemvSafe(_ mat: MLXArray, _ qv: MLXArray, rows: Int) -> MLXArray {
         let limit = Int(Int32.max) / Swift.max(1, dim)
         guard Self.gemvSlice, rows > limit else { return MLX.matmul(mat, qv) }
@@ -7125,6 +7146,70 @@ public final class VectorStore: @unchecked Sendable {
         return MLX.take(pool, sel, axis: 0)
     }
 
+    /// topCIndices on the host, for the CPU (Neural Engine mode), where MLX's partition over a
+    /// million scores took 5-10 ms of a search and this 0.5. The same two-level argument over UNIQUE
+    /// keys (the score's order in the high bits, the row in the low: an equal score goes to the lower
+    /// row): the C-th largest tile maximum is at most the C-th largest score, so the rows at or above
+    /// it hold the top C, and C of them are picked from those. NaN ranks last.
+    static func topCIndicesHost(_ s: UnsafeBufferPointer<Float>, C: Int) -> [Int32] {
+        let n = s.count
+        guard C > 0 else { return [] }
+        guard C < n else { return (0 ..< Int32(n)).map { $0 } }
+        @inline(__always) func key(_ i: Int) -> UInt64 {
+            let v = s[i], b = v.bitPattern
+            let m: UInt32 = v.isNaN ? 0 : b & 0x8000_0000 != 0 ? ~b : b | 0x8000_0000
+            return UInt64(m) << 32 | UInt64(UInt32.max - UInt32(i))
+        }
+        let t = selectTile, tiles = n / t, block = 16384, blocks = (n + block - 1) / block
+        var floor: UInt64 = 0
+        if tiles >= C {
+            var maxima = [UInt64](repeating: 0, count: tiles)
+            let per = block / t
+            maxima.withUnsafeMutableBufferPointer { m in
+                DispatchQueue.concurrentPerform(iterations: (tiles + per - 1) / per) { b in
+                    for k in b * per ..< Swift.min(tiles, (b + 1) * per) {
+                        var best: UInt64 = 0
+                        for i in k * t ..< (k + 1) * t { best = Swift.max(best, key(i)) }
+                        m[k] = best
+                    }
+                }
+            }
+            selectLargest(&maxima, C)
+            floor = maxima[0 ..< C].min() ?? 0
+        }
+        var parts = [[UInt64]](repeating: [], count: blocks)
+        parts.withUnsafeMutableBufferPointer { p in
+            DispatchQueue.concurrentPerform(iterations: blocks) { b in
+                var mine: [UInt64] = []
+                for i in b * block ..< Swift.min(n, (b + 1) * block) { let k = key(i); if k >= floor { mine.append(k) } }
+                p[b] = mine
+            }
+        }
+        var keys = parts.flatMap { $0 }
+        selectLargest(&keys, C)
+        return keys[0 ..< C].map { Int32(bitPattern: UInt32.max - UInt32(truncatingIfNeeded: $0)) }
+    }
+
+    /// Reorders `a` so its first `k` are its `k` largest (in no order): quickselect, median of three.
+    static func selectLargest(_ a: inout [UInt64], _ k: Int) {
+        guard k > 0, k < a.count else { return }
+        let target = k - 1
+        a.withUnsafeMutableBufferPointer { a in
+            var lo = 0, hi = a.count - 1
+            while lo < hi {
+                let x = a[lo], y = a[lo + (hi - lo) / 2], z = a[hi]
+                let pivot = Swift.max(Swift.min(x, y), Swift.min(Swift.max(x, y), z))
+                var i = lo, j = hi
+                while i <= j {
+                    while a[i] > pivot { i += 1 }
+                    while a[j] < pivot { j -= 1 }
+                    if i <= j { a.swapAt(i, j); i += 1; j -= 1 }
+                }
+                if target <= j { hi = j } else if target >= i { lo = i } else { break }
+            }
+        }
+    }
+
     /// The plain-query fast path for quant mode. GPU: argPartition the coarse scores for the top-C
     /// row indices (no full readback). Host: gather those C rows' exact bf16 vectors from flat16,
     /// rescore in one [C, dim] matmul, then reduce best-chunk-per-file over ONLY the C candidates
@@ -7142,8 +7227,21 @@ public final class VectorStore: @unchecked Sendable {
         var phases: [(String, Date)] = []
         func mark(_ name: String) { if tPh != nil { phases.append((name, Date())) } }
         let flat = coarse.reshaped([baseRows])
-        let topIdx = Self.topCIndices(flat, rows: baseRows, C: C)
         var deltaScores: [Float] = []
+        var cand: [Int32]
+        let offGPU = OmniCompute.offGPU
+        if offGPU {
+            // On the CPU (Neural Engine mode): the selection and the delta's scores on the host.
+            let f = flat.asType(.float32)
+            MLX.eval(f)
+            cand = f.asData(access: .noCopyIfContiguous).data.withUnsafeBytes { Self.topCIndicesHost($0.bindMemory(to: Float.self), C: C) }
+            if n > baseRows {
+                deltaScores = flat16.withUnsafeBufferPointer { fb in
+                    OmniCompute.bf16Scores(fb.baseAddress! + baseRows * dim, rows: n - baseRows, dim: dim, query: query)
+                }
+            }
+        } else {
+        let topIdx = Self.topCIndices(flat, rows: baseRows, C: C)
         if n > baseRows {
             let deltaCount = n - baseRows
             let ds: MLXArray = flat16.withUnsafeBytes { raw in
@@ -7157,14 +7255,25 @@ public final class VectorStore: @unchecked Sendable {
         } else {
             MLX.eval(topIdx)
         }
-        let cand = topIdx.asType(.int32).asArray(Int32.self)
+        cand = topIdx.asType(.int32).asArray(Int32.self)
+        }
+        // In slot order: every step below reads each candidate's entries in arrays as long as the
+        // index (its vector, its rows, their files), and in partition order those reads were
+        // scattered cache misses (946k rows: the exact rescore 0.9 -> 0.3 ms, the offers 1.7 -> 1.2).
+        cand.sort()
         mark("coarse+topC")
 
         // Exact rescore of the C candidates (host gather + one small matmul). This is the OTHER
         // half of the funnel: rerankLocked serves filtered queries, this serves plain ones, so an
         // A/B that only disables one of them measures nothing on the path most queries take.
         var exScores: [Float]
-        if Self.quantRerank {
+        if Self.quantRerank, offGPU {
+            // The candidates' rows read where they lie: the gather is the scan's own index.
+            exScores = flat16.withUnsafeBufferPointer { fb in
+                OmniCompute.bf16Scores(fb.baseAddress!, rows: n, dim: dim, query: query, pick: cand)
+            }
+            mark("exact")
+        } else if Self.quantRerank {
             // Uninitialized: every element is written below. Striped across cores: C random rows of
             // the mapped vector file (7680 x dim bf16, ~12 MB at the shipped topK) were copied on one
             // thread, measured 2.4-7.1 ms of a ~21 ms search on a 6.5M-content index.
@@ -7198,7 +7307,7 @@ public final class VectorStore: @unchecked Sendable {
             exScores = exact.reshaped([cand.count]).asType(.float32).asArray(Float.self)
             mark("exact")
         } else {
-            let cs = MLX.take(flat, topIdx, axis: 0)   // keep the coarse scores as final
+            let cs = MLX.take(flat, MLXArray(cand), axis: 0)   // keep the coarse scores as final
             MLX.eval(cs)
             exScores = cs.reshaped([cand.count]).asType(.float32).asArray(Float.self)
         }
@@ -7267,13 +7376,23 @@ public final class VectorStore: @unchecked Sendable {
         for (j, sc) in deltaScores.enumerated() where sc * liftMax >= gate {
             for r in rowsOfSlotLocked(baseRows + j) { offer(r, sc) }
         }
+        mark("offers")
 
         // Top-K files by best-chunk score, ties broken on ascending fileID. Without the secondary
         // key this sorted a Dictionary's values, whose iteration order is randomized, so which
         // member of an exact-tie pool came back varied between otherwise identical runs. The GPU
         // reduce path already breaks ties this way; this makes the two agree.
-        let winners = best.sorted { $0.value.score != $1.value.score ? $0.value.score > $1.value.score : $0.key < $1.key }
-            .prefix(topK).map { $0.value }
+        // Top-K files by best-chunk score, ties to the lower fileID: unique keys (the score's order
+        // high, the inverted file id low), the K largest picked and only those sorted - a sort of
+        // every candidate file was 0.3 ms.
+        var keys = best.map { f, v -> UInt64 in
+            let b = (v.score == 0 ? 0 : v.score).bitPattern
+            let m: UInt32 = b & 0x8000_0000 != 0 ? ~b : b | 0x8000_0000
+            return UInt64(m) << 32 | UInt64(UInt32.max - UInt32(bitPattern: f))
+        }
+        let K = Swift.min(Swift.max(topK, 0), keys.count)
+        Self.selectLargest(&keys, K)
+        let winners = keys[0 ..< K].sorted(by: >).compactMap { best[Int32(bitPattern: UInt32.max - UInt32(truncatingIfNeeded: $0))] }
         mark("reduce")
         if let tPh {
             var prev = tPh
@@ -8243,16 +8362,22 @@ public final class VectorStore: @unchecked Sendable {
         // exactly; equal-score ties at the K-th boundary are pool-equivalent (same contract as before).
         var heapScore = [Float](); heapScore.reserveCapacity(topK)   // parallel min-heaps keyed by score
         var heapRow = [Int32]()    ; heapRow.reserveCapacity(topK)
+        // The root is the WORST survivor: the lowest score, and of equal ones the higher file id, so
+        // a tie at the K-th place keeps the lower file id - the GPU reducer's rule (a heap keyed on
+        // the score alone could let either go).
+        func worse(_ a: Int, _ b: Int) -> Bool {
+            heapScore[a] != heapScore[b] ? heapScore[a] < heapScore[b] : fileID[Int(heapRow[a])] > fileID[Int(heapRow[b])]
+        }
         func siftUp(_ start: Int) {
             var i = start
-            while i > 0 { let p = (i - 1) >> 1; if heapScore[p] <= heapScore[i] { break }
+            while i > 0 { let p = (i - 1) >> 1; if !worse(i, p) { break }
                 heapScore.swapAt(p, i); heapRow.swapAt(p, i); i = p }
         }
         func siftDown(_ start: Int) {
             var i = start; let c = heapScore.count
             while true { let l = 2*i+1, r = 2*i+2; var m = i
-                if l < c && heapScore[l] < heapScore[m] { m = l }
-                if r < c && heapScore[r] < heapScore[m] { m = r }
+                if l < c && worse(l, m) { m = l }
+                if r < c && worse(r, m) { m = r }
                 if m == i { break }; heapScore.swapAt(i, m); heapRow.swapAt(i, m); i = m }
         }
         bestScore.withUnsafeBufferPointer { bsp in
@@ -8280,15 +8405,16 @@ public final class VectorStore: @unchecked Sendable {
             }
         }
         }}
-        // Order the K survivors by descending score (K is small). Ties break on path, the same rule
-        // `reduceTopKReference` uses, so the differential test stays meaningful and two runs of one
-        // query cannot disagree: bf16 scores have an 8-bit mantissa, so exact collisions inside a
-        // top-K are routine, and Swift's sort is not stable.
+        // Order the K survivors by descending score (K is small). Ties break on the lower file id,
+        // the rule of every other reducer (the GPU's, the funnel's) and of `reduceTopKReference`, so
+        // one query orders its ties the same whichever path or unit answers it: bf16 scores have an
+        // 8-bit mantissa, so exact collisions inside a top-K are routine, and Swift's sort is not
+        // stable. (Ties on path here, on file id there, put the same results in a different order
+        // on the CPU: OffGPUSearchTests.)
         let order = (0 ..< heapScore.count).sorted { (a: Int, b: Int) -> Bool in
             let sa: Float = heapScore[a], sb: Float = heapScore[b]
             if sa != sb { return sa > sb }
-            let pa: String = tables.path(rows[Int(heapRow[a])]), pb: String = tables.path(rows[Int(heapRow[b])])
-            return pa < pb
+            return fileID[Int(heapRow[a])] < fileID[Int(heapRow[b])]
         }
         let out = order.map { idx -> SearchHit in
             let ri = Int(heapRow[idx])
@@ -8307,7 +8433,7 @@ public final class VectorStore: @unchecked Sendable {
     /// The original string-keyed best-per-path reducer, kept verbatim as the differential-test oracle
     /// for `reduceTopK`. Not used in production. O(N) with a path-string hash per row.
     static func reduceTopKReference(scores: [Float], rows: [Row], tables: RowTables, filter: SearchFilter, topK: Int) -> [SearchHit] {
-        var best: [String: SearchHit] = [:]
+        var best: [String: SearchHit] = [:], fid: [String: Int32] = [:]
         best.reserveCapacity(min(rows.count, 512))
         for i in 0 ..< rows.count {
             let r = rows[i]
@@ -8317,8 +8443,9 @@ public final class VectorStore: @unchecked Sendable {
             if let e = best[tables.path(r)], e.score >= dot { continue }
             best[tables.path(r)] = SearchHit(path: tables.path(r), score: dot, snippet: "", kind: tables.kind(r), chunkIndex: r.chunkIndex, modified: tables.meta(r).modified,
                                      width: Int(tables.meta(r).width), height: Int(tables.meta(r).height), duration: tables.meta(r).duration, locator: "")
+            fid[tables.path(r)] = r.fid
         }
-        return Array(best.values).sorted { $0.score != $1.score ? $0.score > $1.score : $0.path < $1.path }
+        return Array(best.values).sorted { $0.score != $1.score ? $0.score > $1.score : fid[$0.path]! < fid[$1.path]! }
             .prefix(topK).map { $0 }
     }
 
@@ -12812,7 +12939,36 @@ public final class VectorStore: @unchecked Sendable {
         var out = [Float](repeating: 0, count: n)
         let cd = codes.asType(.uint32).asData(access: .noCopyIfContiguous)
         let block = 8192, blocks = (n + block - 1) / block
-        if Self.bitPlanes > 0, let qp = buildQueryPlanesLocked(qr, words: w, planes: Self.bitPlanes) {
+        if Self.bitPlanes == 4, w % 4 == 0, w <= 124, let qp = buildQueryPlanesLocked(qr, words: w, planes: 4) {
+            // Sixteen bytes at a time: every sum here is an integer, so any order gives the kernel's
+            // floats to the bit (946k rows 3.4 -> 0.7 ms). A byte lane counts at most 8 a vector, so
+            // up to 31 vectors (3,968 dimensions) fit it.
+            let s = qp.scalars.asArray(Float.self), v = w / 4
+            let pv = qp.planes.asArray(UInt32.self).withUnsafeBytes { pr in
+                (0 ..< 4 * v).map { pr.loadUnaligned(fromByteOffset: $0 * 16, as: SIMD16<UInt8>.self) }
+            }
+            func total(_ x: SIMD16<UInt8>) -> Int { Int(SIMD16<UInt16>(truncatingIfNeeded: x).wrappedSum()) }
+            let block = 4096, blocks = (n + block - 1) / block
+            cd.data.withUnsafeBytes { c in
+                out.withUnsafeMutableBufferPointer { o in
+                    DispatchQueue.concurrentPerform(iterations: blocks) { t in
+                        for row in t * block ..< Swift.min(n, (t + 1) * block) {
+                            var a = SIMD16<UInt8>(), a0 = a, a1 = a, a2 = a, a3 = a
+                            for k in 0 ..< v {
+                                let x = c.loadUnaligned(fromByteOffset: (row * v + k) * 16, as: SIMD16<UInt8>.self)
+                                a &+= x.nonzeroBitCount
+                                a0 &+= (x & pv[k]).nonzeroBitCount
+                                a1 &+= (x & pv[v + k]).nonzeroBitCount
+                                a2 &+= (x & pv[2 * v + k]).nonzeroBitCount
+                                a3 &+= (x & pv[3 * v + k]).nonzeroBitCount
+                            }
+                            let weighted = Float(total(a0) + 2 * total(a1) + 4 * total(a2) + 8 * total(a3))
+                            o[row] = 2 * s[0] * Float(total(a)) + 2 * s[1] * weighted + s[2]
+                        }
+                    }
+                }
+            }
+        } else if Self.bitPlanes > 0, let qp = buildQueryPlanesLocked(qr, words: w, planes: Self.bitPlanes) {
             let planes = qp.planes.asArray(UInt32.self), s = qp.scalars.asArray(Float.self), B = Self.bitPlanes
             cd.data.withUnsafeBytes { raw in
                 let c = raw.bindMemory(to: UInt32.self)

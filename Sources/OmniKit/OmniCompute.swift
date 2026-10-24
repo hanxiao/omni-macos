@@ -52,3 +52,49 @@ struct ComputeQueue: @unchecked Sendable {
         base.async { OmniCompute.scoped(work) }
     }
 }
+
+extension OmniCompute {
+    /// The store's exact scan on the CPU: each bf16 row (row-major [count, dim]) against the query,
+    /// summed in fp32 and rounded to bf16 - what MLX's bf16 matmul returns - with SIMD on every core.
+    /// MLX's own CPU matmul and scatter-reduce cost 6.3 ms a search on a 46k-row store; this and the
+    /// host reducer, 1 ms or so (index.md, "Search on the CPU, faster"). `pick`: the rows to score,
+    /// gathered in place (the funnel's candidates); every row otherwise.
+    static func bf16Scores(_ base: UnsafePointer<UInt16>, rows: Int, dim: Int, query: [Float],
+                           pick: [Int32]? = nil) -> [Float] {
+        let count = pick?.count ?? rows
+        guard count > 0, dim > 0, query.count == dim else { return [] }
+        // The query as MLX rounds it to bf16 (qv), round to nearest even.
+        let q = query.map { Float(bitPattern: bf16Round($0.bitPattern)) }
+        let lanes = 16, vectors = dim / lanes
+        let qv = (0 ..< vectors).map { k in SIMD16<Float>(q[k * lanes ..< (k + 1) * lanes]) }
+        var out = [Float](repeating: 0, count: count)
+        // Picked rows are few and scattered (7,680 candidates): small blocks, so every core reads.
+        let block = pick == nil ? 2048 : 128, blocks = (count + block - 1) / block
+        qv.withUnsafeBufferPointer { qb in
+            out.withUnsafeMutableBufferPointer { o in
+                DispatchQueue.concurrentPerform(iterations: blocks) { t in
+                    for i in t * block ..< Swift.min(count, (t + 1) * block) {
+                        let r = base + (pick.map { Int($0[i]) } ?? i) * dim
+                        let raw = UnsafeRawPointer(r)
+                        var acc = SIMD16<Float>()
+                        for k in 0 ..< vectors {
+                            let h = raw.loadUnaligned(fromByteOffset: k * lanes * 2, as: SIMD16<UInt16>.self)
+                            let f = unsafeBitCast(SIMD16<UInt32>(truncatingIfNeeded: h) &<< 16, to: SIMD16<Float>.self)
+                            acc.addProduct(f, qb[k])
+                        }
+                        var s = acc.sum()
+                        for j in vectors * lanes ..< dim { s += Float(bitPattern: UInt32(r[j]) << 16) * q[j] }
+                        o[i] = Float(bitPattern: bf16Round(s.bitPattern))
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    /// fp32 bits rounded to the nearest bf16 (ties to even), as fp32 bits; NaN kept.
+    @inline(__always) static func bf16Round(_ b: UInt32) -> UInt32 {
+        if b & 0x7F80_0000 == 0x7F80_0000, b & 0x007F_FFFF != 0 { return b | 0x0040_0000 }
+        return (b &+ 0x7FFF &+ ((b >> 16) & 1)) & 0xFFFF_0000
+    }
+}
