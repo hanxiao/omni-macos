@@ -833,13 +833,35 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         }
     }
 
+    /// How far Neural Engine mode has come, kind by kind (Han, 2026-10-24: "ready per kind"): text
+    /// from `.text`, images and recordings from `.media`, video from `.video`. A one-time build
+    /// compiles in that order and each kind moves over as its functions are in - text in about a
+    /// minute where everything took six (Nano) - so a kind's indexing waits only for its own
+    /// (`deferredKinds`). `.none` on the GPU.
+    public enum NeuralEnginePhase: Int, Comparable, Sendable {
+        case none, text, media, video
+        public static func < (a: Self, b: Self) -> Bool { a.rawValue < b.rawValue }
+    }
+    private var _anePhase: NeuralEnginePhase = .none
+    public var neuralEnginePhase: NeuralEnginePhase { aneLock.withLock { _anePhase } }
+
+    /// The kinds Neural Engine mode cannot embed yet (their functions still compiling): an indexing
+    /// pass leaves their files for the pass the next phase starts, rather than embedding them on the
+    /// GPU. Empty on the GPU and once everything is in.
+    public var deferredKinds: Set<FileKind> {
+        let (unit, phase) = aneLock.withLock { (_computeUnit, _anePhase) }
+        guard unit == .neuralEngine, phase < .video else { return [] }
+        return phase < .media ? [.image, .audio, .video] : [.video]
+    }
+
     /// Run every model on `unit`. For the Neural Engine the programs are written from this engine's
-    /// own weights and every function compiled once on this Mac (minutes; `progress` reports it),
-    /// then text and towers switch over together; the GPU serves until then, and keeps everything
-    /// if they cannot be built. Returns whether the Neural Engine took over. Blocks: call off the
-    /// main actor.
+    /// own weights and every function compiled once on this Mac (minutes; `progress` reports it), a
+    /// kind at a time - text, then images and recordings, then video - each switching over as soon as
+    /// its functions are in (`onPhase`); the GPU serves what has not, and keeps everything if the
+    /// programs cannot be built. Returns whether the Neural Engine took everything over. Blocks: call
+    /// off the main actor.
     public func setComputeUnit(_ unit: ComputeUnit, cache: URL, progress: ((NeuralEngineBuild) -> Void)? = nil,
-                               isCancelled: (() -> Bool)? = nil) -> Bool {
+                               isCancelled: (() -> Bool)? = nil, onPhase: ((NeuralEnginePhase) -> Void)? = nil) -> Bool {
         aneLock.withLock { _computeUnit = unit }
         guard unit == .neuralEngine else {
             OmniCompute.offGPU = false
@@ -847,12 +869,13 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             // engine again (AppModel.applyComputeUnit).
             aneLock.withLock {
                 _aneText = nil
+                _anePhase = .none
                 if !_gpuTowersReleased { _aneVision = nil; _aneAudio = nil }
             }
             return false
         }
         guard #available(macOS 15.0, *), let name = Self.aneProgramName(config) else { return false }
-        if neuralEngineActive { progress?(NeuralEngineBuild(fraction: 1, stage: .loading)); return true }
+        if neuralEngineActive, neuralEnginePhase == .video { progress?(NeuralEngineBuild(fraction: 1, stage: .loading)); return true }
         let t0 = Date()
         progress?(NeuralEngineBuild(fraction: 0, stage: .writing))
         // 1. The programs, their weights the app's own. Nothing changes for callers yet: the GPU
@@ -889,22 +912,37 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             if s > Self.compiledLoadSeconds { omniPerfLog(String(format: "ane: %@ compiled again (%.1f s): no compiled programs on this Mac; building", shortest, s)) }
             return s <= Self.compiledLoadSeconds
         }
-        if (try? String(contentsOf: stamp, encoding: .utf8)) != key || !compiledHere() {
-            // Compiled and let go: a loaded function holds working buffers (ANEBlocks.Functions).
-            typealias Job = (cost: Double, stage: NeuralEngineBuild.Stage, load: () -> Bool)
-            func compile(_ program: URL?, _ stage: NeuralEngineBuild.Stage, _ names: [(name: String, cost: Double)]) -> [Job] {
-                guard let program else { return [] }
-                let f = ANEBlocks.Functions(program)
-                return names.map { n in (n.cost, stage, { defer { f.unload(n.name) }; return f.model(n.name) != nil }) }
+        let build = (try? String(contentsOf: stamp, encoding: .utf8)) != key || !compiledHere()
+        // Compiled and let go: a loaded function holds working buffers (ANEBlocks.Functions). By
+        // phase: TEXT is the lengths text reaches (the tokenizer stops at 512); MEDIA the backbone's
+        // longer lengths (an image is at most 1,344 tokens), the image sizes up to a photo's 5,120
+        // patches and the recordings'; VIDEO the rest - the layer program and the frame sizes past a
+        // photo - 45% of Nano's build, compiled whether or not the Mac had a video.
+        typealias Job = (cost: Double, stage: NeuralEngineBuild.Stage, load: () -> Bool)
+        func compile(_ program: URL?, _ stage: NeuralEngineBuild.Stage, _ names: [(name: String, cost: Double)]) -> [Job] {
+            guard let program else { return [] }
+            let f = ANEBlocks.Functions(program)
+            return names.map { n in (n.cost, stage, { defer { f.unload(n.name) }; return f.model(n.name) != nil }) }
+        }
+        func textJobs(_ keep: (String) -> Bool) -> [Job] {
+            text.functionNames.filter { keep($0.name) }.map { f in
+                (f.cost, f.name.hasPrefix("B") ? .longText : .text, { defer { text.unload(f.name) }; return text.load(f.name) })
             }
-            let jobs: [Job] =
-                text.functionNames.map { f in (f.cost, f.name.hasPrefix("B") ? .longText : .text,
-                                               { defer { text.unload(f.name) }; return text.load(f.name) }) }
-                + compile(visionProgram, .images, ANEVisionBackend.functionNames(ANEVisionBackend.defaultBuckets))
-                + compile(audioProgram, .audio, ANEAudioBackend.functionNames(ANEAudioBackend.defaultBatches))
-            let total = jobs.reduce(0) { $0 + $1.cost }
-            var done = 0.0
-            let started = Date()
+        }
+        let textMax = 512, photo = 5120
+        let visionSizes = ANEVisionBackend.defaultBuckets
+        let phases: [(NeuralEnginePhase, [Job])] = !build ? [(.text, []), (.media, []), (.video, [])] : [
+            (.text, textJobs { $0.hasPrefix("L") && Int($0.dropFirst())! <= textMax }),
+            (.media, textJobs { $0.hasPrefix("L") && Int($0.dropFirst())! > textMax }
+                + compile(visionProgram, .images, ANEVisionBackend.functionNames(visionSizes.filter { $0 <= photo }))
+                + compile(audioProgram, .audio, ANEAudioBackend.functionNames(ANEAudioBackend.defaultBatches))),
+            (.video, textJobs { $0.hasPrefix("B") }
+                + compile(visionProgram, .images, ANEVisionBackend.functionNames(visionSizes.filter { $0 > photo }))),
+        ]
+        let total = max(1, phases.reduce(0) { $0 + $1.1.reduce(0) { $0 + $1.cost } })
+        var done = 0.0
+        let started = Date()
+        for (phase, jobs) in phases {
             for job in jobs {
                 if isCancelled?() == true { omniPerfLog("ane: build cancelled"); return false }
                 // The time left at the rate so far: the costs are seconds on one Mac, the rate scales
@@ -918,13 +956,45 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                 _ = job.load()
                 done += job.cost
             }
-            try? key.write(to: stamp, atomically: true, encoding: .utf8)
-            omniPerfLog(String(format: "ane: every program compiled (%.1f s)", -t0.timeIntervalSinceNow))
+            if isCancelled?() == true { return false }
+            switch phase {
+            case .text:
+                // The query length loaded now, so a search never waits for a load.
+                _ = text.load("L\(ANETextBackend.defaultLengths[0])")
+                guard aneLock.withLock({ () -> Bool in
+                    guard _computeUnit == .neuralEngine else { return false }
+                    _aneText = text; _anePhase = .text
+                    return true
+                }) else { return false }
+                OmniCompute.offGPU = true   // the store and the map leave the GPU too
+                omniPerfLog(String(format: "ane: text on the Neural Engine (%.1f s)", -t0.timeIntervalSinceNow))
+            case .media:
+                guard installTowers(visionProgram: visionProgram, audioProgram: audioProgram, t0: t0) else { return false }
+            case .video, .none:
+                break
+            }
+            if phase == .video {
+                if build {
+                    try? key.write(to: stamp, atomically: true, encoding: .utf8)
+                    omniPerfLog(String(format: "ane: every program compiled (%.1f s)", -t0.timeIntervalSinceNow))
+                }
+                guard aneLock.withLock({ () -> Bool in
+                    guard _computeUnit == .neuralEngine else { return false }
+                    _anePhase = .video
+                    return true
+                }) else { return false }
+            }
+            onPhase?(phase)
         }
-        // The query length loaded now, so a search never waits for a load.
         progress?(NeuralEngineBuild(fraction: 1, stage: .loading))
-        _ = text.load("L\(ANETextBackend.defaultLengths[0])")
-        if isCancelled?() == true { return false }
+        return neuralEngineActive
+    }
+
+    /// The towers' programs in place of their GPU copies (the media phase): their arrays from the
+    /// app's own weights; a tower whose smallest size will not load keeps its GPU copy. False when
+    /// the unit changed meanwhile.
+    @available(macOS 15.0, *)
+    private func installTowers(visionProgram: URL?, audioProgram: URL?, t0: Date) -> Bool {
         // 3. The towers' arrays, from the app's own weights; a tower whose smallest size will not
         //    load keeps its GPU copy.
         var vision: ANEVisionBackend?, audio: ANEAudioBackend?
@@ -941,16 +1011,14 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         }
         if let v = vision, !v.ready() { vision = nil }
         if let a = audio, !a.ready() { audio = nil }
-        if isCancelled?() == true { return false }
-        // 4. Everything at once.
-        aneLock.withLock {
-            guard _computeUnit == .neuralEngine else { return }
-            _aneText = text
+        // 4. The towers, at once.
+        guard aneLock.withLock({ () -> Bool in
+            guard _computeUnit == .neuralEngine else { return false }
             if let vision { _aneVision = vision }
             if let audio { _aneAudio = audio }
-        }
-        guard neuralEngineActive else { return false }
-        OmniCompute.offGPU = true   // the store and the map leave the GPU too
+            _anePhase = .media
+            return true
+        }) else { return false }
         // Where the towers run now: an engine whose GPU towers went at an earlier switch keeps their
         // programs and builds none (it logged "GPU" for them, which they were not).
         let towersOnANE = aneLock.withLock { (_aneVision != nil, _aneAudio != nil) }
@@ -983,11 +1051,11 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         return true
     }
 
-    /// What a finished build covers: this macOS (the system's compiled form is per OS) and these
-    /// exact programs. A different key means compile again.
     /// Longer than a function takes to load from its compiled form, shorter than any compile.
     static let compiledLoadSeconds = 3.0
 
+    /// What a finished build covers: this macOS (the system's compiled form is per OS) and these
+    /// exact programs. A different key means compile again.
     static func aneProgramsKey(_ prefix: String) -> String {
         var h = SHA256()
         h.update(data: Data(ProcessInfo.processInfo.operatingSystemVersionString.utf8))

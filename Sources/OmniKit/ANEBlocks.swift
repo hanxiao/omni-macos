@@ -55,13 +55,19 @@ public enum ANEBlocks {
     /// EVERY LOADED FUNCTION HOLDS THE NEURAL ENGINE RUNTIME'S WORKING BUFFERS, so a function unused
     /// for `idleSeconds` is let go (the system keeps its compiled form: back in ~0.4 s), and the
     /// one-time build lets each go as soon as it is compiled (`unload`).
+    ///
+    /// A LOAD IS NOT HELD UNDER THE LOCK. A first load is a compile, seconds to a minute, and the
+    /// one-time build compiles while what is ready already serves (ready per kind): held, the build's
+    /// L1024 and L1344 kept every call to the loaded L32 waiting 58 s (the tag labels 4 s -> 62 s),
+    /// and the video sizes held images up the same way. Callers of one function wait for its load.
     final class Functions: @unchecked Sendable {
         let compiled: URL
         static let idleSeconds: TimeInterval = 120
         private var models: [String: MLModel] = [:], failed: Set<String> = []
+        private var loading: Set<String> = []
         private var lastUse: [String: Date] = [:]
         private(set) var seconds: [String: Double] = [:]
-        private let lock = NSLock()
+        private let lock = NSCondition()
         /// Never let go: the lengths a search uses, so no query waits for a load after a quiet spell.
         let pinned: Set<String>
 
@@ -72,30 +78,33 @@ public enum ANEBlocks {
         }
 
         func model(_ name: String) -> MLModel? {
-            lock.withLock {
-                let now = Date()
-                for (n, t) in lastUse where n != name && !pinned.contains(n) && now.timeIntervalSince(t) > Self.idleSeconds {
-                    models[n] = nil; lastUse[n] = nil
-                }
-                lastUse[name] = now
-                if let m = models[name] { return m }
-                guard !failed.contains(name) else { return nil }
-                let c = MLModelConfiguration()
-                c.computeUnits = .cpuAndNeuralEngine
-                c.functionName = name
-                let t0 = Date()
-                do {
-                    let m = try MLModel(contentsOf: compiled, configuration: c)
-                    seconds[name] = -t0.timeIntervalSinceNow
-                    models[name] = m
-                    omniPerfLog(String(format: "ane: %@ %@ ready (%.1f s)", compiled.deletingPathExtension().lastPathComponent, name, seconds[name]!))
-                    return m
-                } catch {
-                    failed.insert(name)
-                    omniPerfLog("ane: \(compiled.deletingPathExtension().lastPathComponent) \(name) not loaded: \(error.localizedDescription)")
-                    return nil
-                }
+            lock.lock()
+            let now = Date()
+            for (n, t) in lastUse where n != name && !pinned.contains(n) && now.timeIntervalSince(t) > Self.idleSeconds {
+                models[n] = nil; lastUse[n] = nil
             }
+            lastUse[name] = now
+            while loading.contains(name) { lock.wait() }
+            if let m = models[name] { lock.unlock(); return m }
+            guard !failed.contains(name) else { lock.unlock(); return nil }
+            loading.insert(name)
+            lock.unlock()
+            let c = MLModelConfiguration()
+            c.computeUnits = .cpuAndNeuralEngine
+            c.functionName = name
+            let t0 = Date()
+            var why = ""
+            let m: MLModel?
+            do { m = try MLModel(contentsOf: compiled, configuration: c) } catch { m = nil; why = error.localizedDescription }
+            let s = -t0.timeIntervalSinceNow
+            lock.lock()
+            loading.remove(name)
+            if let m { models[name] = m; seconds[name] = s } else { failed.insert(name) }
+            lock.broadcast()
+            lock.unlock()
+            let program = compiled.deletingPathExtension().lastPathComponent
+            omniPerfLog(m != nil ? String(format: "ane: %@ %@ ready (%.1f s)", program, name, s) : "ane: \(program) \(name) not loaded: \(why)")
+            return m
         }
     }
 

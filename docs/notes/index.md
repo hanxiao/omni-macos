@@ -2958,3 +2958,33 @@ past it: `omni-verify chunkdump` (the indexer's extraction and cutter) and Tools
 (the same tokenizer without the cut) - a random 50k of 2.86M chunks of a real ~/Documents: Nano 40% of
 chunks past 512, 20% of all chunk text never embedded (Small 42% / 26%); the eval bed 52% / 32%; a
 Chinese 1,800-character chunk 30% embedded on Nano, 49% on Small. Measured, not changed.
+
+## The one-time build, ready per kind (2026-10-24)
+
+Han asked whether the build's minutes were new and optimal. Not new: since 0.19.0 every function compiled
+up front (Nano 369 s now: text 91, the long-sequence layers 92, vision 173, audio 1), and nothing moved
+until all of it was in. Not optimal: 45% of it is video's alone (the layer program, and the vision sizes
+past a photo's 5,120 patches: 7,296 27.6 s, 8,192 46.7 s), compiled for every Mac with or without a
+video, and text - what most of an index is - waited for all of it. Han: ready per kind.
+
+THREE PHASES, EACH MOVED OVER AS IT IS IN (OmniEngine.NeuralEnginePhase): TEXT, the lengths text reaches
+(the tokenizer stops at 512: L32 ... L512; Nano 34 s of compile); MEDIA, the backbone's longer lengths
+(an image is at most 1,344 tokens), the image sizes up to 5,120 and the recordings' - then the towers'
+programs replace their GPU copies; VIDEO, the rest. The stamp is written after the last. Indexing waits
+for the text phase only; a pass leaves the kinds not yet in (OmniEngine.deferredKinds ->
+Indexer.deferredKinds: images, recordings and video, then video; a scanned PDF counts as an image) -
+seen, so the sweep keeps what is indexed, and not embedded, so nothing runs on the GPU - and each later
+phase starts the pass that takes them (`restartAfterPause` when one is running). The tag backfill waits
+for images. DeferredKindsTests: a deferred image is not indexed, an indexed one is not swept away, the
+watcher's path leaves it too, and the pass after the phase takes it.
+
+A FUNCTION'S LOAD WAS HELD UNDER ITS PROGRAM'S LOCK, a compile included: with the build compiling
+L1024 and L1344 beside a text phase already serving, every call to the loaded L32 waited 58 s (the tag
+labels 4 s -> 61.9 s), and images waited out the video sizes the same way. Loads run outside it now;
+callers of one function wait for its load.
+
+In the app (Release, isolated instance, Nano, an empty program cache, the 27-file test corpus): text on
+the Neural Engine at 40.6 s, the label vocabulary 4.1 s, the first text results 71 s after launch (at
+~410 s before: the whole build, then the pass); images and recordings at 210 s (the GPU towers released
+then), their pass 97 s (a lecture recording ~56 s of it); video at 398 s, its 3 files in 8 s. The
+instance's own GPU time after its model load: 267 ms. The build's total is as before.

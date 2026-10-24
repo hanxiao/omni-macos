@@ -1011,6 +1011,10 @@ public final class Indexer: @unchecked Sendable {
     /// Handed to every crawl: the folder of each `.omniignore` it walks past (see
     /// `FileCrawler.onPolicyFile`). Set once, right after init, before any pass runs.
     public var onPolicyFile: (@Sendable (String) -> Void)?
+    /// Kinds to leave for a later pass (OmniEngine.deferredKinds: Neural Engine mode while their
+    /// functions compile). Their files are seen - nothing of theirs is swept away - and not embedded;
+    /// the pass the next phase starts takes them. A scanned PDF counts as an image.
+    public var deferredKinds: (@Sendable () -> Set<FileKind>)?
 
     /// Why a pass was stopped, which decides whether work ALREADY DONE is kept.
     ///
@@ -1766,9 +1770,11 @@ public final class Indexer: @unchecked Sendable {
             // Within a wave: screenshots first (Self.indexingOrder). Newest-first is the walker's
             // (newest folder and newest file first); the wave keeps its root-by-root alternation.
             for k in Array(byKind.keys) { byKind[k] = Self.indexingOrder(byKind[k]!, kind: k) }
+            let deferred = deferredKinds?() ?? []
 
         for kind in kindOrder {
             guard !isCancelled, let files = byKind[kind], !files.isEmpty else { continue }
+            if deferred.contains(kind) { for f in files { tick(f.path) }; continue }
             phaseBegin(kind)
             if kind == .text {
                 // Cross-file text batching: buffer chunks from many files and embed them in
@@ -1912,6 +1918,7 @@ public final class Indexer: @unchecked Sendable {
                         stageStore(path, chunks)
                         if stagedStores.count >= 256 { flushStagedStores() }
                     case .images, .imagePatches, .pdfScan:
+                        if case .pdfScan = item.payload, deferred.contains(.image) { return }   // its pages wait for the image phase
                         if case .pdfScan = item.payload, handleStream(item) { return }   // a long scan takes turns
                         // Scanned pages cost as images, not as text: timed on their own (.scan)
                         // and kept off the text phase's clock.
@@ -3352,6 +3359,7 @@ public final class Indexer: @unchecked Sendable {
         var deletedTop = Set<String>()
         // The crawl's own admission rules, for paths that arrive one at a time (admitsEventPath).
         // Keyed on the deepest root holding the path; a path under no known root is not gated.
+        let deferred = deferredKinds?() ?? []
         let gate = FileCrawler(roots: [], ignore: settings.ignore, enabledKinds: settings.enabledKinds,
                                ownDataPaths: settings.ownDataPaths + sidecarPaths,
                                       ownDataExceptions: settings.ownDataExceptions)
@@ -3443,8 +3451,9 @@ public final class Indexer: @unchecked Sendable {
                 continue
             }
             // Modality turned off: don't index new files of this kind, but DON'T delete ones already
-            // indexed (the user picks purge/keep explicitly when toggling it off).
-            if let kind, !settings.enabledKinds.contains(kind) { continue }
+            // indexed (the user picks purge/keep explicitly when toggling it off). A deferred kind
+            // likewise: the pass its phase starts takes the file.
+            if let kind, !settings.enabledKinds.contains(kind) || deferred.contains(kind) { continue }
             // Already in hand: from the stat above for an explicit event, or from the crawl's own
             // syscall for a directory event.
             let mtime = crawled.modified
@@ -3569,6 +3578,9 @@ public final class Indexer: @unchecked Sendable {
         }
         pipeline(work, force: true, known: .empty, indexed: { known[$0] != nil }, settings: settings) { item in
             let path = item.file.path
+            // A scan's pages wait for the image phase: returned before embedding, never an empty
+            // result (acceptCompleted would delete the file).
+            if case .pdfScan = item.payload, deferred.contains(.image) { return }
             switch item.payload {
             case .text(let pieces) where !pieces.isEmpty:
                 let fid = tNextFid; tNextFid += 1

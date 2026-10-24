@@ -49,7 +49,8 @@ codebase were already measured there, and many were rejected.
   - Indexer: crawler + text extraction + SQLite vector store + cosine search.
   - Neural Engine mode (Settings > Performance > Use the Neural Engine (ANE); every install starts on
     the GPU), all or nothing - nothing of Omni's on the GPU: the store's scans and the folder map on
-    the CPU (`OmniCompute`), indexing standing down while the programs prepare: `ANETextBackend` /
+    the CPU (`OmniCompute`), each kind moving over as its functions compile (text, then images and
+    audio, then video: `NeuralEnginePhase`; a pass defers the kinds not in yet, `deferredKinds`): `ANETextBackend` /
     `ANEProgram` (the text backbone, baked, its weight file written on the Mac from the app's own
     weights; past 1,344 tokens one layer a call over that file), `ANEVisionBackend` / `ANEAudioBackend` (the towers as block programs shipped compiled,
     the weights passed in, `ANEBlocks`); the GPU towers are released in this mode.
@@ -320,11 +321,12 @@ codebase were already measured there, and many were rejected.
   Small's short sequences packed, queries let in between batches), search on the CPU (native scans,
   selection and rescore; ties by file id), and the programs without their rotated copies (Nano's
   labels packed, waited-on batches let in, programs loaded from the cache: compiled forms follow the
-  path).
+  path), the 512-token cut measured and kept, and the one-time build ready per kind.
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
   and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names, Shortcuts,
-  Siri and Services (App Intents), a long book opened at its page (#26), Settings within the screen (#30).
+  Siri and Services (App Intents), a long book opened at its page (#26), Settings within the screen (#30),
+  Preview made to run the passage's search, and a passage opened at its own words (#26, #32, #31).
 - `testing.md` - UI tests and their traps, chaos suites, perf tour, hangwatch and the main-thread
   stall investigations, the agent eval.
 - `link.md` - Linked Macs: pairing, the TLS link, search across Macs, the measurements and the
