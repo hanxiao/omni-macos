@@ -2155,10 +2155,27 @@ final class AppModel {
             applyComputeUnit()
         }
     }
-    /// `preparing`: the one-time build on this Mac, how far and what it does; the GPU serves until
-    /// it is done.
+    /// `preparing`: the one-time build on this Mac (or the programs' load at launch), how far and
+    /// what it does. Indexing waits for it; a search meanwhile embeds its query on the GPU.
     enum NeuralEngineStatus: Equatable { case off, preparing(OmniEngine.NeuralEngineBuild), ready, unavailable }
-    private(set) var neuralEngineStatus: NeuralEngineStatus = .off
+    private(set) var neuralEngineStatus: NeuralEngineStatus = .off {
+        didSet { if case .preparing = oldValue, !neuralEngineBuilding { neuralEngineStandDownLifted() } }
+    }
+    /// INDEXING STANDS DOWN WHILE THE NEURAL ENGINE IS PREPARED, as it does for an OCR run: in that
+    /// mode Omni does not race the GPU, and the encoders are on the GPU until the programs are ready
+    /// - measured, the first 7 s of a launch embedded text there (and a one-time build's minutes).
+    /// Searches still answer meanwhile. The pass (or the catch-up, the watcher's changes, the tag
+    /// backfill) comes back when the Neural Engine is ready, or on the GPU if it cannot be.
+    private var indexingPausedForANE = false
+    private func neuralEngineStandDownLifted() {
+        if indexingPausedForANE {
+            indexingPausedForANE = false
+            startIndexing()
+        }
+        catchUpPendingRoots()
+        drainPendingFSChanges()
+        scheduleTagBackfill()
+    }
     var neuralEngineBuilding: Bool { if case .preparing = neuralEngineStatus { return true } else { return false } }
     /// The choice screen after a first download, shown once.
     private(set) var computeChoicePending = false
@@ -2196,6 +2213,7 @@ final class AppModel {
         aneBuildGeneration += 1   // a build still running for the other setting stops at its next step
         let unit = computeUnit
         guard unit == .neuralEngine else {
+            setStoreOffGPU(false)
             let released = engine.gpuTowersReleased
             _ = engine.setComputeUnit(.gpu, cache: OmniEngine.defaultANECache)
             neuralEngineStatus = .off
@@ -2204,9 +2222,13 @@ final class AppModel {
             if released { Task { await self.reloadEngine() } }
             return
         }
-        guard neuralEngineAvailable else { neuralEngineStatus = .unavailable; return }
+        guard neuralEngineAvailable else { setStoreOffGPU(false); neuralEngineStatus = .unavailable; return }
+        // The store's scans and the folder map leave the GPU at once (OmniCompute); indexing waits
+        // for the Neural Engine (neuralEngineStandDownLifted), a query meanwhile embeds on the GPU.
+        setStoreOffGPU(true)
         if engine.neuralEngineActive { neuralEngineStatus = .ready; return }
         neuralEngineStatus = .preparing(.init(fraction: 0, stage: .writing))
+        if isIndexing { indexingPausedForANE = true; pauseIndexing() }
         // An isolated run keeps its programs in scratch (-omni.ane.cache.dir), like the OCR cache.
         let cache = UserDefaults.standard.string(forKey: "omni.ane.cache.dir").map { URL(fileURLWithPath: $0, isDirectory: true) }
             ?? OmniEngine.defaultANECache
@@ -2234,12 +2256,26 @@ final class AppModel {
             await MainActor.run {
                 guard let self, self.aneBuildGate === gate, self.engine === engine, self.computeUnit == .neuralEngine else { return }
                 self.neuralEngineStatus = ok ? .ready : .unavailable
+                if !ok { self.setStoreOffGPU(false) }   // nothing to run on but the GPU
                 self.supportsImages = engine.supportsImages
                 self.audioSupported = engine.supportsAudio
             }
         }
     }
     private var aneBuildGeneration = 0 { didSet { aneBuildGate?.cancelled = true } }
+
+    /// Move the store's scans (and the folder map) between the GPU and the CPU. The store's resident
+    /// form is rebuilt for the new unit off the main actor and warmed, as at launch, so no search
+    /// pays for it: on the CPU the one-bit funnel takes over from 125k rows, on this GPU from 1M.
+    private func setStoreOffGPU(_ off: Bool) {
+        guard OmniCompute.offGPU != off else { return }
+        OmniCompute.offGPU = off
+        guard let store, let dim = engine?.dim else { return }
+        Task.detached(priority: .utility) {
+            store.computeUnitChanged()
+            _ = store.search([Float](repeating: 0, count: dim), topK: 10, markActive: false)
+        }
+    }
     private var aneBuildGate: AneBuildGate?
     private var aneBuildTask: Task<Void, Never>?
 
@@ -3761,7 +3797,8 @@ final class AppModel {
         let towers = enabledKindTowers
         let loaded: OmniEngine
         do {
-            loaded = try await OmniEngine.loadValidated(modelDir: dir, keepVision: towers.vision, keepAudio: towers.audio)
+            loaded = try await OmniEngine.loadValidated(modelDir: dir, keepVision: towers.vision, keepAudio: towers.audio,
+                                                        validateMedia: computeUnit != .neuralEngine)
         } catch {
             omniPerfLog("engine reload failed: \(error)")
             return false   // the old engine keeps working
@@ -4727,7 +4764,8 @@ final class AppModel {
             // the towers for enabled modalities so a turned-off kind never occupies VRAM.
             let towers = enabledKindTowers
             async let engineC: OmniEngine = {
-                let e = try await OmniEngine.loadValidated(modelDir: dir, keepVision: towers.vision, keepAudio: towers.audio)
+                let e = try await OmniEngine.loadValidated(modelDir: dir, keepVision: towers.vision, keepAudio: towers.audio,
+                                                           validateMedia: computeUnit != .neuralEngine)
                 omniPerfLog("launch engine done")
                 return e
             }()
@@ -4860,7 +4898,9 @@ final class AppModel {
             // behind the in-flight warm and runs on the now-compiled kernels instead of cold-compiling.
             // markActive: false: warm the reduce + base fold without faking a search-active window.
             let warm = Task.detached(priority: .userInitiated) {
-                engine.warmText()
+                // Neural Engine mode warms its own query length (setComputeUnit); the GPU's text
+                // kernels are not warmed for a GPU it does not use.
+                if !OmniCompute.offGPU { engine.warmText() }
                 omniPerfLog("launch warm-text")
                 _ = store.search([Float](repeating: 0, count: engine.dim), topK: 10, markActive: false)
                 omniPerfLog("launch warm-search")
@@ -5419,6 +5459,7 @@ final class AppModel {
     private func recomputeRoots() {
         addedFolders = dedupeKeepingOrder(resolvedRoots(addedFolders))
         roots = RootScope.canonical(addedFolders)
+        IndexedRoots.current = roots.map(\.path)
         saveAddedFolders()
         saveRoots()
         refreshFolderBookmarks()
@@ -5917,7 +5958,7 @@ final class AppModel {
         if !(pendingCatchUpRoots.isEmpty && pendingCatchUpPhotos.isEmpty) { armDrainWatchdog() }
         // indexState != .paused: indexing is paused as a whole, and a Photos change arriving then
         // started a catch-up anyway. Resume's pass drains the queue.
-        guard !indexWritesBlocked, !isPaperRunning, !indexObsolete, !ocrRunActive, powerHold == nil,
+        guard !indexWritesBlocked, !isPaperRunning, !indexObsolete, !ocrRunActive, !neuralEngineBuilding, powerHold == nil,
               indexState != .indexing, indexState != .paused, activeRoots.isEmpty,
               !fsReconcileInFlight,
               let indexer, let store, !(pendingCatchUpRoots.isEmpty && pendingCatchUpPhotos.isEmpty) else { return }
@@ -6940,6 +6981,12 @@ final class AppModel {
                     || n == legacy || n == (legacy as NSString).deletingPathExtension + ".prior" {
                     try? fm.removeItem(at: cacheDir.appendingPathComponent(n))
                 }
+                // Neural Engine mode does not race the GPU: the labels go through the Neural Engine
+                // once it is ready, not the GPU while it prepares (1.3 s of GPU time at a launch
+                // on a new index, measured). Once per index.
+                while OmniCompute.offGPU, !engine.neuralEngineActive, !Task.isCancelled {
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
                 let t0 = Date()
                 guard OmniTagger.buildCache(labels: labels, embedder: engine, to: url,
                                             isCancelled: { Task.isCancelled }) else { return nil }
@@ -7083,6 +7130,7 @@ final class AppModel {
     var fsChangesHeldBy: String? {
         if userPaused { return "indexing is paused in Omni" }
         if ocrRunActive { return "an OCR run is using the GPU" }
+        if neuralEngineBuilding { return "the Neural Engine (ANE) is being prepared" }
         if let powerHold { return powerHold.reason.prefix(1).lowercased() + powerHold.reason.dropFirst() }
         if isPaperRunning { return "the benchmark is running" }
         if indexObsolete { return "the index is waiting to be rebuilt for the current model" }
@@ -7285,6 +7333,7 @@ final class AppModel {
         guard !userPaused else { return }
         // An OCR run owns the GPU while it lasts; see beginOCRRun. endOCRRun kicks this again.
         guard !ocrRunActive else { indexingPausedForOCR = true; return }
+        guard !neuralEngineBuilding else { indexingPausedForANE = true; return }
         guard powerHold == nil else { indexingPausedForPower = true; return }
         guard !indexWritesBlocked, let indexer, let store, indexState != .indexing else { return }
         // !isPaperRunning: same reason as catchUpPendingRoots - the suite owns the engine and the
@@ -7742,7 +7791,7 @@ final class AppModel {
         // !ocrRunActive, !indexObsolete: the same stand-downs the watcher
         // drain and the catch-up pass observe. This calls indexer.update() directly too, so it
         // took the GPU from a transcription and wrote into an index waiting to be rebuilt.
-        guard !indexWritesBlocked, !isPaperRunning, !ocrRunActive, !indexObsolete,
+        guard !indexWritesBlocked, !isPaperRunning, !ocrRunActive, !neuralEngineBuilding, !indexObsolete,
               imageTagsEnabled, !tagBackfillActive, !searching,
               indexState != .indexing, indexState != .paused,
               activeRoots.isEmpty, !fsReconcileInFlight, pendingFSPaths.isEmpty || explicitRetagSince != nil,
@@ -7830,7 +7879,7 @@ final class AppModel {
         if ocrRunActive, !pendingFSPaths.isEmpty, omniPerfEnabled {
             omniPerfLog("gpu-standdown fs-drain held paths=\(pendingFSPaths.count) (ocr run active)")
         }
-        guard !indexWritesBlocked, !isPaperRunning, !ocrRunActive, !pendingFSPaths.isEmpty,
+        guard !indexWritesBlocked, !isPaperRunning, !ocrRunActive, !neuralEngineBuilding, !pendingFSPaths.isEmpty,
               !fsReconcileInFlight, let indexer, let store else { return }
         // Globally paused: keep the events buffered (resume's pass completion re-drains them).
         // Running update() now would also hit the stale cancel and silently DROP the batch.
@@ -7960,7 +8009,7 @@ final class AppModel {
     @ObservationIgnored private var runsOutstanding = 0
     /// A stand-down holding indexing that will restart it when it lifts.
     private var indexStandingDown: Bool {
-        ocrRunActive || powerHold != nil || indexWritesBlocked || isPaperRunning
+        ocrRunActive || neuralEngineBuilding || powerHold != nil || indexWritesBlocked || isPaperRunning
     }
 
     /// Set once the app is terminating so no new index pass starts after quiesceForQuit. Without it,

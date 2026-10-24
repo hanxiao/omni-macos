@@ -48,7 +48,8 @@ codebase were already measured there, and many were rejected.
     tower in fp16, the dtype it computes in (fp32 recompute for a non-finite pass).
   - Indexer: crawler + text extraction + SQLite vector store + cosine search.
   - Neural Engine mode (Settings > Performance > Use the Neural Engine (ANE); every install starts on
-    the GPU), all or nothing: `ANETextBackend` /
+    the GPU), all or nothing - nothing of Omni's on the GPU: the store's scans and the folder map on
+    the CPU (`OmniCompute`), indexing standing down while the programs prepare: `ANETextBackend` /
     `ANEProgram` (the text backbone, baked, its weight file written on the Mac from the app's own
     weights; past 2,048 tokens one layer a call over that file), `ANEVisionBackend` / `ANEAudioBackend` (the towers as block programs shipped compiled,
     the weights passed in, `ANEBlocks`); the GPU towers are released in this mode.
@@ -85,7 +86,7 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (867 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (869 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|delfolders|
@@ -141,7 +142,11 @@ codebase were already measured there, and many were rejected.
   as .mlmodelc. Through the engine: `omni-verify aneengine <model>
   <cache> <tagCache> <dirs...>` (parity, tags, speed, every compile and fallback with OMNI_PERF_LOG=1);
   `anevision`, `aneaudiotokens` (a tower alone), `anepar <mlmodelc> <function>` (placement, call cost);
-  ANEModeTests. Energy and contention: Tools/ane/powerlog.swift (sudoless) and gpuhog.swift.
+  ANEModeTests. Energy and contention: Tools/ane/powerlog.swift (sudoless; `--stream` per second) and
+  gpuhog.swift. Where the work really runs: `Tools/ane/modestress/stress.sh <run> <model> <ane cache>`
+  (an isolated instance from ANE to GPU and back under indexing, UI, REST, MCP and CLI load; per phase
+  its own GPU time, power by unit, footprint, every answer; `analyze.py <run>`), and `benchgoal.sh`
+  / `benchcases.py` (the benchmark per arm with the same attribution, per case).
 - Image indexing end to end on a scratch store: `omni-verify imgindex <model> <imageDir>`.
 - Model-free probes for MLX regressions: `ocr-verify x --probe-qmm | --probe-gather |
   --probe-rowexact [--causal-sweep]`. Re-run them on any MLX or toolchain change.
@@ -263,6 +268,15 @@ codebase were already measured there, and many were rejected.
 - fp16 SUMS OVERFLOW ON AN ATTENTION SINK. Small's token 0 carries ~23,900 from layer 3 on; an
   fp16 sum of squares for its RMSNorm overflowed and the Neural Engine port read cosine 0.975. Scale
   out first (x / max|x|), on the GPU or the ANE, wherever a reduction runs in fp16.
+- NEVER A COMPILED MLX GRAPH ON THE CPU IN THE APP. MLX builds a compiled graph's CPU kernels as a C++
+  library at run time and dlopens it, which the hardened, signed app may not: "Could not load C++
+  shared library" and the app is gone (the stamp probe's compiled B==1 forward, scoped to the CPU in
+  Neural Engine mode). Tests and tools are not hardened and never see it. What runs on the CPU in
+  that mode (the store's scans, the map) uses plain ops, the map its uncompiled epoch (OmniCompute).
+- GPU USE IS MEASURED PER PROCESS, not guessed from the code or from system power: the pid's
+  `AppUsage` accumulatedGPUTime in `ioreg -l -c AGXDeviceUserClient` (what Activity Monitor reads),
+  each record counted ONCE - child nodes repeat the creator line, and summing per line read 9.7 s
+  for 1.35 s. System power by unit (IOReport) sees every app on the Mac.
 - NEVER RUN ONE COMPILED GRAPH IN BOTH fp16 AND bf16. MLX 0.31.1 names a compiled kernel by kind
   and byte size, so both are "f2" and the second type runs the first's kernel: NaN or cosine 0.35,
   silently, across different closures of the same shape too (mlx#3427, fixed in core 0.31.2). The
@@ -290,11 +304,13 @@ codebase were already measured there, and many were rejected.
   the query that waited out the hold (hand-over, the engine's query cache, the ANE query encoder),
   repeated work done (the re-tag that dropped text, media payload keys, released contents), the
   Neural Engine measured again and in the app (programs written on the Mac, the choice, the evals),
-  all or nothing (towers as block programs, compiles on first use, GPU towers released), and the
-  long sequences (HD video's backbone one layer a call on the baked program's weights).
+  all or nothing (towers as block programs, compiles on first use, GPU towers released), the
+  long sequences (HD video's backbone one layer a call on the baked program's weights), and the mode
+  under stress (where work really runs, search on the CPU, the stand-down, the four-arm table).
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
-  and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names, Shortcuts, Siri and Services (App Intents).
+  and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names, Shortcuts,
+  Siri and Services (App Intents), a long book opened at its page (#26), Settings within the screen (#30).
 - `testing.md` - UI tests and their traps, chaos suites, perf tour, hangwatch and the main-thread
   stall investigations, the agent eval.
 - `link.md` - Linked Macs: pairing, the TLS link, search across Macs, the measurements and the

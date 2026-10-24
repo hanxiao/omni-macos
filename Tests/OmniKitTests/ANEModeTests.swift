@@ -10,6 +10,9 @@ final class ANEModeTests: XCTestCase {
     /// Kept between runs: the one-time build is minutes, and its stamp makes every later run seconds.
     static let cache = FileManager.default.temporaryDirectory.appendingPathComponent("omni-ane-tests", isDirectory: true)
 
+    /// The process-wide flag a Neural Engine engine sets moves every later test's store to the CPU.
+    override func tearDown() { OmniCompute.offGPU = false; super.tearDown() }
+
     private func image(_ seed: Int, width: Int = 512, height: Int = 512) -> CGImage {
         let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                             space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!

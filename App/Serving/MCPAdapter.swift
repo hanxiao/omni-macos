@@ -839,7 +839,7 @@ enum MCPAdapter {
                     ] as [String: Any],
                     "recompute": [
                         "type": "boolean",
-                        "description": "Run the vision model now rather than reading stored tags. Slower (a GPU forward per image, plus 5 refinement crops) and capped at \(mcpTagRecomputeMax) images. Off by default."
+                        "description": "Run the vision model now rather than reading stored tags. Slower (a forward pass per image, plus 5 refinement crops) and capped at \(mcpTagRecomputeMax) images. Off by default."
                     ] as [String: Any],
                     "top_k": [
                         "type": "integer", "minimum": 1, "maximum": 25,

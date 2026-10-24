@@ -44,6 +44,12 @@ public final class ProjectionEngine: @unchecked Sendable {
     private let engine: OmniEngine
     public init(engine: OmniEngine) { self.engine = engine }
 
+    /// A slice of the fit behind the engine's low-priority GPU gate - or in Neural Engine mode on the
+    /// CPU, where no gate is needed (OmniCompute; the epochs run uncompiled there).
+    private func gated<T>(_ work: () -> T) -> T {
+        OmniCompute.offGPU ? Device.withDefaultDevice(.cpu, work) : engine.runLowPriorityGPU(work)
+    }
+
     // Tunables shared by the gated and sync paths.
     private static let smallN = 50          // below this, skip force (PCA-2D only)
     private static let batchEpochs = 10     // epochs per gated batch / eval barrier
@@ -81,7 +87,7 @@ public final class ProjectionEngine: @unchecked Sendable {
         var Y0host = [Float]()
         var XL = MLXArray(); var Y0 = MLXArray()
         var pcaMean = MLXArray(); var pcaComps = MLXArray()
-        _ = engine.runLowPriorityGPU { () -> Int in
+        _ = gated { () -> Int in
             XL = L == n ? MLXArray(data.vectors, [n, d]).asType(.float32) : Self.hostTile(data, 0, L)
             let basis = Self.pca2DBasis(XL)
             Y0 = basis.Y; pcaMean = basis.mean; pcaComps = basis.comps
@@ -110,7 +116,7 @@ public final class ProjectionEngine: @unchecked Sendable {
                 var start = L
                 while start < n {
                     let end = min(start + tileRows, n)
-                    let part = engine.runLowPriorityGPU { () -> [Float] in
+                    let part = gated { () -> [Float] in
                         Self.pcaProjectTile(tile: Self.hostTile(data, start, end), mean: pcaMean, comps: pcaComps)
                     }
                     pcaAll.append(contentsOf: part)
@@ -137,7 +143,7 @@ public final class ProjectionEngine: @unchecked Sendable {
         var knnArr = MLXArray()
         let haveKNN = L > k
         if haveKNN {
-            _ = engine.runLowPriorityGPU { () -> Int in
+            _ = gated { () -> Int in
                 knnArr = Self.knn(XL, k: k); eval(knnArr); knnHost = knnArr.asArray(Int32.self); return 0
             }
         }
@@ -154,7 +160,7 @@ public final class ProjectionEngine: @unchecked Sendable {
         // Step 2 (gated): edge/negative-sampling buffers from the kNN graph + scaled PCA-2D force init.
         var Y = Y0
         var edgeFrom = MLXArray(); var edgeTo = MLXArray(); var negHeads = MLXArray()
-        _ = engine.runLowPriorityGPU { () -> Int in
+        _ = gated { () -> Int in
             edgeFrom = MLXArray((0 ..< L).flatMap { Array(repeating: Int32($0), count: k) })  // [L*k]
             edgeTo   = knnArr.reshaped([-1]).asType(.int32)                                    // [L*k]
             negHeads = MLX.concatenated(Array(repeating: edgeFrom, count: negRate), axis: 0)   // [L*k*negRate]
@@ -176,7 +182,7 @@ public final class ProjectionEngine: @unchecked Sendable {
         var epoch = 0
         while epoch < epochs {
             let end = min(epoch + Self.batchEpochs, epochs)
-            _ = engine.runLowPriorityGPU { () -> Int in
+            _ = gated { () -> Int in
                 Y = Self.forceEpochs(Y, edgeFrom: edgeFrom, edgeTo: edgeTo, negHeads: negHeads,
                                      n: L, negRate: negRate, epochStart: epoch, epochEnd: end, totalEpochs: epochs)
                 eval(Y)
@@ -188,7 +194,7 @@ public final class ProjectionEngine: @unchecked Sendable {
             await Task.yield()
         }
 
-        var host = engine.runLowPriorityGPU { () -> [Float] in eval(Y); return Y.asArray(Float.self) }
+        var host = gated { () -> [Float] in eval(Y); return Y.asArray(Float.self) }
         let finite = host.allSatisfy { $0.isFinite }
 
         // Place the non-landmark rows: IDW over each row's nearest landmarks (one [tile, L] GEMM per
@@ -198,7 +204,7 @@ public final class ProjectionEngine: @unchecked Sendable {
         if L < n {
             let tileRows = Self.placementTileRows(L)
             var XLt = MLXArray(); var YLmlx = MLXArray()
-            _ = engine.runLowPriorityGPU { () -> Int in
+            _ = gated { () -> Int in
                 XLt = MLX.negative(XL.transposed())   // pre-negated once; see placeTileIDW
                 YLmlx = MLXArray(host, [L, 2])
                 eval(XLt, YLmlx)
@@ -207,7 +213,7 @@ public final class ProjectionEngine: @unchecked Sendable {
             var start = L
             while start < n {
                 let end = min(start + tileRows, n)
-                let (pos, idx) = engine.runLowPriorityGPU { () -> ([Float], [Int32]) in
+                let (pos, idx) = gated { () -> ([Float], [Int32]) in
                     Self.placeTileIDW(XLtNeg: XLt, YL: YLmlx, tile: Self.hostTile(data, start, end), k: k)
                 }
                 host.append(contentsOf: pos)
@@ -635,7 +641,10 @@ public final class ProjectionEngine: @unchecked Sendable {
     /// gather/scatter ops - the loop was ~16 tiny kernel dispatches per epoch, pure launch
     /// overhead at [L, 2] sizes. Identical math, same op set, no reassociation: positions are
     /// bit-identical to the uncompiled loop (gated by projbench's layout digest).
-    private static let forceEpochCompiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(shapeless: false) { xs in
+    private static let forceEpochCompiled: @Sendable ([MLXArray]) -> [MLXArray] = compile(shapeless: false, forceEpoch)
+    /// The same epoch uncompiled: what the CPU runs in Neural Engine mode (OmniCompute: no compiled
+    /// graph on the CPU in the app).
+    private static func forceEpoch(_ xs: [MLXArray]) -> [MLXArray] {
         let (Y0, edgeFrom, edgeTo, negHeads, negTo, alpha) = (xs[0], xs[1], xs[2], xs[3], xs[4], xs[5])
         var Y = Y0
         // attractive (neighbors)
@@ -668,7 +677,8 @@ public final class ProjectionEngine: @unchecked Sendable {
         for epoch in epochStart ..< epochEnd {
             let alpha = lr * (1.0 - Float(epoch) / Float(totalEpochs))
             let negTo = MLX.randInt(0 ..< n, [nNeg]).asType(.int32)
-            Y = Self.forceEpochCompiled([Y, edgeFrom, edgeTo, negHeads, negTo, MLXArray(alpha)])[0]
+            let step = OmniCompute.offGPU ? Self.forceEpoch : Self.forceEpochCompiled
+            Y = step([Y, edgeFrom, edgeTo, negHeads, negTo, MLXArray(alpha)])[0]
             if (epoch + 1) % 16 == 0 { eval(Y) }              // throttle graph eval to bound memory
         }
         return Y

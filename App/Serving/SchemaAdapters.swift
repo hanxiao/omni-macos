@@ -566,8 +566,21 @@ private let tagMaxImageDimension = 1568
 /// was refused under a root stored as `/Users/me/Documents` although it opens the very same file,
 /// and so was any spelling of `/tmp` or `/var` without the `/private` every stored root carries
 /// (issue #23, where an agent could not OCR a file inside an indexed folder).
+/// The crawl set as the app holds it now (AppModel.recomputeRoots), for served requests, which read
+/// it off the main actor. It was read from the `omni.roots` default, which an isolated run never
+/// writes: there tag_image and ocr judged paths against the installed app's folders and answered
+/// "outside the indexed folders" for every file the run indexed.
+enum IndexedRoots {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var paths: [String]?
+    static var current: [String] {
+        get { lock.withLock { paths } ?? ((UserDefaults.standard.array(forKey: "omni.roots") as? [String]) ?? []) }
+        set { lock.withLock { paths = newValue } }
+    }
+}
+
 func pathIsInIndexedRoot(_ path: String) -> Bool {
-    let roots = ((UserDefaults.standard.array(forKey: "omni.roots") as? [String]) ?? []).map(normalizeStorePath)
+    let roots = IndexedRoots.current.map(normalizeStorePath)
     func inside(_ p: String, _ roots: [String]) -> Bool {
         roots.contains { root in p == root || p.hasPrefix(root.hasSuffix("/") ? root : root + "/") }
     }

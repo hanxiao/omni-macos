@@ -777,7 +777,7 @@ public final class VectorStore: @unchecked Sendable {
     enum Layout { case legacy, v3, v4 }
 
     private var db: OpaquePointer?
-    private let queue = DispatchQueue(label: "omni.vectorstore")
+    private let queue = ComputeQueue(label: "omni.vectorstore")   // its MLX on OmniCompute.device
     private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
     // RESIDENT-SLIM: a row holds ids only; path, kind and the per-file facts are read through the
@@ -1037,6 +1037,14 @@ public final class VectorStore: @unchecked Sendable {
     }
     nonisolated(unsafe) private static let deviceCrossoverRows: Int =
         crossoverRows(gpuCores: SystemProbe.gpuCores())
+    /// The same crossover for the CPU, where the store scans in Neural Engine mode (OmniCompute).
+    /// The exact bf16 scan there is MLX's CPU matmul (~24 ms for 1M x 768) and the one-bit tier's
+    /// popcounts run on every core: the funnel measured ahead at every rung of the bench's ladder,
+    /// 1.64x at 125k rows, 2.97x at 500k, 4.65x at 1M (M3 Ultra; the GPU's own crossover there is
+    /// 1M). The lowest rung measured ahead, as for the GPU classes. On the bench's million-chunk
+    /// store a text query went from 68 to 15.7 ms p50 (the GPU: 3.9), a search while indexing to
+    /// 15.6 (the GPU, waiting behind the indexer: 66).
+    static let cpuCrossoverRows = 125_000
     /// WIDTH vs SPEED, measured in isolation (`omni-verify qmmbench 4500000 768`, M3 Ultra, two
     /// settled runs agreeing to ~1%). Time is NOT monotone in bytes, because the kernel stops being
     /// bandwidth-bound below 4 bits:
@@ -1083,7 +1091,7 @@ public final class VectorStore: @unchecked Sendable {
         if let v = quantBaseOverride { return v }
         if let s = ProcessInfo.processInfo.environment["OMNI_QUANT_BASE"], let v = Int(s) { return v }
         if baseBytes > fullBaseCeilingBytes { return Self.scanBits }
-        return rowCount > deviceCrossoverRows ? Self.scanBits : 0
+        return rowCount > (OmniCompute.offGPU ? cpuCrossoverRows : deviceCrossoverRows) ? Self.scanBits : 0
     }
     /// Width of the quantized scan replica: 1 by default (OMNI_SCAN_BITS, below). Within the affine
     /// quantizedMM tier, 3 and not 4: measured on a 4.5M-row index it is the
@@ -1374,6 +1382,18 @@ public final class VectorStore: @unchecked Sendable {
     /// the cache would count its death twice.
     private func markDeadLocked(_ i: Int32) {
         if deadRows.insert(i).inserted { deadLog.append(i) }
+    }
+
+    /// The unit the store scans on changed (OmniCompute): the resident form it holds may be the
+    /// wrong one for it now - the one-bit funnel crosses over at 125k rows on the CPU, at 1M on this
+    /// GPU. Dropped here when it is; the next search builds the right one (the app warms it).
+    public func computeUnitChanged() {
+        queue.sync {
+            let n = slotCount
+            guard n > 0, dim > 0 else { return }
+            let want = Self.quantBitsFor(baseBytes: n * dim * MemoryLayout<UInt16>.size, rowCount: n)
+            if want != quantBits { invalidateBase() }
+        }
     }
 
     private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxFileIDRows = 0; mlxKindCode = nil; mlxKindCodeRows = 0; mlxModified = nil; mlxModifiedRows = 0; quantBase = nil; bitBase = nil; baseRows = 0
@@ -12764,6 +12784,9 @@ public final class VectorStore: @unchecked Sendable {
     /// quantizedMM path it replaces: larger is better, and the exact rerank fixes the order after.
     private func bitScanLocked(_ codes: MLXArray, query: [Float], rows n: Int) -> MLXArray {
         let qr = rotateForBitsLocked(MLXArray(query, [1, dim])).reshaped([dim])
+        // Neural Engine mode leaves the GPU alone (OmniCompute): the same arithmetic on the CPU's
+        // cores, in the kernels' order, so the scores are the kernels' to the bit.
+        if OmniCompute.offGPU { return bitScanCPU(codes, qr, rows: n) }
         if Self.bitPlanes > 0, let qp = buildQueryPlanesLocked(qr, words: bitWords, planes: Self.bitPlanes) {
             let out = Self.bitPlaneKernel(
                 [codes, qp.planes, qp.scalars,
@@ -12777,6 +12800,58 @@ public final class VectorStore: @unchecked Sendable {
             grid: (n, 1, 1), threadGroup: (256, 1, 1),
             outputShapes: [[n]], outputDTypes: [DType.float32])
         return out[0]
+    }
+
+    /// Scans run on the CPU so far (OffGPUSearchTests: the positive control that the CPU form ran).
+    nonisolated(unsafe) static var cpuBitScans = 0
+    /// bitPlaneKernel (or bitScanKernel when the query has no planes) on the CPU: popcounts per row,
+    /// rows split across the cores.
+    private func bitScanCPU(_ codes: MLXArray, _ qr: MLXArray, rows n: Int) -> MLXArray {
+        Self.cpuBitScans += 1
+        let w = bitWords
+        var out = [Float](repeating: 0, count: n)
+        let cd = codes.asType(.uint32).asData(access: .noCopyIfContiguous)
+        let block = 8192, blocks = (n + block - 1) / block
+        if Self.bitPlanes > 0, let qp = buildQueryPlanesLocked(qr, words: w, planes: Self.bitPlanes) {
+            let planes = qp.planes.asArray(UInt32.self), s = qp.scalars.asArray(Float.self), B = Self.bitPlanes
+            cd.data.withUnsafeBytes { raw in
+                let c = raw.bindMemory(to: UInt32.self)
+                out.withUnsafeMutableBufferPointer { o in
+                    DispatchQueue.concurrentPerform(iterations: blocks) { t in
+                        for row in t * block ..< Swift.min(n, (t + 1) * block) {
+                            var pcCode = 0
+                            var weighted: Float = 0
+                            for k in 0 ..< w {
+                                let word = c[row * w + k]
+                                pcCode += word.nonzeroBitCount
+                                var planeAcc: Float = 0
+                                for b in 0 ..< B { planeAcc += Float(1 << b) * Float((word & planes[b * w + k]).nonzeroBitCount) }
+                                weighted += planeAcc
+                            }
+                            o[row] = 2 * s[0] * Float(pcCode) + 2 * s[1] * weighted + s[2]
+                        }
+                    }
+                }
+            }
+        } else {
+            let q = qr.asType(.float32).asArray(Float.self)
+            cd.data.withUnsafeBytes { raw in
+                let c = raw.bindMemory(to: UInt32.self)
+                out.withUnsafeMutableBufferPointer { o in
+                    DispatchQueue.concurrentPerform(iterations: blocks) { t in
+                        for row in t * block ..< Swift.min(n, (t + 1) * block) {
+                            var acc: Float = 0
+                            for k in 0 ..< w {
+                                let bits = c[row * w + k]
+                                for b in 0 ..< 32 { acc += (bits >> UInt32(b)) & 1 == 1 ? q[k * 32 + b] : -q[k * 32 + b] }
+                            }
+                            o[row] = acc
+                        }
+                    }
+                }
+            }
+        }
+        return MLXArray(out, [n])
     }
 
     private func quantizeRowsLocked(_ range: Range<Int>, bits: Int) -> (wqs: [MLXArray], scs: [MLXArray], bss: [MLXArray]) {

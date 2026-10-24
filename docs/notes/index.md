@@ -2551,3 +2551,135 @@ fifth decimal). Measured again, nothing to index: launch peak 4.5 GB for about a
 own launch peak 3.5), at rest 2.27 GB (GPU 2.47); a fresh one-time build start to finish peaked at
 3.09 GB and ended at 2.19. The second that remains is install-before-release: the GPU towers go only
 once the programs serve, so no image ever finds neither.
+
+## Neural Engine mode under stress: where the work really runs (2026-10-23)
+
+Han, before sleeping: stress and UI-test the Neural Engine mode, the switch to the GPU and back, and
+check through the UI, MCP, the CLI and REST that the work really runs on the unit the mode claims;
+fix what breaks; record energy and speed for Nano and Small on both units, the paper's table.
+
+HOW "REALLY RUNS" IS MEASURED. Per process, not from the code and not from system power: a pid's
+GPU time is the `AppUsage` accumulatedGPUTime of its `AGXDeviceUserClient` records in `ioreg` (what
+Activity Monitor reads), sampled every second or two; system power by unit (IOReport, `powerlog
+--stream`) for the energy, since the Neural Engine has no per-process figure and this instance is
+the only thing using it. Each usage record is counted ONCE: child nodes repeat the creator line, and
+summing per line read 9.7 s of GPU for a launch that used 1.35 s. Harness: Tools/ane/modestress
+(an isolated instance indexes the eval bed from empty on the Neural Engine, the UI searches, finds
+similar and maps a folder through the perf script, REST, MCP search and tag_image and the CLI are
+loaded for 45 s, files are added; then the switch to the GPU and the same; then back).
+
+WHAT STILL RAN ON THE GPU IN NEURAL ENGINE MODE (0.19.0), and what changed:
+
+  - SEARCH ITSELF. The store scores on the GPU (base and delta matmuls, masks, the one-bit funnel's
+    Metal kernels): 90 ms of GPU per ~100 served searches on the eval bed, and on a million-chunk
+    store a few ms a query. Now the store's queue runs its MLX on the CPU in this mode (OmniCompute,
+    ComputeQueue), and the one-bit tier's two Metal kernels have a CPU form - the same popcount
+    arithmetic in the same order, rows across the cores - with identical rankings and scores in
+    every resident form (OffGPUSearchTests: full precision, one-bit, 3-bit; plain and kind-filtered;
+    a counter proves the CPU form ran). mlx-swift reads its default device once (a task-local's
+    initial value), so `Device.setDefault` cannot move later work: the scope is the queue.
+    Cost: MLX's CPU scans 100k x 768 bf16 in ~2.4 ms against 0.6 on the GPU, 1M in ~24 against 3.
+  - THE FOLDER MAP: on the CPU in this mode, its force epochs uncompiled (below).
+  - LAUNCH: 0.19.0 loaded the engine, self-tested the GPU's media path (six image and audio forwards)
+    and warmed the GPU text kernels before applying the mode - the GPU at 85 W through those seconds
+    (system power; the per-process figure taken then was the double-counted one). The media test
+    is skipped when the towers are about to go to the Neural Engine (recoverMediaPath still backs
+    it), the text warm-up too; the store's warm search is on the CPU already.
+  - INDEXING BEFORE THE PROGRAMS WERE READY. The launch pass started at once and embedded on the GPU
+    until the Neural Engine took over (6-7 s; minutes during a one-time build). Indexing now STANDS
+    DOWN while the Neural Engine prepares, as it does for an OCR run: the pass, catch-up, watcher
+    drain and tag backfill wait, Settings > Storage says "Waiting for the Neural Engine (ANE)",
+    list_sources and file_status say so to an agent, and all of it resumes when the programs are
+    ready (or on the GPU if they cannot be). A search meanwhile still embeds its query on the GPU.
+  - THE TAG LABEL CACHE (25k words, once per index) was built on the GPU before the switch: 1.3 s of
+    GPU of the 1.37 s a launch still used once the media test was gone. It now waits for the Neural
+    Engine: 69.9 s on Nano's, 252.9 s on Small's, once. A launch is down to 27-44 ms of GPU.
+
+  NEVER A COMPILED MLX GRAPH ON THE CPU IN THE APP. The first try scoped the engine's GPU gate to the
+  CPU in this mode; the model-stamp probe (the backbone's compiled B==1 forward) then ran on the CPU,
+  where MLX builds the graph's kernels as a C++ library and dlopens it - refused for the hardened,
+  signed app ("Could not load C++ shared library"), and the app was gone. Tests and tools are not
+  hardened and never saw it. The gate is as it was; the stamp probe, one text forward a launch, is
+  the encoders' only GPU work in this mode. The folder map's force epoch is compiled, so on the CPU
+  it runs the same epoch uncompiled (bit-identical by construction, projbench's digest).
+
+RESULTS, the fixed build, the instance's own GPU time per phase (eval bed, 226 files):
+
+    phase                         Nano                 Small
+    launch to Neural Engine ready 27 ms               105 ms
+    indexing from empty           8.7 ms in 177 s      16 ms in 894 s
+    UI search, similar, map       1.3 ms               1.4 ms
+    REST + MCP + CLI, 45 s        0 ms                 0 ms
+    files added and indexed       0 ms                 0 ms
+    -- switched to the GPU --     82-198 ms a phase    188-6,361 ms a phase (tag recompute)
+    -- back to the Neural Engine  0 ms in every phase  0 ms in every phase
+
+  The milliseconds left are the window's own drawing. Every served request answered: Nano 465
+  searches and 153 tag_image, Small 255 and 68, no failure, no empty answer; every added file
+  indexed in every mode (40/40 x 3); no fallback to the GPU. The ANE drew 4.6 W (Nano) and 3.5 W
+  (Small) while indexing. Peak footprint 4.8 GB (Nano, label cache and indexing at once), 6.0 GB
+  (Small); 7.9 GB for a moment in Small's switch back to the GPU (the engine reloads beside the old).
+
+ALSO FOUND BY THE STRESS RUN:
+  - The update prompt was `runModal()` at launch: with 0.19.0 published, an instance sat in the modal
+    loop and its launch pass never started (no crawl in 3 minutes). It is a sheet on the window now,
+    or the alert's own non-modal window when there is none; indexing goes on underneath.
+  - tag_image and ocr judged paths against the `omni.roots` default, which an isolated run never
+    writes: every file "outside the indexed folders". They read the app's live folder list now
+    (IndexedRoots, set where the roots are derived).
+  - The perf script's `waitfile` waited 2 minutes at most; an hour now.
+
+SEARCH ON THE CPU, AND WHAT IT COST. The first benchmark with the store on the CPU (Nano, the
+million-chunk store) read a text query at 68 ms p50 against 3.9 on the GPU: the exact bf16 scan, MLX's
+CPU matmul. The one-bit funnel's CPU form beat that scan at every rung of the same benchmark's ladder
+(1.64x at 125k rows, 4.75x at 1M, 7.1x at 2M), where on this GPU it only wins past 2M - so on the
+CPU the funnel takes over from 125k rows (VectorStore.cpuCrossoverRows), and a change of unit
+rebuilds the store's resident form in the background (computeUnitChanged, warmed as at launch).
+Text query 68 -> 15.7 ms, filtered 75 -> 10.0, find similar 63 -> 14.9, a search with nothing else
+running 63 -> 7.2; a search WHILE INDEXING 15.6 ms on the Neural Engine against 67 on the GPU, where
+the query waits behind the indexer. The memory at rest fell with it (the funnel holds 96 bytes a row
+on the CPU, the exact base 1,536): 5.6 GB against the GPU mode's 9.1.
+
+A BENCHMARK BUG FOR SMALL: the shared million-chunk store was built at a fixed 768 dimensions and
+the query rows search it with the engine's own query vectors, Small's 1,024: every such search was a
+dimension mismatch answered empty at once, and Small's text, filtered, filename and while-indexing
+rows read 0.01 ms since the first Small run (this morning's too). The store is built at the model's
+width now (PaperCaseCatalog.specs(modelDim:)); Nano's store is unchanged.
+
+GPU USE OUTSIDE THE BENCHMARK'S OWN INSTRUMENTS (its clock probe, a 0.3 s GPU attention run after
+every case; the simulated GPU app; the attention curve; the canary), per arm: Nano GPU 131 s, Nano
+ANE 2.1 s; Small GPU 285 s, Small ANE 4.5 s - in both Neural Engine arms what the clock probes alone
+take (~4.4 s). The driver books a client's GPU time seconds late (the attention curve's 3.7 s showed
+in the next case, prune_fold, which run alone uses none), so an instrument's window is extended 8 s.
+
+RETRIEVAL QUALITY (omni-verify eval, 440 queries, the bed indexed from scratch by each unit):
+Nano MRR 0.892 on the Neural Engine, 0.890 on the GPU (R@1 0.84 / 0.83, R@10 0.99 both, absent-query
+AUC 0.981 / 0.983); Small 0.930 / 0.933 (R@1 0.89 both; audio 0.693 / 0.760 over its 9 queries, the
+fp16 drift on loud passages measured before, "all or nothing").
+
+THE TABLE (omni-verify bench, full scale, M3 Ultra 512 GB, Nano's arms back to back, Small's back to
+back; p50 ms unless a unit is given; system energy less an idle baseline, CPU 2.4 / GPU 0.35 / ANE 0 /
+DRAM 2.8 W):
+
+    row                                     Nano GPU   Nano ANE   Small GPU   Small ANE
+    text indexing, tokens/s                 77,597     22,305     19,595      4,791
+    index one image                         13.1       42.0       40.2        132
+    whole pass, same files, s               7.3        27.0       29.1        130
+    text query / filtered / find similar    3.9/3.8/3.8 15.7/10.0/14.9 6.6/6.4/6.4 18.7/11.6/16.8
+    image / audio / video query             27/73/98   98/329/221 73/91/143   280/396/474
+    search, nothing else running            4.2        7.2        5.5         10.9
+    search while indexing                   67         15.6       41          18.9
+    search with a GPU app running           7.0        19.1       10.3        22.7
+    indexing lost, a GPU app running        18.0%      -0.6%      18.9%       -0.8%
+    peak memory, every kind + search, MB    11,442     5,787      9,110       8,190
+    at rest, model and index loaded, MB     9,092      5,580      6,838       7,571*
+    GPU while indexing text (system), W     70.0       2.0        116.5       0.5
+    ANE while indexing text, W              0          5.2        0           6.2
+    energy per million tokens indexed, J    1,036      667        6,439       2,794
+    whole run, wall and energy              14 min 28.9 kJ 21 min 16.4 kJ 15 min 52.8 kJ 29 min 23.4 kJ
+    retrieval MRR, 440 queries              0.890      0.892      0.933       0.930
+
+  * taken right after the run's last cases, while the Neural Engine functions they loaded still hold
+    their working buffers (released after 2 minutes idle). The app itself, Small, at rest after
+    indexing the HD clips (the long-sequence layer) and Documents: 4.20 GB on the Neural Engine, 4.25
+    on the GPU.

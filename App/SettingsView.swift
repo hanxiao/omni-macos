@@ -33,7 +33,11 @@ struct SettingsView: View {
         // Size to the selected tab rather than forcing one height across five differently sized
         // panes (the Storage tab can show an out-of-date banner plus a Model section). Keeps the
         // first section header clear of the tab strip and removes dead space on short tabs.
+        // NEVER TALLER THAN THE SCREEN (#30): Performance is ~1,150 pt and a 13-inch MacBook shows
+        // ~900; past the screen's usable height a pane scrolls inside the window, as in System
+        // Settings.
         .frame(width: 480)
+        .frame(maxHeight: Self.maxHeight)
         .fixedSize(horizontal: false, vertical: true)
         // ONE TYPE SYSTEM FOR EVERY PANE, so a new row does not invent a sixth style:
         //   row text (labels, values)            body; values .secondary
@@ -47,6 +51,16 @@ struct SettingsView: View {
         .onReceive(NotificationCenter.default.publisher(for: .omniPerfSettingsTab)) { note in
             if let raw = note.object as? String, let t = SettingsTab(rawValue: raw) { tab = t }
         }
+    }
+
+    /// The tallest a pane may be: the main screen's usable height less the window's title bar and
+    /// tab strip and a margin. `-omni.settingsScreenHeight <pt>` (launch arguments only) stands in
+    /// for a smaller screen, for a screenshot of what a MacBook shows.
+    static var maxHeight: CGFloat {
+        let screen = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)["omni.settingsScreenHeight"]
+            .flatMap { ($0 as? String).flatMap(Double.init) }.map { CGFloat($0) }
+            ?? NSScreen.main?.visibleFrame.height ?? 900
+        return max(400, screen - 140)
     }
 }
 
@@ -218,6 +232,13 @@ private struct IndexStatusRow: View {
                 HStack(spacing: 8) {
                     Image(systemName: "pause.circle").foregroundStyle(.secondary)
                     Text("Paused while transcribing")
+                    Spacer()
+                }
+            } else if model.neuralEngineBuilding {
+                // Neural Engine mode does not index on the GPU: indexing waits for the programs.
+                HStack(spacing: 8) {
+                    Image(systemName: "pause.circle").foregroundStyle(.secondary)
+                    Text("Waiting for the Neural Engine (ANE)")
                     Spacer()
                 }
             } else {
@@ -433,7 +454,7 @@ private struct ContentTypesTab: View {
             } header: {
                 Text("Long files")
             } footer: {
-                Text("Text, Markdown, web pages and code are always read in full. Logs and JSON files over 2 MB are cut at 2 MB unless this is on.")
+                Text("Text, Markdown, PDFs, documents, web pages and code are always read in full. Logs and JSON files over 2 MB are cut at 2 MB unless this is on.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 

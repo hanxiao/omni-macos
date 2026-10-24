@@ -421,10 +421,17 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
     /// fresh buffers until it passes; a low rate can pass it, and recoverMediaPath() is the runtime
     /// backstop. Attempts are capped: if every one fails the last engine is returned, so the app
     /// still runs and media files skip rather than the launch failing.
-    public static func loadValidated(modelDir: URL, gpuCacheBytes: Int = 0, keepVision: Bool = true, keepAudio: Bool = true, maxAttempts: Int = 4) async throws -> OmniEngine {
+    /// `validateMedia` false: the GPU's media path is not self-tested, because it is about to be
+    /// handed to the Neural Engine (the app in that mode: six GPU forwards at every launch, the GPU
+    /// at 85 W for those seconds, for towers released a few seconds later). recoverMediaPath() still
+    /// backs it.
+    public static func loadValidated(modelDir: URL, gpuCacheBytes: Int = 0, keepVision: Bool = true, keepAudio: Bool = true,
+                                     maxAttempts: Int = 4, validateMedia: Bool = true) async throws -> OmniEngine {
         var engine = try await OmniEngine(modelDir: modelDir, gpuCacheBytes: gpuCacheBytes, keepVision: keepVision, keepAudio: keepAudio)
         var attempt = 1
-        while attempt < maxAttempts && !engine.mediaPathFinite() {
+        // A headless tool in Neural Engine mode (OMNI_COMPUTE) took the towers there at init.
+        let validateMedia = validateMedia && !engine.neuralEngineActive
+        while validateMedia, attempt < maxAttempts && !engine.mediaPathFinite() {
             FileHandle.standardError.write(Data("OmniEngine: media self-test produced NaN on load attempt \(attempt); reloading weights\n".utf8))
             engine = try await OmniEngine(modelDir: modelDir, gpuCacheBytes: gpuCacheBytes, keepVision: keepVision, keepAudio: keepAudio)
             attempt += 1
@@ -835,6 +842,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                                isCancelled: (() -> Bool)? = nil) -> Bool {
         aneLock.withLock { _computeUnit = unit }
         guard unit == .neuralEngine else {
+            OmniCompute.offGPU = false
             // With the GPU towers released, the programs stay the towers until the app loads the
             // engine again (AppModel.applyComputeUnit).
             aneLock.withLock {
@@ -928,6 +936,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             if let audio { _aneAudio = audio }
         }
         guard neuralEngineActive else { return false }
+        OmniCompute.offGPU = true   // the store and the map leave the GPU too
         omniPerfLog(String(format: "ane: search and indexing on the Neural Engine (%.1f s; vision %@, audio %@)", -t0.timeIntervalSinceNow,
                            vision == nil ? "GPU" : "ANE", audio == nil ? "GPU" : "ANE"))
         // The GPU copies of the towers are dead weight now (Nano: 1.4 GB of footprint): every image,

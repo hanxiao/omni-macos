@@ -82,14 +82,52 @@ enum Updater {
         a.addButton(withTitle: "Install and Relaunch")          // default (rightmost, Return)
         a.addButton(withTitle: "Later").keyEquivalent = "\u{1b}"  // Esc dismisses (HIG: cancel-equivalent)
         a.addButton(withTitle: "Skip This Version")
-        switch a.runModal() {
-        case .alertFirstButtonReturn:
-            startUpdate(m)
-        case .alertThirdButtonReturn:
-            // Stop the daily launch check from re-prompting for this version.
-            OmniPrefs.set(m.version, forKey: "omni.skipVersion")
-        default:
-            break
+        present(a) { response in
+            switch response {
+            case .alertFirstButtonReturn:
+                startUpdate(m)
+            case .alertThirdButtonReturn:
+                // Stop the daily launch check from re-prompting for this version.
+                OmniPrefs.set(m.version, forKey: "omni.skipVersion")
+            default:
+                break
+            }
+        }
+    }
+
+    /// THE PROMPT NEVER HOLDS THE APP. It was `runModal()`: the launch check found a release and
+    /// the main thread sat in a modal loop until somebody answered - the launch pass never started,
+    /// so a Mac left alone after an update was released indexed nothing (measured: an instance with
+    /// 0.19.0 published logged no crawl in 3 minutes). A sheet on the main window instead, or the
+    /// alert's own window, non-modal, when there is no window to hang it on.
+    private static func present(_ a: NSAlert, _ done: @escaping @MainActor (NSApplication.ModalResponse) -> Void) {
+        if let w = NSApp.mainWindow ?? NSApp.windows.first(where: { $0.isVisible && $0.canBecomeMain }) {
+            a.beginSheetModal(for: w) { response in MainActor.assumeIsolated { done(response) } }
+            return
+        }
+        let buttons = AlertButtons(a, done)
+        a.layout()
+        for b in a.buttons { b.target = buttons; b.action = #selector(AlertButtons.pressed(_:)) }
+        a.window.center()
+        a.window.makeKeyAndOrderFront(nil)
+        NSApp.activate()
+    }
+
+    /// The buttons of an alert shown in its own window: each closes it and answers as runModal would.
+    @MainActor private final class AlertButtons: NSObject {
+        private static var live: [AlertButtons] = []
+        let alert: NSAlert
+        let done: @MainActor (NSApplication.ModalResponse) -> Void
+        init(_ alert: NSAlert, _ done: @escaping @MainActor (NSApplication.ModalResponse) -> Void) {
+            self.alert = alert; self.done = done
+            super.init()
+            Self.live.append(self)
+        }
+        @objc func pressed(_ sender: NSButton) {
+            let i = alert.buttons.firstIndex(of: sender) ?? 1
+            alert.window.orderOut(nil)
+            Self.live.removeAll { $0 === self }
+            done(NSApplication.ModalResponse(rawValue: NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + i))
         }
     }
 

@@ -1358,3 +1358,27 @@ the whole width to the window's edge, not the part the sidebar covers.
   the raw water im..." at Page 41 for "boat engine repair", where the row showed the page's opening
   before. Open-at-the-match reads the snippet (words only, so the ellipsis is ignored) and now starts
   from the matched passage.
+
+## A long book opened at its page; Settings within the screen (issues #26, #30, 2026-10-23)
+
+#26, on a 4,273-page 288 MB PDF: a double-click opened Preview 20-30 s later at an unrelated page,
+each further click opened it again, and the CPU stayed busy until quit. Three causes in OpenAtHit:
+the phrase unique to the page was checked with PDFKit's findString, which on a mismatch reads on to
+the end of the book (~2.4 ms a page, for up to hundreds of candidates, unbounded); the prefetch held
+the page cache's lock for its whole 8 s budget, so the open waited behind it and then gave up and
+opened plainly (Preview restored its last page); and every click queued its own open. Now the phrase
+is built from runs of plain words within one line of the page, so it occurs verbatim in the page's
+text and its uniqueness is a substring test - no search; the pages are read one lock-hold at a time
+(PDFKit is still read by one thread at a time); one deadline bounds it all, and a long book's deep
+page gets a ten-word phrase checked against the pages read so far; one open per file at a time. On
+a generated 4,000-page book (a running header on every page): page 100 in 252 ms with every earlier
+page checked, pages 2,000 and 3,990 in ~1.0 s; through the app, Return on the page-3,990 hit opened
+Preview at "Page 3,990 of 4,000" with the phrase found and highlighted (1,118 ms). The reporter's
+other question - only the first 2 MB of a PDF indexed? - was the Settings text, which listed text,
+Markdown, web pages and code as read in full; PDFs and converted documents are read in turns to the
+end (that book's facts on pages 100, 2,000 and 3,990 found at those pages), and it says so now.
+
+#30: Settings sized every pane to its full height (`fixedSize`), and Performance is ~1,150 pt
+against a 13-inch MacBook's ~900. The window is capped at the screen's usable height less its
+chrome, and a taller pane scrolls inside it, as System Settings does (`-omni.settingsScreenHeight`
+stands in for a smaller screen in a screenshot: 848 pt on a 900 pt screen).

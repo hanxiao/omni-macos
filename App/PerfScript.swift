@@ -37,9 +37,9 @@ enum PerfScript {
                         let files = (try? await OmniIntentSearch.run(String(raw.dropFirst(7)), limit: 5)) ?? []
                         omniPerfLog("script intent n=\(files.count) " + files.map { "\($0.name) [\($0.location)] \($0.passage.prefix(60))" }.joined(separator: " | "))
                     }
-                    else if raw.hasPrefix("waitfile:") {   // hold here until <path> exists (another process's cue)
+                    else if raw.hasPrefix("waitfile:") {   // hold here until <path> exists (another process's cue), an hour at most
                         let path = String(raw.dropFirst(9))
-                        for _ in 0 ..< 600 where !FileManager.default.fileExists(atPath: path) {
+                        for _ in 0 ..< 18_000 where !FileManager.default.fileExists(atPath: path) {
                             try? await Task.sleep(for: .milliseconds(200))
                         }
                     }
