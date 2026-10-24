@@ -875,7 +875,21 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         //    so the minutes of the build never hold the towers twice.
         let stamp = cache.appendingPathComponent("\(prefix).prepared")
         let key = Self.aneProgramsKey(prefix)
-        if (try? String(contentsOf: stamp, encoding: .utf8)) != key {
+        // THE STAMP IS NOT ENOUGH. The system keeps a compiled function only where it was made (by
+        // the program's path, on this Mac), so a cache that came here another way - Migration
+        // Assistant, a restore, a copied folder - or one the system purged holds none, and every
+        // function compiled on first use: L2048 55 s inside the first indexing pass. The shortest
+        // text length is the canary: loaded from its compiled form 0.3-1 s, compiled 6 s (Nano) to
+        // 24 s (Small).
+        let shortest = "L\(ANETextBackend.defaultLengths[0])"
+        func compiledHere() -> Bool {
+            let t = Date()
+            guard text.load(shortest) else { return false }
+            let s = -t.timeIntervalSinceNow
+            if s > Self.compiledLoadSeconds { omniPerfLog(String(format: "ane: %@ compiled again (%.1f s): no compiled programs on this Mac; building", shortest, s)) }
+            return s <= Self.compiledLoadSeconds
+        }
+        if (try? String(contentsOf: stamp, encoding: .utf8)) != key || !compiledHere() {
             // Compiled and let go: a loaded function holds working buffers (ANEBlocks.Functions).
             typealias Job = (cost: Double, stage: NeuralEngineBuild.Stage, load: () -> Bool)
             func compile(_ program: URL?, _ stage: NeuralEngineBuild.Stage, _ names: [(name: String, cost: Double)]) -> [Job] {
@@ -971,6 +985,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
 
     /// What a finished build covers: this macOS (the system's compiled form is per OS) and these
     /// exact programs. A different key means compile again.
+    /// Longer than a function takes to load from its compiled form, shorter than any compile.
+    static let compiledLoadSeconds = 3.0
+
     static func aneProgramsKey(_ prefix: String) -> String {
         var h = SHA256()
         h.update(data: Data(ProcessInfo.processInfo.operatingSystemVersionString.utf8))

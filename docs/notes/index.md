@@ -2867,6 +2867,17 @@ the build's stamp said nothing was left to do; the benchmark found it as one vid
 Copies at a new path compiled 3 times of 3 (3.1, 8.5, 8.7 s); new contents at the same path compiled
 the new program (3.1 s), so an update never runs a stale one. (One copy of the old program did load
 at once: the key is not the path alone. It does not matter here.)
+  - THE STAMP WAS NOT ENOUGH EITHER. A prepared cache that reaches a Mac some other way (Migration
+    Assistant, a restore, a copied folder: the stress harness's copy) or that the system purged has
+    the stamp and none of the compiled forms: an instance on such a copy said "ready" in 12.8 s and
+    then compiled during its first indexing pass - L2048 55 s, L1024 21 s, a vision size 18.6 s,
+    each waited out by the file that needed it. The shortest text length is now loaded before the
+    stamp is believed: from its compiled form 0.3-1 s, compiled 6 s (Nano) to 24 s (Small); past 3 s
+    the build runs. Controls (aneengine, Nano): a copy of a prepared cache at a new path rebuilt (L32
+    6.3 s, the build 382 s), the same copy run again was ready in 2.3 s with no build. And the
+    canary caught the purge in the wild: the tests' prepared cache, used in place all day, had lost
+    its compiled forms by the evening (L32 6.2 s, after a day of compiling every program several
+    times over) and rebuilt, where it would have compiled function by function inside a pass.
 The programs are copied into the Neural Engine cache now (ANEBlocks.settled, once per content) and
 loaded from there, as the text program always was: first run 9 functions 12.1 s (compiling at the
 new path), the next 1.8 s, none over 0.3.
