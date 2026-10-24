@@ -18,8 +18,10 @@ import OmniKit
 /// replaces. A scanned PDF has no text for Preview to find and opens at its first page, as before.
 enum OpenAtHit {
     /// Open `path` at the hit's place when one is known, else exactly as PhotoActions.open does.
-    @MainActor static func open(_ path: String, locator: String, snippet: String) {
-        guard !PhotoLibrary.isPhotoPath(path), !locator.isEmpty else { PhotoActions.open(path); return }
+    /// `opened`: called on the main actor once the file is handed to its app (a long PDF's phrase can
+    /// take a second to work out, and Preview a few more to come up: the row shows it is working).
+    @MainActor static func open(_ path: String, locator: String, snippet: String, opened: (@MainActor () -> Void)? = nil) {
+        guard !PhotoLibrary.isPhotoPath(path), !locator.isEmpty else { PhotoActions.open(path); opened?(); return }
         let url = URL(fileURLWithPath: path)
         if url.pathExtension.lowercased() == "pdf", let page = ChunkPreview.pageIndex(fromLocator: locator) {
             // The phrase reads the document's pages up to this one (~2.4 ms a page, measured):
@@ -27,7 +29,7 @@ enum OpenAtHit {
             // thread, within `openBudget`, never late. ONE OPEN AT A TIME PER FILE: clicks that
             // arrive while it is worked out are the same request (#26: a slow open queued every
             // double-click and Preview came back again and again).
-            guard !pendingOpens.contains(url.path) else { return }
+            guard !pendingOpens.contains(url.path) else { opened?(); return }
             pendingOpens.insert(url.path)
             Task.detached(priority: .userInitiated) {
                 let t0 = Date()
@@ -36,19 +38,20 @@ enum OpenAtHit {
                                    -t0.timeIntervalSinceNow * 1000))
                 await MainActor.run {
                     pendingOpens.remove(url.path)
-                    send(url, searchText: phrase, line: nil)
+                    send(url, searchText: phrase, line: nil, opened: opened)
                 }
             }
             return
         }
         if let line = lineNumber(fromLocator: locator) {
-            send(url, searchText: nil, line: line)
+            send(url, searchText: nil, line: line, opened: opened)
             return
         }
         // A RECORDING AT ITS MOMENT: the start of the segment that matched, in the player that opens
         // the file anyway, when that player can be told where to start. Anything else opens as before.
-        if let t = ChunkPreview.seconds(fromTimeLocator: locator), t >= 1, Moment.open(url, at: t) { return }
+        if let t = ChunkPreview.seconds(fromTimeLocator: locator), t >= 1, Moment.open(url, at: t) { opened?(); return }
         PhotoActions.open(path)
+        opened?()
     }
 
     @MainActor private static var pendingOpens: Set<String> = []
@@ -88,7 +91,10 @@ enum OpenAtHit {
         nonisolated func phrase(_ url: URL, page: Int, snippet: String, budget: TimeInterval = OpenAtHit.openBudget) -> String? {
             let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)?
                 .timeIntervalSince1970 ?? 0
-            let doc = "\(url.path)|\(mtime)", key = "\(doc)|\(page)"
+            // BY PASSAGE, NOT BY PAGE: a dense page holds several chunks, each its own result, and a
+            // phrase kept per page sent every one of them to the first one's words (#32: two rows of
+            // page 2049, two different passages, one search).
+            let doc = "\(url.path)|\(mtime)", key = "\(doc)|\(page)|\(OpenAtHit.lead(snippet).joined(separator: " "))"
             if let hit = lock.withLock({ done[key] }) { return hit }
             let pages = lock.withLock { () -> PageTexts in
                 textOrder.removeAll { $0 == doc }
@@ -128,6 +134,11 @@ enum OpenAtHit {
         var pageCount: Int { lock.withLock { doc?.pageCount ?? 0 } }
     }
 
+    /// The first four plain words of a passage: where its chunk starts on the page.
+    nonisolated static func lead(_ snippet: String) -> [String] {
+        snippet.lowercased().split(whereSeparator: { !($0.isLetter || $0.isNumber) }).prefix(4).map(String.init)
+    }
+
     nonisolated static func normalized(_ s: String) -> String {
         s.lowercased().split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
     }
@@ -138,11 +149,36 @@ enum OpenAtHit {
         return n
     }
 
-    private static func send(_ url: URL, searchText: String?, line: Int?) {
+    @MainActor private static func send(_ url: URL, searchText: String?, line: Int?, opened: (@MainActor () -> Void)? = nil) {
         guard searchText != nil || line != nil,
               let app = NSWorkspace.shared.urlForApplication(toOpen: url) else {
-            NSWorkspace.shared.openAsync(url); return
+            NSWorkspace.shared.openAsync(url); opened?(); return
         }
+        let config = NSWorkspace.OpenConfiguration()
+        config.appleEvent = openEvent(url, searchText: searchText, line: line)
+        NSWorkspace.shared.open([url], withApplicationAt: app, configuration: config) { _, error in
+            if let opened { DispatchQueue.main.async { MainActor.assumeIsolated { opened() } } }
+            // A refused event must not swallow the open: fall back to the plain one.
+            if error != nil { DispatchQueue.main.async { NSWorkspace.shared.openAsync(url) } }
+        }
+        // TWICE FOR A SEARCH (#26). To a document Preview already has open, the first event puts the
+        // phrase in its search field and does not run it: the window stays where it was until a click
+        // on the page (reproduced on a 4,000-page book: a second phrase 6 or 15 s after the first
+        // stayed on the first's page). The same event again 0.4 s later runs it; from Preview not
+        // running, just opened, or open for a while, the book landed on the page with the phrase
+        // found every time. Where the first one worked, the second finds it again.
+        guard let searchText else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            MainActor.assumeIsolated {
+                let again = NSWorkspace.OpenConfiguration()
+                again.appleEvent = openEvent(url, searchText: searchText, line: nil)
+                NSWorkspace.shared.open([url], withApplicationAt: app, configuration: again) { _, _ in }
+            }
+        }
+    }
+
+    /// The open-documents event for `url`, with the text to find or the line to show.
+    private static func openEvent(_ url: URL, searchText: String?, line: Int?) -> NSAppleEventDescriptor {
         let event = NSAppleEventDescriptor(eventClass: AEEventClass(kCoreEventClass),
                                            eventID: AEEventID(kAEOpenDocuments),
                                            targetDescriptor: nil,
@@ -157,12 +193,7 @@ enum OpenAtHit {
         if let line, let range = selectionRange(line: line) {
             event.setParam(range, forKeyword: AEKeyword(keyAEPosition))
         }
-        let config = NSWorkspace.OpenConfiguration()
-        config.appleEvent = event
-        NSWorkspace.shared.open([url], withApplicationAt: app, configuration: config) { _, error in
-            // A refused event must not swallow the open: fall back to the plain one.
-            if error != nil { DispatchQueue.main.async { NSWorkspace.shared.openAsync(url) } }
-        }
+        return event
     }
 
     /// The classic SelectionRange, 68k-packed (22 bytes): unused1 (Int16), lineNum (zero-based),
@@ -208,7 +239,7 @@ enum OpenAtHit {
             if !run.isEmpty { runs.append(run) }
         }
         guard runs.reduce(0, { $0 + $1.count }) >= 4 else { return nil }
-        let lead = snippet.lowercased().split(whereSeparator: { !($0.isLetter || $0.isNumber) }).prefix(4).map(String.init)
+        let lead = Self.lead(snippet)
         // The run where the matched chunk starts, first.
         let first = runs.firstIndex { r in
             lead.count == 4 && r.count >= 4 && (0 ... r.count - 4).contains { Array(r[$0 ..< $0 + 4]) == lead }

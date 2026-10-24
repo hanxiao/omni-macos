@@ -7917,6 +7917,34 @@ if args.count >= 5 && args[1] == "aneprogram" {
     }
     exit(0)
 }
+// Every text chunk the indexer would embed from these folders - its extraction, its cutter - as
+// JSON lines {path, chars, text}: what a tokenizer without the 512 cut makes of them is counted
+// outside (Tools/eval/chunktokens.py).
+//   omni-verify chunkdump <out.jsonl> <dir>...
+if args.count >= 4 && args[1] == "chunkdump" {
+    FileManager.default.createFile(atPath: args[2], contents: nil)
+    let out = try FileHandle(forWritingTo: URL(fileURLWithPath: args[2]))
+    var files = 0, chunks = 0
+    for dir in args[3...] {
+        let e = FileManager.default.enumerator(at: URL(fileURLWithPath: dir), includingPropertiesForKeys: [.isRegularFileKey])
+        while let u = e?.nextObject() as? URL {
+            guard (try? u.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true, FileExtractor.kind(for: u) == .text else { continue }
+            let text: String
+            switch (try? FileExtractor.extract(u)) ?? .empty {
+            case .text(let t), .pagedText(let t, _): text = t
+            default: continue
+            }
+            files += 1
+            for piece in ContentChunker.cut(text) {
+                let row: [String: Any] = ["path": u.path, "chars": piece.text.count, "text": piece.text]
+                if let d = try? JSONSerialization.data(withJSONObject: row) { out.write(d); out.write(Data("\n".utf8)); chunks += 1 }
+            }
+        }
+    }
+    try out.close()
+    print("\(files) files, \(chunks) chunks -> \(args[2])")
+    exit(0)
+}
 // One function of two builds of a program: see ANEHintAB.pair.
 if args.count >= 5 && args[1] == "anepair" {
     if #available(macOS 15.0, *) {

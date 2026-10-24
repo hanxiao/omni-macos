@@ -798,8 +798,9 @@ extension ResultRow {
     }
 }
 
-/// The matching passages (chunks) of a file, each shown as an excerpt with a top/bottom
-/// alpha fade to signal there is more text before and after it in the file. A chunk's
+/// The matching passages (chunks) of a file, each shown as an excerpt with a fade at its foot
+/// to signal there is more text after it in the file (#31: a fade at the top too made the first
+/// line hard to read; the text before a passage is what its locator already points at). A chunk's
 /// locator ("Page 3", "Line 1240") leads the excerpt; for scanned-PDF pages the snippet is
 /// just the file name, so the locator + score carry the row alone.
 /// Chrome-free (rows only): the list wraps it in an inline card, the grid in a popover.
@@ -811,8 +812,12 @@ struct PassagesView: View {
     var fileName: String = ""
     var path: String = ""
     var kind: String = ""
+    /// The passage under the pointer (a highlight says a passage opens on its own, #31), and the one
+    /// being opened (a spinner until its app has the file).
+    @State private var hovered: ChunkHit.ID?
+    @State private var opening: ChunkHit.ID?
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 0) {
             ForEach(passages ?? []) { p in
                 HStack(alignment: .top, spacing: 8) {
                     RoundedRectangle(cornerRadius: 1.5).fill(.quaternary).frame(width: 3)
@@ -832,24 +837,33 @@ struct PassagesView: View {
                                 // The fade signals there is more text before/after the excerpt -
                                 // applied to the excerpt only so the locator stays crisp.
                                 .mask(LinearGradient(stops: [
-                                    .init(color: .clear, location: 0),
-                                    .init(color: .black, location: 0.22),
+                                    .init(color: .black, location: 0),
                                     .init(color: .black, location: 0.78),
                                     .init(color: .clear, location: 1),
                                 ], startPoint: .top, endPoint: .bottom))
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    Text(scoreText(p.score)).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
+                    if opening == p.id {
+                        ProgressView().controlSize(.mini)
+                    } else {
+                        Text(scoreText(p.score)).font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
+                    }
                 }
+                .padding(.vertical, 4).padding(.horizontal, 6)
+                .background(RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(hovered == p.id && !path.isEmpty ? AnyShapeStyle(.quaternary) : AnyShapeStyle(.clear)))
                 // A PASSAGE OPENS WHERE IT IS (#26): double-click opens the file at this passage's
                 // page or line, not the file's top hit. Hovering works the PDF phrase out first.
                 .contentShape(Rectangle())
                 // Simultaneous, as on the rows, so the list's marquee still sees a drag that starts here.
                 .simultaneousGesture(TapGesture(count: 2).onEnded {
-                    if !path.isEmpty { OpenAtHit.open(path, locator: p.locator, snippet: p.snippet) }
+                    guard !path.isEmpty else { return }
+                    opening = p.id
+                    OpenAtHit.open(path, locator: p.locator, snippet: p.snippet) { if opening == p.id { opening = nil } }
                 })
                 .onHover { inside in
+                    if inside { hovered = p.id } else if hovered == p.id { hovered = nil }
                     if inside, !path.isEmpty { OpenAtHit.prefetch(path, locator: p.locator, snippet: p.snippet) }
                 }
                 .help(p.locator.isEmpty ? "" : "Double-click to open at \(p.locator)")

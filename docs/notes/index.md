@@ -2948,3 +2948,13 @@ the rest (24 layers x 52.6 ms at 5,120 patches). The benchmark's own image rows 
     the compiled program was reused by its weights' hash alone: a new graph would have run the old
     compiled one, whose functions are not the ones asked for. The stamp is the weights' hash and the
     graph's now.
+
+THE TOKENIZER CUTS EVERY TEXT AT 512 TOKENS, and stays so (Han, 2026-10-24: "if it's always like this
+then I guess it's fine"). Both checkpoints' tokenizer.json carry truncation max_length 512 and the
+app's tokenizer (swift-tokenizers over the Rust `tokenizers`) applies it, so a chunk is embedded to its
+512th token, in either mode, as since the first release; the models take 8,192 (Nano) and 32,768
+(Small). Chunks are cut by characters (target 1,800, up to 4,000), and code, data and CJK text run
+past it: `omni-verify chunkdump` (the indexer's extraction and cutter) and Tools/eval/chunktokens.py
+(the same tokenizer without the cut) - a random 50k of 2.86M chunks of a real ~/Documents: Nano 40% of
+chunks past 512, 20% of all chunk text never embedded (Small 42% / 26%); the eval bed 52% / 32%; a
+Chinese 1,800-character chunk 30% embedded on Nano, 49% on Small. Measured, not changed.

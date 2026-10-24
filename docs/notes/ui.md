@@ -1382,3 +1382,32 @@ end (that book's facts on pages 100, 2,000 and 3,990 found at those pages), and 
 against a 13-inch MacBook's ~900. The window is capped at the screen's usable height less its
 chrome, and a taller pane scrolls inside it, as System Settings does (`-omni.settingsScreenHeight`
 stands in for a smaller screen in a screenshot: 848 pt on a 900 pt screen).
+
+## Preview runs the search; a passage opens at its own words; the passage rows (#26, #31, #32, 2026-10-24)
+
+#26, the reporter on 0.19.2: Preview came up at its last page with the passage's phrase typed into its
+search field and not searched, until a click on the page. Reproduced on a generated 4,000-page book:
+opened fresh, the phrase is found (Page 3,990 of 4,000); a second open with another phrase 6 or 15 s
+later, the book already open, fills the field and leaves the window where it was. The same open-
+documents event sent again 0.4 s later runs it: from Preview not running, just opened and open for a
+while, the book landed on the phrase's page every time (pages 3,990, 120, 2,500; a single send to the
+just-opened book failed both times). So OpenAtHit sends a search twice.
+
+#32: two rows under one file on the same page, double-clicked, searched the same words. A dense page
+holds several chunks - each its own result, rightly - and the phrase was kept per page, so every
+passage on it was sent the first one's. It is kept per passage now (the page and the four words the
+row's chunk starts with), each built from where its chunk starts.
+
+#31: the passage text faded at its top as well as its foot, and the first line was hard to read: the
+foot only now (the locator says where it starts). A passage row highlights under the pointer, as it
+opens on its own with a double-click, and shows a spinner in place of its score from the double-click
+until its app has the file (a long book's phrase can take a second, Preview a few more). Not
+reproduced: the sidebar losing its padding while typing, and a narrow search field at launch - not at
+the reporter's 1,020 x 682 window, with a folder chip, history rows added while typing, or long ones
+(perf script, isolated instance); asked for steps.
+
+The reporter's questions, measured (isolated instance, Nano, GPU): a generated 3,500-page PDF with 34 MB
+of text indexed in 178 s, every page in the index (16,614 passages, 3,500 distinct page locators), the
+footprint 7.1 GB at its peak while indexing, 2.75 GB at rest, 3.06 GB after a search, and 2.20 GB a
+minute after, where it stayed (the idle trim lets the GPU's buffers go; the model stays, so the next
+search does not load it).
