@@ -1,4 +1,5 @@
 import CoreML
+import CoreVideo
 import Foundation
 import MLX
 
@@ -128,9 +129,13 @@ public enum ANEBlocks {
         }
     }
 
-    /// fp16 array of `shape` holding `v` (row-major).
+    /// fp16 array of `shape` holding `v` (row-major). A matrix lives in an IOSurface (a one-channel
+    /// fp16 pixel buffer, a row per row), which the Neural Engine reads where it lies instead of the
+    /// copy Core ML makes of an ordinary array on every call: a vision layer 4.2 -> 4.0 ms at 1,024
+    /// patches, an audio block 8.7 -> 8.0 ms (anepar, ANE_IOSURFACE).
     static func array(_ v: [Float], _ shape: [Int]) -> MLFeatureValue? {
-        guard let a = try? MLMultiArray(shape: shape.map { NSNumber(value: $0) }, dataType: .float16) else { return nil }
+        guard let a = shape.count == 2 ? surface(rows: shape[0], cols: shape[1]) : try? MLMultiArray(shape: shape.map { NSNumber(value: $0) }, dataType: .float16)
+        else { return nil }
         let h = Half.bits(v)
         guard h.count == a.count else { return nil }
         a.withUnsafeMutableBytes { raw, strides in
@@ -149,6 +154,13 @@ public enum ANEBlocks {
             }
         }
         return MLFeatureValue(multiArray: a)
+    }
+
+    private static func surface(rows: Int, cols: Int) -> MLMultiArray? {
+        var pb: CVPixelBuffer?
+        let attrs = [kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary
+        guard CVPixelBufferCreate(nil, cols, rows, kCVPixelFormatType_OneComponent16Half, attrs, &pb) == kCVReturnSuccess, let pb else { return nil }
+        return MLMultiArray(pixelBuffer: pb, shape: [NSNumber(value: rows), NSNumber(value: cols)])
     }
 
     /// A weight matrix [rows, cols] as (rows, cols); a vector as the channel column (1, C, 1, 1).

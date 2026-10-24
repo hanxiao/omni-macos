@@ -2824,11 +2824,15 @@ itself (one signed d x d permutation per head, a constant of the graph) the same
   there the rotated copy did not come out of the ANE row for row: image vectors move in the fifth
   decimal (eval bed, 46 images, cosine to the GPU min / median: 0.99806 / 0.99914 -> 0.99816 /
   0.99912, photos 0.99730 / 0.99912 -> 0.99730 / 0.99907, screenshots 0.99681 / 0.99788 -> 0.99677 /
-  0.99782; tags agree 1.00 both). The new form rotates the values the reference rotates.
+  0.99782). The new form rotates the values the reference rotates. Tag quality (tageval, COCO-150,
+  mAP base / with crops at 0.8): GPU 0.647 / 0.697, the Neural Engine 0.649 / 0.692 (last night's
+  programs 0.649 / 0.691). (aneengine's "tags agree" compares nothing when its tag cache does not
+  exist - OmniTagger(cacheURL:) is nil then; give it a copy of a real one, tags-d768.cache: photos
+  0.84-0.86 of the top tags agree with the GPU's, screenshots 0.69, near-ties like booked/bookings.)
   Small, the same 46 images: 0.99871 / 0.99912 -> 0.99876 / 0.99911, photos 0.99743 / 0.99928 ->
   0.99710 / 0.99931, screenshots 0.99392 / 0.99772 -> 0.99371 / 0.99781, video 0.99871 / 0.99897 ->
-  0.99873 / 0.99904; tags agree 1.00; an image 259 -> 243 ms, a screenshot 1,228 -> 1,132, a clip 437
-  -> 410 (aneengine).
+  0.99873 / 0.99904; an image 259 -> 243 ms, a screenshot 1,228 -> 1,132, a clip 437 -> 410
+  (aneengine).
   The weight files the Mac writes (and the system holds): Nano 254.9 -> 226.6 MB, Small 1,058 -> 882.
 
 NANO'S LABELS PACKED. Nano's program took one key mask for every query, so short sequences could not
@@ -2878,6 +2882,12 @@ at once: the key is not the path alone. It does not matter here.)
     canary caught the purge in the wild: the tests' prepared cache, used in place all day, had lost
     its compiled forms by the evening (L32 6.2 s, after a day of compiling every program several
     times over) and rebuilt, where it would have compiled function by function inside a pass.
+  - WHERE THEY ARE: ~/Library/Caches/<bundle id>/com.apple.e5rt.e5bundlecache, one per app (Omni,
+    the renamed copy, omni-verify, the test runner each have their own: 10 GB for omni-verify after
+    this day). So a compiled form is the app's, not the program's - the renamed copy rebuilt on a
+    cache omni-verify had just compiled at that very path (the canary: L32 6.0 s, the build 402 s,
+    then all six ComputeUnitUITests passed) - and it lives in Caches, which macOS clears when the
+    disk runs low. The canary is the only check that sees either.
 The programs are copied into the Neural Engine cache now (ANEBlocks.settled, once per content) and
 loaded from there, as the text program always was: first run 9 functions 12.1 s (compiling at the
 new path), the next 1.8 s, none over 0.3.
@@ -2909,3 +2919,17 @@ identical): `optimizationHints.specializationStrategy = .fastPrediction` recompi
 (Nano L32 7 s, L512 15 s, Small L32 30 s) and is Nano L32 -1%, Nano L512 +5.5% (slower), Small L32
 -1.2%: not taken. Preallocated outputs (`outputBackings`) save ~60 us a call (Nano L32 2.66 -> 2.59
 ms): not worth the code.
+
+THE TOWERS' WEIGHT MATRICES IN IOSURFACES. Every block call passed the layer's weights as ordinary
+arrays, which Core ML copies for the Neural Engine each time; one-channel fp16 pixel buffers it reads
+in place (ANEBlocks.array). Per call (anepar, ANE_IOSURFACE, two rounds): a vision layer at 1,024
+patches 4.2 -> 4.0 ms, at 5,120 37.7 -> 37.0, an audio block 8.7 -> 8.0. The vectors are the same to
+the fifth decimal on every set above. The benchmark, Nano, before and after interleaved: index one
+image 40.0 40.1 -> 38.5 38.3 ms, an image query 80.3 80.2 -> 77.3 76.3, an audio query 316.5 316.2 ->
+296.8 298.3, a video query 195.8 194.0 -> 197.8 205.4 (its long sequences' layers read their weights
+from the mapped program file, unchanged). Last night's 1.6 -> 1.4 ms at 256 patches was the same
+effect, read then as too small to be the fix; at every size it is a few percent for no cost.
+
+TAG SCORES ON THE CPU in this mode (MLX's CPU matmul of an image's rows against the 25,465 labels,
+OmniTagger.scoreGraph): 256 rows 5.5 ms, 1,024 10.8, 1,280 13.1 (aneengine, a real label cache).
+
