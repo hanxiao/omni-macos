@@ -154,7 +154,7 @@ def build(W, L):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("weights"); ap.add_argument("--out", required=True)
-    ap.add_argument("--lengths", default="32,64,128,256,512,1024,2048")
+    ap.add_argument("--lengths", default="32,64,128,256,512,1024,1344")
     a = ap.parse_args()
     W = mx.load(a.weights)
     lengths = list(map(int, a.lengths.split(",")))

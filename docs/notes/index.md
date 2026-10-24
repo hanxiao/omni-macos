@@ -2933,3 +2933,18 @@ effect, read then as too small to be the fix; at every size it is a few percent 
 TAG SCORES ON THE CPU in this mode (MLX's CPU matmul of an image's rows against the 25,465 labels,
 OmniTagger.scoreGraph): 256 rows 5.5 ms, 1,024 10.8, 1,280 13.1 (aneengine, a real label cache).
 
+
+THE LONGEST BAKED LENGTH IS AN IMAGE'S, NOT TEXT'S. Text stops at 512 tokens (the tokenizer), so the
+baked L1024 and L2048 ran only media: an image is at most 5,120 patches, 1,280 tokens and the
+wrapper's, and a photo went to L2048 padded by 37%. L1344 instead (anepar, zero inputs): Nano 95.2
+-> 52.6 ms a call, Small 400 -> 250; its compile 55 -> 36 s, 303 -> 187. Sequences past 1,344 are a
+small video's slices and go to the layer program, which gets a 2,048 bucket (ANEModeTests: a clip
+in that range, at parity, nothing to the GPU). Phone-size images (4032 x 3024, generated; the bed's
+own never pass 4,096 patches) through the engine, Nano, interleaved: 608 610 -> 565 566 ms, the same
+vectors to the fifth decimal; on Small the backbone's share is 400 -> 250 ms of ~1.66 s, the tower
+the rest (24 layers x 52.6 ms at 5,120 patches). The benchmark's own image rows do not reach it
+(38.7 38.4 -> 38.4 38.2 ms); its video query 195.9 203.3 -> 190.2 187.6.
+  - The text program's weights are the same for any set of lengths (the recipes did not change), and
+    the compiled program was reused by its weights' hash alone: a new graph would have run the old
+    compiled one, whose functions are not the ones asked for. The stamp is the weights' hash and the
+    graph's now.

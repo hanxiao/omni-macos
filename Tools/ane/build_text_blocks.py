@@ -1,4 +1,4 @@
-"""The text backbone past its baked program's longest length (2,048), for the long sequences a video
+"""The text backbone past its baked program's longest length (1,344, any image), for the long sequences a video
 segment makes (a 1080p clip ~4,130 tokens, square ~6,090): ONE LAYER as a block program, no weights
 inside (anelib.py), called once per layer with that layer's weights, which ANETextBackend reads from
 the baked program's own weight file (the same fp16 tensors, already scaled and rotated: no copy).
@@ -19,10 +19,10 @@ import numpy as np
 from coremltools.converters.mil import Builder as mb
 from anelib import spec, program, lin, attention, query_block, save_multifunction
 
-# The segment shapes past 2,048 at OmniVideoPreprocess's 6 frames (3 temporal slices) and the
-# wrapper's tokens: 720p 4:3 ~2,085, 720p 16:9 ~2,775, 1080p 16:9 ~4,131, 3:2 ~4,866, 4:3 ~5,454,
-# square ~6,090; the pixel budget caps any clip at 6,272 media tokens.
-LENGTHS = "2560,3072,4224,4992,5504,6400"
+# 2,048 for a small video's slices; past it the segment shapes at OmniVideoPreprocess's 6 frames (3
+# temporal slices) and the wrapper's tokens: 720p 4:3 ~2,085, 720p 16:9 ~2,775, 1080p 16:9 ~4,131, 3:2
+# ~4,866, 4:3 ~5,454, square ~6,090; the pixel budget caps any clip at 6,272 media tokens.
+LENGTHS = "2048,2560,3072,4224,4992,5504,6400"
 QBLOCK = 128
 
 

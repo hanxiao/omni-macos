@@ -30,7 +30,11 @@ public enum ANEProgram {
         let dir = cache.appendingPathComponent(name, isDirectory: true)
         let stamp = dir.appendingPathComponent("weights.sha256")
         let model = dir.appendingPathComponent(name + ".mlmodelc", isDirectory: true)
-        if (try? String(contentsOf: stamp, encoding: .utf8)) == recipe.sha256, fm.fileExists(atPath: model.path) { return model }
+        // The weights AND the graph: a new graph over the same weights (another set of lengths) left
+        // the old compiled program in place, its functions not the ones asked for.
+        guard let graph = try? Data(contentsOf: graphURL) else { return nil }
+        let built = recipe.sha256 + " " + SHA256.hash(data: graph).map { String(format: "%02x", $0) }.joined()
+        if (try? String(contentsOf: stamp, encoding: .utf8)) == built, fm.fileExists(atPath: model.path) { return model }
         try? fm.removeItem(at: dir)
         let work = cache.appendingPathComponent(name + ".building-\(UUID().uuidString)", isDirectory: true)
         defer { try? fm.removeItem(at: work) }
@@ -45,10 +49,10 @@ public enum ANEProgram {
                 omniPerfLog("ane \(name): the weights written are not the ones built (\(digest.prefix(12)) vs \(recipe.sha256.prefix(12))): GPU")
                 return nil
             }
-            let built = try awaitCompile(pkg)
+            let compiled = try awaitCompile(pkg)
             try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            try fm.moveItem(at: built, to: model)
-            try recipe.sha256.write(to: stamp, atomically: true, encoding: .utf8)
+            try fm.moveItem(at: compiled, to: model)
+            try built.write(to: stamp, atomically: true, encoding: .utf8)
             return model
         } catch {
             omniPerfLog("ane \(name): build failed: \(error)")

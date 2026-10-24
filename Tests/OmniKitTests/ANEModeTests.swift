@@ -66,6 +66,12 @@ final class ANEModeTests: XCTestCase {
         let frames = (0 ..< 6).map { image($0 + 5, width: 1568, height: 882) }
         let gv = try XCTUnwrap(gpu.embedVideoFrames(frames)), av = try XCTUnwrap(ane.embedVideoFrames(frames))
         XCTAssertGreaterThan(Self.cosine(gv, av), 0.99)
+        // A small clip past the longest baked length (1,344, any image) and within the layer
+        // program's first bucket (2,048).
+        let small = try XCTUnwrap([(1120, 840), (1024, 768), (1280, 720)].lazy.map { w, h in (0 ..< 4).map { self.image($0 + 20, width: w, height: h) } }
+            .first { (1_360 ... 2_000).contains((OmniVideoPreprocess.preprocessRaw($0)?.numPatches ?? 0) / 4) }, "no clip size in 1,344 ... 2,048 tokens")
+        let gs = try XCTUnwrap(gpu.embedVideoFrames(small)), asv = try XCTUnwrap(ane.embedVideoFrames(small))
+        XCTAssertGreaterThan(Self.cosine(gs, asv), 0.99)
         XCTAssertEqual(ane.neuralEngineFallbacks, 0, "something went to the GPU in Neural Engine mode")
 
         // Back to the GPU: text there at once, images still on the programs until a reload.

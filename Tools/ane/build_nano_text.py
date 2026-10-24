@@ -129,7 +129,7 @@ def build(W, L, B=1, full_mask=False):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("weights"); ap.add_argument("--lengths", default="32,64,128,256,512,1024,2048"); ap.add_argument("--out", required=True)
+    ap.add_argument("weights"); ap.add_argument("--lengths", default="32,64,128,256,512,1024,1344"); ap.add_argument("--out", required=True)
     ap.add_argument("--batch", type=int, default=1, help="sequences per call (indexing shapes)")
     ap.add_argument("--precision", default="fp16", help="fp32: the same program in fp32, a maths check on the CPU")
     a = ap.parse_args()

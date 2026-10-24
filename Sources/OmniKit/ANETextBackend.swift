@@ -25,10 +25,14 @@ import MLX
 /// compile each (Nano 6,144: 742 s; Small 4,608: 74 min); as one layer, seconds.
 @available(macOS 15.0, *)
 public final class ANETextBackend: @unchecked Sendable {
-    /// The buckets the shipped program has (Tools/ane/build_nano_text.py).
-    public static let defaultLengths = [32, 64, 128, 256, 512, 1024, 2048]
-    /// The layer program's buckets (Tools/ane/build_text_blocks.py).
-    public static let defaultBlockLengths = [2560, 3072, 4224, 4992, 5504, 6400]
+    /// The buckets the shipped program has (Tools/ane/build_nano_text.py). Text stops at 512 tokens
+    /// (the tokenizer's truncation), so the longer ones are media's: 1,344 holds any image (5,120
+    /// patches, 1,280 tokens, and the wrapper's), where 2,048 padded a photo by 37% (Small 400 -> 250
+    /// ms a call, Nano 95 -> 53; its compile 303 -> 187 s, 55 -> 36).
+    public static let defaultLengths = [32, 64, 128, 256, 512, 1024, 1344]
+    /// The layer program's buckets (Tools/ane/build_text_blocks.py): from past 1,344, a small
+    /// video's slices, to the longest segment.
+    public static let defaultBlockLengths = [2048, 2560, 3072, 4224, 4992, 5504, 6400]
     public let lengths: [Int]
     /// Empty when there is no layer program or its weights could not be mapped.
     public let blockLengths: [Int]
@@ -132,7 +136,7 @@ public final class ANETextBackend: @unchecked Sendable {
     }
 
     /// Every function with its first compile in about seconds, for the build's progress (Nano: L32
-    /// 6 s, L2048 54 s; a layer at 6,400 19 s, Small's 33 s; the towers' are on the same scale).
+    /// 6 s, L1344 36 s; a layer at 6,400 19 s, Small's 33 s; the towers' are on the same scale).
     public var functionNames: [(name: String, cost: Double)] {
         lengths.map { ("L\($0)", 3 + Double($0) / 40) } + blockLengths.map { ("B\($0)", 2 + Double($0) / (causal ? 190 : 380)) }
     }
