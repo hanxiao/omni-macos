@@ -148,6 +148,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for it in w.toolbar?.items ?? [] {
             let r = it.view.map { $0.convert($0.bounds, to: nil) } ?? .zero
             lines.append("\(it.itemIdentifier.rawValue) frame=\(NSStringFromRect(r))")
+            // The search item has no `view`: its field is where its width is.
+            if let s = it as? NSSearchToolbarItem {
+                let f = s.searchField
+                lines.append("   field=\(NSStringFromRect(f.convert(f.bounds, to: nil))) preferred=\(s.preferredWidthForSearchField) first=\(w.firstResponder === f.currentEditor() || w.firstResponder === f)")
+            }
             for c in it.view?.constraints ?? [] {
                 lines.append("   constraint: \(c)")
             }

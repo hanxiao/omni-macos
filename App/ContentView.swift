@@ -190,7 +190,12 @@ struct ContentView: View {
             // alone - rebuilt the toolbar and AppKit re-laid out its items: ~320 ms of main thread
             // per result set, measured with the toolbar removed. Same fix as `OCRToolbar`.
             .modifier(SearchToolbar(columns: $columns, browse: browseMode))
-            .background(WindowTitleHider(sidebarWidth: model.ocrMode ? 168 : 260))
+            // NO WIDTH WHILE THE DRAWER IS FOLDED. Setting the divider of a folded sidebar unfolds
+            // it: OCR mode folds its empty page rail as the wanted width turns to the rail's, and a
+            // tuner pass that ran after the fold brought the rail back, the columns following it
+            // (logged in the 15.7 VM, 0.19.4 included; the search field's width hold made it the
+            // usual order). The width is asked for again when the drawer is.
+            .background(WindowTitleHider(sidebarWidth: ocrDrawerWanted ? (model.ocrMode ? 168 : 260) : 0))
         }
     }
 
@@ -925,8 +930,9 @@ private struct WindowTitleHider: NSViewRepresentable {
     ///
     /// WHAT IT ACTUALLY DOES, and this list is now the code rather than a memory of it: sets the
     /// restored sidebar width once per wanted value, turns off the titlebar separator, pins the
-    /// full-height `.unified` toolbar style, keeps the window alive when it closes, and hides the
-    /// 1pt rule inside Tahoe's titlebar scroll pocket.
+    /// full-height `.unified` toolbar style, keeps the window alive when it closes, hides the
+    /// 1pt rule inside Tahoe's titlebar scroll pocket, and before Tahoe holds the search field at
+    /// its own width (#31).
     ///
     /// It no longer caps the search field, installs a flexible-space constraint, or embeds the
     /// search-by-file button in the field - 692c238 removed all three when that button became a
@@ -985,6 +991,7 @@ private struct WindowTitleHider: NSViewRepresentable {
             // macOS 14/15 draw the window title in the toolbar; Tahoe removes it with
             // `.toolbar(removing: .title)`. See the `center` item in the toolbar for the space.
             if #unavailable(macOS 26.0), w.titleVisibility != .hidden { w.titleVisibility = .hidden }
+            if #unavailable(macOS 26.0) { holdSearchFieldWidth(w) }
             // No rule under the toolbar. Finder's column header sits on the SAME surface as the
             // chrome with no seam between them; the automatic separator drew a hairline there and
             // made the header read as a second bar stuck underneath. The header keeps its OWN
@@ -1042,6 +1049,25 @@ private struct WindowTitleHider: NSViewRepresentable {
             if v.bounds.height <= 1 && v.bounds.width > 100 && !v.isHidden { v.isHidden = true }
             for c in v.subviews { hideThinFills(in: c) }
         }
+
+        /// macOS 14/15: THE SEARCH FIELD NEVER GOES BELOW ITS OWN WIDTH (#31). There the toolbar's
+        /// free space is an empty centre item (`center`, SearchToolbar), and AppKit keeps it centred
+        /// by shrinking the items on its right: the field got what the buttons beside it left of
+        /// half the toolbar - 174pt idle in an 820pt window, 33pt in Recents with its magnifier and
+        /// clear button drawn over each other. Focused, the field takes its preferred width and
+        /// AppKit moves the centre item instead; held at that width, it does so idle too, and where
+        /// the whole toolbar cannot fit, buttons go into the overflow menu as they do while typing.
+        /// Where there is room (1,020pt and wider) nothing moves. Tahoe has no centre item.
+        private func holdSearchFieldWidth(_ w: NSWindow) {
+            guard let item = w.toolbar?.items.lazy.compactMap({ $0 as? NSSearchToolbarItem }).first else { return }
+            let field = item.searchField
+            guard !field.constraints.contains(where: { $0.identifier == Self.searchWidthID }) else { return }
+            let c = field.widthAnchor.constraint(greaterThanOrEqualToConstant: item.preferredWidthForSearchField)
+            c.identifier = Self.searchWidthID
+            c.priority = NSLayoutConstraint.Priority(999)   // under AppKit's own, should one ever disagree
+            c.isActive = true
+        }
+        private static let searchWidthID = "omni.searchFieldWidth"
 
         /// Set once per wanted width, never on every window update: this is a correction to what
         /// the window restored, not a policy, and re-applying it would fight a divider drag.

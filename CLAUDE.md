@@ -87,7 +87,7 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (869 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (879 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|delfolders|
@@ -170,6 +170,9 @@ codebase were already measured there, and many were rejected.
 - EVERY UI CHANGE IS SHOWN TO HAN and follows macOS Tahoe, Liquid Glass and native macOS design.
   UI text and hints are plain: no mannered prose. The UI writes the Neural Engine as "Neural Engine
   (ANE)", or "ANE" once it has been named (Han, 2026-10-23).
+- A FIX FOR AN OLDER macOS NEVER DEGRADES TAHOE (Han, 2026-10-25). Its UI design and Liquid Glass
+  stay as they are: gate the fix `#unavailable(macOS 26.0)` where it can be, and compare the Tahoe
+  window against the last release, side by side, before it ships.
 - DEDUP IS PART OF THE DESIGN; NEVER DISABLE IT (Han, 2026-10-14). Content dedup and chunk reuse
   (`contentDedup`, `globalChunkReuse`, `vectorsForContentKeys`) stay on in every shipped path, and a
   new path goes through them rather than around them. A test may switch something off only as a
@@ -327,7 +330,8 @@ codebase were already measured there, and many were rejected.
   and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names, Shortcuts,
   Siri and Services (App Intents), a long book opened at its page (#26), Settings within the screen (#30),
   Preview made to run the passage's search, a passage opened at its own words (#26, #32, #31), and
-  the sidebar squeezed by the columns on macOS 15 (#31; the header's layout loop).
+  the sidebar squeezed by the columns on macOS 15 (#31; the header's layout loop), the search field
+  squeezed by the centre item and Preview searching other words (#31, #32; `omni-verify pagephrase`).
 - `testing.md` - UI tests and their traps, chaos suites, perf tour, hangwatch and the main-thread
   stall investigations, the agent eval.
 - `link.md` - Linked Macs: pairing, the TLS link, search across Macs, the measurements and the

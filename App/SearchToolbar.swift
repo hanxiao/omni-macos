@@ -336,6 +336,8 @@ struct SearchToolbar: ViewModifier {
             // buttons. An empty centre item takes that job: AppKit gives a principal item flexible
             // room on both sides. Checked on 15.7 in search, results and OCR mode; the window keeps
             // its name "Omni" for the Window menu and Mission Control.
+            // AppKit keeps a centre item centred by shrinking what is beside it, the search field
+            // first; the tuner holds the field at its own width, so the centre item gives way (#31).
             ToolbarItem(id: "center", placement: .principal) { Color.clear.frame(width: 1, height: 1) }
         }
         // Flexible space after back/forward pushes every other control to the trailing edge (chevrons

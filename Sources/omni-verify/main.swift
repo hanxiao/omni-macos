@@ -7945,6 +7945,69 @@ if args.count >= 4 && args[1] == "chunkdump" {
     print("\(files) files, \(chunks) chunks -> \(args[2])")
     exit(0)
 }
+// The words a double-click sends Preview for each passage of these PDFs (PagePhrase, #32): every
+// chunk's stored opening and every window of `width` a result row can show, on the page of the chunk
+// it is from. Counted: phrases that are the passage's own words, ones from elsewhere on the page,
+// none; and passages whose opening the 0.19.4 rule found (its first four words as one run of plain
+// words on one line - where it did not, the phrase came from the top of the page).
+//   omni-verify pagephrase <width> <pdf>...
+if args.count >= 4 && args[1] == "pagephrase" {
+    let width = Int(args[2]) ?? Indexer.defaultSnippetLength
+    var own = 0, elsewhere = 0, none = 0, oldFound = 0, total = 0, ms: [Double] = []
+    func words(_ s: String) -> String { PagePhrase.lead(s, count: .max).joined(separator: " ") }
+    func oldFinds(_ raw: String, _ snippet: String) -> Bool {
+        let lead = snippet.lowercased().split(whereSeparator: { !($0.isLetter || $0.isNumber) }).prefix(4).map(String.init)
+        guard lead.count == 4 else { return false }
+        for line in raw.split(whereSeparator: { $0.isNewline }) {
+            var run: [String] = []
+            for w in line.split(whereSeparator: { $0.isWhitespace }) + [Substring("")] {
+                if !w.isEmpty, w.allSatisfy({ $0.isLetter || $0.isNumber }) { run.append(w.lowercased()); continue }
+                if run.count >= 4, (0 ... run.count - 4).contains(where: { Array(run[$0 ..< $0 + 4]) == lead }) { return true }
+                run = []
+            }
+        }
+        return false
+    }
+    for path in args[3...] {
+        let url = URL(fileURLWithPath: path)
+        guard let doc = PDFDocument(url: url) else { continue }
+        var text = "", starts: [Int] = []   // UTF-8 offset of each page, as the chunker counts
+        for i in 0 ..< doc.pageCount {
+            let s = doc.page(at: i)?.string ?? ""
+            starts.append(text.utf8.count); text += s
+            if !s.hasSuffix("\n") { text += "\n" }
+        }
+        let texts = PageTexts(url)
+        var fileOwn = 0, fileTotal = 0
+        for piece in ContentChunker.cut(text) {
+            let page = max(0, (starts.lastIndex { $0 <= piece.byteOffset } ?? 0))
+            let opening = String(piece.text.split(whereSeparator: { $0.isNewline || $0 == "\t" }).joined(separator: " ").prefix(Indexer.defaultSnippetLength))
+            for snippet in [opening] + PassageWindow.windows(piece.text, width: width) {
+                guard PagePhrase.lead(snippet).count >= 4 else { continue }
+                total += 1; fileTotal += 1
+                if oldFinds(doc.page(at: page)?.string ?? "", snippet) { oldFound += 1 }
+                let t0 = Date()
+                let phrase = PagePhrase.unique(texts, page: page, near: snippet, budget: 8)
+                ms.append(-t0.timeIntervalSinceNow * 1000)
+                guard let phrase else { none += 1; continue }
+                let mine = words(snippet), tail = phrase.split(separator: " ").dropFirst().joined(separator: " ")
+                let isOwn = mine.contains(phrase) || mine.split(separator: " ").dropFirst().joined(separator: " ").hasPrefix(tail)
+                if isOwn { own += 1; fileOwn += 1 } else { elsewhere += 1 }
+                // PAGEPHRASE_SHOW=n: every n-th passage, its page, opening and phrase.
+                if let n = Int(ProcessInfo.processInfo.environment["PAGEPHRASE_SHOW"] ?? ""), n > 0, total % n == 0 {
+                    print("\(isOwn ? "OWN" : "ELSEWHERE") page \(page + 1) [\(snippet.split(whereSeparator: { $0.isNewline }).joined(separator: " ").prefix(120))] -> \(phrase)")
+                }
+            }
+        }
+        print(String(format: "%5d/%5d own  %@", fileOwn, fileTotal, url.lastPathComponent))
+    }
+    ms.sort()
+    func pct(_ n: Int) -> String { String(format: "%.1f%%", 100 * Double(n) / Double(max(1, total))) }
+    print("passages \(total): own words \(own) (\(pct(own))), elsewhere on the page \(elsewhere) (\(pct(elsewhere))), none \(none)")
+    print("0.19.4 rule found the opening: \(oldFound) (\(pct(oldFound)))")
+    if !ms.isEmpty { print(String(format: "ms p50 %.1f p90 %.1f max %.1f", ms[ms.count / 2], ms[ms.count * 9 / 10], ms.last!)) }
+    exit(0)
+}
 // One function of two builds of a program: see ANEHintAB.pair.
 if args.count >= 5 && args[1] == "anepair" {
     if #available(macOS 15.0, *) {

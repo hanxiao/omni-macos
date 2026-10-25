@@ -1435,3 +1435,49 @@ reproduced there.
   not. The header now measures the pane's edge, outside its frame, which the padding cannot move.
 - Not reproduced: a narrow search field at launch - three relaunches in the VM with the window state
   kept (1,000 x 660 restored), the field full width each time.
+
+## The search field squeezed by the centre item; Preview searched other words (#31, #32, 2026-10-25)
+
+#31, the reporter's recording (macOS 15.8.1, 820 x 570, the narrowest the window goes): the field at
+~170pt idle at launch, and in Recents ~33pt, its magnifier and clear button drawn over each other.
+Reproduced in the 15.7 VM on 0.19.4 with the toolbar dump (which now prints the search field's own
+frame: the search item has no `view`).
+- CAUSE: before Tahoe the toolbar's free space is an empty `.principal` item, and AppKit keeps a
+  centre item centred by shrinking the items on its right, the field first. The field got what the
+  buttons beside it left of half the detail pane: 174pt idle in the empty window, 33pt in Recents
+  (star, view picker, Search by File, Share). Focused, it takes its preferred width (240pt) and AppKit
+  moves the centre item instead - which is why it was "sometimes" narrow: idle, not typing.
+- FIX (macOS 14/15 only): the tuner holds the field at least at its preferred width (a 999 constraint
+  on `searchField`). The centre item gives way idle as it did while typing. At 820pt the empty window
+  shows 242pt with every button; Recents 242pt with the view picker, Search by File and Share in the
+  overflow menu (all three are in the menu bar too). At 1,020 x 682 and 1,400 x 800 with results, the
+  frames are identical to 0.19.4 (242 / 307pt): the hold only acts when the field would be squeezed.
+- MEASURED AND NOT DONE: a 160pt floor keeps the view picker visible in Recents at 820pt but the field
+  still jumps 162 -> 242pt on focus; no centre item packs the buttons left and leaves the field at 33pt
+  in Recents.
+- WHAT THE HOLD SHOOK LOOSE: OCR mode's empty page rail stayed open (3 of 3 runs; 0.19.4 1 of 4).
+  Logged: the tuner set the sidebar to the rail's 168pt after SwiftUI had folded it, and setting a
+  folded sidebar's divider unfolds it; the hold only made that the usual order. The tuner is now asked
+  for no width while the drawer is folded (folded 3 of 3 after; back to search restores 260pt). A blanket "never touch a collapsed
+  sidebar" was tried first and dropped: the launch correction is also what unfolds a sidebar the
+  window restored folded.
+- TAHOE runs none of the hold (no centre item); its window was compared with 0.19.4 side by side:
+  820 x 570 empty and Recents, 1,400 x 800 with results, idle and focused, OCR mode folded and back -
+  pixel-identical but for a row's indexed time. With a document open in OCR mode the rail comes back at
+  the same width; 0.19.4's toolbar there settled differently from run to run (field expanded with
+  items in the overflow menu, or collapsed with all of them shown), the new build the latter 3 of 3.
+
+#32, the reporter on 0.19.4: double-clicking a passage opened Preview at the right page and highlighted
+other words - "Adulterants in unregulated herbal" from the top of the page for a passage that starts
+at the heading "THROMBOTIC MICROANGIOPATHY" lower down. The phrase was built from the passage's first
+four words, looked for as a run of plain words on one line, and a comma among them, a heading on its
+own line or a window starting mid-word missed, so it came from the top of the page. PagePhrase
+(OmniKit now, with tests) finds the passage by any six of its words in order, punctuation and line
+breaks aside, on its page or the next (a window of a long chunk), and takes the phrase from the
+passage's own words first, at any length that qualifies (four words too when every earlier page is
+checked), once on its page. `omni-verify pagephrase 220 <pdf>...` over 40 local arXiv PDFs, every
+chunk opening and 220-character window (18,571 passages): the passage's own words for 81.9%, where
+the 0.19.4 rule found the opening for 22.6% (the rest went to the top of the page). What is left is
+mostly text no phrase can come from: reference lists, author lines, tables, prompts that repeat on
+earlier pages. Preview, sent two of them as the app sends them: page 7 and page 21 of a 22-page paper,
+the phrase highlighted at the passage, "Found on 1 page".
