@@ -326,7 +326,8 @@ codebase were already measured there, and many were rejected.
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
   and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names, Shortcuts,
   Siri and Services (App Intents), a long book opened at its page (#26), Settings within the screen (#30),
-  Preview made to run the passage's search, and a passage opened at its own words (#26, #32, #31).
+  Preview made to run the passage's search, a passage opened at its own words (#26, #32, #31), and
+  the sidebar squeezed by the columns on macOS 15 (#31; the header's layout loop).
 - `testing.md` - UI tests and their traps, chaos suites, perf tour, hangwatch and the main-thread
   stall investigations, the agent eval.
 - `link.md` - Linked Macs: pairing, the TLS link, search across Macs, the measurements and the

@@ -260,9 +260,6 @@ struct BrowserHeader<Menu: View>: View {
         .font(.caption)
         .padding(.leading, BrowserMetrics.rowLead + BrowserMetrics.listInset)
         .padding(.trailing, trailingPad)
-        .onGeometryChange(for: CGFloat.self, of: { $0.frame(in: .global).maxX }) { x in
-            if abs(x - headerMaxX) > 0.5 { headerMaxX = x }
-        }
         .padding(.vertical, 5)
         // NO fill. In Finder the header sits on the same surface as the toolbar - there is no seam
         // between them - so painting a grey band here is what made it read as a separate component
@@ -271,8 +268,17 @@ struct BrowserHeader<Menu: View>: View {
         .contentShape(.rect)
         .contextMenu { menu() }
         // Leading, like the rows under it (ResultsList): columns wider than the pane run off the
-        // trailing edge instead of being centred half under the sidebar.
-        .frame(maxWidth: .infinity, alignment: .leading)
+        // trailing edge instead of being centred half under the sidebar. And NO LEAST WIDTH: before
+        // Tahoe the header is stacked above the list (`columnHeader`), so the columns' sum became
+        // the pane's minimum, and a 1,020pt window's split view took it from the sidebar - 246 to
+        // 120pt, its titles against the window's edge, as soon as results showed (#31, macOS 15).
+        .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+        // The PANE's edge, measured outside that frame. Measured inside it, the edge was the
+        // columns' own once they overflow, which moves with the padding derived from it: every
+        // pass added the padding again and the main thread never left layout.
+        .onGeometryChange(for: CGFloat.self, of: { $0.frame(in: .global).maxX }) { x in
+            if abs(x - headerMaxX) > 0.5 { headerMaxX = x }
+        }
     }
 
     /// The trailing padding, MEASURED from the rows rather than assumed. A visible scroller (the

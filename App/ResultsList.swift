@@ -150,8 +150,10 @@ struct ResultsList<Footer: View>: View {
                                 // was centred, so the overflow went half under the floating sidebar:
                                 // the disclosure triangles sat against its edge (1,036pt of default
                                 // columns in a 1,280pt window's 988pt list). Now the extra goes off
-                                // the trailing edge, as a too-narrow Finder list does.
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                                // the trailing edge, as a too-narrow Finder list does. NO LEAST
+                                // WIDTH either: a row as wide as its columns made the stack wider
+                                // than the scroll view, which centred it again (BrowserHeader, #31).
+                                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
                                 // Rows drag files OUT of the app from their icon and name (see
                                 // FileDrag). Never back in: an in-app drag was easy to misclick onto
                                 // the search drop target, so inside Omni the drag offers nothing.
@@ -211,6 +213,7 @@ struct ResultsList<Footer: View>: View {
                                                   onToggle: { toggle(member.path) },
                                                   columns: columns.visible)
                                             .equatable()
+                                            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
                                             .contentShape(Rectangle())
                                             .resultClick { handleTap(member.path) }
                                             .simultaneousGesture(TapGesture(count: 2).onEnded { open(member.path) })

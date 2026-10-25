@@ -1411,3 +1411,27 @@ of text indexed in 178 s, every page in the index (16,614 passages, 3,500 distin
 footprint 7.1 GB at its peak while indexing, 2.75 GB at rest, 3.06 GB after a search, and 2.20 GB a
 minute after, where it stayed (the idle trim lets the GPU's buffers go; the model stays, so the next
 search does not load it).
+
+## The sidebar squeezed by the columns (#31, macOS 15, 2026-10-25)
+
+The reporter (macOS 15.8.1) saw the sidebar lose its padding while typing: 127pt wide, the section
+titles against the window's edge. Reproduced in the 15.7 VM on 0.19.3 at their 1,020 x 682 window:
+246pt at launch, 120pt the moment results showed. Tahoe never showed it, which is why it was not
+reproduced there.
+- CAUSE: before Tahoe, `columnHeader` stacks the header above the list, and the header's least width
+  is the sum of its fixed columns (~900pt). That became the detail pane's minimum, and the split view
+  took it from the sidebar, under the sidebar's own 230pt minimum. On Tahoe the header is an overlay
+  and adds nothing to the pane's minimum.
+- FIX: the header and the result rows are framed `minWidth: 0`, leading. Columns wider than the list
+  run off the trailing edge, as in a too-narrow Finder list, on every system. On Tahoe this also fixes
+  the same width: 0.19.3 centred the overflowing rows and header, so at 1,020pt the names and
+  disclosure triangles sat under the floating sidebar ("rrisons Pri...", "Name" hidden). Where the
+  columns fit (1,400 x 800) the two builds draw the same.
+- A LAYOUT LOOP THE FIRST TRY FOUND: the header's trailing padding is derived from where the header
+  ends (`headerMaxX`), measured inside its frame. Once the columns overflow, that end moves with the
+  padding, so every pass added the padding again: the main thread never left layout (VM, typing
+  stopped at the first word, `sample` all in `BrowserHeader.body`). At 2x the header's and rows' ends
+  round to the same point and the loop stalls; at the VM's 1x they differ by a fraction and it does
+  not. The header now measures the pane's edge, outside its frame, which the padding cannot move.
+- Not reproduced: a narrow search field at launch - three relaunches in the VM with the window state
+  kept (1,000 x 660 restored), the field full width each time.
