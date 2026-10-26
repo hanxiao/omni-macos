@@ -64,6 +64,33 @@ final class VisionEncoderTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(c1632, 0.999, "fp16 vision tower against fp32")
     }
 
+    /// A batch carved into one image per chunk (someone is searching: `carve`) embeds each image as
+    /// the packed batch does, to fp16 rounding: the attention is block-diagonal, but the fp16 kernels
+    /// tile by the packed row count, so the sums run in another order. Measured 0.99991-0.99992 on
+    /// these three; the fp16 tower's own bound against fp32 is 0.999 (testVisionTowerParity).
+    func testCarvedChunksMatchPackedChunks() async throws {
+        let enc = try await makeEncoder()
+        guard let url = Bundle.module.url(forResource: "test_image", withExtension: "png"),
+              let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else {
+            throw XCTSkip("test image missing")
+        }
+        // Three different shapes: the image, its left half, its top half.
+        let w = img.width, h = img.height
+        let crops = [img, img.cropping(to: CGRect(x: 0, y: 0, width: w / 2, height: h)),
+                     img.cropping(to: CGRect(x: 0, y: 0, width: w, height: h / 2))].compactMap { $0 }
+        let raws = crops.map { OmniVisionPreprocess.preprocessRaw($0) }
+        func inputs() -> [OmniImageEncoder.Preprocessed] { raws.map { (pixelValues: $0.tensor(), gridTHW: $0.gridTHW) } }
+        let packed = enc.encode(images: inputs(), tagger: nil, carve: { false }).vecs
+        let carved = enc.encode(images: inputs(), tagger: nil, carve: { true }).vecs
+        XCTAssertEqual(packed.count, 3); XCTAssertEqual(carved.count, 3)
+        for (a, b) in zip(packed, carved) {
+            let c = cosine(a, b)
+            print(String(format: "[vision carve] packed vs one image a chunk: %.6f", c))
+            XCTAssertGreaterThanOrEqual(c, 0.9995, "a carved chunk embeds as the packed batch does")
+        }
+    }
+
     /// End-to-end from the PNG: also exercises Swift preprocessing (CoreGraphics
     /// resize differs from PIL bicubic, so this is a looser, informational bound).
     func testEndToEndImageEmbedding() async throws {

@@ -333,7 +333,7 @@ struct ContentView: View {
 
     @ViewBuilder private var contentBody: some View {
         VStack(spacing: 0) {
-            if !model.results.isEmpty {
+            if model.hasListedResults {
                 // `.equatable()`: see the conformance on ResultsList.
                 ResultsList { belowThresholdFooter }.equatable()
             } else if showsClipboardOff {
@@ -354,92 +354,13 @@ struct ContentView: View {
             } else if showsFolderViz {
                 FolderEmbeddingVisualization(folderName: model.selectedFolderForViz!.lastPathComponent)
             } else {
-                emptyState
+                EmptyResults()
             }
         }
         // Leaving the map releases the folders browsed BEFORE this one. The selected folder's
         // layout stays cached, so clearing the query still puts its map back instantly.
         .onChange(of: showsFolderViz) { _, shown in
             if !shown { model.trimProjectionCacheToCurrent() }
-        }
-    }
-
-    @ViewBuilder private var emptyState: some View {
-        // Indexing is invisible here - the sidebar's per-folder progress is the only cue, and
-        // search works while it runs. The user just adds folders and searches.
-        // THE FIRST SCREEN A NEW INSTALL SEES, now that nothing is indexed by default (see
-        // AppModel.loadRoots). Keyed on hasSources, not on `roots`: a user who added only their
-        // photo library has a source and can search, and telling them to add a folder over the
-        // top of it would be wrong.
-        if let scope = model.linkedScope, !model.link.isOnline(scope.peer) {
-            CenteredStatus(symbol: CenteredStatus.moleSleep, title: "\(model.link.name(of: scope.peer)) is offline",
-                           subtitle: "", showSpinner: false, action: ("Try Again", { model.link.retry(scope.peer) }))
-        } else if !model.hasSources {
-            CenteredStatus(symbol: CenteredStatus.moleSleep, title: "Add folders to search",
-                           subtitle: "", showSpinner: false,
-                           action: ("Add\u{2026}", { SourcePicker.add(to: model) }),
-                           prominent: true)
-        } else if let err = model.queryError {
-            CenteredStatus(symbol: "exclamationmark.magnifyingglass", title: "Couldn't search by that file",
-                           subtitle: err, showSpinner: false)
-        } else if model.indexObsolete && model.hasQuery {
-            // A dim/model mismatch makes every search return nothing; explain it and offer both the
-            // cheap fix (switch back to the model the index was built with) and the rebuild.
-            let built = model.indexBuiltVariant
-            CenteredStatus(symbol: "arrow.triangle.2.circlepath",
-                           title: built != nil ? "Switch to \(built!.title) or reindex" : "Reindex to search",
-                           // The FACT only. The sentence that used to follow it ("Switch back to
-                           // keep your index, or reindex with the current model") described the two
-                           // buttons directly beneath it, which already say so themselves.
-                           subtitle: built != nil
-                               ? "Built with \(built!.title). \(model.modelVariant.title) is loaded."
-                               : "Built with a different model than the one loaded.",
-                           showSpinner: false,
-                           action: built.map { v in ("Switch to \(v.title)", { model.selectVariant(v) }) },
-                           secondary: ("Reindex", { model.resumeIndexing() }),
-                           // Two ways out, and switching back is the cheap one: it keeps the index
-                           // that reindexing would spend an hour rebuilding.
-                           prominent: true)
-        } else if !model.hasQuery || model.isResolving {
-            // Idle prompt, and the in-flight search state. They share one calm placeholder so a
-            // pending search only fades a small spinner in under the same prompt - it never flashes
-            // "No matches" while the debounce/search for what you just typed is still running.
-            // LINKED MACS COUNT, when the next search reaches them: every linked Mac online and
-            // sharing, unless a folder on this Mac scopes it. Their files are in the number and their
-            // moles beside this one, so the prompt says what the search box will cover.
-            let reach = model.linkedScope == nil && model.filterFolders.isEmpty ? model.link.searchable().count : 0
-            let total = model.indexedFiles + (reach > 0 ? model.link.searchableFiles : 0)
-            SearchWaysPrompt(
-                // With several folders scoped there is no browser to show (that needs exactly one),
-                // so the prompt is the only place that says what the next query will cover.
-                title: model.linkedScope.map { "Search \(model.link.name(of: $0.peer))" }
-                    ?? (model.filterFolders.count > 1
-                    ? "Search \(model.filterFolders.count) folders"
-                    : (total > 0 ? "Search \(total.formatted()) file\(total == 1 ? "" : "s")\(reach > 0 ? " on \(reach + 1) Macs" : "")"
-                       : "Search your files")),
-                count: total,
-                showSpinner: model.isResolving,
-                symbol: reach == 0 ? CenteredStatus.moleSearch
-                    : reach == 1 ? CenteredStatus.moleSearchLinked : CenteredStatus.moleSearchLinkedMany)
-        } else if model.hiddenWeaker > 0 {
-            // The count sits in the BUTTON, the only thing that acts on it. As a subtitle it
-            // restated the title and then named the mechanism doing it.
-            CenteredStatus(symbol: CenteredStatus.moleSad,
-                           title: "No results above \(Int(model.minScore * 100))%",
-                           subtitle: "", showSpinner: false,
-                           action: (Self.weakerMatchesTitle(model.hiddenWeaker),
-                                    { model.showWeakerMatches() }))
-        } else if model.filtersActive {
-            // Filters can hide every result; the empty state is the only place left to escape
-            // them. The cause goes in the TITLE - as a subtitle it was a sentence explaining the
-            // button underneath it.
-            CenteredStatus(symbol: CenteredStatus.moleSad, title: "No matches with these filters",
-                           subtitle: "", showSpinner: false,
-                           action: ("Clear Filters", { model.clearFilters() }))
-        } else {
-            // No subtitle. "Try a different phrase" is the only thing anyone could do here, so
-            // saying it adds a line and no information.
-            CenteredStatus(symbol: CenteredStatus.moleSad, title: "No matches", subtitle: "", showSpinner: false)
         }
     }
 
@@ -547,11 +468,7 @@ struct ContentView: View {
         // searches instantly without a trip to the sidebar.
         let trimmed = raw.trimmingCharacters(in: .whitespaces)
         if trimmed.count >= 1 {
-            let needle = trimmed.lowercased()
-            let hist = model.searchHistory
-                .filter { !$0.isFile && $0.displayText.lowercased().contains(needle) && $0.displayText.lowercased() != needle }
-                .sorted { a, b in a.bookmarked != b.bookmarked ? a.bookmarked : a.lastUsed > b.lastUsed }
-                .prefix(5)
+            let hist = model.historyMatches(trimmed)
             // The LABEL is the compact form and the COMPLETION is still the full query. Showing
             // `displayText` here rendered a 340-character path as a ten-line wrapped paragraph,
             // five of them stacked - the suggestion list was taller than the window.
@@ -770,6 +687,104 @@ struct CenteredStatus: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding()
+    }
+}
+
+/// What the pane says when no result is listed. ITS OWN VIEW because whether a search is still
+/// resolving depends on the query text: read in ContentView's body, every keystroke before the first
+/// result re-ran the whole window - the split view, the toolbar and the search field (perf script
+/// counts, 2026-10-26).
+private struct EmptyResults: View {
+    @Environment(AppModel.self) private var model: AppModel
+
+    var body: some View {
+        // Indexing is invisible here - the sidebar's per-folder progress is the only cue, and
+        // search works while it runs. The user just adds folders and searches.
+        // THE FIRST SCREEN A NEW INSTALL SEES, now that nothing is indexed by default (see
+        // AppModel.loadRoots). Keyed on hasSources, not on `roots`: a user who added only their
+        // photo library has a source and can search, and telling them to add a folder over the
+        // top of it would be wrong.
+        if let scope = model.linkedScope, !model.link.isOnline(scope.peer) {
+            CenteredStatus(symbol: CenteredStatus.moleSleep, title: "\(model.link.name(of: scope.peer)) is offline",
+                           subtitle: "", showSpinner: false, action: ("Try Again", { model.link.retry(scope.peer) }))
+        } else if !model.hasSources {
+            CenteredStatus(symbol: CenteredStatus.moleSleep, title: "Add folders to search",
+                           subtitle: "", showSpinner: false,
+                           action: ("Add\u{2026}", { SourcePicker.add(to: model) }),
+                           prominent: true)
+        } else if let err = model.queryError {
+            CenteredStatus(symbol: "exclamationmark.magnifyingglass", title: "Couldn't search by that file",
+                           subtitle: err, showSpinner: false)
+        } else if model.indexObsolete && model.hasQuery {
+            // A dim/model mismatch makes every search return nothing; explain it and offer both the
+            // cheap fix (switch back to the model the index was built with) and the rebuild.
+            let built = model.indexBuiltVariant
+            CenteredStatus(symbol: "arrow.triangle.2.circlepath",
+                           title: built != nil ? "Switch to \(built!.title) or reindex" : "Reindex to search",
+                           // The FACT only. The sentence that used to follow it ("Switch back to
+                           // keep your index, or reindex with the current model") described the two
+                           // buttons directly beneath it, which already say so themselves.
+                           subtitle: built != nil
+                               ? "Built with \(built!.title). \(model.modelVariant.title) is loaded."
+                               : "Built with a different model than the one loaded.",
+                           showSpinner: false,
+                           action: built.map { v in ("Switch to \(v.title)", { model.selectVariant(v) }) },
+                           secondary: ("Reindex", { model.resumeIndexing() }),
+                           // Two ways out, and switching back is the cheap one: it keeps the index
+                           // that reindexing would spend an hour rebuilding.
+                           prominent: true)
+        } else if !model.hasQuery || model.isResolving {
+            // Idle prompt, and the in-flight search state. They share one calm placeholder so a
+            // pending search only fades a small spinner in under the same prompt - it never flashes
+            // "No matches" while the debounce/search for what you just typed is still running.
+            IdleSearchPrompt()
+        } else if model.hiddenWeaker > 0 {
+            // The count sits in the BUTTON, the only thing that acts on it. As a subtitle it
+            // restated the title and then named the mechanism doing it.
+            CenteredStatus(symbol: CenteredStatus.moleSad,
+                           title: "No results above \(Int(model.minScore * 100))%",
+                           subtitle: "", showSpinner: false,
+                           action: (ContentView.weakerMatchesTitle(model.hiddenWeaker),
+                                    { model.showWeakerMatches() }))
+        } else if model.filtersActive {
+            // Filters can hide every result; the empty state is the only place left to escape
+            // them. The cause goes in the TITLE - as a subtitle it was a sentence explaining the
+            // button underneath it.
+            CenteredStatus(symbol: CenteredStatus.moleSad, title: "No matches with these filters",
+                           subtitle: "", showSpinner: false,
+                           action: ("Clear Filters", { model.clearFilters() }))
+        } else {
+            // No subtitle. "Try a different phrase" is the only thing anyone could do here, so
+            // saying it adds a line and no information.
+            CenteredStatus(symbol: CenteredStatus.moleSad, title: "No matches", subtitle: "", showSpinner: false)
+        }
+    }
+}
+
+/// The idle prompt with what the next search covers. ITS OWN VIEW because the count climbs with every
+/// stats tick while indexing: read in ContentView's body, each tick re-ran the whole window (counted
+/// per perf-script step, 2026-10-26).
+private struct IdleSearchPrompt: View {
+    @Environment(AppModel.self) private var model: AppModel
+
+    var body: some View {
+        // LINKED MACS COUNT, when the next search reaches them: every linked Mac online and
+        // sharing, unless a folder on this Mac scopes it. Their files are in the number and their
+        // moles beside this one, so the prompt says what the search box will cover.
+        let reach = model.linkedScope == nil && model.filterFolders.isEmpty ? model.link.searchable().count : 0
+        let total = model.indexedFiles + (reach > 0 ? model.link.searchableFiles : 0)
+        SearchWaysPrompt(
+            // With several folders scoped there is no browser to show (that needs exactly one),
+            // so the prompt is the only place that says what the next query will cover.
+            title: model.linkedScope.map { "Search \(model.link.name(of: $0.peer))" }
+                ?? (model.filterFolders.count > 1
+                ? "Search \(model.filterFolders.count) folders"
+                : (total > 0 ? "Search \(total.formatted()) file\(total == 1 ? "" : "s")\(reach > 0 ? " on \(reach + 1) Macs" : "")"
+                   : "Search your files")),
+            count: total,
+            showSpinner: model.isResolving,
+            symbol: reach == 0 ? CenteredStatus.moleSearch
+                : reach == 1 ? CenteredStatus.moleSearchLinked : CenteredStatus.moleSearchLinkedMany)
     }
 }
 

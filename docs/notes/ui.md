@@ -1481,3 +1481,130 @@ the 0.19.4 rule found the opening for 22.6% (the rest went to the top of the pag
 mostly text no phrase can come from: reference lists, author lines, tables, prompts that repeat on
 earlier pages. Preview, sent two of them as the app sends them: page 7 and page 21 of a 22-page paper,
 the phrase highlighted at the passage, "Found on 1 page".
+
+## Search history without a cap (Han, 2026-10-25)
+
+Han: the sidebar's History keeps everything, and Settings > History > Keep history for has Forever.
+The 200-row ceiling had filled with agents' searches: on his Mac all 200 rows were MCP queries from
+the last 20 days, and his own typed searches were gone (one bookmark left).
+
+MEASURED FIRST (`historybench:N` perf-script step, the app's own code on N synthetic searches over a
+year, four in five from agents). Uncapped, the old code was linear with a heavy constant: every
+element write re-ran the bookmark mark over the whole list (8 writes per recorded search), and the
+merge, the suggestions and the day folders lowercased, parsed or sorted every row each time.
+
+| per action, main thread | 10k old | 10k new | 100k old | 100k new |
+|---|---|---|---|---|
+| a typed search recorded | 105 ms | 2.8 ms | 1,066 ms | 30 ms |
+| an agent's search recorded | 5.3 ms | 0.07 ms | 52 ms | 1.6 ms |
+| suggestions, a keystroke matching nothing | 25 ms | 0.4 ms | 239 ms | 4.4 ms |
+| the day folders | 20 ms | 1.0 ms | 202 ms | 0.7 ms |
+| the bookmark mark, a keystroke | 2.8 ms | 0 | 28 ms | 0 |
+| save (encode) | 30 ms | off main | 289 ms | off main |
+| launch read | 139 ms | off main | 1,409 ms | off main (440 ms) |
+
+HOW: the list is newest first by `lastUsed`, always (`placeHistory`, `touchHistory`), so nothing sorts
+it and a day folder is a range found by bisection (only an open day's rows are copied). Each row
+carries its text lowercased in memory (`folded`, not saved): suggestions are a `memmem` per row
+with an early stop, the bookmark mark is a set kept per change that can touch a bookmark, and an
+agent's repeated query is found in a set of the served rows' texts. The typed-search merge
+compares typed rows only and parses just the rows with the same words.
+
+STORAGE moved from the UserDefaults blob to `Application Support/Omni/history.json` (28 MB at 100k):
+saved on its own queue, one write per burst (`HistorySaver`), flushed at quit; read off the main
+actor at launch, the query-image sweep and the dead-recents prune waiting for it. The blob is read
+once, collapsed (`canonicalized`, no longer run every launch), written to the file and removed. An
+older Omni after this one sees an empty History. `-omni.historyFile <path>` gives an isolated run
+its own file to read and write; with it: the real 201-row blob moved over, a typed, a REST and an
+MCP search sent one second before Quit all in the file, the order newest first, a repeated query in
+other case merged, nothing duplicated, a relaunch read it back, and 3-day retention left the 30
+recent rows of the last three days and the bookmark.
+
+## Renders per step: what re-ran the window (2026-10-26)
+
+Han's goal: find the UI's lags, redraws and renders nobody asked for. THE INSTRUMENT: every `script`
+line of the perf script now ends with `counts[...]`, the `UIProbe.count` tallies since the step
+before (`UIProbe.takeTotals`, with `-omni.hangwatch`), and a temporary `UIProbe.count("body.X")` was
+put at the top of all 125 view, modifier and commands bodies (a script inserts and removes them,
+marked). New steps: `seedhistory:N` (the sidebar at N searches, left in place) and `note:<text>` (a
+marker a harness waits on; the served-load loop runs between `note:served-on` and `note:served-off`).
+The tour: an isolated instance over the eval tree plus 6,000 generated text files, indexing through
+most of it, hangwatch at 100 ms; idle, typing, selection and arrows, grid and list, Find Similar,
+the sidebar, browsing, Recents, served load at 4 searches a second, Settings, 20,000 searches seeded,
+a history row clicked, served load again.
+
+SIX CAUSES, each read off the counts and fixed:
+- THE MENU BAR WAS PART OF THE APP'S BODY. Declared inline in `OmniApp.body`, every value a menu item
+  reads (`menuSelection` on each arrow press, the bookmark state, Back and Forward) re-ran the App's
+  body, and with it the window's root view, the toolbar and the search field: one whole-window render
+  per selection change. `OmniCommands`, its own `Commands` type: select and arrows now re-run the
+  menus only (ContentView 1 -> 0 a step).
+- THE EMPTY STATE'S COUNT. "Search 6,226 files" read `indexedFiles` in ContentView's body, so while
+  indexing every stats tick (1.5 s) re-ran the window. `IdleSearchPrompt` reads it: 5 -> 0 window
+  renders in an 8 s idle step.
+- THE SIDEBAR SELECTION IN THE ENVIRONMENT. Every row's `SidebarRow` modifier and the whole history
+  section read it, so any click re-ran all of them: 462 rows and a 150 ms stall with 20,000 searches
+  in History. One observed flag per row (`SidebarSelectionFlags`): a click re-runs the two rows
+  whose flag flips (462 -> 1), the history row's tint comes from its own flag (`HistoryRowLabel`).
+- A NEW OBJECT AS A @State's INITIAL VALUE MAKES EVERY RE-CREATION A CHANGED VIEW. The first form of
+  the flags (`@State var flags = SidebarSelectionFlags()`) re-ran the sidebar with every window
+  render, 18 times while typing one sentence: the initial value is built on each init and compared.
+  The flags are made on first use. (`TypingTimers`, `SplitScroll`, `ResultFrames` and
+  `ScrollZoomCatcher` have the same shape; their parents re-create them rarely, left.)
+- THE PROGRESS PIE NEVER STOPPED ANIMATING. Progress is published up to 12 times a second and each
+  value restarted the wedge's 0.2 s animation; Time Profiler on the idle window while indexing put
+  most of the main thread in drawing those frames. `CloudSyncPie` takes whole percent (under a pixel
+  of a 16 pt rim): pie renders 37 -> 10 an idle step; the idle main thread, old/new/old/new back to
+  back, 2.41 / 1.74 / 2.41 / 1.97 s per 45 s.
+- THE WINDOW READ THE RESULTS TO SEE IF THERE WERE ANY. `!model.results.isEmpty` re-ran it with each
+  result set (the list, then the passages, then the grouping: 2-3 a search while typing), and the
+  empty states read `isResolving`, which reads the query text: a window render per keystroke before
+  the first result. `hasListedResults` (stored, written on change) and `EmptyResults` (its own view):
+  typing "kitchen renovation" from an empty box, 11 -> 3 window renders.
+
+- THE OCR WORKSPACE ASKED FOR THE WHOLE SECTION LIST TO SEE IF IT WAS EMPTY. `sectionIDs` reads every
+  page's state, so `OCRView` re-ran with each page's every transition: 85 + 14 times over a 40-page
+  scan's two 30 s windows. `hasSections` stops at the first section: 0 + 3. Same transcript (23,834
+  tokens), 45.5 / 46.3 s; the main thread there is the streamed text and the readout (24 Hz, as
+  designed), so its CPU did not move.
+
+- THE HISTORY UNDER AGENT LOAD, KEPT FOREVER. With 20,000 searches over a year (Settings > History >
+  Forever, `set:historyDays=...` then `seedhistory:N[:M]`, one in M bookmarked) and an agent searching
+  4 times a second, the main thread blocked 27-30 times in 20 s, ~100 ms each (3.1 s, 15%): every
+  batch of served searches re-ran the history section and SwiftUI's List diffed all its rows
+  (`OutlineListCoordinator.diffRows` -> `ViewListTree.child(at:)`, which walks the rows from the
+  start for each row: the cost grows with the square of the rows - 365 days a year, the bookmarks,
+  the open days' searches). What fixed it:
+  - served searches reach the history every 2 s instead of every 0.5 s, a quarter of the diffs (and
+    the 400-search cap on a batch, written for the old 200-row history, is gone: it would drop
+    searches at very high rates);
+  - the row ids are STORED INTEGERS: the diff asks for every row's id many times over, and an id
+    worked out on demand (a day's date formatted) was most of its time, a string id hashed
+    Unicode-normalised at every visit (agents' queries carry CJK) much of the rest;
+  - the days and the open days' searches are one flat ForEach, one view per element.
+  At one bookmark in 50 (400): stalls over 50 ms under agent load 28 -> 0 and the main thread 3.75 ->
+  2.38 s of 20 s; but a history click or a clear stalled ~340 ms flat against ~190 nested. At one in
+  2,000 (10 bookmarks; Han has 1), flat and nested rows are level with the rest in place - 0 stalls
+  under agent load in both, 1.7-2.1 s of main thread, the first fill ~330-350 ms - and clicks and
+  clears are slightly better flat (3.0 / 3.1 s of stalls over six actions, nested 3.3 / 3.4): kept.
+  Still left: the diff itself; fewer rows is the only further lever (older days folded into months,
+  as Notes and Safari do), a design decision not taken.
+
+WHAT IS LEFT WHILE TYPING, profiled (Time Profiler over five typed queries, ~150 keystrokes, a settled
+index, hangwatch at 60 ms): blocks of 60-100 ms and one of 150 ms, each where a result set lands; the
+time is SwiftUI's graph update and the window's layout (NSHostingView.layout runs inside an
+NSAnimationContext group of SwiftUI's own, a third of the busy time), the toolbar's layout ~16%, no
+Omni frame in the heavy stacks. Grid and list switch under 100 ms in the final tours. These are the
+first-results costs testing.md ("UI stress") already took apart and staged over frames.
+
+THE WHOLE TOUR, main-thread CPU, the build before and after back to back on the same script: 12.1 s
+-> 9.5 s on the GPU. In Neural Engine mode (the programs from a warm cache used in place: a COPIED
+cache recompiles, the compiled forms follow the path) the same counts fall the same way, and the
+steps that idle or serve while indexing take 25-40% less main thread (an idle 8 s 389 -> 231 ms,
+12 s of served load 1,323 -> 985 ms). The menus follow the state through `OmniCommands`
+(`menustate:<menu>` step: Open, Quick Look and the rest turn on with a selection, Ignore Folder
+names the selected file's folder, Back turns on after a search, all off after a clear), and five
+states (idle, a result selected, a history row selected, a folder selected, cleared) are
+pixel-identical to the build before. Unchanged on purpose: the prompt's rolling digits (0.3 s per stats tick, the design), the
+history section re-running once per batch of served searches (about 1.6 a second under agent load,
+~15 ms each at 20,000 searches), the first results' toolbar insert (testing.md, "UI stress").

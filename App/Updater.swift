@@ -240,20 +240,20 @@ enum Updater {
                 guard let url = URL(string: m.url) else { throw UpdateError("The update has an invalid download URL.") }
                 progressUI.show("Updating Omni")
                 progressUI.onCancel = { downloadTask?.cancel() }
-                progressUI.status("Downloading Omni \(m.version)...")
+                progressUI.status("Downloading Omni \(m.version)\u{2026}")
                 progressUI.fraction(0)
                 let file = try await download(url)
                 dmg = file
 
                 progressUI.cancellable(false)   // past this point the steps are not interruptible
-                progressUI.status("Verifying...")
+                progressUI.status("Verifying\u{2026}")
                 progressUI.indeterminate()
                 if let want = m.md5?.lowercased() {
                     let actual = await Task.detached(priority: .userInitiated) { md5Hex(file) }.value
                     if actual != want { throw UpdateError("The download's checksum did not match the published MD5.") }
                 }
 
-                progressUI.status("Installing...")
+                progressUI.status("Installing\u{2026}")
                 // mountAndStage also re-verifies the staged app's signature before returning, so a
                 // corrupt download is rejected before we ever touch the installed copy. Off-main so
                 // the long ditto/codesign do not stall the UI.
@@ -264,7 +264,7 @@ enum Updater {
                 guard FileManager.default.isWritableFile(atPath: parent.path) else {
                     throw UpdateError("Omni can't write to \(parent.path). Move Omni to your Applications folder, or install the update manually.")
                 }
-                progressUI.status("Omni will relaunch to finish updating...")
+                progressUI.status("Omni will relaunch to finish updating\u{2026}")
                 launchReplaceAndQuit(staged: staged, dest: dest)   // does not return - quits the app
             } catch {
                 progressUI.close()

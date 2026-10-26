@@ -418,6 +418,9 @@ Measured on APFS clones of the real 6.55M-content / 10.7M-occurrence index, no s
   skips every directory rule.
 - An isolated run (`-omni.dbDir` launch argument) keeps its `.omniignore` beside its index and never
   writes the migration marker, so tests cannot migrate the user's real policy.
+- NOT DONE (Han, 2026-10-25): default rules for agents' session stores (`.openclaw/agents/*/sessions`,
+  `.claude/projects`, `.codex/sessions`, ...), proposed after agents' searches returned other agents'
+  transcripts (half the top-5 slots in 157 searches). Han did not want them shipped to every user.
 
 ## Renamed folders, folder .omniignore files, OCR path check (issue #23, 2026-09-25)
 
@@ -1722,7 +1725,9 @@ Three causes, each found by sampling, not guessed:
   sidebar's history (`searchHistory`, observed), one main-actor hop each: at 150 searches/s the
   history list re-diffed continuously, 39% of main-thread samples, and every other main-actor hop
   queued behind it. Served queries now reach the history in batches twice a second
-  (`PendingServedSearches`), one list update for the lot.
+  (`PendingServedSearches`), one list update for the lot. (Every 2 s since 2026-10-26: with the
+  history kept forever each update's diff grows with the square of the sidebar's rows; ui.md,
+  "Renders per step".)
 - BLOCKING WORK ON THE COOPERATIVE POOL. Every adapter called the store and the GPU synchronously
   inside the request's Task. `ServedWork`, an OperationQueue four wide, now runs all of it (MCP
   tools, REST adapters, the linked-Mac responder, which used a global queue); a waiting request
@@ -1734,6 +1739,21 @@ Three causes, each found by sampling, not guessed:
   connection per request - which read exactly like the server pausing; the server's own log showed
   0 ms requests separated by 18 s gaps. The harness keeps one HTTP connection per thread now, as MCP
   clients do. Same lesson as the positive controls: check the instrument before the subject.
+
+THE SAME LOAD AGAINST 0.19.5, 2026-10-26 (the release app copied and isolated the same way, the new
+build with the 2 s history batch, interleaved, after a 5 s warm-up): 8 clients 379/s (p99 64 ms) for
+the release against 538 and 483/s (p99 32, 60) for the new build; 32 clients 412 and 510/s (p99 716,
+140) against 484 and 544/s (p99 188, 104). From a cold launch both are level: 417-455/s in the first
+10 s, 532-552/s after. One release run served 3 searches a second for 20 s (p50 2.6 s) and was not
+seen again in seven launches; nothing in its log explains it.
+- "Application performed a reentrant operation in its NSTableView delegate. This warning will become
+  an assert in the future." Logged about once per served batch when an agent repeats searches (each
+  repeat moves its History row to the top), in 0.19.5 and now alike. Caught with lldb on NSLog: SwiftUI's
+  sidebar List (`OutlineListCoordinator.diffRows`) calls `NSTableView endUpdates`, and AppKit's row
+  height cache re-enters itself while resizing the table (`NSTableRowHeightData _cacheRowSpansInRange`
+  -> `NSTableView _updateTableViewSize` -> `_cacheRowSpansInRange`). No Omni frame in the stack, no
+  delegate of ours: SwiftUI's List and AppKit between themselves. Recorded; if the assert ever ships it
+  is the List that has to go, not a line of ours.
 
 ## Passages: the text a hit matched (2026-10-20)
 
@@ -2171,6 +2191,38 @@ chunk's tower and its backbone (`eval(perImage)` already syncs there). Served, a
   forward; `OMNI_MEDIA_TIMING=1`), proportionally more on a small GPU. A smaller patch budget would
   shorten it; its throughput cost is not measured. Audio is not split: an audio batch is one forward
   with no sync inside (the interactive per-clip carve still covers typed queries).
+
+THE CHUNK IN FLIGHT, CARVED (2026-10-26). The interactive carve (one image per gate hold while someone
+searches) was decided once per call, so a batch that began before the first keystroke ran to its end
+in full chunks and a typed query waited behind the chunk in flight. `carve` is now asked before each
+chunk inside the call (OmniImageEncoder.encode): while the 2 s activity window is open a chunk is one
+image. `querylat`, 16 mixed images (9 screenshots of 4,000 patches, 7 photos of 1,024), interleaved,
+typed p50 / p90 ms:
+
+| | carve per chunk | per call only |
+|---|---|---|
+| chunks of 8,192 patches (shipped) | 21 / 62, 33 / 183, 23 / 52 | 35 / 114, 24 / 65, 48 / 115 |
+| chunks of 32,768 (a slower GPU's chunk time) | 46 / 129, 52 / 199 | 85 / 210, 53 / 289 |
+
+  On this GPU a full chunk mostly ends inside the keystroke's 180 ms lead, so the gain is modest and
+  noisy here (the live app was indexing on the same GPU); where a chunk outlasts the lead it is
+  clear (max 155 / 211 against 259 / 535 ms). Image indexing with nobody searching is the same path:
+  160 images, six interleaved pairs, -0.2 / 0.0 / -0.5 / +1.4 / +0.5 images/s and one pair the live
+  app disturbed. A SMALLER PATCH BUDGET instead (4,096 always): typed p50 23 / 27 against 65 / 51, but
+  image indexing 6% slower (19.9 / 18.5 / 19.7 against 19.0 / 17.0 / 18.6 images/s) - not taken.
+- RETRIEVAL, the extreme case: the eval bed indexed from scratch twice, normally and with EVERY image
+  batch carved (a measurement switch, removed), 440 queries: the per-tag table identical in every
+  row (ALL MRR 0.890, R@1 0.83; gen-image 0.773, image 0.774, image-ml 0.623 in both), absent-query
+  AUC 0.983 / 0.982, three queries moved by one or two places among near-ties (32 -> 34, 5 -> 6,
+  6 -> 5).
+- NOT BIT-IDENTICAL, AND NEVER WAS: an image alone in a chunk and the same image packed with others
+  agree to cosine 0.99991-0.99992, not to the bit (the fp16 kernels tile by the packed row count).
+  The per-call carve has always produced that; its comment said bit-identical.
+  VisionEncoderTests.testCarvedChunksMatchPackedChunks holds it at 0.9995 (fp16 against fp32 is
+  0.999).
+- A PROBE BUG: `querylat` reused its query texts across its idle, text and image passes, so since the
+  engine began keeping query vectors every served query after the first pass was a cache hit and
+  read 0.0 ms. The texts carry the pass now.
 
 THE ENGINE KEEPS QUERY VECTORS NOW (`cachedQueryVector`, 256, LRU), moved from AppModel, which kept
 the window's own and nobody else's. Every caller shares it: the window's re-runs, served search (an
@@ -2684,6 +2736,47 @@ DRAM 2.8 W):
     indexing the HD clips (the long-sequence layer) and Documents: 4.20 GB on the Neural Engine, 4.25
     on the GPU.
 
+TAGS OVER MCP, 2026-10-26 (`tag_image`, an isolated instance on the eval bed, 12 images: 9 screenshots of
+1280x800, 3 photos of 512 px). Stored tags: 1 ms a call on either unit. Recompute (the image and 5
+refinement crops, six tower passes): GPU p50 235 ms; ANE ~1,040 ms a screenshot (its 4,096-patch tower)
+and ~485 ms a photo, steady from the second call (the first loads the sizes it needs, 3.5-7.7 s). The
+ANE's cost is the vision attention at large sizes (index.md, "Queries per attention block"); index-time
+tags score the one forward and have no crops, so only an agent's explicit recompute pays it. A call
+that arrives while the label cache is still building says so ("tagging is unavailable ... or the
+label cache is still building"); at launch that is ~4 s on Nano, before the first pass.
+
+THE CLIPBOARD, 2026-10-26: an isolated instance with capture on, reading a NAMED pasteboard a harness
+writes (`-omni.clipboard.pasteboard <name>`, launch argument only: a measured instance never reads what
+the user copies; its clips go to its own scratch folder), `file_status` polled per clip. A copy to
+searchable, p50: GPU text 488 ms, image 512 ms; Neural Engine text 485 ms, image 819 ms (the first of
+each 2.1-2.4 s, the image size loading). ~400 ms of it is the capture itself, the 0.5 s poll and the
+save, the same on either unit.
+PHOTOS could not be measured in isolation: a copy re-signed with the Developer ID identity satisfies
+the installed app's designated requirement but did not get its Photos grant ("no access"), and getting
+one is a permission prompt, which is the user's to answer. Photos' assets embed through the image path
+measured above on both units.
+
+THE TABLE AGAIN, 2026-10-26 (after the render, history and image-carve work; same harness, the live
+app beside it). Against the arms of 2026-10-23 07:00 (before the batched ANE text path; their Small
+query rows are the dimension bug above and do not count):
+
+    row                                  Nano GPU       Nano ANE       Small GPU      Small ANE
+    text indexing, tokens/s              77,770 76,520  22,310 38,860  19,580 19,080  5,090 9,388
+    index one image, ms                  13.4 13.2      42.0 38.6      46.0 37.7      130 118
+    whole pass, same files, s            7.2 7.4        27.1 14.9      29.1 30.7      126 65
+    text / filtered / similar, ms        3.6/3.7/3.7 -> 3.7/3.7/3.7    6.2/5.9/6.0 (table 6.6/6.4/6.4)
+                                         ANE 3.7/3.8/3.8 -> 4.9/5.3/4.8 (search on the CPU)
+    image / audio / video query, ms      27/72/80 -> 27/72/91   ANE 85/315/185 -> 77/296/184
+                                         Small GPU 72/90/141 (table 73/91/143), ANE 256/371/431 -> 237/355/405
+    search while indexing p50, ms        66 66          5.1 6.2        - 49           - 6.0
+    at rest, model and index, MB         9,083 6,162    8,382 5,494    7,656 6,692    6,904 7,463
+
+  Every row level or better, as the later ANE work predicts. Two cells looked otherwise and are not:
+  Small GPU's search while indexing p95 658 ms has its slow queries in one round of four (56 and 42 of
+  ~100 over 300 ms in round 2, almost none in the others) while other processes held 15.7% of the GPU
+  (3% in the Nano arms); Small ANE's audio query p95 1.6 s holds a first-use compile of an audio size.
+  The text path these cases index is untouched by this round's changes.
+
 ## The switch through the real UI, and the labels one call at a time (2026-10-23, night)
 
 - WHAT RAN. UITests/ComputeUnitUITests through Scripts/compute-unit-ui.sh, inside one automation
@@ -2988,3 +3081,35 @@ the Neural Engine at 40.6 s, the label vocabulary 4.1 s, the first text results 
 ~410 s before: the whole build, then the pass); images and recordings at 210 s (the GPU towers released
 then), their pass 97 s (a lecture recording ~56 s of it); video at 398 s, its 3 files in 8 s. The
 instance's own GPU time after its model load: 267 ms. The build's total is as before.
+
+## Agents' second searches (2026-10-25)
+
+Every agent turn that called Omni: the dataroom harness (42 turns, open-weights models), openclaw (67
+turns in 45 sessions, 2026-09-22..10-25, Opus 5/5.5; its sessions are in
+`~/.openclaw/agents/*/agent/openclaw-agent.sqlite` since 09-07, `transcript_events`), and Omni's own
+`~/Library/Logs/Omni/serving.log`, which records every served request with its server-side ms (800
+searches since 10-11). Of 107 turns, the first search was followed by grep/find 38 times, another
+search 28, opening a hit 22.
+
+- TIMEOUTS ENDED BY 0.16: every 60 s timeout is on or before 10-13; 0 in ~186 searches since. But the
+  live app's served searches are slow server-side, which no benchmark here reproduces (served p50
+  36 ms in `querylat`): p50 0.2-0.7 s on 10-15..10-19, 10.5 s on 10-20 (0.17.3), 18.8 s text and
+  14.6 s image on 10-24 (0.18.1), a burst's first search often the slowest. The live app was still
+  0.18.1 on 10-25 (up since 10-21 22:39, 98% CPU, footprint 15 GB). Not explained yet; the next
+  measurement is the same log after updating, then an isolated instance with agent logs appended into
+  an indexed folder and `OMNI_SEARCH_TIMING=1`.
+- TRANSCRIPTS ARE 46% (harness) AND 40% (openclaw) OF THE TOP 5, but only the harness complains (47 of
+  147 rounds against 2 of 99): its grounding task forbids derived sources (sitroom `NOT_SOURCES`),
+  while openclaw reads old sessions as its memory and finds things only they hold. One more reason not
+  to demote them by default. `exclude_folders` (0.18.0) was used in 7 harness searches, all one run,
+  and that run took it from the line under the results (`poolSummary`, 0.18.0: "Top 30:
+  jina-dataroom-harness/runs 14, ..."), excluding `runs` next and later scoping to `backup` after
+  ".openclaw/agents 23". 27 searches in the traces carried that line; no openclaw search did (all were
+  before 10-21).
+- EXACT STRINGS FALL BACK TO GREP: person names, amounts and file names, where the top hits were a
+  transcript or another run's query.txt with the same words; quoting does the exact match ("DFlash2")
+  but 2 of 58 retries quoted. Retries were mostly rewordings (32 of 58); shortened ones ended in grep
+  9 of 14.
+- NOT OMNI: openclaw's secret redaction masks any long run of letters, digits and slashes (first 5 +
+  "…" + last 4), so `/Users/hanxiao/Downloads/hanxiao2013icdm-paper.pdf` reached the model as
+  `/Users…icdm-paper.pdf` (8 of 491 result lines; mdfind output too).

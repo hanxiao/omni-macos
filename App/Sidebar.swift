@@ -32,10 +32,10 @@ private struct SidebarMaterial: ViewModifier {
 /// colour, where ours kept them black and grey. AppKit's highlight is switched off on this outline
 /// view (SidebarHighlightOff) and the row draws Finder's instead, so the pill does not change with
 /// keyboard focus the way AppKit's does - Finder's never does either.
-private struct SidebarSelectionKey: EnvironmentKey { static let defaultValue: SidebarSelection? = nil }
+private struct SidebarSelectionKey: EnvironmentKey { static let defaultValue: SidebarSelectionFlags? = nil }
 private struct SidebarRowSelectedKey: EnvironmentKey { static let defaultValue = false }
 extension EnvironmentValues {
-    fileprivate var sidebarSelection: SidebarSelection? {
+    fileprivate var sidebarSelection: SidebarSelectionFlags? {
         get { self[SidebarSelectionKey.self] } set { self[SidebarSelectionKey.self] = newValue }
     }
     /// True inside the selected row: its icon and title take the accent colour.
@@ -44,12 +44,36 @@ extension EnvironmentValues {
     }
 }
 
+/// Which row is selected, as ONE FLAG PER ROW. The selection itself in the environment made every row
+/// depend on it, so a click re-ran every row's modifier and the whole history section: 462 rows and
+/// a 150 ms stall with 20,000 searches in History (perf script, 2026-10-26). A row observes its own
+/// flag, and a selection change touches the two rows whose flag flips.
+@MainActor final class SidebarSelectionFlags {
+    @MainActor @Observable final class Flag { var on = false }
+    private var flags: [SidebarSelection: Flag] = [:]
+    private var current: SidebarSelection?
+
+    func flag(_ tag: SidebarSelection) -> Flag {
+        if let f = flags[tag] { return f }
+        let f = Flag(); f.on = tag == current
+        flags[tag] = f
+        return f
+    }
+
+    func select(_ tag: SidebarSelection?) {
+        guard tag != current else { return }
+        if let old = current { flags[old]?.on = false }
+        current = tag
+        if let tag { flags[tag]?.on = true }
+    }
+}
+
 private struct SidebarRow: ViewModifier {
     let tag: SidebarSelection
     @Environment(\.sidebarSelection) private var selection
     @Environment(\.colorScheme) private var scheme
     func body(content: Content) -> some View {
-        let on = selection == tag
+        let on = selection?.flag(tag).on ?? false
         content
             .environment(\.sidebarRowSelected, on)
             .tag(tag)
@@ -111,6 +135,11 @@ struct Sidebar: View {
     @Environment(AppModel.self) private var model: AppModel
     @State private var dropTargeted = false
     @State private var selection: SidebarSelection?
+    /// The rows' view of `selection` (SidebarSelectionFlags), the same reference for the view's life.
+    /// Made on first use, not as the state's initial value: an initial value is built on EVERY init
+    /// of this view, and a new object there makes each re-creation by the window a changed view, so
+    /// the sidebar re-ran with every window render (18 times while typing a sentence, 2026-10-26).
+    @State private var selectionFlags: SidebarSelectionFlags?
     @State private var folds = SidebarFolds.load()
 
 
@@ -233,7 +262,12 @@ struct Sidebar: View {
     var body: some View {
         list
             .listStyle(.sidebar)
-            .environment(\.sidebarSelection, selection)
+            .environment(\.sidebarSelection, selectionFlags)
+            .onChange(of: selection, initial: true) { _, sel in
+                let flags = selectionFlags ?? SidebarSelectionFlags()
+                flags.select(sel)
+                if selectionFlags == nil { selectionFlags = flags }
+            }
             .background(SidebarHighlightOff())
         // Let the window's own sidebar material show through instead of the List's opaque fill.
         // The trailing inspector gets that for free because the system draws its background; a
@@ -381,7 +415,9 @@ private struct HistorySections: View {
         let bookmarks = model.historyBookmarks
         if !bookmarks.isEmpty {
             Section(isExpanded: $folds.section("Bookmarks")) {
-                ForEach(bookmarks) { item in historyRow(item) }
+                ForEach(bookmarks.map { Row(id: $0.id, kind: .search($0)) }) { row in
+                    if case .search(let item) = row.kind { historyRow(item) }
+                }
             } header: {
                 SidebarHeader("Bookmarks")
             }
@@ -393,21 +429,16 @@ private struct HistorySections: View {
                 // it reserve a triangle column for every row, which moved Recents, Clipboard and the
                 // folders off the edge Finder puts its own rows on. The folder row toggles on a click
                 // instead, and its searches are indented under it.
-                ForEach(days, id: \.day) { day in
-                    let open = $folds.day(day.day)
-                    Button { withAnimation(.snappy(duration: 0.2)) { open.wrappedValue.toggle() } } label: {
-                        DayRow(day: day.day, open: open.wrappedValue)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityValue(open.wrappedValue ? "Expanded" : "Collapsed")
-                    .contextMenu {
-                        Button(role: .destructive) { model.removeHistory(day.items) } label: {
-                            Label("Remove from History", systemImage: "trash")
-                        }
-                    }
-                    if open.wrappedValue {
-                        ForEach(day.items) { item in historyRow(item, indent: true) }
+                //
+                // AND ONE VIEW PER ELEMENT. Each day used to emit its own row and then, when open, a
+                // ForEach of its searches, so the elements were different numbers of rows, and the
+                // sidebar's List diffs by walking them from the start for every row: ~100 ms for each
+                // change at 20,000 searches, once per batch of an agent's searches (2026-10-26). The
+                // days and the open days' searches are one flat list.
+                ForEach(rows(days)) { row in
+                    switch row.kind {
+                    case .day(let day, let range): dayRow(day, range)
+                    case .search(let item): historyRow(item, indent: true)
                     }
                 }
             } header: {
@@ -416,8 +447,46 @@ private struct HistorySections: View {
         }
     }
 
+    /// The id is STORED, and a number: the List's diff looks every row's id up many times over (it
+    /// walks the rows from the start for each one), so an id worked out on demand (a day's date
+    /// formatted) was most of its time, and a string id was hashed each time, Unicode-normalised for
+    /// the CJK in agents' queries. The hash of the row's string id, taken once per render.
+    private struct Row: Identifiable {
+        enum Kind { case day(Date, Range<Int>), search(HistoryItem) }
+        let id: Int
+        let kind: Kind
+        init(id: String, kind: Kind) { self.id = id.hashValue; self.kind = kind }
+    }
+
+    private func rows(_ days: [(day: Date, range: Range<Int>)]) -> [Row] {
+        var rows: [Row] = []
+        rows.reserveCapacity(days.count)
+        for d in days {
+            rows.append(Row(id: "day:" + SidebarFolds.dayKey(d.day), kind: .day(d.day, d.range)))
+            if folds.isOpen(d.day) {
+                rows += model.historyItems(in: d.range).map { Row(id: $0.id, kind: .search($0)) }
+            }
+        }
+        return rows
+    }
+
+    private func dayRow(_ day: Date, _ range: Range<Int>) -> some View {
+        let open = $folds.day(day)
+        return Button { withAnimation(.snappy(duration: 0.2)) { open.wrappedValue.toggle() } } label: {
+            DayRow(day: day, open: open.wrappedValue)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityValue(open.wrappedValue ? "Expanded" : "Collapsed")
+        .contextMenu {
+            Button(role: .destructive) { model.removeHistory(model.historyItems(in: range)) } label: {
+                Label("Remove from History", systemImage: "trash")
+            }
+        }
+    }
+
     private func historyRow(_ item: HistoryItem, indent: Bool = false) -> some View {
-        HoverRow { hovered in row(item, hovered: hovered) }
+        HoverRow { hovered in HistoryRowLabel(item: item, hovered: hovered) }
             .padding(.leading, indent ? 8 : 0)   // half an icon in from the day: enough to read as inside it
             .help(item.isFile ? (item.filePath ?? item.displayLabel) : item.displayText)
             .contextMenu {
@@ -432,65 +501,71 @@ private struct HistorySections: View {
             }
             .sidebarRow(.history(item.id))
     }
+}
 
-    @Environment(\.sidebarSelection) private var selection
+/// One search in the History section. ITS OWN VIEW so the selected tint comes from the row's own
+/// flag (`sidebarRowSelected`, set by `sidebarRow`) and not from the section, which would re-run
+/// every row on every click.
+private struct HistoryRowLabel: View {
+    @Environment(AppModel.self) private var model: AppModel
+    @Environment(\.sidebarRowSelected) private var on
+    let item: HistoryItem
+    let hovered: Bool
 
-    @ViewBuilder private func row(_ item: HistoryItem, hovered: Bool) -> some View {
-                    let on = selection == .history(item.id)
-                                        HStack(spacing: 7) {
-                        // A bookmark draws exactly like the search it was: the Bookmarks header
-                        // already says what a star would.
-                        if item.isFile, let p = item.filePath {
-                            // A file query: show its thumbnail (falls back to a generic icon if the
-                            // file is gone, so deleted files degrade gracefully).
-                            Thumbnail(path: p, side: 16, corner: 3)
-                        } else if item.isMCP {
-                            // An agent's tool call, marked with the protocol's own mark rather than
-                            // a globe: the globe says the query crossed a socket, which is true of
-                            // every served row and therefore tells the reader nothing.
-                            MCPMark().sidebarTint(on, else: Color.secondary).frame(width: 16, height: 16)
-                        } else if item.isCLI {
-                            // The `omni` command line: an agent or a person in a shell.
-                            Image(systemName: "terminal").sidebarTint(on, else: Color.secondary).frame(width: 16)
-                        } else if item.isServed {
-                            // The REST surface: a script or a curl, not an agent.
-                            Image(systemName: "network").sidebarTint(on, else: Color.secondary).frame(width: 16)
-                        } else {
-                            Image(systemName: "magnifyingglass").sidebarTint(on, else: Color.secondary).frame(width: 16)
-                        }
-                        Text(item.displayLabel).lineLimit(1).truncationMode(item.isFile ? .middle : .tail)
-                            .sidebarTint(on, else: .primary)
-                            .layoutPriority(1)            // the words the reader typed survive; the scope gives way first
-                        if let scope = item.displayScope {
-                            Text(scope).font(.caption).foregroundStyle(.tertiary)
-                                .lineLimit(1).truncationMode(.tail)
-                        }
-                        Spacer(minLength: 0)
-                        if hovered {
-                            // Under the pointer the trailing glyph gives way to Remove from
-                            // History, drawn with the trash its context menu and the day's use:
-                            // one action, one icon, wherever it appears.
-                            Button { model.removeHistory(item) } label: {
-                                Image(systemName: "trash").foregroundStyle(.secondary)
-                            }
-                            .buttonStyle(.plain)
-                            .help("Remove from History")
-                        } else if item.isFile, let k = item.fileKind, let fk = FileKind(rawValue: k), fk != .text {
-                            Image(systemName: fk.symbol).font(.caption2).foregroundStyle(.tertiary)
-                        } else if !item.isFile, item.isFiltered {
-                            // Same trailing-glyph treatment as the file rows' kind symbol. It
-                            // matters more now that the label drops the qualifiers: without it a
-                            // filtered search and a bare one look identical. `tag:` keeps its own
-                            // glyph; anything else gets the generic filter mark. The full query
-                            // is still one hover away.
-                            let tagged = SearchQueryParser.parse(item.displayText)
-                                .qualifiers.contains { $0.key == "tag" }
-                            Image(systemName: tagged ? "tag" : "line.3.horizontal.decrease")
-                                .font(.caption2).foregroundStyle(.tertiary)
-                        }
-                    }
+    var body: some View {
+        HStack(spacing: 7) {
+            // A bookmark draws exactly like the search it was: the Bookmarks header
+            // already says what a star would.
+            if item.isFile, let p = item.filePath {
+                // A file query: show its thumbnail (falls back to a generic icon if the
+                // file is gone, so deleted files degrade gracefully).
+                Thumbnail(path: p, side: 16, corner: 3)
+            } else if item.isMCP {
+                // An agent's tool call, marked with the protocol's own mark rather than
+                // a globe: the globe says the query crossed a socket, which is true of
+                // every served row and therefore tells the reader nothing.
+                MCPMark().sidebarTint(on, else: Color.secondary).frame(width: 16, height: 16)
+            } else if item.isCLI {
+                // The `omni` command line: an agent or a person in a shell.
+                Image(systemName: "terminal").sidebarTint(on, else: Color.secondary).frame(width: 16)
+            } else if item.isServed {
+                // The REST surface: a script or a curl, not an agent.
+                Image(systemName: "network").sidebarTint(on, else: Color.secondary).frame(width: 16)
+            } else {
+                Image(systemName: "magnifyingglass").sidebarTint(on, else: Color.secondary).frame(width: 16)
+            }
+            Text(item.displayLabel).lineLimit(1).truncationMode(item.isFile ? .middle : .tail)
+                .sidebarTint(on, else: .primary)
+                .layoutPriority(1)            // the words the reader typed survive; the scope gives way first
+            if let scope = item.displayScope {
+                Text(scope).font(.caption).foregroundStyle(.tertiary)
+                    .lineLimit(1).truncationMode(.tail)
+            }
+            Spacer(minLength: 0)
+            if hovered {
+                // Under the pointer the trailing glyph gives way to Remove from
+                // History, drawn with the trash its context menu and the day's use:
+                // one action, one icon, wherever it appears.
+                Button { model.removeHistory(item) } label: {
+                    Image(systemName: "trash").foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Remove from History")
+            } else if item.isFile, let k = item.fileKind, let fk = FileKind(rawValue: k), fk != .text {
+                Image(systemName: fk.symbol).font(.caption2).foregroundStyle(.tertiary)
+            } else if !item.isFile, item.isFiltered {
+                // Same trailing-glyph treatment as the file rows' kind symbol. It
+                // matters more now that the label drops the qualifiers: without it a
+                // filtered search and a bare one look identical. `tag:` keeps its own
+                // glyph; anything else gets the generic filter mark. The full query
+                // is still one hover away.
+                let tagged = SearchQueryParser.parse(item.displayText)
+                    .qualifiers.contains { $0.key == "tag" }
+                Image(systemName: tagged ? "tag" : "line.3.horizontal.decrease")
+                    .font(.caption2).foregroundStyle(.tertiary)
+            }
+        }
     }
-
 }
 
 /// A row that knows whether the pointer is over it. Its own view, so a hover redraws one row and
@@ -950,6 +1025,16 @@ struct CloudSyncPie: View {
     /// Secondary on a normal surface; white on a selected row, where a grey pie on the accent fill
     /// is all but invisible - the same swap the row's labels make.
     var tint: Color = .secondary
+
+    /// WHOLE PERCENT, rounded down. Progress is published up to 12 times a second and each new value
+    /// started the wedge's 0.2 s animation again, so a pie was never still while indexing, and its
+    /// frames were most of the main thread's work with the window idle (Time Profiler, 2026-10-26).
+    /// At 16 pt a percent is under a pixel of the rim; a pie that has not moved a percent is the same
+    /// view, and SwiftUI skips it.
+    init(fraction: Double?, tint: Color = .secondary) {
+        self.fraction = fraction.map { ($0 * 100).rounded(.down) / 100 }
+        self.tint = tint
+    }
 
     var body: some View {
         // NOTHING UNTIL THERE IS SOMETHING TO SHOW. `nil` means queued behind another pass, or

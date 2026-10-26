@@ -23,8 +23,37 @@ enum IndexState { case idle, indexing, paused }
 /// apart from a script.
 enum HistorySource: String, Codable, Sendable { case app, serving, mcp, cli }
 
+/// The search history's saves: one at a time on its own queue, each of the newest list. A save
+/// asked for while one is waiting replaces it, so a burst of searches is one write.
+final class HistorySaver: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "omni.history.save", qos: .utility)
+    private let lock = NSLock()
+    private var pending: (items: [HistoryItem], file: URL)?   // guarded by lock
+
+    func save(_ items: [HistoryItem], to file: URL) {
+        lock.lock()
+        let queued = pending != nil
+        pending = (items, file)
+        lock.unlock()
+        if !queued { queue.async { self.write() } }
+    }
+
+    /// Waits for every save asked for so far, on the caller's thread.
+    func flush() { queue.sync { self.write() } }
+
+    private func write() {
+        lock.lock()
+        let job = pending
+        pending = nil
+        lock.unlock()
+        guard let job, let data = try? JSONEncoder().encode(job.items) else { return }
+        try? FileManager.default.createDirectory(at: job.file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? data.write(to: job.file, options: .atomic)
+    }
+}
+
 struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
-    var query: String                 // semantic (embedding) text, or "" for a file query
+    var query: String { didSet { refold() } }   // semantic (embedding) text, or "" for a file query
     var bookmarked: Bool
     var lastUsed: Date
     var kinds: [String] = []          // FileKind rawValues
@@ -34,7 +63,44 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
     var sortOrder: String = "relevance" // SortOrder rawValue
     // The literal search-box text the user typed, including any `key:value` qualifiers. Optional so
     // history saved before the query language decodes unchanged (it falls back to `query`).
-    var rawQuery: String? = nil
+    var rawQuery: String? = nil { didSet { refold() } }
+    /// `displayText` lowercased, in memory only (not in CodingKeys). The suggestions, the bookmark
+    /// mark and the served-search merge compare this, so none of them lowercases every row of an
+    /// uncapped history on each keystroke or request: 1 us a row, 95 ms at 100k rows.
+    private(set) var folded = ""
+    private mutating func refold() { folded = displayText.lowercased() }
+
+    init(query: String, bookmarked: Bool, lastUsed: Date, kinds: [String] = [], folder: String? = nil,
+         ext: String = "", dateRange: String = "any", sortOrder: String = "relevance", rawQuery: String? = nil) {
+        self.query = query; self.bookmarked = bookmarked; self.lastUsed = lastUsed; self.kinds = kinds
+        self.folder = folder; self.ext = ext; self.dateRange = dateRange; self.sortOrder = sortOrder
+        self.rawQuery = rawQuery
+        refold()
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case query, bookmarked, lastUsed, kinds, folder, ext, dateRange, sortOrder, rawQuery, filePath, fileKind, similar, source
+    }
+
+    /// Every field after the first three is optional on the way in, so a row written by any earlier
+    /// version reads back rather than failing the whole list.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        query = try c.decode(String.self, forKey: .query)
+        bookmarked = try c.decode(Bool.self, forKey: .bookmarked)
+        lastUsed = try c.decode(Date.self, forKey: .lastUsed)
+        kinds = try c.decodeIfPresent([String].self, forKey: .kinds) ?? []
+        folder = try c.decodeIfPresent(String.self, forKey: .folder)
+        ext = try c.decodeIfPresent(String.self, forKey: .ext) ?? ""
+        dateRange = try c.decodeIfPresent(String.self, forKey: .dateRange) ?? "any"
+        sortOrder = try c.decodeIfPresent(String.self, forKey: .sortOrder) ?? "relevance"
+        rawQuery = try c.decodeIfPresent(String.self, forKey: .rawQuery)
+        filePath = try c.decodeIfPresent(String.self, forKey: .filePath)
+        fileKind = try c.decodeIfPresent(String.self, forKey: .fileKind)
+        similar = try c.decodeIfPresent(Bool.self, forKey: .similar) ?? false
+        source = try c.decodeIfPresent(String.self, forKey: .source) ?? HistorySource.app.rawValue
+        refold()
+    }
     // File-query fields (all optional/defaulted so existing persisted JSON decodes unchanged).
     var filePath: String? = nil       // set when the query is a file
     var fileKind: String? = nil       // FileKind rawValue, for the row glyph
@@ -1697,10 +1763,30 @@ final class AppModel {
     var shareProfilingResults: Bool = UserDefaults.standard.bool(forKey: "omni.profiling.uploadEnabled") {
         didSet { ProfilingService.setShareEnabled(shareProfilingResults) }
     }
-    /// Past searches shown in the sidebar (recents auto-pruned; bookmarks pinned and kept).
-    private(set) var searchHistory: [HistoryItem] = [] { didSet { refreshSearchFlags() } }
-    private let historyKey = "omni.searchHistory"
-    private let maxRecentHistory = 200   // hard ceiling on recents; the day window is the real control
+    /// Past searches shown in the sidebar: bookmarks, and recents for as long as Settings > History
+    /// keeps them, with NO COUNT CAP (Han, 2026-10-25). NEWEST FIRST by `lastUsed`, always: every
+    /// write keeps that order (`placeHistory`), so nothing that reads the list sorts it - the prune,
+    /// the day folders and the suggestions each stay cheap at 100k rows (`historybench`).
+    private(set) var searchHistory: [HistoryItem] = [] {
+        didSet {
+            historyRevision &+= 1
+            if !historyEditIsServed { bookmarksRevision &+= 1; servedKeys = nil }
+            refreshSearchFlags()
+        }
+    }
+    @ObservationIgnored private var historyRevision = 0
+    /// Moves only when a change could touch a bookmark: an agent's search never does, so a stream
+    /// of them does not rebuild `bookmarkKeys` each time.
+    @ObservationIgnored private var bookmarksRevision = 0
+    /// Set around the served-search writes, which keep `servedKeys` themselves.
+    @ObservationIgnored private var historyEditIsServed = false
+    /// The served rows' `folded` texts: whether a served search is already a row, without a walk.
+    /// nil after any other change, rebuilt at the next served search.
+    @ObservationIgnored private var servedKeys: Set<String>?
+    /// Where history lived until 0.19.5: one UserDefaults blob, read once to move it to `historyFile`.
+    private let legacyHistoryKey = "omni.searchHistory"
+    /// Settings > History > Keep history for: Forever.
+    static let keepHistoryForever = Int.max
     /// When searches enter History (Settings > History). Default: automatic, as before.
     var historyMode: HistoryMode = .auto {
         didSet { OmniPrefs.set(historyMode.rawValue, forKey: "omni.historyMode") }
@@ -1714,9 +1800,9 @@ final class AppModel {
     var saveServingHistory: Bool = true {
         didSet { OmniPrefs.set(saveServingHistory, forKey: "omni.saveServingHistory") }
     }
-    /// Recent (non-bookmarked) searches older than this many days are pruned. Default 31 (about a
-    /// month), so the sidebar's day buckets - Yesterday, Previous 7 Days, Previous 30 Days - actually
-    /// fill in. Users who picked a shorter window in Settings keep it.
+    /// Recent (non-bookmarked) searches older than this many days are pruned; `keepHistoryForever`
+    /// prunes nothing. Default 31 (about a month), so the sidebar's day buckets - Yesterday,
+    /// Previous 7 Days, Previous 30 Days - actually fill in. Users who picked a window keep it.
     var historyRetentionDays: Int = 31 {
         didSet {
             OmniPrefs.set(historyRetentionDays, forKey: "omni.historyRetentionDays")
@@ -2592,9 +2678,7 @@ final class AppModel {
         loadSettings()
         loadIgnore()
         loadPerf()
-        loadHistory()
-        sweepUnsavedQueryImages() 
-        pruneDeadFileRecents()    
+        loadHistory()   // the query-image sweep and the dead-recents prune run when it arrives
         if let raw = UserDefaults.standard.string(forKey: "omni.historyMode"), let m = HistoryMode(rawValue: raw) { historyMode = m }
         if UserDefaults.standard.object(forKey: "omni.saveServingHistory") != nil {
             saveServingHistory = UserDefaults.standard.bool(forKey: "omni.saveServingHistory")
@@ -2674,16 +2758,47 @@ final class AppModel {
         searchHistory.filter { $0.bookmarked }.sorted { $0.lastUsed > $1.lastUsed }
     }
 
-    /// The sidebar's History section: every other search, one folder per calendar day that has any,
-    /// newest day first.
-    var historyDays: [(day: Date, items: [HistoryItem])] {
+    /// The sidebar's History section: one folder per calendar day that has a recent search, newest
+    /// day first, each as its range of `searchHistory` - the list is newest first, so a day is one
+    /// run of it, found by bisection, and only an OPEN day's rows are ever copied out
+    /// (`historyItems(in:)`). Built once per change of the list.
+    var historyDays: [(day: Date, range: Range<Int>)] {
+        let items = searchHistory
+        if daysCache.revision == historyRevision { return daysCache.days }
         let cal = Calendar.current
-        var days: [(day: Date, items: [HistoryItem])] = []
-        for item in searchHistory.filter({ !$0.bookmarked }).sorted(by: { $0.lastUsed > $1.lastUsed }) {
-            let day = cal.startOfDay(for: item.lastUsed)
-            if days.last?.day == day { days[days.count - 1].items.append(item) } else { days.append((day, [item])) }
+        var days: [(day: Date, range: Range<Int>)] = []
+        var i = 0
+        while i < items.count {
+            let day = cal.startOfDay(for: items[i].lastUsed)
+            var lo = i + 1, hi = items.count
+            while lo < hi { let m = (lo + hi) / 2; if items[m].lastUsed >= day { lo = m + 1 } else { hi = m } }
+            if items[i ..< lo].contains(where: { !$0.bookmarked }) { days.append((day, i ..< lo)) }
+            i = lo
         }
+        daysCache = (historyRevision, days)
         return days
+    }
+    @ObservationIgnored private var daysCache: (revision: Int, days: [(day: Date, range: Range<Int>)]) = (-1, [])
+
+    /// The recent searches of one day folder.
+    func historyItems(in range: Range<Int>) -> [HistoryItem] {
+        searchHistory[range.clamped(to: searchHistory.indices)].filter { !$0.bookmarked }
+    }
+
+    /// Put `item` where its `lastUsed` belongs in the newest-first list - the front, for anything
+    /// used just now, unless the clock went back.
+    private func placeHistory(_ item: HistoryItem) {
+        var lo = 0, hi = searchHistory.count
+        while lo < hi { let m = (lo + hi) / 2; if searchHistory[m].lastUsed > item.lastUsed { lo = m + 1 } else { hi = m } }
+        searchHistory.insert(item, at: lo)
+    }
+
+    /// Row `i`, changed by `edit` and used just now: taken out and put back at the front.
+    private func touchHistory(at i: Int, _ edit: (inout HistoryItem) -> Void) {
+        var item = searchHistory.remove(at: i)
+        edit(&item)
+        item.lastUsed = Date()
+        placeHistory(item)
     }
 
     /// Snapshot of the active filters + sort, stored with a recorded query and restored on re-run.
@@ -2707,28 +2822,38 @@ final class AppModel {
         // Need semantic text to embed (q), and skip the item just launched from a history click.
         guard q.count >= 2, raw != lastHistoryRunQuery else { return }
         let ctx = currentSearchContext()
-        let lower = raw.lowercased()
+        let incoming = HistoryItem(query: q, bookmarked: false, lastUsed: Date(), rawQuery: raw)
+        let lower = incoming.folded
         // Identity/dedup/prefix-collapse use the full typed string (qualifiers included), so
         // "type:pdf budget" and "budget" are distinct entries and live-typed prefixes still collapse.
-        searchHistory.removeAll { !$0.bookmarked && !$0.isFile && !$0.displayText.isEmpty
-            && $0.displayText.count < raw.count && lower.hasPrefix($0.displayText.lowercased()) }
-        // Canonical, not the literal string: see `HistoryItem.canonicalKey`.
-        let incomingKey = HistoryItem(query: q, bookmarked: false, lastUsed: Date(), rawQuery: raw).canonicalKey
-        if let i = searchHistory.firstIndex(where: { !$0.isFile && $0.canonicalKey == incomingKey }) {
-            searchHistory[i].lastUsed = Date()
-            searchHistory[i].query = q
-            searchHistory[i].rawQuery = raw
-            searchHistory[i].kinds = ctx.kinds; searchHistory[i].folder = ctx.folder
-            searchHistory[i].ext = ctx.ext; searchHistory[i].dateRange = ctx.dateRange; searchHistory[i].sortOrder = ctx.sort
+        // Typed rows only: an agent's search is never a prefix someone was typing.
+        if searchHistory.contains(where: { isLiveTypedPrefix($0, of: lower) }) {
+            searchHistory.removeAll { isLiveTypedPrefix($0, of: lower) }
+        }
+        // Canonical, not the literal string: see `HistoryItem.canonicalKey`. The parse runs only on
+        // rows with the same words; every typed row has its semantic text in `query`.
+        let incomingKey = incoming.canonicalKey
+        let qLower = q.lowercased()
+        if let i = searchHistory.firstIndex(where: { !$0.isFile && !$0.isServed && $0.query.utf8.count == q.utf8.count
+            && $0.query.lowercased() == qLower && $0.canonicalKey == incomingKey }) {
+            touchHistory(at: i) {
+                $0.query = q; $0.rawQuery = raw
+                $0.kinds = ctx.kinds; $0.folder = ctx.folder
+                $0.ext = ctx.ext; $0.dateRange = ctx.dateRange; $0.sortOrder = ctx.sort
+            }
         } else {
-            var item = HistoryItem(query: q, bookmarked: false, lastUsed: Date(),
-                                   kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
-                                   dateRange: ctx.dateRange, sortOrder: ctx.sort)
-            item.rawQuery = raw
-            searchHistory.insert(item, at: 0)
+            var item = incoming
+            item.kinds = ctx.kinds; item.folder = ctx.folder; item.ext = ctx.ext
+            item.dateRange = ctx.dateRange; item.sortOrder = ctx.sort
+            placeHistory(item)
         }
         pruneHistory()
         persistHistory()
+    }
+
+    private func isLiveTypedPrefix(_ item: HistoryItem, of lower: String) -> Bool {
+        !item.bookmarked && !item.isFile && !item.isServed && !item.folded.isEmpty
+            && item.folded.utf8.count < lower.utf8.count && lower.hasPrefix(item.folded)
     }
 
     /// Remember a search that arrived over the server. Called from the serving backend, which runs
@@ -2748,22 +2873,25 @@ final class AppModel {
             case .cli: HistorySource.cli.rawValue
             case .intent: HistorySource.serving.rawValue
         }
-        if let i = searchHistory.firstIndex(where: { $0.isServed && $0.displayText.caseInsensitiveCompare(q) == .orderedSame }) {
-            searchHistory[i].lastUsed = Date()
+        var item = HistoryItem(query: q, bookmarked: false, lastUsed: Date(), rawQuery: q)
+        item.source = source
+        let key = item.folded
+        var keys = servedKeys ?? Set(searchHistory.lazy.filter(\.isServed).map(\.folded))
+        historyEditIsServed = true
+        defer { historyEditIsServed = false }
+        if keys.contains(key), let i = searchHistory.firstIndex(where: { $0.isServed && $0.folded == key }) {
             // The same text can arrive first over REST and later from an agent. The row keeps one
             // identity (both are `serving:` ids) and takes the surface that used it last, so the
-            // mark tracks where the query is actually coming from.
-            searchHistory[i].source = source
+            // mark tracks where the query is actually coming from. A bookmarked row keeps its text,
+            // so the bookmarks are unchanged.
+            touchHistory(at: i) { $0.source = source }
         } else {
-            var item = HistoryItem(query: q, bookmarked: false, lastUsed: Date())
-            item.rawQuery = q
-            item.source = source
-            searchHistory.insert(item, at: 0)
+            placeHistory(item)
+            keys.insert(key)
         }
-        // The in-memory insert is immediate, so the sidebar updates live. The SORT and the JSON
-        // encode are not: prune+persist per request is fine at human typing speed and wasteful at
-        // agent speed, where a burst of searches would each sort 200 items and rewrite the whole
-        // list to UserDefaults on the main actor.
+        servedKeys = keys
+        // The in-memory insert is immediate, so the sidebar updates live. The prune and the save
+        // are not: per request they are fine at human typing speed and wasteful at agent speed.
         scheduleServedHistoryFlush()
     }
 
@@ -2846,39 +2974,49 @@ final class AppModel {
         let ctx = currentSearchContext()
         let path = fq.url.path
         if let i = searchHistory.firstIndex(where: { $0.filePath == path }) {
-            searchHistory[i].lastUsed = Date()
-            searchHistory[i].similar = fq.similar
-            searchHistory[i].kinds = ctx.kinds; searchHistory[i].folder = ctx.folder
-            searchHistory[i].ext = ctx.ext; searchHistory[i].dateRange = ctx.dateRange; searchHistory[i].sortOrder = ctx.sort
+            touchHistory(at: i) {
+                $0.similar = fq.similar
+                $0.kinds = ctx.kinds; $0.folder = ctx.folder
+                $0.ext = ctx.ext; $0.dateRange = ctx.dateRange; $0.sortOrder = ctx.sort
+            }
         } else {
             var item = HistoryItem(query: "", bookmarked: false, lastUsed: Date(),
                                    kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
                                    dateRange: ctx.dateRange, sortOrder: ctx.sort)
             item.filePath = path; item.fileKind = fq.kind.rawValue; item.similar = fq.similar
-            searchHistory.insert(item, at: 0)
+            placeHistory(item)
         }
         pruneHistory()
         persistHistory()
     }
 
     func toggleHistoryBookmark(_ item: HistoryItem) {
-        guard let i = searchHistory.firstIndex(where: { $0.id == item.id }) else { return }
-        searchHistory[i].bookmarked.toggle()
-        searchHistory[i].lastUsed = Date()
+        guard let i = historyIndex(of: item) else { return }
+        touchHistory(at: i) { $0.bookmarked.toggle() }
         persistHistory()
     }
 
     func removeHistory(_ item: HistoryItem) {
-        searchHistory.removeAll { $0.id == item.id }
+        guard let i = historyIndex(of: item) else { return }
+        searchHistory.remove(at: i)
         persistHistory()
     }
 
     /// Drop a whole date group at once - what the trash on a sidebar section header does.
     func removeHistory(_ items: [HistoryItem]) {
-        let ids = Set(items.map(\.id))
+        let ids = Set(items.map(\.id)), texts = Set(items.map(\.displayText))
         guard !ids.isEmpty else { return }
-        searchHistory.removeAll { ids.contains($0.id) }
+        searchHistory.removeAll { texts.contains($0.displayText) && ids.contains($0.id) }
         persistHistory()
+    }
+
+    /// Where `item` is now: found by what identifies it, without building every row's `id`.
+    private func historyIndex(of item: HistoryItem) -> Int? {
+        if let p = item.filePath { return searchHistory.firstIndex { $0.filePath == p } }
+        let key = item.folded, served = item.isServed, text = item.displayText
+        return searchHistory.firstIndex {
+            $0.filePath == nil && $0.isServed == served && $0.folded.utf8.count == key.utf8.count && $0.displayText == text
+        }
     }
 
     // MARK: - Bookmark / clear (the explicit, mode-independent entry points)
@@ -2899,18 +3037,32 @@ final class AppModel {
         let any = fileQuery != nil || !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || !filterTags.isEmpty || !filterTagsExclude.isEmpty
         if any != hasQuery { hasQuery = any }
+        // Runs on every keystroke and every change of the history: read against the bookmarks
+        // alone, which `bookmarkKeys` keeps per change of the list.
         let marked: Bool
         if let fq = fileQuery {
-            marked = searchHistory.contains { $0.filePath == fq.url.path && $0.bookmarked }
+            marked = bookmarkKeys.paths.contains(fq.url.path)
         } else if raw.isEmpty {
             marked = false
         } else {
-            marked = searchHistory.contains {
-                !$0.isFile && $0.displayText.caseInsensitiveCompare(raw) == .orderedSame && $0.bookmarked
-            }
+            marked = bookmarkKeys.texts.contains(raw.lowercased())
         }
         if marked != currentSearchIsBookmarked { currentSearchIsBookmarked = marked }
     }
+
+    /// The bookmarked searches' texts (lowercased) and files, rebuilt only when the list changed.
+    private var bookmarkKeys: (texts: Set<String>, paths: Set<String>) {
+        if bookmarkCache.revision != bookmarksRevision {
+            var texts = Set<String>(), paths = Set<String>()
+            let h = searchHistory
+            for i in h.indices where h[i].bookmarked {
+                if let p = h[i].filePath { paths.insert(p) } else { texts.insert(h[i].folded) }
+            }
+            bookmarkCache = (bookmarksRevision, texts, paths)
+        }
+        return (bookmarkCache.texts, bookmarkCache.paths)
+    }
+    @ObservationIgnored private var bookmarkCache: (revision: Int, texts: Set<String>, paths: Set<String>) = (-1, [], [])
 
     var recentHistoryCount: Int { searchHistory.lazy.filter { !$0.bookmarked }.count }
     var bookmarkCount: Int { searchHistory.lazy.filter { $0.bookmarked }.count }
@@ -2928,30 +3080,114 @@ final class AppModel {
                     // a recent, which would show a generic, soon-dangling "Dropped image" entry.
                     searchHistory.remove(at: i)
                 } else {
-                    searchHistory[i].bookmarked.toggle(); searchHistory[i].lastUsed = Date()
+                    touchHistory(at: i) { $0.bookmarked.toggle() }
                 }
             } else {
                 var item = HistoryItem(query: "", bookmarked: true, lastUsed: Date(),
                                        kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
                                        dateRange: ctx.dateRange, sortOrder: ctx.sort)
                 item.filePath = path; item.fileKind = fq.kind.rawValue; item.similar = fq.similar
-                searchHistory.insert(item, at: 0)
+                placeHistory(item)
             }
             persistHistory(); return
         }
         let raw = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !raw.isEmpty else { return }
-        if let i = searchHistory.firstIndex(where: { !$0.isFile && $0.displayText.caseInsensitiveCompare(raw) == .orderedSame }) {
-            searchHistory[i].bookmarked.toggle(); searchHistory[i].lastUsed = Date()
+        let lower = raw.lowercased()
+        if let i = searchHistory.firstIndex(where: { !$0.isFile && $0.folded.utf8.count == lower.utf8.count && $0.folded == lower }) {
+            touchHistory(at: i) { $0.bookmarked.toggle() }
         } else {
-            var item = HistoryItem(query: q, bookmarked: true, lastUsed: Date(),
+            let item = HistoryItem(query: q, bookmarked: true, lastUsed: Date(),
                                    kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
-                                   dateRange: ctx.dateRange, sortOrder: ctx.sort)
-            item.rawQuery = raw
-            searchHistory.insert(item, at: 0)
+                                   dateRange: ctx.dateRange, sortOrder: ctx.sort, rawQuery: raw)
+            placeHistory(item)
         }
         persistHistory()
+    }
+
+    /// Past searches whose text contains `typed` (not equal to it), bookmarks first, then newest: the
+    /// search field's suggestions. The list is newest first, so the walk stops at the `limit`-th match;
+    /// each row is a byte search of its `folded` text, not a lowercasing.
+    func historyMatches(_ typed: String, limit: Int = 5) -> [HistoryItem] {
+        let needle = Array(typed.lowercased().utf8)
+        guard !needle.isEmpty else { return [] }
+        let h = searchHistory
+        return needle.withUnsafeBufferPointer { n -> [HistoryItem] in
+            func matches(_ i: Int) -> Bool {
+                guard h[i].folded.utf8.count > n.count, h[i].filePath == nil else { return false }
+                var text = h[i].folded
+                return text.withUTF8 { memmem($0.baseAddress, $0.count, n.baseAddress, n.count) != nil }
+            }
+            var out: [HistoryItem] = []
+            for pass in 0 ..< 2 {   // bookmarks first, then the rest
+                for i in h.indices where h[i].bookmarked == (pass == 0) && matches(i) {
+                    out.append(h[i])
+                    if out.count == limit { return out }
+                }
+            }
+            return out
+        }
+    }
+
+    /// N synthetic searches over a year, newest first: four in five from agents, the rest typed, some
+    /// with qualifiers, one in fifty bookmarked. `historybench` times the paths that walk them;
+    /// `seedhistory` (perf script) leaves them in place so the UI is measured at that size.
+    static func syntheticHistory(_ n: Int, now: Date, bookmarkEvery: Int = 50) -> [HistoryItem] {
+        (0 ..< n).map { i in
+            var item = HistoryItem(query: "", bookmarked: i % bookmarkEvery == 7 % bookmarkEvery,
+                                   lastUsed: now.addingTimeInterval(-Double(i) * 365 * 86_400 / Double(max(n, 1))))
+            if i % 5 == 0 {
+                let raw = i % 10 == 0 ? "type:pdf budget review \(i)" : "kitchen renovation quote \(i)"
+                item.query = SearchQueryParser.parse(raw).semanticText; item.rawQuery = raw
+            } else {
+                let raw = "agent query \(i) Dell BNY Jina Omni POC benchmark 完成 结论 \(i % 977)"
+                item.query = raw; item.rawQuery = raw; item.source = HistorySource.mcp.rawValue
+            }
+            return item
+        }
+    }
+
+    /// `seedhistory:N[:M]` (perf script): the sidebar at that size, one search in M bookmarked (50).
+    /// An isolated run never writes it.
+    func seedHistory(_ n: Int, bookmarkEvery: Int = 50) {
+        searchHistory = Self.syntheticHistory(n, now: Date(), bookmarkEvery: max(1, bookmarkEvery))
+    }
+
+    /// `historybench:N` (perf script): the time of every path that walks a history of N synthetic
+    /// searches (`syntheticHistory`), on the app's own code. The real history is put back after; an isolated run
+    /// never writes it.
+    func runHistoryBench(_ n: Int) {
+        let saved = searchHistory, savedRaw = rawQuery, savedQuery = query
+        let now = Date()
+        func seed() -> [HistoryItem] { Self.syntheticHistory(n, now: now) }
+        func ms(_ reps: Int = 5, setup: () -> Void = {}, _ body: () -> Void) -> Double {
+            var t: [Double] = []
+            for _ in 0 ..< reps { setup(); let s = Date(); body(); t.append(-s.timeIntervalSinceNow * 1000) }
+            return t.sorted()[t.count / 2]
+        }
+        searchHistory = seed()
+        var data = Data()
+        let encode = ms { data = (try? JSONEncoder().encode(searchHistory)) ?? Data() }
+        // The launch read (off the main actor since the history went uncapped): decode and order.
+        let load = ms(3) { _ = ((try? JSONDecoder().decode([HistoryItem].self, from: data)) ?? []).sorted { $0.lastUsed > $1.lastUsed } }
+        let days = ms(setup: { historyRevision &+= 1 }) { _ = historyDays }
+        let suggestMiss = ms { _ = historyMatches("zzqx") }
+        let suggestHit = ms { _ = historyMatches("kitchen") }
+        let flags = ms { rawQuery = "kitchen renovation quote 5"; rawQuery = "kitchen renovation quote 15" }
+        let servedNew = ms(20) { recordServedSearch("bench served \(UUID().uuidString)", surface: .mcp) }
+        let servedSame = ms(20) { recordServedSearch("agent query 1 Dell BNY Jina Omni POC benchmark 完成 结论 1", surface: .mcp) }
+        let seeded = seed()
+        let typed = ms(5, setup: {
+            searchHistory = seeded
+            let raw = "bench typed \(UUID().uuidString.prefix(8))"
+            rawQuery = raw; query = raw; lastHistoryRunQuery = nil
+        }) { recordCurrentSearchToHistory(viaSubmit: true) }
+        let prune = ms(3, setup: { searchHistory = seeded }) { pruneHistory() }
+        omniPerfLog(String(format: "historybench n=%d bytes=%d encode=%.1fms load=%.1fms days=%.1fms suggest-miss=%.1fms "
+                           + "suggest-hit=%.1fms flags=%.1fms served-new=%.2fms served-same=%.2fms typed=%.1fms prune=%.1fms",
+                           n, data.count, encode, load, days, suggestMiss, suggestHit, flags, servedNew, servedSame, typed, prune))
+        searchHistory = saved; rawQuery = savedRaw; query = savedQuery
     }
 
     /// Clear recent searches. Bookmarks are explicit saves, not history, so they are kept.
@@ -2960,17 +3196,14 @@ final class AppModel {
         persistHistory()
     }
 
-    /// Keep every bookmark; drop non-bookmarked recents older than the retention window, then cap to
-    /// the most recent N as a hard ceiling.
+    /// Keep every bookmark; drop non-bookmarked recents older than the retention window. No count
+    /// cap, and with "Forever" nothing at all. Written only when something goes: the list is
+    /// observed, and an equal write still redraws the sidebar.
     private func pruneHistory() {
+        guard historyRetentionDays != Self.keepHistoryForever else { return }
         let cutoff = Date().addingTimeInterval(-Double(historyRetentionDays) * 86_400)
-        var recents = 0
-        searchHistory = searchHistory.sorted { $0.lastUsed > $1.lastUsed }.filter { item in
-            if item.bookmarked { return true }
-            if item.lastUsed < cutoff { return false }
-            recents += 1
-            return recents <= maxRecentHistory
-        }
+        guard searchHistory.contains(where: { !$0.bookmarked && $0.lastUsed < cutoff }) else { return }
+        searchHistory.removeAll { !$0.bookmarked && $0.lastUsed < cutoff }
     }
 
     /// UI state that a TEST must not write into the real install.
@@ -2987,21 +3220,91 @@ final class AppModel {
     private static let ephemeralUIState =
         UserDefaults.standard.bool(forKey: "omni.ephemeralUIState")
 
+    /// `history.json` in Application Support/Omni. Its own file, not UserDefaults: uncapped, the list
+    /// is 28 MB at 100k searches, and every save would rewrite the app's whole preferences domain.
+    nonisolated static func historyFileURL() -> URL? {
+        if let path = historyFileArgument { return URL(fileURLWithPath: path) }
+        return try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+            .appendingPathComponent("Omni", isDirectory: true).appendingPathComponent("history.json")
+    }
+
+    /// `-omni.historyFile <path>`: a test's own history file, which an isolated run reads AND
+    /// writes - the one way to check saving, the move from UserDefaults and the quit flush
+    /// without touching the user's.
+    nonisolated static let historyFileArgument: String? = {
+        let path = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)["omni.historyFile"] as? String
+        return path?.isEmpty == false ? path : nil
+    }()
+
+    /// Saves, one at a time and off the main actor, always of the newest list. Encoding 100k
+    /// searches took 289 ms, which on the main actor was a stall at every save.
+    private static let historySaver = HistorySaver()
+    /// Set once the saved history is in memory; nothing is saved before, or an empty list would
+    /// overwrite the file during the launch read.
+    @ObservationIgnored private var historyLoaded = false
+
     private func persistHistory() {
         // An isolated run (`-omni.dbDir` as a launch argument) READS the user's history, so a perf
         // script can replay it, and never writes it: a test's searches used to land in the real
-        // sidebar and, at the 200-item cap, push the user's own out.
-        guard !Self.ephemeralUIState, !Self.isolatedByLaunchArgument else { return }
-        if let data = try? JSONEncoder().encode(searchHistory) { OmniPrefs.set(data, forKey: historyKey) }
+        // sidebar.
+        guard Self.savesHistory, historyLoaded, let file = Self.historyFileURL() else { return }
+        Self.historySaver.save(searchHistory, to: file)
     }
 
+    private static var savesHistory: Bool {
+        !ephemeralUIState && (!isolatedByLaunchArgument || historyFileArgument != nil)
+    }
+
+    /// The quit path: what is pending is written before the process exits.
+    func flushHistoryForQuit() {
+        persistHistory()
+        Self.historySaver.flush()
+    }
+
+    /// Read off the main actor; the sidebar fills in when it arrives. Until 0.19.5 the history was
+    /// a UserDefaults blob: read once, collapsed (`canonicalized`), written to the file, and removed.
     private func loadHistory() {
-        guard !Self.ephemeralUIState else { return }
-        guard let data = UserDefaults.standard.data(forKey: historyKey),
-              let items = try? JSONDecoder().decode([HistoryItem].self, from: data) else { return }
-        let merged = Self.canonicalized(items)
+        guard !Self.ephemeralUIState else { historyLoaded = true; return }
+        Self.readHistory(file: Self.historyFileURL(), legacy: UserDefaults.standard.data(forKey: legacyHistoryKey)) { [weak self] items, migrated in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.adoptLoadedHistory(items, migrated: migrated) } }
+        }
+    }
+
+    nonisolated private static func readHistory(file: URL?, legacy: Data?, done: @escaping @Sendable ([HistoryItem], Bool) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            var items: [HistoryItem] = [], migrated = false
+            if let file, let data = try? Data(contentsOf: file), let saved = try? JSONDecoder().decode([HistoryItem].self, from: data) {
+                items = saved
+            } else if let legacy, let saved = try? JSONDecoder().decode([HistoryItem].self, from: legacy) {
+                items = canonicalized(saved); migrated = true
+            }
+            items.sort { $0.lastUsed > $1.lastUsed }
+            done(items, migrated)
+        }
+    }
+
+    private func adoptLoadedHistory(_ items: [HistoryItem], migrated: Bool) {
+        // A search recorded while the file was read is newer than anything in it.
+        var merged = items
+        if !searchHistory.isEmpty {
+            let ids = Set(searchHistory.map(\.id))
+            merged = (searchHistory + merged.filter { !ids.contains($0.id) }).sorted { $0.lastUsed > $1.lastUsed }
+        }
+        historyLoaded = true
         searchHistory = merged
-        if merged.count != items.count { persistHistory() }   // write the collapse back once
+        sweepUnsavedQueryImages()   // both need the bookmarks: before the read they would see none
+        pruneDeadFileRecents()
+        pruneHistory()
+        guard Self.savesHistory else { return }
+        if migrated {
+            flushHistoryForQuit()
+            // The blob goes only from the real install's own preferences, once the file holds it.
+            if Self.persistsUIState, let file = Self.historyFileURL(), FileManager.default.fileExists(atPath: file.path) {
+                OmniPrefs.remove(legacyHistoryKey)
+            }
+        } else if searchHistory.count != items.count {
+            persistHistory()
+        }
     }
 
     /// Collapse rows that are the SAME search written two ways.
@@ -3012,7 +3315,7 @@ final class AppModel {
     /// original. Both rows replay identically and render identically; they were just two spellings.
     /// Re-parsing each one and keying on the canonical form merges them, newest `lastUsed` winning,
     /// and a bookmark on either survives.
-    private static func canonicalized(_ items: [HistoryItem]) -> [HistoryItem] {
+    nonisolated private static func canonicalized(_ items: [HistoryItem]) -> [HistoryItem] {
         var seen: [String: Int] = [:]          // canonical key -> index into out
         var out: [HistoryItem] = []
         for item in items {
@@ -3054,6 +3357,10 @@ final class AppModel {
     /// list of files and needs no notion of stacks. `groups` carries the members for the views that
     /// render them.
     private(set) var results: [SearchHit] = []
+    /// `!results.isEmpty`, stored and written only when it changes: the window chooses between the
+    /// list and its empty states on this, and reading `results` for it re-ran the window with every
+    /// result set, two or three times a search while typing (perf script counts, 2026-10-26).
+    private(set) var hasListedResults = false
     private(set) var groups: [ResultGroup] = []
     /// Hits not on the list: under the strong-matches floor (`minScore`) or folded as weaker matches
     /// of this query (`VectorStore.weakFold`). The footer's "Show N weaker matches" brings them back.
@@ -3183,7 +3490,10 @@ final class AppModel {
         if resultSections != sections { resultSections = sections }
         if groups != ordered { groups = ordered }
         let reps = ordered.map(\.representative)
-        if results != reps { results = reps; refreshSelectionOrdered() }
+        if results != reps {
+            results = reps; refreshSelectionOrdered()
+            if hasListedResults == reps.isEmpty { hasListedResults = !reps.isEmpty }
+        }
         // Drop expansion state for stacks that no longer exist, so the set cannot grow unbounded
         // across a session of typing.
         if !expandedStacks.isEmpty {

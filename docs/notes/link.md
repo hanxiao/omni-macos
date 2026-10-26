@@ -103,6 +103,11 @@ B killed, frozen and unplugged against the feature off; B's own search latency w
   clipboard guards returned the clipboard file in search and served its bytes. With "open files"
   off, search answers and fetch is refused.
 
+- ANSWERING ON EITHER UNIT (2026-10-26): `linktool` as the other Mac, an isolated instance on the eval
+  bed answering `search` over the link, 30 queries each: GPU p50 6.1 ms (p90 6.8, max 13.8), Neural
+  Engine p50 7.0 ms (p90 7.8, max 8.5), no errors. The answer is the served search on `ServedWork`;
+  in Neural Engine mode its scan runs on the CPU.
+
 ## Agents (MCP and `omni`), 2026-10-12
 
 - `search` covers linked Macs by default (Han); `macs` names some, `[]` or `none` keeps it to this

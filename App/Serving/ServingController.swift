@@ -86,13 +86,15 @@ final class ServingController {
         // speed (50-150 searches a second) the sidebar's list re-diffed its rows continuously: 39% of
         // main-thread samples under a 32-client load, and every main-actor hop queued behind it
         // (index.md, "Served search under load"). Queries now wait here and reach the history together
-        // twice a second - one list update for the lot, still live to the eye. `onServedSearch` is
+        // every two seconds - one list update for the lot. Not twice a second: with the history kept
+        // forever the sidebar's diff grows with the square of its rows, and at 20,000 searches each
+        // update cost the main thread ~100 ms (ui.md, "Renders per step"). `onServedSearch` is
         // weak-captured through self so a torn-down controller cannot resurrect the model.
         let pending = servedSearches
         b.onSearch = { [weak self] q, surface in
             guard pending.add(q, surface) else { return }
             Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 500_000_000)
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
                 for (q, surface) in pending.take() { self?.onServedSearch?(q, surface) }
             }
         }
@@ -396,9 +398,9 @@ final class PendingServedSearches: @unchecked Sendable {
 
     func add(_ q: String, _ surface: ServedSurface) -> Bool {
         lock.withLock {
+            // Every one: the history keeps every search (no count cap since 2026-10-25), and a batch
+            // is bounded by its two seconds.
             items.append((q, surface))
-            // A burst can outrun the history's own cap; there is no point holding more than that.
-            if items.count > 400 { items.removeFirst(items.count - 400) }
             if armed { return false }
             armed = true
             return true

@@ -14,7 +14,8 @@ import OmniKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         AppModel.shared?.quiesceForQuit()       // stop indexing so no new MLX work starts mid-exit
-        UserDefaults.standard.synchronize()     // persist settings/history/roots before the hard exit
+        AppModel.shared?.flushHistoryForQuit()  // the search history's file, written before the exit
+        UserDefaults.standard.synchronize()     // persist settings/roots before the hard exit
         _exit(0)                                 // immediate; skips the MLX C++ destructors (no GPU-sync hang/crash)
     }
 
@@ -288,295 +289,307 @@ struct OmniApp: App {
         }
         .defaultSize(width: 1000, height: 660)
         .windowResizability(.contentMinSize)
-        .commands {
-            // About, then the update check, in Apple's order and with its separator. NO
-            // BENCHMARK HERE. The app menu holds what the APP is - identity, updates, settings,
-            // quitting - not a job that pins this Mac for minutes; it sat one slip below About,
-            // and its real home is Settings > Performance, where it still is.
-            CommandGroup(replacing: .appInfo) {
-                Button("About Omni") { showAbout() }
-                Divider()
-                Button("Check for Updates\u{2026}") { Updater.check(userInitiated: true) }
-            }
-            // Cmd-V/C/A are routed: when a text field is being edited they do the standard text
-            // paste/copy/select-all; otherwise they act on the search results - Cmd-V searches by a
-            // FILE or IMAGE on the clipboard, Cmd-C copies the selected files (Finder-style, with
-            // their paths as text for a text field; see AppModel.copySelectedFiles), Cmd-A selects
-            // every result. Replacing .pasteboard means re-declaring Cut too (plain responder forward).
-            CommandGroup(replacing: .pasteboard) {
-                Button("Cut") { NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: nil) }
-                    .keyboardShortcut("x", modifiers: .command)
-                Button("Copy") { copyCommand() }
-                    .keyboardShortcut("c", modifiers: .command)
-                Button("Paste") { pasteCommand() }
-                    .keyboardShortcut("v", modifiers: .command)
-                Button("Select All") { selectAllCommand() }
-                    .keyboardShortcut("a", modifiers: .command)
-                // COPYING IS AN EDIT COMMAND. This sat in File, under the transcription items,
-                // because that is where the rest of the OCR block grew - but a menu is read by
-                // what a command IS, not by which feature added it, and every Mac app puts a copy
-                // beside the other copies. Same chord, same condition.
-                if model.ocrMode {
-                    Divider()
-                    Button("Copy Markdown") { ocr.copyMarkdownToPasteboard() }
-                        .keyboardShortcut("c", modifiers: [.command, .shift])
-                        .disabled(!ocr.hasCompletedPages)
-                }
-            }
-            // The primary actions on the selected result, reachable from the menu bar and keyboard
-            // with visible shortcut hints (previously double-click / context-menu only).
-            CommandGroup(after: .newItem) {
-                // The OCR toggle's tooltip names this chord, so the menu bar has to own it:
-                // a key equivalent declared only on a toolbar button never fires on macOS, and
-                // an advertised-but-dead shortcut is worse than none.
-                Button(model.ocrMode ? "Back to Search" : "Transcribe a Document") {
-                    model.ocrMode.toggle()
-                }
-                .keyboardShortcut("o", modifiers: [.command, .option])
-                // APPLE'S FILE ORDER: open, close, save, share - then the commands that run the
-                // document. It used to read open, save, copy, share, find next, find previous,
-                // pause, stop, close: Close at the far end from Open, a copy among the saves, and
-                // the two Find items in the wrong menu entirely. Every chord is unchanged.
-                if model.ocrMode {
-                    Button("Open Document\u{2026}") { ocr.chooseAndOpen() }
-                        .keyboardShortcut("o", modifiers: .command)
-                    Button("Close Document") { ocr.clear() }
-                        .keyboardShortcut("w", modifiers: [.command, .shift])
-                        .disabled(!ocr.hasPages)
-                    Divider()
-                    Button("Save Markdown\u{2026}") { ocr.exportMarkdown() }
-                        .keyboardShortcut("s", modifiers: .command)
-                        .disabled(!ocr.hasCompletedPages)
-                    // Same system share sheet the results carry, and like Finder's Share it takes
-                    // no key equivalent.
-                    ShareLink(item: TranscriptFile(name: ocr.suggestedFileName,
-                                                   markdown: { ocr.documentMarkdown }),
-                              preview: SharePreview(ocr.documentName,
-                                                    image: Image(systemName: "doc.plaintext"))) {
-                        Text("Share\u{2026}")
-                    }
-                    .disabled(!ocr.hasCompletedPages)
-                    Divider()
-                    // Pause had no menu item and no key equivalent - it existed only as a button
-                    // on the floating readout, which is the chrome that withdraws a few seconds
-                    // after a run. So the one gesture that hands the GPU back POLITELY, keeping the
-                    // queue, was the hard one to reach, while Stop - which discards the queue - had
-                    // Cmd-. Same argument as the context-menu items promoted in the menu-bar audit.
-                    Button(ocr.isPaused ? "Resume Transcribing" : "Pause Transcribing") {
-                        ocr.isPaused ? ocr.resume() : ocr.pause()
-                    }
-                    .keyboardShortcut(".", modifiers: [.command, .option])
-                    .disabled(!ocr.isBusy)
-                    Button("Stop Transcribing") { ocr.cancel() }
-                        .keyboardShortcut(".", modifiers: .command)
-                        .disabled(!ocr.isBusy)
-                }
-                Divider()
-                // Open / Reveal / Copy / Move to Trash act on the WHOLE selection. Quick Look and
-                // Find similar are single-item, so they are disabled when several results are selected
-                // (the context menu hides them outright there).
-                // `menuSelection`, not the selection: see AppModel.MenuSelection.
-                let sel = model.menuSelection
-                let multi = sel.pathsCount > 1
-                // Cmd-O has one owner at a time: in OCR mode it opens a document to transcribe
-                // (above), so the results version gives the chord up - it does not merely disable
-                // itself. A DISABLED item still owns its key equivalent, and AppKit resolves the
-                // duplicate by stripping the equivalent from the other one, which showed up as
-                // "Open Document..." rendering with no shortcut at all and Cmd-O doing nothing.
-                Button("Open") { model.openSelected() }
-                    .keyboardShortcut(model.ocrMode ? nil : KeyboardShortcut("o", modifiers: .command))
-                    .disabled(!sel.hasSelection || model.ocrMode)
-                Button("Quick Look") { model.toggleQuickLook() }
-                    .keyboardShortcut("y", modifiers: .command)
-                    .disabled(!sel.hasSelection || multi)
-                Button("Show in Finder") { model.revealSelected() }
-                    .keyboardShortcut("r", modifiers: [.command, .shift])
-                    .disabled(!sel.hasSelection)
-                // The menu bar owns these shortcuts too: keyboard equivalents declared only
-                // inside a closed context menu never fire on macOS, so the app's own Shortcuts
-                // window was advertising a dead Option-Cmd-F. The context-menu items remain as
-                // click targets naming the same chords.
-                Button("Find Similar") { model.findSimilarSelected() }
-                    .keyboardShortcut("f", modifiers: [.command, .option])
-                    .disabled(!sel.hasSelection || multi)
-                Button(multi ? "Copy \(sel.pathsCount) Paths" : "Copy Path") { model.copySelectedPaths() }
-                    .keyboardShortcut("c", modifiers: [.command, .option])
-                    .disabled(!sel.hasSelection)
-                // Native share picker over the whole selection, mirroring the context menu. Like
-                // Finder's Share it carries no key equivalent; disabled with nothing selected. A
-                // button, not a ShareLink: a ShareLink holds the selected URLs, so every arrow press
-                // rebuilt the menu bar to carry the new ones. The picker builds them when it opens.
-                Button("Share\u{2026}") { SelectionShare.present(model.selectedURLsOrdered) }
-                    .disabled(!sel.hasSelection)
-                // Move to Trash (reversible). Cmd-Delete is routed: in a text field it stays the
-                // editor's delete-to-line-start, so typing in the search box can never trash files.
-                Button(multi ? "Move \(sel.pathsCount) Items to Trash" : "Move to Trash") { moveToTrashCommand() }
-                    .keyboardShortcut(.delete, modifiers: .command)
-                    .disabled(!sel.hasSelection)
-                Divider()
-                // Search-level actions in one group: start a search from a file, save the
-                // current one. (A lone item between two separators reads as over-separation.)
-                Button("Search by File\u{2026}") { model.searchByFilePanel() }
-                    .keyboardShortcut("o", modifiers: [.command, .shift])
-                    .disabled(model.phase != .ready)
-                // Bookmark the current search. The menu bar owns the Cmd-D shortcut (always present,
-                // just disabled when there's nothing to save) so it works even when the toolbar star
-                // is hidden; the toolbar button is a click target that names the same shortcut.
-                Button(model.currentSearchIsBookmarked ? "Remove Bookmark" : "Bookmark Search") {
-                    model.toggleBookmarkCurrentSearch()
-                }
-                .keyboardShortcut("d", modifiers: .command)
-                .disabled(!model.hasActiveSearch)
-                // Linked Macs (docs/notes/link.md): the first link starts here, before the sidebar
-                // has a Linked Macs section to offer it.
-                Button("Link a Mac\u{2026}") { model.link.openWindow() }
-                    .disabled(model.phase != .ready)
-                Divider()
-                // EVERYTHING BELOW WAS CONTEXT-MENU OR TOOLBAR ONLY. A feature reachable by
-                // right-click alone is a feature most people never find, and it cannot be given a
-                // working key equivalent either - a chord declared inside a closed context menu
-                // never fires on macOS.
-                // Both directions between the two modes, in the menu bar as well as in the
-                // context menus - a feature reachable only by right-click is one most people never
-                // find, and only the menu bar can carry a working key equivalent.
-                Button(Transcribe.title(sel.transcribable)) {
-                    Transcribe.send(model.selectedPathsForMenu, model: model, ocr: ocr)
-                }
-                .keyboardShortcut("t", modifiers: [.command, .option])
-                .disabled(sel.transcribable == 0)
-                Divider()
-                Button("Generate Tags") { model.requestTags(Array(model.selectedPaths)) }
-                    .disabled(!sel.hasSelection || !model.canGenerateTags || !sel.taggable)
-                Button("Search in This Folder") { model.enterFolder(model.filterFolder) }
-                    .disabled(model.filterFolder == nil)
-                Menu("Visualize") {
-                    Button("UMAP") { if let f = model.filterFolder { model.visualizeFolder(f, umap: true) } }
-                    Button("PCA") { if let f = model.filterFolder { model.visualizeFolder(f, umap: false) } }
-                }
-                .disabled(model.filterFolder == nil)
-                Button(ignoreFolderTitle) {
-                    if let p = model.selection { model.ignoreEnclosingFolder(ofPath: p) }
-                }
-                .disabled(model.menuSelection.enclosingFolder.map { !model.canIgnoreFolder($0) } ?? true)
-                Divider()
-                // THE LIBRARY'S OWN COMMANDS, LAST. These two were attached after the View menu's
-                // toolbar group, which put "Index" and "Pause indexing" under Show Toolbar and
-                // Customize Toolbar - View is where a window's appearance is changed, and building
-                // the index is not an appearance. They sit with the serving switch instead: the
-                // two things Omni does in the background, in the menu that owns the library.
-                //
-                // Cmd-Shift-I, not Cmd-R: in a file browser Cmd-R reads as Finder's Show Original /
-                // Reload, so it is reserved (Reveal uses Cmd-Shift-R above).
-                Button(model.isPaused ? "Resume Indexing" : (!model.hasIndexedFiles ? "Index" : "Update Index")) { model.resumeIndexing() }
-                    .keyboardShortcut("i", modifiers: [.command, .shift])
-                    .disabled(model.isIndexing || !model.canIndex)
-                Button("Pause Indexing") { model.userPauseIndexing() }
-                    .disabled(!model.canPauseIndexing || model.isPaused)
-                // The serving switch, same one as Settings and the toolbar toggle.
-                Toggle("Serve over HTTP", isOn: Binding(get: { model.serving.isOn },
-                                                        set: { model.serving.enabled = $0 }))
-                    .disabled(model.serving.pausedForBenchmark)
-            }
-            // Add to the SYSTEM View menu (which NavigationSplitView already provides with Show
-            // Sidebar / Full Screen) instead of declaring a second "View" CommandMenu - otherwise
-            // the menu bar shows two "View" menus. Cmd-1 gallery, Cmd-2 list, plus Sort by.
-            CommandGroup(after: .sidebar) {
-                // Sequoia's View menu lacks the automatic Show/Hide Sidebar item here (Tahoe
-                // provides its own - gated so the menu never shows two). Same responder-chain
-                // action and Ctrl-Cmd-S chord as the system item.
-                // UNCONDITIONAL. This was gated to pre-Tahoe on the belief that macOS 26 supplies
-                // its own Show/Hide Sidebar item here; dumping the live menu bar showed the View
-                // menu with no sidebar item at all, so on Tahoe the only way to unhide the sidebar
-                // was the toolbar button. Same responder-chain action and chord as the system item,
-                // so if AppKit ever does add one back this is the same command twice, not a clash.
-                Button(model.sidebarShown ? "Hide Sidebar" : "Show Sidebar") { NSApp.sendAction(Selector(("toggleSidebar:")), to: nil, from: nil) }
-                    .keyboardShortcut("s", modifiers: [.command, .control])
-                // Back / Forward used to live here. They are in GO now, where Finder keeps them,
-                // and they cannot be in both: two menu items with one key equivalent make AppKit
-                // strip the chord from one of them, which shows up as Cmd-[ silently doing nothing.
-                // The toolbar chevrons still name the same chords; the Go menu owns them.
-                // Inline Picker so the active mode gets a checkmark (Finder-style); the Cmd-1/Cmd-2
-                // shortcuts ride on the items.
-                Picker("View", selection: Binding(get: { model.viewMode }, set: { model.viewMode = $0 })) {
-                    Text("as Gallery").keyboardShortcut("1", modifiers: .command).tag(ResultViewMode.grid)
-                    Text("as List").keyboardShortcut("2", modifiers: .command).tag(ResultViewMode.list)
-                }
-                .pickerStyle(.inline)
-                .labelsHidden()
-                Picker("Sort By", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
-                    ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
-                }
-            }
-            // FINDER HAS A GO MENU AND WE DID NOT. Dumped both menu bars through the accessibility
-            // API and compared them item by item rather than from memory: Back and Forward were
-            // buried in View, there was no way up a level, no way to jump to an indexed root, and
-            // no Go to Folder at all. Finder's order is kept - navigation, then places, then the
-            // typed path - so the muscle memory transfers.
-            CommandMenu("Go") {
-                Button("Back") { model.goBack() }
-                    .keyboardShortcut("[", modifiers: .command)
-                    .disabled(!model.canGoBack)
-                Button("Forward") { model.goForward() }
-                    .keyboardShortcut("]", modifiers: .command)
-                    .disabled(!model.canGoForward)
-                // Finder's chord for this exact action, on the exact same meaning.
-                Button("Enclosing Folder") { model.enterFolder(model.enclosingFolder) }
-                    .keyboardShortcut(.upArrow, modifiers: .command)
-                    .disabled(model.enclosingFolder == nil)
-                Divider()
-                // Finder lists Documents / Desktop / Downloads here; ours are whatever the user
-                // added, which is the same idea with the right contents for this app.
-                ForEach(Array(model.roots.enumerated()), id: \.element) { i, url in
-                    Button(SpecialFolder.name(for: url)) { model.enterFolder(url) }
-                        // Cmd-1..9 belong to the view modes, so the roots take Ctrl-Cmd-1..9.
-                        .keyboardShortcut(i < 9 ? KeyboardShortcut(KeyEquivalent(Character("\(i + 1)")),
-                                                                   modifiers: [.command, .control]) : nil)
-                }
-                if !model.photoSources.isEmpty {
-                    Divider()
-                    ForEach(model.photoSources) { source in
-                        Button(source.title) { model.enterPhotoSource(source) }
-                    }
-                }
-                Divider()
-                // Off in OCR mode: there ⇧⌘G is Find Previous (Edit menu), the same pair every find
-                // bar uses, and two enabled items on one shortcut left AppKit to pick by menu order.
-                Button("Go to Folder\u{2026}") { showGoToFolder = true }
-                    .keyboardShortcut("g", modifiers: [.command, .shift])
-                    .disabled(model.phase != .ready || model.ocrMode)
-            }
-            // Focus the toolbar search field (.searchable doesn't bind ⌘F on its own).
-            // THE WHOLE FIND GROUP, in the menu Mac users look in for it. Find focuses the
-            // toolbar search field (`.searchable` does not bind Cmd-F on its own); Find Next and
-            // Find Previous step the transcript's matches and used to sit in File, four items
-            // below Save, where nobody looks for Cmd-G. "Search for Selected Text" is this app's
-            // Use Selection for Find, so it joins them.
-            CommandGroup(after: .textEditing) {
-                Button("Find") {
-                    guard let w = NSApp.keyWindow ?? NSApp.mainWindow,
-                          let item = w.toolbar?.items.compactMap({ $0 as? NSSearchToolbarItem }).first else { return }
-                    w.makeFirstResponder(item.searchField)
-                }
-                .keyboardShortcut("f", modifiers: .command)
-                Button("Find Next") { ocr.stepMatch(by: 1) }
-                    .keyboardShortcut("g", modifiers: .command)
-                    .disabled(!model.ocrMode || ocr.matchCount == 0)
-                Button("Find Previous") { ocr.stepMatch(by: -1) }
-                    .keyboardShortcut("g", modifiers: [.command, .shift])
-                    .disabled(!model.ocrMode || ocr.matchCount == 0)
-                Button("Search for Selected Text") { searchForTranscriptSelection() }
-                    .keyboardShortcut("e", modifiers: [.command, .option])
-                    .disabled(!model.ocrMode)
-            }
-            CommandGroup(replacing: .help) {
-                Button("Omni Website") { NSWorkspace.shared.open(URL(string: "https://hanxiao.io/omni")!) }
-                Button("Omni Keyboard Shortcuts") { showShortcuts() }
-                    .keyboardShortcut("/", modifiers: .command)
-            }
-        }
+        .commands { OmniCommands(model: model, ocr: ocr, showGoToFolder: $showGoToFolder) }
 
         Settings {
             SettingsView().environment(model)
+        }
+    }
+}
+
+/// The menu bar, in its own body. Declared inline in the App's body, every value a menu item reads
+/// (the selection's `menuSelection` on each arrow press, the bookmark state, Back and Forward) re-ran
+/// the App's body, and with it the window's root view and the toolbar: one whole-window render per
+/// selection change (counted per perf-script step, 2026-10-26). Here they re-run the menus alone.
+private struct OmniCommands: Commands {
+    let model: AppModel
+    let ocr: OCRSession
+    @Binding var showGoToFolder: Bool
+
+    var body: some Commands {
+        // About, then the update check, in Apple's order and with its separator. NO
+        // BENCHMARK HERE. The app menu holds what the APP is - identity, updates, settings,
+        // quitting - not a job that pins this Mac for minutes; it sat one slip below About,
+        // and its real home is Settings > Performance, where it still is.
+        CommandGroup(replacing: .appInfo) {
+            Button("About Omni") { showAbout() }
+            Divider()
+            Button("Check for Updates\u{2026}") { Updater.check(userInitiated: true) }
+        }
+        // Cmd-V/C/A are routed: when a text field is being edited they do the standard text
+        // paste/copy/select-all; otherwise they act on the search results - Cmd-V searches by a
+        // FILE or IMAGE on the clipboard, Cmd-C copies the selected files (Finder-style, with
+        // their paths as text for a text field; see AppModel.copySelectedFiles), Cmd-A selects
+        // every result. Replacing .pasteboard means re-declaring Cut too (plain responder forward).
+        CommandGroup(replacing: .pasteboard) {
+            Button("Cut") { NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: nil) }
+                .keyboardShortcut("x", modifiers: .command)
+            Button("Copy") { copyCommand() }
+                .keyboardShortcut("c", modifiers: .command)
+            Button("Paste") { pasteCommand() }
+                .keyboardShortcut("v", modifiers: .command)
+            Button("Select All") { selectAllCommand() }
+                .keyboardShortcut("a", modifiers: .command)
+            // COPYING IS AN EDIT COMMAND. This sat in File, under the transcription items,
+            // because that is where the rest of the OCR block grew - but a menu is read by
+            // what a command IS, not by which feature added it, and every Mac app puts a copy
+            // beside the other copies. Same chord, same condition.
+            if model.ocrMode {
+                Divider()
+                Button("Copy Markdown") { ocr.copyMarkdownToPasteboard() }
+                    .keyboardShortcut("c", modifiers: [.command, .shift])
+                    .disabled(!ocr.hasCompletedPages)
+            }
+        }
+        // The primary actions on the selected result, reachable from the menu bar and keyboard
+        // with visible shortcut hints (previously double-click / context-menu only).
+        CommandGroup(after: .newItem) {
+            // The OCR toggle's tooltip names this chord, so the menu bar has to own it:
+            // a key equivalent declared only on a toolbar button never fires on macOS, and
+            // an advertised-but-dead shortcut is worse than none.
+            Button(model.ocrMode ? "Back to Search" : "Transcribe a Document") {
+                model.ocrMode.toggle()
+            }
+            .keyboardShortcut("o", modifiers: [.command, .option])
+            // APPLE'S FILE ORDER: open, close, save, share - then the commands that run the
+            // document. It used to read open, save, copy, share, find next, find previous,
+            // pause, stop, close: Close at the far end from Open, a copy among the saves, and
+            // the two Find items in the wrong menu entirely. Every chord is unchanged.
+            if model.ocrMode {
+                Button("Open Document\u{2026}") { ocr.chooseAndOpen() }
+                    .keyboardShortcut("o", modifiers: .command)
+                Button("Close Document") { ocr.clear() }
+                    .keyboardShortcut("w", modifiers: [.command, .shift])
+                    .disabled(!ocr.hasPages)
+                Divider()
+                Button("Save Markdown\u{2026}") { ocr.exportMarkdown() }
+                    .keyboardShortcut("s", modifiers: .command)
+                    .disabled(!ocr.hasCompletedPages)
+                // Same system share sheet the results carry, and like Finder's Share it takes
+                // no key equivalent.
+                ShareLink(item: TranscriptFile(name: ocr.suggestedFileName,
+                                               markdown: { ocr.documentMarkdown }),
+                          preview: SharePreview(ocr.documentName,
+                                                image: Image(systemName: "doc.plaintext"))) {
+                    Text("Share\u{2026}")
+                }
+                .disabled(!ocr.hasCompletedPages)
+                Divider()
+                // Pause had no menu item and no key equivalent - it existed only as a button
+                // on the floating readout, which is the chrome that withdraws a few seconds
+                // after a run. So the one gesture that hands the GPU back POLITELY, keeping the
+                // queue, was the hard one to reach, while Stop - which discards the queue - had
+                // Cmd-. Same argument as the context-menu items promoted in the menu-bar audit.
+                Button(ocr.isPaused ? "Resume Transcribing" : "Pause Transcribing") {
+                    ocr.isPaused ? ocr.resume() : ocr.pause()
+                }
+                .keyboardShortcut(".", modifiers: [.command, .option])
+                .disabled(!ocr.isBusy)
+                Button("Stop Transcribing") { ocr.cancel() }
+                    .keyboardShortcut(".", modifiers: .command)
+                    .disabled(!ocr.isBusy)
+            }
+            Divider()
+            // Open / Reveal / Copy / Move to Trash act on the WHOLE selection. Quick Look and
+            // Find similar are single-item, so they are disabled when several results are selected
+            // (the context menu hides them outright there).
+            // `menuSelection`, not the selection: see AppModel.MenuSelection.
+            let sel = model.menuSelection
+            let multi = sel.pathsCount > 1
+            // Cmd-O has one owner at a time: in OCR mode it opens a document to transcribe
+            // (above), so the results version gives the chord up - it does not merely disable
+            // itself. A DISABLED item still owns its key equivalent, and AppKit resolves the
+            // duplicate by stripping the equivalent from the other one, which showed up as
+            // "Open Document..." rendering with no shortcut at all and Cmd-O doing nothing.
+            Button("Open") { model.openSelected() }
+                .keyboardShortcut(model.ocrMode ? nil : KeyboardShortcut("o", modifiers: .command))
+                .disabled(!sel.hasSelection || model.ocrMode)
+            Button("Quick Look") { model.toggleQuickLook() }
+                .keyboardShortcut("y", modifiers: .command)
+                .disabled(!sel.hasSelection || multi)
+            Button("Show in Finder") { model.revealSelected() }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+                .disabled(!sel.hasSelection)
+            // The menu bar owns these shortcuts too: keyboard equivalents declared only
+            // inside a closed context menu never fire on macOS, so the app's own Shortcuts
+            // window was advertising a dead Option-Cmd-F. The context-menu items remain as
+            // click targets naming the same chords.
+            Button("Find Similar") { model.findSimilarSelected() }
+                .keyboardShortcut("f", modifiers: [.command, .option])
+                .disabled(!sel.hasSelection || multi)
+            Button(multi ? "Copy \(sel.pathsCount) Paths" : "Copy Path") { model.copySelectedPaths() }
+                .keyboardShortcut("c", modifiers: [.command, .option])
+                .disabled(!sel.hasSelection)
+            // Native share picker over the whole selection, mirroring the context menu. Like
+            // Finder's Share it carries no key equivalent; disabled with nothing selected. A
+            // button, not a ShareLink: a ShareLink holds the selected URLs, so every arrow press
+            // rebuilt the menu bar to carry the new ones. The picker builds them when it opens.
+            Button("Share\u{2026}") { SelectionShare.present(model.selectedURLsOrdered) }
+                .disabled(!sel.hasSelection)
+            // Move to Trash (reversible). Cmd-Delete is routed: in a text field it stays the
+            // editor's delete-to-line-start, so typing in the search box can never trash files.
+            Button(multi ? "Move \(sel.pathsCount) Items to Trash" : "Move to Trash") { moveToTrashCommand() }
+                .keyboardShortcut(.delete, modifiers: .command)
+                .disabled(!sel.hasSelection)
+            Divider()
+            // Search-level actions in one group: start a search from a file, save the
+            // current one. (A lone item between two separators reads as over-separation.)
+            Button("Search by File\u{2026}") { model.searchByFilePanel() }
+                .keyboardShortcut("o", modifiers: [.command, .shift])
+                .disabled(model.phase != .ready)
+            // Bookmark the current search. The menu bar owns the Cmd-D shortcut (always present,
+            // just disabled when there's nothing to save) so it works even when the toolbar star
+            // is hidden; the toolbar button is a click target that names the same shortcut.
+            Button(model.currentSearchIsBookmarked ? "Remove Bookmark" : "Bookmark Search") {
+                model.toggleBookmarkCurrentSearch()
+            }
+            .keyboardShortcut("d", modifiers: .command)
+            .disabled(!model.hasActiveSearch)
+            // Linked Macs (docs/notes/link.md): the first link starts here, before the sidebar
+            // has a Linked Macs section to offer it.
+            Button("Link a Mac\u{2026}") { model.link.openWindow() }
+                .disabled(model.phase != .ready)
+            Divider()
+            // EVERYTHING BELOW WAS CONTEXT-MENU OR TOOLBAR ONLY. A feature reachable by
+            // right-click alone is a feature most people never find, and it cannot be given a
+            // working key equivalent either - a chord declared inside a closed context menu
+            // never fires on macOS.
+            // Both directions between the two modes, in the menu bar as well as in the
+            // context menus - a feature reachable only by right-click is one most people never
+            // find, and only the menu bar can carry a working key equivalent.
+            Button(Transcribe.title(sel.transcribable)) {
+                Transcribe.send(model.selectedPathsForMenu, model: model, ocr: ocr)
+            }
+            .keyboardShortcut("t", modifiers: [.command, .option])
+            .disabled(sel.transcribable == 0)
+            Divider()
+            Button("Generate Tags") { model.requestTags(Array(model.selectedPaths)) }
+                .disabled(!sel.hasSelection || !model.canGenerateTags || !sel.taggable)
+            Button("Search in This Folder") { model.enterFolder(model.filterFolder) }
+                .disabled(model.filterFolder == nil)
+            Menu("Visualize") {
+                Button("UMAP") { if let f = model.filterFolder { model.visualizeFolder(f, umap: true) } }
+                Button("PCA") { if let f = model.filterFolder { model.visualizeFolder(f, umap: false) } }
+            }
+            .disabled(model.filterFolder == nil)
+            Button(ignoreFolderTitle) {
+                if let p = model.selection { model.ignoreEnclosingFolder(ofPath: p) }
+            }
+            .disabled(model.menuSelection.enclosingFolder.map { !model.canIgnoreFolder($0) } ?? true)
+            Divider()
+            // THE LIBRARY'S OWN COMMANDS, LAST. These two were attached after the View menu's
+            // toolbar group, which put "Index" and "Pause indexing" under Show Toolbar and
+            // Customize Toolbar - View is where a window's appearance is changed, and building
+            // the index is not an appearance. They sit with the serving switch instead: the
+            // two things Omni does in the background, in the menu that owns the library.
+            //
+            // Cmd-Shift-I, not Cmd-R: in a file browser Cmd-R reads as Finder's Show Original /
+            // Reload, so it is reserved (Reveal uses Cmd-Shift-R above).
+            Button(model.isPaused ? "Resume Indexing" : (!model.hasIndexedFiles ? "Index" : "Update Index")) { model.resumeIndexing() }
+                .keyboardShortcut("i", modifiers: [.command, .shift])
+                .disabled(model.isIndexing || !model.canIndex)
+            Button("Pause Indexing") { model.userPauseIndexing() }
+                .disabled(!model.canPauseIndexing || model.isPaused)
+            // The serving switch, same one as Settings and the toolbar toggle.
+            Toggle("Serve over HTTP", isOn: Binding(get: { model.serving.isOn },
+                                                    set: { model.serving.enabled = $0 }))
+                .disabled(model.serving.pausedForBenchmark)
+        }
+        // Add to the SYSTEM View menu (which NavigationSplitView already provides with Show
+        // Sidebar / Full Screen) instead of declaring a second "View" CommandMenu - otherwise
+        // the menu bar shows two "View" menus. Cmd-1 gallery, Cmd-2 list, plus Sort by.
+        CommandGroup(after: .sidebar) {
+            // Sequoia's View menu lacks the automatic Show/Hide Sidebar item here (Tahoe
+            // provides its own - gated so the menu never shows two). Same responder-chain
+            // action and Ctrl-Cmd-S chord as the system item.
+            // UNCONDITIONAL. This was gated to pre-Tahoe on the belief that macOS 26 supplies
+            // its own Show/Hide Sidebar item here; dumping the live menu bar showed the View
+            // menu with no sidebar item at all, so on Tahoe the only way to unhide the sidebar
+            // was the toolbar button. Same responder-chain action and chord as the system item,
+            // so if AppKit ever does add one back this is the same command twice, not a clash.
+            Button(model.sidebarShown ? "Hide Sidebar" : "Show Sidebar") { NSApp.sendAction(Selector(("toggleSidebar:")), to: nil, from: nil) }
+                .keyboardShortcut("s", modifiers: [.command, .control])
+            // Back / Forward used to live here. They are in GO now, where Finder keeps them,
+            // and they cannot be in both: two menu items with one key equivalent make AppKit
+            // strip the chord from one of them, which shows up as Cmd-[ silently doing nothing.
+            // The toolbar chevrons still name the same chords; the Go menu owns them.
+            // Inline Picker so the active mode gets a checkmark (Finder-style); the Cmd-1/Cmd-2
+            // shortcuts ride on the items.
+            Picker("View", selection: Binding(get: { model.viewMode }, set: { model.viewMode = $0 })) {
+                Text("as Gallery").keyboardShortcut("1", modifiers: .command).tag(ResultViewMode.grid)
+                Text("as List").keyboardShortcut("2", modifiers: .command).tag(ResultViewMode.list)
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+            Picker("Sort By", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
+                ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
+            }
+        }
+        // FINDER HAS A GO MENU AND WE DID NOT. Dumped both menu bars through the accessibility
+        // API and compared them item by item rather than from memory: Back and Forward were
+        // buried in View, there was no way up a level, no way to jump to an indexed root, and
+        // no Go to Folder at all. Finder's order is kept - navigation, then places, then the
+        // typed path - so the muscle memory transfers.
+        CommandMenu("Go") {
+            Button("Back") { model.goBack() }
+                .keyboardShortcut("[", modifiers: .command)
+                .disabled(!model.canGoBack)
+            Button("Forward") { model.goForward() }
+                .keyboardShortcut("]", modifiers: .command)
+                .disabled(!model.canGoForward)
+            // Finder's chord for this exact action, on the exact same meaning.
+            Button("Enclosing Folder") { model.enterFolder(model.enclosingFolder) }
+                .keyboardShortcut(.upArrow, modifiers: .command)
+                .disabled(model.enclosingFolder == nil)
+            Divider()
+            // Finder lists Documents / Desktop / Downloads here; ours are whatever the user
+            // added, which is the same idea with the right contents for this app.
+            ForEach(Array(model.roots.enumerated()), id: \.element) { i, url in
+                Button(SpecialFolder.name(for: url)) { model.enterFolder(url) }
+                    // Cmd-1..9 belong to the view modes, so the roots take Ctrl-Cmd-1..9.
+                    .keyboardShortcut(i < 9 ? KeyboardShortcut(KeyEquivalent(Character("\(i + 1)")),
+                                                               modifiers: [.command, .control]) : nil)
+            }
+            if !model.photoSources.isEmpty {
+                Divider()
+                ForEach(model.photoSources) { source in
+                    Button(source.title) { model.enterPhotoSource(source) }
+                }
+            }
+            Divider()
+            // Off in OCR mode: there ⇧⌘G is Find Previous (Edit menu), the same pair every find
+            // bar uses, and two enabled items on one shortcut left AppKit to pick by menu order.
+            Button("Go to Folder\u{2026}") { showGoToFolder = true }
+                .keyboardShortcut("g", modifiers: [.command, .shift])
+                .disabled(model.phase != .ready || model.ocrMode)
+        }
+        // Focus the toolbar search field (.searchable doesn't bind ⌘F on its own).
+        // THE WHOLE FIND GROUP, in the menu Mac users look in for it. Find focuses the
+        // toolbar search field (`.searchable` does not bind Cmd-F on its own); Find Next and
+        // Find Previous step the transcript's matches and used to sit in File, four items
+        // below Save, where nobody looks for Cmd-G. "Search for Selected Text" is this app's
+        // Use Selection for Find, so it joins them.
+        CommandGroup(after: .textEditing) {
+            Button("Find") {
+                guard let w = NSApp.keyWindow ?? NSApp.mainWindow,
+                      let item = w.toolbar?.items.compactMap({ $0 as? NSSearchToolbarItem }).first else { return }
+                w.makeFirstResponder(item.searchField)
+            }
+            .keyboardShortcut("f", modifiers: .command)
+            Button("Find Next") { ocr.stepMatch(by: 1) }
+                .keyboardShortcut("g", modifiers: .command)
+                .disabled(!model.ocrMode || ocr.matchCount == 0)
+            Button("Find Previous") { ocr.stepMatch(by: -1) }
+                .keyboardShortcut("g", modifiers: [.command, .shift])
+                .disabled(!model.ocrMode || ocr.matchCount == 0)
+            Button("Search for Selected Text") { searchForTranscriptSelection() }
+                .keyboardShortcut("e", modifiers: [.command, .option])
+                .disabled(!model.ocrMode)
+        }
+        CommandGroup(replacing: .help) {
+            Button("Omni Website") { NSWorkspace.shared.open(URL(string: "https://hanxiao.io/omni")!) }
+            Button("Omni Keyboard Shortcuts") { showShortcuts() }
+                .keyboardShortcut("/", modifiers: .command)
         }
     }
 
@@ -607,7 +620,7 @@ struct OmniApp: App {
     }
 
     private func showShortcuts() {
-        if let w = OmniApp.shortcutsWindow {
+        if let w = OmniCommands.shortcutsWindow {
             w.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); return
         }
         let win = NSWindow(contentViewController: NSHostingController(rootView: ShortcutsView()))
@@ -615,7 +628,7 @@ struct OmniApp: App {
         win.styleMask = [.titled, .closable]
         win.isReleasedWhenClosed = false      // keep the retained instance so reopening is instant
         win.center()
-        OmniApp.shortcutsWindow = win
+        OmniCommands.shortcutsWindow = win
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -1080,7 +1093,20 @@ enum UIProbe {
 
 
 
+    /// Every count since the last `takeTotals`, stall or no stall: what a perf-script step rendered.
+    private static var totals: [String: Int] = [:]
+
+    /// The counts since the last call, most first, then cleared ("" when nothing counted).
+    static func takeTotals() -> String {
+        guard enabled, !totals.isEmpty else { return "" }
+        let parts = totals.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+        totals.removeAll(keepingCapacity: true)
+        return " counts[" + parts.joined(separator: " ") + "]"
+    }
+
     private static func add(_ label: String, _ seconds: Double) {
+        totals[label, default: 0] += 1
         if tallies[label] == nil { order.append(label) }
         tallies[label, default: Tally()].n += 1
         tallies[label, default: Tally()].seconds += seconds

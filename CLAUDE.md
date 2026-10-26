@@ -87,7 +87,7 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (879 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (880 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|delfolders|
@@ -173,6 +173,9 @@ codebase were already measured there, and many were rejected.
 - A FIX FOR AN OLDER macOS NEVER DEGRADES TAHOE (Han, 2026-10-25). Its UI design and Liquid Glass
   stay as they are: gate the fix `#unavailable(macOS 26.0)` where it can be, and compare the Tahoe
   window against the last release, side by side, before it ships.
+- SEARCH HISTORY HAS NO COUNT CAP (Han, 2026-10-25). The sidebar keeps every search, typed or
+  served, for as long as Settings > History says, "Forever" included. Anything that walks the
+  history is measured at that size (`historybench:N` perf-script step), never bounded by a cap.
 - DEDUP IS PART OF THE DESIGN; NEVER DISABLE IT (Han, 2026-10-14). Content dedup and chunk reuse
   (`contentDedup`, `globalChunkReuse`, `vectorsForContentKeys`) stay on in every shipped path, and a
   new path goes through them rather than around them. A test may switch something off only as a
@@ -221,7 +224,8 @@ codebase were already measured there, and many were rejected.
   instance) - by pid. Quit every isolated instance when done (`pgrep -x Omni`), and run them under
   a footprint watchdog (`footprint -p`, kill past a cap): two left running were seen at 100 GB
   while the machine was already under jetsam pressure. Linked Macs on one Mac: `-omni.link.port`,
-  `-omni.link.name`, `-omni.link.bonjour NO`.
+  `-omni.link.name`, `-omni.link.bonjour NO`. Clipboard capture under test: `-omni.clipboard.pasteboard <name>`
+  (a named pasteboard; never the user's).
 - NEVER ANSWER A TCC OR FOLDER PROMPT FOR THE USER. Test files live outside the XCUITest runner's
   sandbox container, and UI/chaos suites drive a renamed copy (`Scripts/chaos-app.sh`,
   `io.hanxiao.omni.chaos`): by the real bundle id, `launch()` quits the user's Omni. The copy has none
@@ -230,7 +234,10 @@ codebase were already measured there, and many were rejected.
 - A REAL INDEX IS BENCHMARKED ON AN APFS CLONE (`cp -c -R`) taken with the app quit; a live one
   clones inconsistent. /Volumes/han2tb/bench-index is the standing one.
 - @Observable NOTIFIES ON EVERY WRITE, EQUAL OR NOT. Guard writes, store derived Bools, and keep
-  high-rate state out of anything the toolbar, menu bar or a row body reads (ui.md, testing.md).
+  high-rate state out of anything the toolbar, menu bar or a row body reads (ui.md, testing.md). The
+  menu bar is its own `Commands` type (inline in the App's body it re-ran the window per selection),
+  and a `@State` never starts as a new object (each re-creation then reads as a changed view): ui.md,
+  "Renders per step". Count renders per step (`counts[...]`) before and after any view change.
 - AUDIOTOOLBOX IS READ IN SMALL CALLS. One `AVAudioFile.read` of 60 s on a silent screen-recording
   soundtrack never returned and grew a realtime-safe allocator to 31 GB (0.17.0, index.md "The
   soundtrack read that never returned"). Every read goes through `AudioSegmentReader.readFrames`.
@@ -314,7 +321,8 @@ codebase were already measured there, and many were rejected.
   the text on scanned pages and the metadata migration not done, the index that paused itself
   (refused arguments, structuredContent measured and not turned on), the kernel review (fp16
   vision tower, batched image backbone, the RoPE kernel; fusion and audio measured and not done),
-  the query that waited out the hold (hand-over, the engine's query cache, the ANE query encoder),
+  the query that waited out the hold (hand-over, the engine's query cache, the ANE query encoder,
+  the image chunk carved per chunk),
   repeated work done (the re-tag that dropped text, media payload keys, released contents), the
   Neural Engine measured again and in the app (programs written on the Mac, the choice, the evals),
   all or nothing (towers as block programs, compiles on first use, GPU towers released), the
@@ -324,14 +332,18 @@ codebase were already measured there, and many were rejected.
   Small's short sequences packed, queries let in between batches), search on the CPU (native scans,
   selection and rescore; ties by file id), and the programs without their rotated copies (Nano's
   labels packed, waited-on batches let in, programs loaded from the cache: compiled forms follow the
-  path), the 512-token cut measured and kept, and the one-time build ready per kind.
+  path), the 512-token cut measured and kept, the one-time build ready per kind, and agents' second
+  searches (serving.log latency on the live app, transcripts, exact strings).
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
   and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names, Shortcuts,
   Siri and Services (App Intents), a long book opened at its page (#26), Settings within the screen (#30),
   Preview made to run the passage's search, a passage opened at its own words (#26, #32, #31), and
   the sidebar squeezed by the columns on macOS 15 (#31; the header's layout loop), the search field
-  squeezed by the centre item and Preview searching other words (#31, #32; `omni-verify pagephrase`).
+  squeezed by the centre item and Preview searching other words (#31, #32; `omni-verify pagephrase`),
+  search history without a cap (`historybench`, history.json), and renders per step (`counts[...]` on
+  each perf-script line: the menu bar out of the App's body, a flag per sidebar row, the pie in whole
+  percent).
 - `testing.md` - UI tests and their traps, chaos suites, perf tour, hangwatch and the main-thread
   stall investigations, the agent eval.
 - `link.md` - Linked Macs: pairing, the TLS link, search across Macs, the measurements and the

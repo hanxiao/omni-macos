@@ -437,15 +437,26 @@ final class OCRSession {
         // Through the per-page sources, and through `hasText` rather than the text: this list is
         // what the whole transcript scroller is built from, and reading `texts` here made it depend
         // on every token of every page in flight.
-        return visibleDocument?.pageIDs.filter {
-            // Read `pages` when a page has no source yet, so the dependency exists either way.
-            guard sources.indices.contains($0) else { return pages.indices.contains($0) && pages[$0].state == .done }
-            switch sources[$0].state {
-            case .done, .failed: return true
-            case .running: return sources[$0].hasText
-            case .pending, .stopped: return false
-            }
-        } ?? []
+        return visibleDocument?.pageIDs.filter(isSection) ?? []
+    }
+
+    /// Whether `sectionIDs` has any, without building it. It stops at the first section, so a view
+    /// that asks only this depends on that page: the workspace read `sectionIDs.isEmpty` and re-ran
+    /// with every page's every state change, ~100 times on a 40-page scan (perf script counts,
+    /// 2026-10-26).
+    var hasSections: Bool {
+        if documentEdit != nil { return !editSections.isEmpty || !pagesAfterEdit.isEmpty }
+        return visibleDocument?.pageIDs.contains(where: isSection) ?? false
+    }
+
+    private func isSection(_ id: Int) -> Bool {
+        // Read `pages` when a page has no source yet, so the dependency exists either way.
+        guard sources.indices.contains(id) else { return pages.indices.contains(id) && pages[id].state == .done }
+        switch sources[id].state {
+        case .done, .failed: return true
+        case .running: return sources[id].hasText
+        case .pending, .stopped: return false
+        }
     }
 
     /// What the navigator marks. `visibleIndex` is global, so on a tab whose pages nothing has

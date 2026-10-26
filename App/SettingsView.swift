@@ -806,8 +806,8 @@ private struct PerformanceTab: View {
                 Text(model.isPaperRunning ? "Locked while the benchmark runs."
                      : model.memoryPressureActive ? "Paused while memory is low. Resumes automatically."
                      : (model.modelIndexBytes > 0
-                        ? "Extra memory for indexing, on top of the model and index (\(ByteSize.memory(model.modelIndexBytes))) and a \(ByteSize.memory(omniWorkingFloorBytes)) working buffer. More indexes faster. With none, indexing still runs, more slowly."
-                        : "Extra memory for indexing, on top of the model, the index and a \(ByteSize.memory(omniWorkingFloorBytes)) working buffer. More indexes faster. With none, indexing still runs, more slowly."))
+                        ? "Extra memory for indexing, on top of the model and index (\(ByteSize.memory(model.modelIndexBytes))) and a \(ByteSize.memory(omniWorkingFloorBytes)) working buffer. More is faster. With none, indexing still runs, more slowly."
+                        : "Extra memory for indexing, on top of the model, the index and a \(ByteSize.memory(omniWorkingFloorBytes)) working buffer. More is faster. With none, indexing still runs, more slowly."))
                     .font(.caption).foregroundStyle(.secondary)
             }
             Section {
@@ -1100,6 +1100,7 @@ private struct HistoryTab: View {
                     Text("7 days").tag(7)
                     Text("14 days").tag(14)
                     Text("31 days").tag(31)
+                    Text("Forever").tag(AppModel.keepHistoryForever)
                 }
                 .help("Bookmarks are never removed")
                 // ONE ROW, and the button on the trailing edge. As two rows the Form drew a

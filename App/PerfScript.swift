@@ -14,7 +14,7 @@ import OmniLink
 /// `wait:<seconds>`, `intent:<text>` (the Shortcuts search action's own search, logged). For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
 /// (window size, centered), `front`, `appearance:light|dark`, `ocrview:raw|rendered|split|triple`, `ocrpage:<n>`, `history:<n>`, `sort:<order>`,
-/// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `menu:<title>`, `recents`, `clipboard:on|off`, `powerhold:hot|lowpower|battery|none`, `ocrrun:on|off`, `stall:queue:<path>|flag`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
+/// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `menu:<title>`, `historybench:<n>`, `seedhistory:<n>[:<m>]`, `note:<text>`, `menustate:<menu>`, `recents`, `clipboard:on|off`, `powerhold:hot|lowpower|battery|none`, `ocrrun:on|off`, `stall:queue:<path>|flag`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
 enum PerfScript {
@@ -25,6 +25,7 @@ enum PerfScript {
             // Let the launch finish and the warm-up land.
             while model.phase != .ready { try? await Task.sleep(for: .milliseconds(200)) }
             try? await Task.sleep(for: .seconds(4))
+            _ = UIProbe.takeTotals()   // launch's renders are not the first step's
             var times = 1
             for raw in script.split(separator: ";").map({ String($0).trimmingCharacters(in: .whitespaces) }) {
                 if raw.hasPrefix("repeat:") { times = Int(raw.dropFirst(7)) ?? 1; continue }
@@ -47,8 +48,9 @@ enum PerfScript {
                     let pause = raw.hasPrefix("wait:") ? Double(raw.dropFirst(5)) ?? 0 : settle
                     try? await Task.sleep(for: .seconds(pause))
                     let cpu = (HangWatch.threadCPU() - cpu0) * 1000
-                    omniPerfLog(String(format: "script %@%@ main-cpu=%.0fms wall=%.1fs",
-                                       raw, times > 1 ? " #\(i + 1)" : "", cpu, -t0.timeIntervalSinceNow))
+                    omniPerfLog(String(format: "script %@%@ main-cpu=%.0fms wall=%.1fs%@",
+                                       raw, times > 1 ? " #\(i + 1)" : "", cpu, -t0.timeIntervalSinceNow,
+                                       UIProbe.takeTotals()))
                 }
                 times = 1
             }
@@ -100,6 +102,14 @@ enum PerfScript {
             if let menu = NSApp.mainMenu, let item = find(menu), let owner = item.menu {
                 owner.performActionForItem(at: owner.index(of: item))
             }
+        case "menustate":   // the items of a menu bar menu as AppKit holds them, enabled or not: menustate:File
+            if let top = NSApp.mainMenu?.items.first(where: { $0.title == arg })?.submenu {
+                // As AppKit does when the menu opens: SwiftUI fills its items in menuNeedsUpdate.
+                top.delegate?.menuNeedsUpdate?(top)
+                top.update()
+                let items = top.items.filter { !$0.isSeparatorItem }.map { "\($0.title)=\($0.isEnabled ? "on" : "off")" }
+                omniPerfLog("menustate \(arg): " + items.joined(separator: ", "))
+            }
         case "share": SelectionShare.present(model.selectedURLsOrdered)   // what File > Share does
         case "cliptest":   // the clipboard history must never record Omni's own file copies
             let pb = NSPasteboard(name: .init("io.hanxiao.omni.cliptest"))
@@ -133,6 +143,11 @@ enum PerfScript {
         case "ocrview": NotificationCenter.default.post(name: .omniPerfOCRView, object: arg)   // raw | rendered | split | triple
         case "ocrpage": NotificationCenter.default.post(name: .omniPerfOCRPage, object: Int(arg) ?? 1)   // a thumbnail click
         case "remember": model.recordCurrentSearchToHistory(viaSubmit: true)   // what Return does
+        case "historybench": model.runHistoryBench(Int(arg) ?? 10_000)   // the history's paths at N searches
+        case "seedhistory":   // seedhistory:N[:M], left in place
+            let nm = arg.split(separator: ":").compactMap { Int($0) }
+            model.seedHistory(nm.first ?? 10_000, bookmarkEvery: nm.count > 1 ? nm[1] : 50)
+        case "note": break   // a marker in the log for a harness to wait on
         case "sort": model.sortOrder = SortOrder(rawValue: arg) ?? .relevance
         case "set":       // a Settings value through the setter its control uses: set:<name>=<value>
             let kv = arg.split(separator: "=", maxSplits: 1).map(String.init)

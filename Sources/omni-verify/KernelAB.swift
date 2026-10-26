@@ -185,7 +185,9 @@ enum KernelAB {
                 }
                 engine.endInteractive()
                 Thread.sleep(forTimeInterval: Double.random(in: 0.3 ... 0.8))
-                let q = queries[i % queries.count] + " \(i)"   // unique: the engine keeps repeated queries
+                // Unique per mode too: the engine keeps query vectors, and the same text in the idle
+                // pass made every later served query a cache hit (read 0.0 ms, 2026-10-26).
+                let q = queries[i % queries.count] + " \(mode) \(i)"
                 if i % 2 == 0 {
                     engine.noteInteractive()
                     Thread.sleep(forTimeInterval: 0.18)

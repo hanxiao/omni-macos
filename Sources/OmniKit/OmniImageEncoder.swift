@@ -28,7 +28,8 @@ public final class OmniImageEncoder: @unchecked Sendable {
         }
         // Scale to the USER'S memory cap, not physical RAM: the packed-patch count is the vision
         // tower's main VRAM driver, and a smaller budget only packs fewer images per forward -
-        // per-image vectors are unchanged (B=1 is block-diagonal), so retrieval is identical.
+        // per-image vectors are unchanged to fp16 rounding (B=1 is block-diagonal; cosine 0.9999, see
+        // `carve`), so retrieval is identical.
         // Down-only: at the default 6GB cap this is the historical 8192, and a tighter cap pulls
         // it down (the old physical-RAM rule ignored a small cap on a big machine). It does NOT
         // scale up - measured at 3x budget the throughput is flat (18.6s vs 18.8s per 60 images;
@@ -76,10 +77,16 @@ public final class OmniImageEncoder: @unchecked Sendable {
     /// pooling; tagging adds one matmul + reduce per image, no extra forward). `tagScores[i]` is
     /// the raw [2V] score vector for input i (see OmniTagger.finalize), nil array when no tagger.
     /// `yieldPoint` runs between chunks, when nothing is in flight (each chunk evaluates before the
-    /// next is built): see OmniTextEncoder.encodeTokenBatchesPipelined.
+    /// next is built): see OmniTextEncoder.encodeTokenBatchesPipelined. `carve`, asked before each
+    /// chunk, makes it ONE image while true: someone is searching, and a query that arrives waits
+    /// for the chunk in flight. Asked per chunk, not per call: a batch that began before the first
+    /// keystroke ran to its end in full chunks, and a typed query waited p50 51-65 ms behind them
+    /// (querylat, 16 mixed images). Vectors are per image either way, to fp16 rounding (cosine
+    /// 0.9999: the kernels tile by the packed row count), as the per-call carve always gave.
     public func encode(images inputs: [Preprocessed], prefixIds: [Int] = [], suffixIds: [Int] = [],
                        tagger: OmniTagger?,
-                       yieldPoint: (_ drain: () -> Void) -> Void = { _ in }) -> (vecs: [[Float]], tagScores: [[Float]]?) {
+                       yieldPoint: (_ drain: () -> Void) -> Void = { _ in },
+                       carve: () -> Bool = { false }) -> (vecs: [[Float]], tagScores: [[Float]]?) {
         if inputs.isEmpty { lastSequenceLength = 0; return ([], tagger == nil ? nil : []) }
         var out: [[Float]] = []
         out.reserveCapacity(inputs.count)
@@ -91,9 +98,10 @@ public final class OmniImageEncoder: @unchecked Sendable {
             // Greedily fill a chunk up to the patch budget (always take >=1 to make progress).
             var j = i
             var packed = 0
+            let budget = carve() ? 0 : patchBudget
             while j < inputs.count {
                 let n = inputs[j].gridTHW.reduce(0) { $0 + $1.0 * $1.1 * $1.2 }
-                if j > i && packed + n > patchBudget { break }
+                if j > i && packed + n > budget { break }
                 packed += n
                 j += 1
             }

@@ -30,15 +30,26 @@ final class ClipboardMonitor {
 
     init(history: ClipboardHistory) {
         self.history = history
-        self.lastChange = NSPasteboard.general.changeCount
+        self.lastChange = Self.pasteboard.changeCount
     }
+
+    /// The pasteboard read: the system's, or for an isolated run a named one a harness writes
+    /// (`-omni.clipboard.pasteboard <name>`, launch argument only), so a measured instance never
+    /// reads what the user copies.
+    static let pasteboard: NSPasteboard = {
+        let args = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+        if let name = args["omni.clipboard.pasteboard"] as? String, !name.isEmpty {
+            return NSPasteboard(name: .init(name))
+        }
+        return .general
+    }()
 
     func start() {
         guard timer == nil else { return }
         // Whatever was on the pasteboard before capture started is not recorded, but if an earlier
         // session recorded it, that clip is the current one: pasting it must not find itself.
-        lastChange = NSPasteboard.general.changeCount
-        if let clip = Self.clip(from: NSPasteboard.general), let url = history.existingFile(for: clip) {
+        lastChange = Self.pasteboard.changeCount
+        if let clip = Self.clip(from: Self.pasteboard), let url = history.existingFile(for: clip) {
             var text: String? = nil
             if case .text(let s) = clip { text = s }
             current = (url, text)
@@ -56,7 +67,7 @@ final class ClipboardMonitor {
     }
 
     private func poll() {
-        let pb = NSPasteboard.general
+        let pb = Self.pasteboard
         let change = pb.changeCount
         guard change != lastChange else { return }
         lastChange = change

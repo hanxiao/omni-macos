@@ -123,7 +123,7 @@ struct OCRView: View {
     @ViewBuilder private var content: some View {
         if visibleDocumentUnreadable {
             CenteredHint(symbol: "exclamationmark.triangle", title: "Could not read this file", detail: "")
-        } else if session.sectionIDs.isEmpty {
+        } else if !session.hasSections {
             // Say which of the two waits this is. "Queued" was shown for both, and for the first
             // run of a session it was simply wrong: nothing is queued behind anything, the app is
             // reading four and a half gigabytes of weights off disk.

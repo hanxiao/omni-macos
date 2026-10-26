@@ -1586,7 +1586,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             let r = run(highPriority: false) { () -> ([[Float]], [[Float]]?) in
                 let inputs: [OmniImageEncoder.Preprocessed] = group.map { (pixelValues: $0.tensor(), gridTHW: $0.gridTHW) }
                 let r = enc.encode(images: inputs, prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: tagger,
-                                   yieldPoint: yieldToWaitingQuery)
+                                   yieldPoint: yieldToWaitingQuery, carve: { self.interactiveQueryActive })
                 addTokens(enc.lastSequenceLength)
                 return r
             }
@@ -1713,7 +1713,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         // per-batch carving (the text path already shrinks its gate window when interactiveQueryActive).
         // Block-diagonal image batching gives ~0 GPU throughput (the vision tower is saturated per
         // image - measured), so splitting it costs ~nothing; vectors are per-image independent (same
-        // cu_seqlens forward), so bit-identical. Full batch when idle (max indexing pipeline overlap).
+        // cu_seqlens forward) to fp16 rounding - not bit-identical: the kernels tile by the packed
+        // row count, cosine 0.9999 (VisionEncoderTests.testCarvedChunksMatchPackedChunks). Full
+        // batch when idle (max indexing pipeline overlap).
         if interactiveQueryActive, raws.count > 1 {
             var out: [[Float]] = []; out.reserveCapacity(raws.count)
             for r in raws {
@@ -1731,7 +1733,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             // decode boundary). Then one batched encode.
             let inputs: [OmniImageEncoder.Preprocessed] = raws.map { (pixelValues: $0.tensor(), gridTHW: $0.gridTHW) }
             let v = enc.encode(images: inputs, prefixIds: docPrefix, suffixIds: mediaSuffix, tagger: nil,
-                               yieldPoint: yieldToWaitingQuery).vecs
+                               yieldPoint: yieldToWaitingQuery, carve: { self.interactiveQueryActive }).vecs
             addTokens(enc.lastSequenceLength)
             return v
         }
