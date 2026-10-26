@@ -14,7 +14,7 @@ import OmniLink
 /// `wait:<seconds>`, `intent:<text>` (the Shortcuts search action's own search, logged). For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
 /// (window size, centered), `front`, `appearance:light|dark`, `ocrview:raw|rendered|split|triple`, `ocrpage:<n>`, `history:<n>`, `sort:<order>`,
-/// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `menu:<title>`, `historybench:<n>`, `seedhistory:<n>[:<m>]`, `note:<text>`, `menustate:<menu>`, `recents`, `clipboard:on|off`, `powerhold:hot|lowpower|battery|none`, `ocrrun:on|off`, `stall:queue:<path>|flag`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
+/// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `menu:<title>`, `historybench:<n>`, `seedhistory:<n>[:<m>]`, `note:<text>`, `menustate:<menu>`, `historyfold:<n>`, `sidebarscroll:<top|bottom|f>`, `recents`, `clipboard:on|off`, `powerhold:hot|lowpower|battery|none`, `ocrrun:on|off`, `stall:queue:<path>|flag`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
 enum PerfScript {
@@ -148,6 +148,16 @@ enum PerfScript {
             let nm = arg.split(separator: ":").compactMap { Int($0) }
             model.seedHistory(nm.first ?? 10_000, bookmarkEvery: nm.count > 1 ? nm[1] : 50)
         case "note": break   // a marker in the log for a harness to wait on
+        case "sidebarscroll":   // scroll the main window's sidebar: top, bottom, or a fraction 0...1
+            if let w = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil && $0.title == "Omni" }),
+               let outline = firstView(of: NSOutlineView.self, in: w.contentView), let sv = outline.enclosingScrollView {
+                let doc = sv.documentView?.bounds.height ?? 0, view = sv.contentView.bounds.height
+                let f = arg == "top" ? 0 : (arg == "bottom" ? 1 : (Double(arg) ?? 1))
+                sv.contentView.scroll(to: NSPoint(x: 0, y: max(0, (doc - view) * f)))
+                sv.reflectScrolledClipView(sv.contentView)
+            }
+        case "historyfold":   // open or close the n-th History folder (a day or a month), newest first; -k: the k-th month
+            NotificationCenter.default.post(name: .omniPerfHistoryFold, object: Int(arg) ?? 0)
         case "sort": model.sortOrder = SortOrder(rawValue: arg) ?? .relevance
         case "set":       // a Settings value through the setter its control uses: set:<name>=<value>
             let kv = arg.split(separator: "=", maxSplits: 1).map(String.init)
@@ -407,6 +417,7 @@ extension Notification.Name {
     static let omniPerfSettingsTab = Notification.Name("omni.perf.settingsTab")
     static let omniPerfSidebarSelect = Notification.Name("omni.perf.sidebarSelect")
     static let omniPerfLinkFold = Notification.Name("omni.perf.linkFold")
+    static let omniPerfHistoryFold = Notification.Name("omni.perf.historyFold")
     static let omniPerfOCRView = Notification.Name("omni.perf.ocrView")
     static let omniPerfOCRPage = Notification.Name("omni.perf.ocrPage")
 }

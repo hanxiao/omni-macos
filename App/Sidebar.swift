@@ -342,6 +342,14 @@ struct Sidebar: View {
         .onReceive(NotificationCenter.default.publisher(for: .omniPerfLinkFold)) { note in
             if let id = note.object as? String { $folds.section("mac:" + id).wrappedValue.toggle() }
         }
+        .onReceive(NotificationCenter.default.publisher(for: .omniPerfHistoryFold)) { note in
+            // The n-th History folder, newest first, as a click on its row would; -k the k-th month.
+            guard let n = note.object as? Int else { return }
+            let all = model.historyDays
+            let pick = n >= 0 ? (all.indices.contains(n) ? all[n] : nil)
+                              : all.filter(\.month).dropFirst(-n - 1).first
+            if let d = pick { $folds.day(d.day, month: d.month).wrappedValue.toggle() }
+        }
         .sheet(isPresented: Binding(get: { model.showPhotoPicker }, set: { model.showPhotoPicker = $0 })) { PhotoSourcePicker() }
         .sheet(isPresented: Binding(get: { model.showPhotoDenied }, set: { model.showPhotoDenied = $0 })) { PhotoAccessDenied() }
         .onDeleteCommand {
@@ -434,10 +442,11 @@ private struct HistorySections: View {
                 // ForEach of its searches, so the elements were different numbers of rows, and the
                 // sidebar's List diffs by walking them from the start for every row: ~100 ms for each
                 // change at 20,000 searches, once per batch of an agent's searches (2026-10-26). The
-                // days and the open days' searches are one flat list.
+                // days and the open days' searches are one flat list. Past 30 days a folder is a
+                // month (AppModel.historyDays).
                 ForEach(rows(days)) { row in
                     switch row.kind {
-                    case .day(let day, let range): dayRow(day, range)
+                    case .day(let day, let range, let month): dayRow(day, range, month: month)
                     case .search(let item): historyRow(item, indent: true)
                     }
                 }
@@ -452,28 +461,29 @@ private struct HistorySections: View {
     /// formatted) was most of its time, and a string id was hashed each time, Unicode-normalised for
     /// the CJK in agents' queries. The hash of the row's string id, taken once per render.
     private struct Row: Identifiable {
-        enum Kind { case day(Date, Range<Int>), search(HistoryItem) }
+        enum Kind { case day(Date, Range<Int>, month: Bool), search(HistoryItem) }
         let id: Int
         let kind: Kind
         init(id: String, kind: Kind) { self.id = id.hashValue; self.kind = kind }
     }
 
-    private func rows(_ days: [(day: Date, range: Range<Int>)]) -> [Row] {
+    private func rows(_ days: [(day: Date, range: Range<Int>, month: Bool)]) -> [Row] {
         var rows: [Row] = []
         rows.reserveCapacity(days.count)
         for d in days {
-            rows.append(Row(id: "day:" + SidebarFolds.dayKey(d.day), kind: .day(d.day, d.range)))
-            if folds.isOpen(d.day) {
+            let key = SidebarFolds.key(d.day, month: d.month)
+            rows.append(Row(id: "day:" + key, kind: .day(d.day, d.range, month: d.month)))
+            if folds.isOpen(d.day, month: d.month) {
                 rows += model.historyItems(in: d.range).map { Row(id: $0.id, kind: .search($0)) }
             }
         }
         return rows
     }
 
-    private func dayRow(_ day: Date, _ range: Range<Int>) -> some View {
-        let open = $folds.day(day)
+    private func dayRow(_ day: Date, _ range: Range<Int>, month: Bool) -> some View {
+        let open = $folds.day(day, month: month)
         return Button { withAnimation(.snappy(duration: 0.2)) { open.wrappedValue.toggle() } } label: {
-            DayRow(day: day, open: open.wrappedValue)
+            DayRow(day: day, month: month, open: open.wrappedValue)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -589,6 +599,8 @@ private struct SidebarHeader: View {
 /// shows a chevron, the same mark a section header shows.
 private struct DayRow: View {
     let day: Date
+    /// A month folder: past 30 days History folds by month.
+    var month = false
     let open: Bool
 
     /// All in the system's locale: "Today" and "Yesterday" come from the relative formatter, and
@@ -603,6 +615,11 @@ private struct DayRow: View {
 
     private var title: String {
         let cal = Calendar.current
+        if month {
+            // "September" this year, "September 2025" before it, in the system's locale.
+            return cal.isDate(day, equalTo: Date(), toGranularity: .year)
+                ? day.formatted(.dateTime.month(.wide)) : day.formatted(.dateTime.month(.wide).year())
+        }
         if cal.isDateInToday(day) || cal.isDateInYesterday(day) { return Self.relative.string(from: day) }
         let sameYear = cal.isDate(day, equalTo: Date(), toGranularity: .year)
         return sameYear ? day.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
@@ -659,8 +676,17 @@ struct SidebarFolds: Codable, Equatable {
         return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
     }
 
-    func isOpen(_ day: Date) -> Bool {
-        if let set = days[Self.dayKey(day)] { return set }
+    /// A day's key, or a month's ("yyyy-MM"): both live in `days`, and never collide.
+    static func key(_ day: Date, month: Bool) -> String {
+        guard month else { return dayKey(day) }
+        let c = Calendar.current.dateComponents([.year, .month], from: day)
+        return String(format: "%04d-%02d", c.year ?? 0, c.month ?? 0)
+    }
+
+    /// A folder nobody touched: today and yesterday open, every other day and every month closed.
+    func isOpen(_ day: Date, month: Bool = false) -> Bool {
+        if let set = days[Self.key(day, month: month)] { return set }
+        guard !month else { return false }
         let cal = Calendar.current
         return cal.isDateInToday(day) || cal.isDateInYesterday(day)
     }
@@ -673,9 +699,9 @@ extension Binding where Value == SidebarFolds {
                           if open { wrappedValue.collapsed.remove(name) } else { wrappedValue.collapsed.insert(name) }
                       })
     }
-    func day(_ day: Date) -> Binding<Bool> {
-        Binding<Bool>(get: { wrappedValue.isOpen(day) },
-                      set: { wrappedValue.days[SidebarFolds.dayKey(day)] = $0 })
+    func day(_ day: Date, month: Bool = false) -> Binding<Bool> {
+        Binding<Bool>(get: { wrappedValue.isOpen(day, month: month) },
+                      set: { wrappedValue.days[SidebarFolds.key(day, month: month)] = $0 })
     }
 }
 

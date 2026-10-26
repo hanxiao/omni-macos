@@ -1587,8 +1587,13 @@ SIX CAUSES, each read off the counts and fixed:
   2,000 (10 bookmarks; Han has 1), flat and nested rows are level with the rest in place - 0 stalls
   under agent load in both, 1.7-2.1 s of main thread, the first fill ~330-350 ms - and clicks and
   clears are slightly better flat (3.0 / 3.1 s of stalls over six actions, nested 3.3 / 3.4): kept.
-  Still left: the diff itself; fewer rows is the only further lever (older days folded into months,
-  as Notes and Safari do), a design decision not taken.
+  Then the rows themselves (Han, 2026-10-26): past 30 days History folds BY MONTH ("September" this
+  year, "September 2025" before it; closed until opened, a month's fold kept beside the days' in
+  SidebarFolds as "yyyy-MM"), so a year is ~42 folders, not 365. At 20,000 searches over a year,
+  against the build before it, back to back: agent load 2.21 / 1.94 -> 1.11 / 1.13 s of main thread
+  in 20 s (0 stalls over 50 ms in both), history clicks and clears 3.07 / 2.90 -> 2.12 / 1.53 s of
+  stalls, the first fill 329 / 324 -> 134 / 135 ms. Perf-script steps `historyfold:<n>` (-k: the
+  k-th month) and `sidebarscroll:<top|bottom|f>` for the screenshots.
 
 WHAT IS LEFT WHILE TYPING, profiled (Time Profiler over five typed queries, ~150 keystrokes, a settled
 index, hangwatch at 60 ms): blocks of 60-100 ms and one of 150 ms, each where a result set lands; the

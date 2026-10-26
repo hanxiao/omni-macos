@@ -174,7 +174,8 @@ codebase were already measured there, and many were rejected.
   stay as they are: gate the fix `#unavailable(macOS 26.0)` where it can be, and compare the Tahoe
   window against the last release, side by side, before it ships.
 - SEARCH HISTORY HAS NO COUNT CAP (Han, 2026-10-25). The sidebar keeps every search, typed or
-  served, for as long as Settings > History says, "Forever" included. Anything that walks the
+  served, for as long as Settings > History says, "Forever" included; past 30 days it folds by month
+  (Han, 2026-10-26). Anything that walks the
   history is measured at that size (`historybench:N` perf-script step), never bounded by a cap.
 - DEDUP IS PART OF THE DESIGN; NEVER DISABLE IT (Han, 2026-10-14). Content dedup and chunk reuse
   (`contentDedup`, `globalChunkReuse`, `vectorsForContentKeys`) stay on in every shipped path, and a

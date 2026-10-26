@@ -30,7 +30,7 @@ final class LinkResponder: LinkService, @unchecked Sendable {
         guard let (e, s, m) = lock.withLock({ () -> (OmniEngine, VectorStore, String)? in
             guard let engine, let store else { return nil }
             return (engine, store, modelName)
-        }) else { throw LinkError.refused("Omni there is still starting.") }
+        }) else { throw LinkError.refused("Omni on that Mac is still starting.") }
         return (e, s, m)
     }
 

@@ -2758,27 +2758,37 @@ final class AppModel {
         searchHistory.filter { $0.bookmarked }.sorted { $0.lastUsed > $1.lastUsed }
     }
 
-    /// The sidebar's History section: one folder per calendar day that has a recent search, newest
-    /// day first, each as its range of `searchHistory` - the list is newest first, so a day is one
-    /// run of it, found by bisection, and only an OPEN day's rows are ever copied out
-    /// (`historyItems(in:)`). Built once per change of the list.
-    var historyDays: [(day: Date, range: Range<Int>)] {
+    /// The sidebar's History section: one folder per calendar day over the last `historyDayFolders`
+    /// days, then one per calendar MONTH (Han, 2026-10-26: with history kept forever a folder a day
+    /// was 365 rows a year, and the sidebar's List diffs with the square of its rows). Newest first,
+    /// each as its range of `searchHistory` - the list is newest first, so a day or a month is one
+    /// run of it, found by bisection, and only an OPEN folder's rows are ever copied out
+    /// (`historyItems(in:)`). Built once per change of the list, and again when the day turns.
+    var historyDays: [(day: Date, range: Range<Int>, month: Bool)] {
         let items = searchHistory
-        if daysCache.revision == historyRevision { return daysCache.days }
         let cal = Calendar.current
-        var days: [(day: Date, range: Range<Int>)] = []
+        let today = cal.startOfDay(for: Date())
+        if daysCache.revision == historyRevision, daysCache.today == today { return daysCache.days }
+        let cutoff = cal.date(byAdding: .day, value: -(Self.historyDayFolders - 1), to: today) ?? today
+        var days: [(day: Date, range: Range<Int>, month: Bool)] = []
         var i = 0
         while i < items.count {
-            let day = cal.startOfDay(for: items[i].lastUsed)
+            let used = items[i].lastUsed
+            let month = used < cutoff
+            let start = month ? (cal.dateInterval(of: .month, for: used)?.start ?? cal.startOfDay(for: used))
+                              : cal.startOfDay(for: used)
             var lo = i + 1, hi = items.count
-            while lo < hi { let m = (lo + hi) / 2; if items[m].lastUsed >= day { lo = m + 1 } else { hi = m } }
-            if items[i ..< lo].contains(where: { !$0.bookmarked }) { days.append((day, i ..< lo)) }
+            while lo < hi { let m = (lo + hi) / 2; if items[m].lastUsed >= start { lo = m + 1 } else { hi = m } }
+            if items[i ..< lo].contains(where: { !$0.bookmarked }) { days.append((start, i ..< lo, month)) }
             i = lo
         }
-        daysCache = (historyRevision, days)
+        daysCache = (historyRevision, today, days)
         return days
     }
-    @ObservationIgnored private var daysCache: (revision: Int, days: [(day: Date, range: Range<Int>)]) = (-1, [])
+    /// Days shown one folder each, today included; older searches fold by month.
+    static let historyDayFolders = 30
+    @ObservationIgnored private var daysCache: (revision: Int, today: Date, days: [(day: Date, range: Range<Int>, month: Bool)])
+        = (-1, .distantPast, [])
 
     /// The recent searches of one day folder.
     func historyItems(in range: Range<Int>) -> [HistoryItem] {
