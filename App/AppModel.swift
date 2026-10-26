@@ -5922,7 +5922,7 @@ final class AppModel {
         // default hidden-name rule dropped a 180,911-file `.openclaw` the user had added by name.
         // An agent wants a folder; these are the disk, its system areas and the whole home.
         if Self.tooBroadToIndex(canonical) {
-            return .fail("\(path) is too broad to index as one source: it would take in system and app data and swallow the folders already added. Add the folders inside it instead, such as ~/Documents.")
+            return .fail("\(path) is too broad to index as one source: it holds system and app data and the folders already added. Add the folders inside it instead, such as ~/Documents.")
         }
         let coveredBy = RootScope.rootCovering(URL(fileURLWithPath: canonical), in: roots)
         addRoots([url])
