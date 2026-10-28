@@ -3113,3 +3113,217 @@ search 28, opening a hit 22.
 - NOT OMNI: openclaw's secret redaction masks any long run of letters, digits and slashes (first 5 +
   "…" + last 4), so `/Users/hanxiao/Downloads/hanxiao2013icdm-paper.pdf` reached the model as
   `/Users…icdm-paper.pdf` (8 of 491 result lines; mdfind output too).
+
+## Decks and workbooks (2026-10-27)
+
+`.pptx`, `.xlsx`, `.xls` and `.numbers` were in no FileExtractor kind list, so the crawl skipped them:
+not searchable, not even by name. Spotlight on this Mac: 46 `.xlsx`, 10 `.xls`, 8 `.pptx`; the one
+`.numbers` is an empty folder under ~/Library/Application Scripts, and the 48 `.key` it counts as
+Keynote are PEM keys (IWorkText reads none of them, as before). Han's design: every page two chunks,
+its words on the text tower and its picture on the image tower; store and scoring as they are. This
+round: `.pptx`, `.xlsx`, `.numbers` (Han); not `.xls` (binary BIFF, a reader of its own) and not the
+pictures inside Word, Pages and Keynote files (rows existing indexes hold: a migration).
+
+- THE WORDS (OfficeDocument): Office Open XML read with IWorkText's zip reader and Foundation's
+  XMLParser, only the parts that hold words. A deck's slides in `p:sldIdLst` order, a paragraph a
+  line, speaker notes through each slide's relationships after its words; slide number, date and
+  header placeholders left out. A workbook's sheets in workbook order, inflated one at a time, cells
+  as the sheet shows them: shared and inline strings (phonetic runs left out), booleans, errors,
+  formula results, numbers to 15 significant digits (0.30000000000000004 reads 0.3) and dates by
+  their number format (built-in 14-22 and 45-47, or a code with d/m/y/h outside quotes and brackets;
+  the 1900 system's phantom 29 February kept). 2 MB of text at most, as every extraction.
+  A Numbers document's tables live in IWA tiles IWorkText does not read; its words come from Quick
+  Look's preview, which draws each sheet as a PDF, rebuilt row by row from where PDFKit finds its
+  lines (PDFKit's own string reads a table column by column: "Cabinets Countertop ... 4200 1800").
+- THE PIECES (Indexer.documentPieces): a slide cut as converted text is, at "Slide 3"; a sheet cut
+  by ROWS, every piece opening with the sheet's name and its header row, a row a line with " | "
+  between cells, at the cells it holds: "Guests A12:E21". read_file reads a deck or a workbook a
+  page (slide, sheet) at a time, a sheet from a row on with `line` (under its name and header; the
+  reply's next call names the sheet and the row), and an exact phrase in one is found at the page
+  read_file takes.
+- THE PICTURES (DocumentPictures, Sources/OmniPages): the one public Quick Look API that draws,
+  QLThumbnailGenerator, stops at the first page (it does draw it: 960x540 for a deck whose own
+  thumbnail is 384x216). `qlmanage -p -o` writes the whole preview out: a deck as one HTML page with
+  a `div.slide` per slide, a workbook as an HTML page per sheet, a Numbers document as a PDF per
+  sheet. WebKit draws the deck's slides offscreen; it cannot open a .pptx or .xlsx itself ("Frame
+  load interrupted"). WebKit wants a main thread with a run loop, so the drawing is its own process,
+  `omni-pages` in Contents/Helpers (the indexer and the command line tools have no main thread to
+  lend; the app's is the UI's): the preview's scripts off, nothing but its own files loaded (a
+  content rule blocks every other URL), two drawings at a time, 120 s at most, PNGs in a folder that
+  goes with the item. Its window is one slide's size (at most 4,096 points a side) and scrolls to
+  each slide: drawn first in a window as tall as the deck, 200 slides made it ~110,000 points, past
+  the largest texture WindowServer makes (16,384), and a tool that captures every window takes
+  WindowServer down on such a window. That is how this Mac's GUI session ended at 04:13 on
+  2026-10-27, though not on ours: `peekaboo` (another agent's screenshot tool) asked ScreenCaptureKit
+  for a window list holding another process's 30,000 x 30,000-point window at (-15000, -15000), and
+  WindowServer aborted in `create_iosurface_for_window_list` on its texture descriptor. The scrolled
+  drawing is pixel-identical to the tall one (a 20-slide deck and a real 4-slide deck, every slide,
+  the last ones that cannot scroll to the top included). Measured: 200 slides 2.8 s (80 MB, 30 MB
+  of PNGs), a 4-5 slide deck 0.43-0.52 s, a 2-sheet Numbers document 0.6-0.8 s; slide 1 within
+  ~1.5/255 per channel of Quick Look's own thumbnail. A slide's picture is a chunk of kind 'scan' (the Text
+  toggle's, the media scale) at the slide's locator, streamed with a scanned PDF's pages through one
+  loop (embedPagePictures), keyed by what the tower sees: a deck saved again with its slides as they
+  were embeds no picture again (4 -> 0, OfficeDocumentTests). In Neural Engine mode a deck waits for
+  the image kind, as a scan does. A hit on a slide's picture shows as the document, at "Slide 3".
+  Not drawn: a deck Quick Look has no preview for (python-pptx decks with speaker notes: "TCMessage
+  Exception"), which is indexed by its words. A workbook's preview draws a chart as an empty box.
+- THE EVAL: bed `eval-bed-2` (/Volumes/han2tb/omni-eval-2): three decks (one German), four workbooks
+  (a guest list with one name among 37 rows, a car loan, a 700-row inventory with one needle row, a
+  rainfall chart) and two Numbers documents, from `Tools/eval/office.py` (committed in
+  Tools/eval/office, copied by evalbed), 20 queries: `deck` 7 (words on a slide), `deck-pic` 3 (a
+  picture-only slide showing a built-in picture nothing else in the bed shows: an archery target, a
+  white rose beside the bed's red one, a yin-yang), `sheet` 7, `numbers` 3; places `@s3` and
+  `@cGuests:21`. Three arms on fresh indexes, MRR (Nano / Small):
+
+      tag (n)          no pictures      slides only      slides and sheets
+      deck (7)         1.000 / 1.000    1.000 / 1.000    1.000 / 1.000
+      deck-pic (3)     0.000 / 0.000    1.000 / 1.000    1.000 / 1.000
+      sheet (7)        0.857 / 0.857    0.857 / 0.857    0.714 / 0.714
+      numbers (3)      0.667 / 1.000    0.667 / 1.000    1.000 / 1.000
+      image (13)       0.774 / 0.949    0.771 / 0.910    0.766 / 0.910
+      ALL (145)        0.876 / 0.907    0.896 / 0.925    0.899 / 0.918
+
+  SLIDES ONLY ship (FileExtractor.slideExtensions). A sheet's picture is a picture of its cells: on
+  the media scale it outranked its own cells' piece, and the hit lost its row ("Guests" for "which
+  table is Priya Raman sitting at", not "Guests A1:E38"); on Small it found nothing the cells did
+  not, and it joined weak image queries' top 3 (the guest list for "sunflower" in Korean). Its one
+  win was Nano telling the chess club's two sheets apart. The price of slide pictures is that a
+  slide's picture is a picture: "yellow flower" ranks the white-rose slide first on Small (was the
+  daisy), and a title slide joins the weak multilingual image queries. The arm switch is retired.
+- IN THE APP (isolated instances, Nano; this Mac's own Omni at 100-260% CPU throughout, catching up
+  after a restart): the build before indexed the folder's 20 notes and skipped its 11 decks and
+  workbooks (dated January, older than any pass); this build on the same index took all 11 and left
+  the 20 unchanged. Fresh index, GPU: 31 files in 22.4 s; a 4-5 slide deck embedded in 0.30-0.37 s
+  (its words and pictures), 200 slides in 14.4 s (72 ms a slide; the same 200 pictures as photos
+  through `imgindex`, 109 ms each: a slide's picture costs what a 1.3 MP photo costs). Neural Engine:
+  a 4-5 slide deck 1.2-1.5 s, 200 slides 61-69 s (~300 ms a slide), the first deck 38 s while the
+  vision programs compiled; with the image kind not in yet the decks waited and came in with a later
+  pass (302 s after a cold launch, 206 s warm). The same top answer for six queries on both units
+  (the yin-yang at Slide 3, Priya at "Guests A1:E38", SKU-48213 at "Stock A481:D528"). No main-thread
+  block over 100 ms in any run (hangwatch's positive control, block:cpu:450, read 478 ms); peak
+  footprint 2.7-4.1 GB.
+- A SHEET'S PIECE IS A QUARTER OF A CHUNK (450 characters at the default 1,800). Cut at a whole
+  chunk, a piece held ~48 rows, and one row among them was outvoted: "titanium camping kettle bin
+  location" missed its place on both models. The inventory got three more items named once among
+  its 700 look-alike parts (a ship's bell, a tripod, a dutch oven; `sheet` 10 queries, the bed 148),
+  and the piece size was the one change, on fresh indexes (MRR, `sheet` / ALL):
+
+      piece            1,800            900              450
+      Nano             0.750 / 0.892    0.900 / 0.902    1.000 / 0.909
+      Small            0.800 / 0.923    1.000 / 0.936    1.000 / 0.933
+
+  Every other tag the same, but for one Korean voice-memo query on Small at 450 (rank 1 -> 2, a
+  near tie between two recordings). A hit names about ten rows ("Stock A508:D518"). The cost, on
+  this Mac's 33 workbooks (771k characters of cells): ~2,000 pieces, not ~500, and ~10% more text
+  embedded (the header repeated). Narrowing a hit to its one row was not built: the piece already
+  names ten rows, and read_file starts a sheet at the first of them.
+- LEFT: `.xls`, pictures inside Word, Pages and Keynote files, and workbook charts are not done.
+
+## PDF pages as pictures, PDF tables and CSV tables measured (2026-10-27)
+
+After the decks, Han asked whether a PDF should get pictures as slides do. A PDF was either read
+for its text or, below 8 characters a page on average, embedded as page pictures (a scan) - never
+both. So a scanned page inside a text PDF (a signed page added to a contract) was in no chunk at
+all, and a page that is mostly a photo or a chart was found only by its caption.
+
+- WHICH PAGES (PDFPagePictures): on this Mac's 1,678 PDFs, 485 have a text layer (6,135 pages) and
+  1,193 are scans (1,826 pages). In the text PDFs, 20 pages have no text of their own (in 9 files)
+  and 220 draw images over 30% of the page (in 59 files). The images' share is read from the content
+  stream (each image XObject through the transform in force where it is drawn; nothing decoded or
+  rendered): 0.15 ms a page p50, 1.9 s for all 7,950 pages. A logo in a letterhead is not a picture
+  page.
+- THE EVAL (eval-bed-2, three PDFs added: a newsletter whose page 2 is a photo of an American
+  football with a caption that does not name it, a flyer whose page 2 is a lipstick print, a
+  boathouse lease whose page 2 is a scanned signed extension; tag `pdf-figure`, 3 queries, the bed
+  151), fresh indexes, MRR (`pdf-figure` / ALL):
+
+      pictures         none             the pages the text does not carry    every page
+      Nano             0.029 / 0.888    1.000 / 0.900                        0.667 / 0.887
+      Small            0.024 / 0.915    1.000 / 0.931                        0.667 / 0.918
+
+  Every other tag the same with the chosen pages, but for two queries: "lease agreement" and "pdf of
+  the lease agreement" rank the new boathouse lease's scanned page first and the bed's lease .docx
+  second - both are leases, and neither query names the boathouse. Every page pictured hurt words:
+  the bread page's picture outranked the sourdough notes for "75 percent hydration dough", a
+  boathouse page the sailing log for "the boat engine broke down", and the lease page's picture fell
+  behind its own page 1. The arm switch is retired.
+- THE PATHS, one selection and one embed (pictureChunks, which decks use too), three ways in: a
+  short PDF in the main pass as a deck is (the words, then the pictures at "Page N", kind scan); a
+  long PDF in its turns, each turn's pages with it; and the enrichment, for a PDF indexed before
+  pictures (text PDFs' ledger keys carry `|f1`, scope s3: each text PDF is looked at once, nothing
+  else is redone) and for one whose pictures waited. In Neural Engine mode a PDF's words do not
+  wait for its pictures: stored at once, the pictures added at the end of the first pass after the
+  image kind is in (`picturesWaiting` keeps the phase armed). A picture already stored under its key
+  is not embedded again; the words a PDF had are kept as they were (PDFPagePicturesTests: no text
+  embedded again on an index from before). A hit on a picture shows "Scanned page 2", as a scan's.
+- IN THE APP, AN INDEX FROM BEFORE (isolated instances, Nano, GPU; clones of this Mac's 485 text
+  PDFs and 100 of its scans): 0.19.6 indexed them in 146 s. This build on a clone of that index
+  re-read nothing (585 unchanged), visited exactly the 485 text PDFs once (no scan), and added 240
+  page pictures in 65 files in 50 s (14.0 s of GPU); all 10,089 text chunks the same (file, key,
+  locator). A search every 0.5 s throughout: p50 5.2 ms, p90 36 ms, max 53 ms during the pass (p50
+  4.9 ms outside it); no main-thread block over 100 ms (hangwatch at 100 ms); peak footprint 3.7 GB.
+  This Mac's own Omni at 96-189% CPU and up to 63% of the GPU that evening.
+  UNDER KILL (2026-10-28): the same upgrade SIGKILLed at 12, 20 and 15 s into three launches, each
+  during the pass: storeaudit 0 failing checks after every kill, the fourth launch finished the last
+  98 files, and the rows (file, ordinal, kind, key, locator) came out byte-identical to the
+  uninterrupted run, no ordinal twice. NEURAL ENGINE MODE, the same clone and a warm ANE cache: the
+  first pass finished the 420 text PDFs needing no picture in 37.7 s with the image kind not in; the
+  65 that do got their 240 pictures in the pass after it was (470 s from launch); rows identical to
+  the GPU run, 0 failing checks, 0.03 s of GPU in all, searches p50 3.8 ms / max 22 ms, no
+  main-thread block over 100 ms.
+- NOT DONE: a bare page's words (a scan's are read by Vision on the screen-text lane; a bare page
+  inside a text PDF is found by its picture only), and the label for a figure page ("Scanned page 2"
+  where it was never scanned).
+- PDF TABLES, MEASURED AND NOT BUILT. PDFKit reads a page in the order the file draws it: a table
+  drawn row by row reads as rows, one drawn column by column as a list of labels and then lists of
+  numbers ("Total liabilities" 16 lines from its "48,214"). 400 sampled PDFs: 77 of 311 text pages
+  had rows split that way, 12% of those rows read whole. Rebuilding rows from line geometry costs
+  ~3% over page.string, but geometry cannot tell a table from prose in columns: 6,894 two-piece rows
+  were two-column prose (nearly full), and three-piece rows fill anything from 10% to 100% of their
+  span. macOS 26's RecognizeDocumentsRequest can: it found the synthetic table drawn either way and
+  nothing in 2-, 3- and 4-column prose (English and Chinese). But it costs 0.86 s a page p50 (the
+  same at 1,600, 1,024 or 768 px; 768 missed 6 of 44), run only on pages with 3+ consecutive split
+  rows of 3+ pieces (13% of text pages here; it confirmed tables on 44 of 1,355, 3%): ~11 minutes for
+  this Mac's PDFs once, and the rebuilt text must be kept for passages and read_file, which cannot
+  wait on Vision. Not built; the `ocr` tool already reads a page's tables as HTML for an agent that
+  asks, at a few seconds a page.
+- CSV AS TABLES, MEASURED AND NOT BUILT. A CSV is plain text, so its pieces past the first have no
+  column names. Built and taken out again: a CSV or TSV new to the index read as one sheet (fields
+  split outside quotes, each record numbered by the line it starts on) and cut as a sheet is, the
+  header atop each piece, located by its cells ("A137:G141"); one the index held kept its line cut,
+  edits included (Han: "only for new files? so no reindexing for existing users?"). That part held:
+  an 0.19.6 index of 150 of this Mac's CSVs read none again, and an edited one kept 33 of its 34
+  chunks. THE COST of a CSV new to the index (fresh indexes of the same 150, 9.3 MB, Nano, isolated
+  instances, interleaved):
+
+      cut                      index time     rows      pieces cut (no embed)   characters
+      lines (0.19.6)           19.1-19.2 s     4,547    4,541                   9.3M
+      table, a full chunk      27.3 s          6,224    6,224                   10.5M
+      table, half a chunk      53.5-53.9 s    13,918   13,918                   11.0M
+      table, a quarter         67.9-71.0 s    31,078   31,078                   12.7M
+
+  Every table cut repeats the header, so none costs what lines cost, and a wide table's header
+  (capped at half a piece) leaves a quarter piece room for one row: a 24-column CSV went from 130
+  pieces to 3,579. THE EVAL (Tools/eval/office/orders.csv: 900 orders, three items named once and
+  one order number; tag `csv`, 4 queries, each answer at its rows or a line chunk starting up to 90
+  lines before; the bed 155), MRR `csv` / `sheet` / ALL, fresh indexes:
+
+      cut                      Nano                     Small
+      lines for CSV            0.500 / 1.000 / 0.890    0.625 / 1.000 / 0.923
+      table, a quarter         0.800 / 1.000 / 0.898    1.000 / 1.000 / 0.929
+      table, a full chunk      0.511 / 0.750 / 0.874    0.500 / 0.800 / 0.904
+
+  The gain is the small piece, and the small piece is the cost; a full chunk costs 43% and finds
+  nothing lines do not. Han, on the quarter's cost: "definitely i dont want this". CSV is cut a
+  line at a time, as in 0.19.6; the eval keeps its `csv` queries. Sheets keep a quarter of a chunk:
+  never indexed before, they slow nothing that was, and at a full chunk they lose their rows.
+- READ_FILE ON WINDOWS LINE ENDS (since 0.18.0, found checking the agent surface): it split a text
+  file on "\n", and "\r\n" is one Character in Swift, so a CRLF file (Excel's and Python's CSVs
+  among them) read as one line and every "Line 36" past the first was "past the end". Lines are now
+  split by Character.isNewline, as the index counts them (TextSliceTests; fails on the old split).
+- MCP, CLI AND HTTP (2026-10-28, an isolated instance over the bed's decks, workbooks and figure
+  PDFs): a slide hit served as the document at "Slide 4" (a hit on its picture shows the picture's
+  tags as its passage, as an image hit does, even on a slide with words), a sheet's at its cells ("Stock A508:D518"), a figure page at "Page 2" (kind
+  scan, an inline page image as a scan's); `ext` takes pptx, xlsx and numbers; `kinds: text` holds
+  the slide pictures (text implies scan); read_file reads a slide, a sheet from a row under its
+  header, and (with the fix above) a CRLF file at any line; file_status counts the new chunks.

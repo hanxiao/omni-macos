@@ -27,9 +27,14 @@ extension ChunkHit {
 
 extension SearchHit {
     /// What the FILE is, for showing it: a screenshot found by its text, or a video found by its
-    /// soundtrack, is still a picture or a video. `kind` stays the kind of the chunk that matched,
-    /// which is what every score scale and filter is about. Only those two cases differ.
+    /// soundtrack, is still a picture or a video, and a deck found by a slide's picture is still a
+    /// document. `kind` stays the kind of the chunk that matched, which is what every score scale and
+    /// filter is about. Only those three cases differ.
     public var fileKind: String {
+        if kind == FileKind.scan.rawValue {
+            let ext = (path as NSString).pathExtension.lowercased()
+            return FileExtractor.documentExtensions.contains(ext) ? FileKind.text.rawValue : kind
+        }
         guard kind == FileKind.text.rawValue || kind == FileKind.audio.rawValue,
               let k = FileExtractor.kind(forExtension: (path as NSString).pathExtension.lowercased()),
               k == .image || k == .video else { return kind }

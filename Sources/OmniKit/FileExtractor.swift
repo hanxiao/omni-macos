@@ -60,6 +60,9 @@ public enum ExtractedContent {
     /// small groups (render -> patchify -> embed -> free), so a 500-page scan never holds more
     /// than a group of pages in memory. Use `renderPDFPage` to rasterize one page.
     case scannedPDF(pageCount: Int)
+    /// A deck or a workbook, a page a slide or a sheet (OfficeDocument), with the pages drawn when
+    /// they were drawn to read them (a Numbers sheet's words come from its preview: DocumentPictures).
+    case document([DocumentPage], pictures: RenderedPages?)
     case empty
 }
 
@@ -80,6 +83,13 @@ public enum FileExtractor {
     public static let officeExtensions: Set<String> = ["rtf", "rtfd", "doc", "docx", "odt", "pages", "key", "webarchive"]
     /// Read by `IWorkText`: NSAttributedString has no importer for them and fails on every file.
     static let iWorkExtensions: Set<String> = ["pages", "key"]
+    /// Read a page at a time, a slide or a sheet: their words by OfficeDocument (a Numbers sheet's
+    /// from the preview Quick Look draws of it).
+    public static let documentExtensions: Set<String> = ["pptx", "xlsx", "numbers"]
+    /// Of those, the ones whose pages are also embedded as pictures (DocumentPictures): slides. A
+    /// sheet's picture is a picture of its cells, which outranked the cells' own piece and lost the
+    /// row it was found at (docs/notes/index.md, "Decks and workbooks").
+    public static let slideExtensions: Set<String> = ["pptx"]
     public static let imageExtensions: Set<String> = ["png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "heic", "heif", "webp"]
     public static let videoExtensions: Set<String> = ["mp4", "mov", "m4v", "avi", "mkv", "webm", "mpg", "mpeg", "wmv", "flv", "3gp"]
     public static let audioExtensions: Set<String> = ["mp3", "wav", "m4a", "aac", "flac", "ogg", "oga", "aiff", "aif", "caf", "wma"]
@@ -110,7 +120,8 @@ public enum FileExtractor {
         if imageExtensions.contains(ext) { return .image }
         if videoExtensions.contains(ext) { return .video }
         if audioExtensions.contains(ext) { return .audio }
-        if textExtensions.contains(ext) || pdfExtensions.contains(ext) || officeExtensions.contains(ext) { return .text }
+        if textExtensions.contains(ext) || pdfExtensions.contains(ext) || officeExtensions.contains(ext)
+            || documentExtensions.contains(ext) { return .text }
         return nil
     }
 
@@ -120,7 +131,7 @@ public enum FileExtractor {
         case .image: return imageExtensions.sorted()
         case .video: return videoExtensions.sorted()
         case .audio: return audioExtensions.sorted()
-        case .text: return (textExtensions.union(pdfExtensions).union(officeExtensions)).sorted()
+        case .text: return (textExtensions.union(pdfExtensions).union(officeExtensions).union(documentExtensions)).sorted()
         case .scan: return []   // .pdf belongs to text; scanned-ness is an extraction-time fact
         }
     }
@@ -137,6 +148,7 @@ public enum FileExtractor {
         if textExtensions.contains(ext) { return try extractText(url) }
         if pdfExtensions.contains(ext) { return try extractPDF(url, maxImageDimension: maxImageDimension) }
         if officeExtensions.contains(ext) { return extractOffice(url) }
+        if documentExtensions.contains(ext) { return extractDocument(url, maxImageDimension: maxImageDimension) }
         if imageExtensions.contains(ext) {
             if let img = loadImage(url, maxDimension: maxImageDimension) { return .images([img]) }
             return .empty
@@ -238,6 +250,19 @@ public enum FileExtractor {
         return .empty
     }
 
+    /// A deck's slides or a workbook's sheets. A Numbers document's words are read from the pages
+    /// Quick Look draws (its tables live in IWA tiles IWorkText does not read), so those pictures
+    /// come back with them; a deck's and a workbook's are drawn by whoever wants them.
+    private static func extractDocument(_ url: URL, maxImageDimension: Int) -> ExtractedContent {
+        if url.pathExtension.lowercased() == "numbers" {
+            guard let drawn = DocumentPictures.render(url, maxDimension: maxImageDimension) else { return .empty }
+            let pages = drawn.pages.filter { !$0.text.isEmpty }.map { DocumentPage(label: $0.label, text: $0.text) }
+            return .document(pages, pictures: drawn)
+        }
+        guard let pages = OfficeDocument.extract(url), !pages.isEmpty else { return .empty }
+        return .document(pages, pictures: nil)
+    }
+
     // MARK: - Image
 
     /// Decode an image, downsampled so the largest side is <= maxDimension. The vision
@@ -275,7 +300,7 @@ public enum FileExtractor {
         return (d, Int(abs(sz.width).rounded()), Int(abs(sz.height).rounded()))
     }
 
-    static func loadImage(_ url: URL, maxDimension: Int = 1568) -> CGImage? {
+    public static func loadImage(_ url: URL, maxDimension: Int = 1568) -> CGImage? {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let opts: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,

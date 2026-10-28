@@ -73,6 +73,7 @@ if args.count >= 3 && args[1] == "extract" {
         switch content {
         case .text(let s)?: text = s
         case .pagedText(let s, _)?: text = s
+        case .document(let pages, _)?: text = pages.map(TextSlice.pageText).joined(separator: "\n\n")
         case nil: text = "<threw>"
         default: text = "<\(String(describing: content!).prefix(40))>"
         }

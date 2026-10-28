@@ -341,7 +341,7 @@ public struct ChunkAnchor: Sendable, Hashable {
 /// Code reads no .docx), and Omni has already done the work.
 public enum TextSlice {
     public struct Slice: Sendable {
-        /// "page", "line" or "character": what `start`, `end`, `total` and `next` count.
+        /// "page", "line", "row" or "character": what `start`, `end`, `total` and `next` count.
         public let unit: String
         public let start: Int
         public let end: Int
@@ -349,6 +349,8 @@ public enum TextSlice {
         /// Where the next call starts, or nil at the end.
         public let next: Int?
         public let text: String
+        /// The sheet a slice of rows is in (its page), which the next call names too.
+        public var page: Int? = nil
     }
     public enum Outcome: Sendable {
         case text(Slice)
@@ -389,6 +391,43 @@ public enum TextSlice {
            size > FileExtractor.maxTextBytes {
             return largeTextLines(url, from: line ?? 1, cap: cap)
         }
+        // A deck or a workbook by page, a slide or a sheet each, as the index reads it.
+        if FileExtractor.documentExtensions.contains(ext), offset == nil {
+            guard case .document(let pages, _)? = try? FileExtractor.extract(url), !pages.isEmpty else {
+                return .unreadable("Omni found no text in this file")
+            }
+            let n = pages.count
+            let first = min(max(1, page ?? 1), n)
+            // A sheet from a row on, under its name and header: where a hit's cells start ("Stock A508:D518").
+            if let from = line, let header = pages[first - 1].rows.first {
+                let sheet = pages[first - 1]
+                func cells(_ r: SheetRow) -> String { r.cells.map(\.value).joined(separator: " | ") }
+                guard let at = sheet.rows.firstIndex(where: { $0.row >= from }) else {
+                    return .unreadable("row \(from) is past the end of \(sheet.label) (its last row is \(sheet.rows.last!.row))")
+                }
+                var text = sheet.label + (header.row < sheet.rows[at].row ? "\n" + cells(header) : ""), last = at
+                for i in at ..< sheet.rows.count {
+                    let s = cells(sheet.rows[i])
+                    if i > at, text.count + s.count + 1 > cap { break }
+                    text += "\n" + s
+                    last = i
+                    if text.count >= cap { break }
+                }
+                return .text(Slice(unit: "row", start: sheet.rows[at].row, end: sheet.rows[last].row, total: sheet.rows.last!.row,
+                                   next: last + 1 < sheet.rows.count ? sheet.rows[last + 1].row : nil,
+                                   text: String(text.prefix(cap)), page: first))
+            }
+            var text = "", last = first
+            for p in first ... n {
+                let s = pageText(pages[p - 1])
+                if p > first, text.count + s.count > cap { break }
+                text += (p > first ? "\n\n" : "") + s
+                last = p
+                if text.count >= cap { break }
+            }
+            return .text(Slice(unit: "page", start: first, end: last, total: n, next: last < n ? last + 1 : nil,
+                               text: String(text.prefix(cap))))
+        }
         let whole: String
         switch try? FileExtractor.extract(url) {
         case .text(let s)?: whole = s
@@ -420,6 +459,12 @@ public enum TextSlice {
         let to = from + whole.distance(from: lo, to: hi)
         return .text(Slice(unit: "character", start: from, end: to, total: total, next: to < total ? to : nil,
                            text: String(whole[lo ..< hi])))
+    }
+
+    /// A slide or a sheet as read_file shows it: its name, then its words, or its rows a line each.
+    public static func pageText(_ page: DocumentPage) -> String {
+        let body = page.rows.isEmpty ? page.text : page.rows.map { $0.cells.map(\.value).joined(separator: " | ") }.joined(separator: "\n")
+        return page.label + "\n" + body
     }
 
     /// Why a file has no text to read: not a format Omni reads, a medium, gone, or in iCloud only.
@@ -522,6 +567,10 @@ public enum TextSlice {
             return .matches(kept, total: total, partial: limit < data.count && limit == maxBytes)
         }
         switch try? FileExtractor.extract(url) {
+        case .document(let pages, _)?:
+            // At the page read_file reads it from.
+            for (p, page) in pages.enumerated() { scan(pageText(page)) { _, _ in "Page \(p + 1)" } }
+            return .matches(kept, total: total, partial: false)
         case .text(let s)?, .pagedText(let s, _)?:
             scan(s) { text, at in
                 let idx = String.Index(utf16Offset: at, in: text)

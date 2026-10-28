@@ -1891,6 +1891,12 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                 return pages.isEmpty ? nil : embedVideoQuery(pages, asDocument: asDocument)
             case .images(let pages):
                 return pages.isEmpty ? nil : embedVideoQuery(pages, asDocument: asDocument)
+            case .document(let pages, _):
+                // A deck or a workbook by its words, a page after another, as a converted document is.
+                let t = pages.map { p in
+                    p.rows.isEmpty ? p.text : p.rows.map { $0.cells.map(\.value).joined(separator: " | ") }.joined(separator: "\n")
+                }.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                return t.isEmpty ? nil : embedText(t, as: asDocument ? .passage : .query)
             case .empty:
                 return nil
             }

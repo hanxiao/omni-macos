@@ -170,7 +170,10 @@ final class DecodedItem: @unchecked Sendable {
                    textStream,
                    // A text PDF with more than a first window of text: its pages are read a turn at
                    // a time (pdfTextTurn), so nothing of its text is held between turns.
-                   pdfTextTurns(pageCount: Int) }
+                   pdfTextTurns(pageCount: Int),
+                   // A deck: its pieces at their slides, keyed, and its slides drawn - embedded
+                   // together (embedDocument), the pictures streamed like a scan's pages.
+                   document([TextPiece], keys: [String], pictures: any PagePictures, maxDimension: Int) }
     let file: CrawledFile
     let kind: String
     private(set) var payload: Payload
@@ -723,6 +726,9 @@ public final class Indexer: @unchecked Sendable {
             keep(t, origin: FileExtractor.textExtensions.contains(ext) ? .plain : .opaque, wholeDocument: true)
         case .pagedText(let t, let s)?:
             keep(t, origin: .paged(s), wholeDocument: true)
+        case .document(let pages, _)?:
+            // Cut a page at a time, as the index cut it: every piece keyed as it was stored.
+            for p in documentPieces(pages, settings: settings) { out[chunkKey(p.text, settings: settings)] = p.text }
         default:
             break
         }
@@ -1692,8 +1698,8 @@ public final class Indexer: @unchecked Sendable {
                 if let s = item.streamSource { try? FileManager.default.removeItem(at: s) }
                 guard !first else { return }
                 Self.recordFinishedKey(item, store: store)
-                if item.enrichable, let ck = item.contentKey {
-                    store.enrichLedger.record([EnrichLedger.key(digest: StoreSchema.contentDigestHex(ck), path: path)])
+                if item.enrichable, !item.enrichFailed, let ck = item.contentKey {
+                    store.enrichLedger.record([EnrichLedger.key(digest: StoreSchema.contentDigestHex(ck), path: path, textPDF: Self.isTextPDF(item))])
                 }
             case .failed:
                 // Cancelled: the cursor stays, and the next pass resumes there. Anything else (the
@@ -1917,6 +1923,19 @@ public final class Indexer: @unchecked Sendable {
                         // Content-dedup hit: rows are ready, join the batched store directly.
                         stageStore(path, chunks)
                         if stagedStores.count >= 256 { flushStagedStores() }
+                    case .document(_, _, let pictures, _):
+                        // Its pictures need the image tower: while that is not in, a deck waits for
+                        // the image phase whole, its text with it, as a scan's pages do. A PDF's
+                        // words are stored now (embed).
+                        if deferred.contains(.image), !(pictures is PDFPagePictures) { return }
+                        let t0 = CFAbsoluteTimeGetCurrent()
+                        let chunks = self.embed(item)
+                        if omniPerfEnabled {
+                            omniPerfLog(String(format: "document-embed %.0fms .%@ pieces=%d pictures=%d", (CFAbsoluteTimeGetCurrent() - t0) * 1000,
+                                               item.file.ext, chunks.filter { $0.kind == FileKind.text.rawValue }.count,
+                                               chunks.filter { $0.kind == FileKind.scan.rawValue }.count))
+                        }
+                        storeChunks(path, chunks)
                     case .images, .imagePatches, .pdfScan:
                         if case .pdfScan = item.payload, deferred.contains(.image) { return }   // its pages wait for the image phase
                         if case .pdfScan = item.payload, handleStream(item) { return }   // a long scan takes turns
@@ -2609,6 +2628,8 @@ public final class Indexer: @unchecked Sendable {
             recordIdentifiers(chunk(text, settings: settings, origin: origin), digest: ck)
         case .pagedText(let text, let pageStarts):
             recordIdentifiers(chunk(text, settings: settings, origin: .paged(pageStarts)), digest: ck)
+        case .document(let pages, _):
+            recordIdentifiers(documentPieces(pages, settings: settings), digest: ck)
         default:
             store.idIndex.record(contentKey: ck, chunks: [])   // read; nothing to look up
         }
@@ -2857,20 +2878,25 @@ public final class Indexer: @unchecked Sendable {
         for start in stride(from: 0, to: candidates.count, by: 64) {
             let batch = Array(candidates[start ..< min(candidates.count, start + 64)])
             let digests = store.contentDigests(paths: batch.map(\.path))
-            let done = ledger.done(digests.map { EnrichLedger.key(digest: $0.value, path: $0.key) })
+            func key(_ c: (path: String, kind: String, modified: Double, size: Int, duration: Double), _ d: String) -> String {
+                EnrichLedger.key(digest: d, path: c.path, textPDF: c.kind == FileKind.text.rawValue && c.path.lowercased().hasSuffix(".pdf"))
+            }
+            let done = ledger.done(batch.compactMap { c in digests[c.path].map { key(c, $0) } })
             for c in batch {
                 if isCancelled { return enriched }
-                guard let d = digests[c.path], !done.contains(EnrichLedger.key(digest: d, path: c.path)) else { continue }
+                guard let d = digests[c.path], !done.contains(key(c, d)) else { continue }
                 onFile(c.path)
                 // A pool per file: Vision, AVFoundation and PDFKit objects are autoreleased, and the
                 // whole enrichment runs inside one call of index() that drains only when it returns.
                 if autoreleasepool(invoking: { enrichOne(c, digest: d, settings: settings) }) {
-                    ledger.record([EnrichLedger.key(digest: d, path: c.path)])
+                    ledger.record([key(c, d)])
                     enriched += 1
                 }
             }
         }
-        if !isCancelled { ledger.backfilled = true }
+        // Pictures that waited for the image kind are tried again at the next pass's end.
+        if !isCancelled, picturesWaiting == 0 { ledger.backfilled = true }
+        picturesWaiting = 0
         return enriched
     }
 
@@ -2906,7 +2932,8 @@ public final class Indexer: @unchecked Sendable {
             if let ck = item.contentKey { store.recordContentKeys([(c.path, ck, c.modified, c.size)]) }
             return true
         case FileKind.scan.rawValue:
-            guard settings.screenText else { return true }
+            // A deck's or a workbook's page pictures have their words beside them already.
+            guard settings.screenText, c.path.lowercased().hasSuffix(".pdf") else { return true }
             // A copy of a scan whose text is already in takes the copy's rows, as a screenshot does.
             for other in store.pathsForContentDigests([digest])[digest] ?? [] where other != c.path {
                 guard let rows = store.storedChunks(path: other), rows.contains(where: { $0.kind == FileKind.text.rawValue })
@@ -2936,13 +2963,15 @@ public final class Indexer: @unchecked Sendable {
             guard let pieces = readScreenText(file, settings: settings) else { return false }
             return pieces.isEmpty || addScreenText(file, digest: digest, pieces: pieces, settings: settings)
         case FileKind.text.rawValue:
+            guard c.path.lowercased().hasSuffix(".pdf"),
+                  case .pagedText(let text, let starts) = ContentSources.source(for: file).content(file, kind: .text, settings: settings),
+                  let all = store.storedChunks(path: c.path)?.sorted(by: { $0.chunkIndex < $1.chunkIndex }) else { return true }
+            let stored = all.filter { $0.kind != FileKind.scan.rawValue }
+            let pieces = chunk(text, settings: settings, origin: .paged(starts))
+            var rows = stored, moved = false
             // A PDF indexed before chunks opened at the page holding most of them (pageOf): the
             // same chunks, keys and vectors, each at its page now. Nothing is embedded; a file
             // whose stored chunks are not today's cut (other settings then) is left as it is.
-            guard c.path.lowercased().hasSuffix(".pdf"),
-                  case .pagedText(let text, let starts) = ContentSources.source(for: file).content(file, kind: .text, settings: settings),
-                  let stored = store.storedChunks(path: c.path)?.sorted(by: { $0.chunkIndex < $1.chunkIndex }) else { return true }
-            let pieces = chunk(text, settings: settings, origin: .paged(starts))
             // A SHORT PDF STORED AS ONE CHUNK, which today's cut makes one per page (chunk()): its
             // pages are embedded and replace that chunk - only when the stored one is exactly the old
             // cut of this same text. A few chunks a file, and 49 such files in 1,613 real PDFs.
@@ -2951,19 +2980,25 @@ public final class Indexer: @unchecked Sendable {
                 let vecs = embedGroupsReusing([keyed], width: textBatchSize).flatMap { $0 }
                 guard !isCancelled, vecs.count == pieces.count, vecs.allSatisfy({ !$0.isEmpty && Self.isFinite($0) }) else { return false }
                 recordIdentifiers(pieces, digest: digest)
-                return write(pieces.enumerated().map { j, piece in
+                rows = pieces.enumerated().map { j, piece in
                     IndexedChunk(path: c.path, modified: c.modified, size: c.size, kind: FileKind.text.rawValue, chunkIndex: j,
                                  snippet: snippet(piece.text), embedding: vecs[j], locator: piece.locator, chunkKey: keyed[j].key)
-                })
+                }
+                moved = true
+            } else if pieces.count == stored.count,
+                      zip(pieces, stored).allSatisfy({ chunkKey($0.text, settings: settings) == $1.chunkKey }),
+                      zip(pieces, stored).contains(where: { $0.locator != $1.locator }) {
+                rows = zip(pieces, stored).map { piece, row in
+                    var r = row
+                    r.locator = piece.locator
+                    return r
+                }
+                moved = true
             }
-            guard pieces.count == stored.count,
-                  zip(pieces, stored).allSatisfy({ chunkKey($0.text, settings: settings) == $1.chunkKey }) else { return true }
-            guard zip(pieces, stored).contains(where: { $0.locator != $1.locator }) else { return true }
-            return write(zip(pieces, stored).map { piece, row in
-                var moved = row
-                moved.locator = piece.locator
-                return moved
-            })
+            guard !rows.isEmpty else { return true }
+            guard let pictures = addPagePictures(file, text: text, starts: starts, after: rows, stored: all, settings: settings) else { return false }
+            guard moved || pictures.map(\.chunkKey) != all.filter({ $0.kind == FileKind.scan.rawValue }).map(\.chunkKey) else { return true }
+            return write(rows + pictures)
         case FileKind.video.rawValue:
             guard settings.soundtrack else { return true }
             guard let reader = OmniAudioPreprocess.AudioSegmentReader(url: file.url) else { return true }   // silent
@@ -2974,6 +3009,28 @@ public final class Indexer: @unchecked Sendable {
         default:
             return true
         }
+    }
+
+    /// THE PAGES A TEXT PDF'S TEXT DOES NOT CARRY, pictured after `rows` (its words), for a PDF
+    /// indexed before page pictures or whose pictures waited for the image kind; a picture stored
+    /// under its key (`stored`) is not embedded again. [] when it has none; nil when not now (the
+    /// image kind not in yet: the phase stays armed for the next pass's end; cancelled).
+    func addPagePictures(_ file: CrawledFile, text: String, starts: [Int], after rows: [IndexedChunk],
+                         stored: [IndexedChunk], settings: IndexSettings) -> [IndexedChunk]? {
+        guard let pictures = PDFPagePictures.of(file.url, text: text, pageStarts: starts) else { return [] }
+        if deferredKinds?().contains(.image) == true { picturesWaiting += 1; return nil }
+        return pictureChunks(file, pictures, first: (rows.map(\.chunkIndex).max() ?? -1) + 1,
+                             known: Self.knownPictures(stored), maxDimension: settings.maxImageDimension)
+    }
+
+    /// Pictures the enrichment left for the image kind this phase (addPagePictures).
+    var picturesWaiting = 0
+
+    /// A PDF read for its text (not a scan), whose enrichment includes its page pictures.
+    static func isTextPDF(_ item: DecodedItem) -> Bool {
+        guard FileExtractor.pdfExtensions.contains(item.file.ext.lowercased()) else { return false }
+        if case .pdfScan = item.payload { return false }
+        return true
     }
 
     /// The same, for a content already named by its digest (the backfill reads digests).
@@ -3065,10 +3122,10 @@ public final class Indexer: @unchecked Sendable {
     /// One turn's text pieces of a file that takes turns, stored after what earlier turns stored:
     /// identifiers, embedding (stored vectors reused by chunk key), one write, the cursor advanced.
     /// The text window and the PDF page turn both end here.
-    func storeTurn(_ item: DecodedItem, _ kept: [TextPiece], cursor c: inout StreamCursors.Cursor, last: Bool,
+    func storeTurn(_ item: DecodedItem, _ kept: [TextPiece], pictures: [IndexedChunk] = [], cursor c: inout StreamCursors.Cursor, last: Bool,
                    settings: IndexSettings) -> Bool {
         let file = item.file
-        guard !kept.isEmpty else {
+        guard !kept.isEmpty || !pictures.isEmpty else {
             if last && c.written == 0 { store.deletePaths([file.path]) }   // nothing indexable after all
             return true
         }
@@ -3087,7 +3144,7 @@ public final class Indexer: @unchecked Sendable {
             IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: item.kind,
                          chunkIndex: c.written + j, snippet: snippet(piece.text), embedding: vecs[j],
                          locator: piece.locator, chunkKey: keyed[j].key)
-        }
+        } + pictures.enumerated().map { k, p in var r = p; r.chunkIndex = c.written + kept.count + k; return r }
         do {
             try Self.writeWaitingOutLocks { try store.replaceMany([(file.path, chunks)], keepExisting: c.written > 0) }
         } catch {
@@ -3110,21 +3167,36 @@ public final class Indexer: @unchecked Sendable {
               let doc = PDFDocument(url: file.url), doc.pageCount == pageCount else { return .failed }
         let start = c.unit ?? 0
         let budget = start == 0 ? Self.firstWindowBytes : FileExtractor.maxTextBytes
-        var text = "", starts: [Int] = [], bytes = 0, page = start
+        var text = "", starts: [Int] = [], bytes = 0, page = start, own: [String] = []
         while page < pageCount, page == start || bytes < budget {
             let s = autoreleasepool { doc.page(at: page)?.string ?? "" }
             starts.append(text.count)
             text += s
             if !s.hasSuffix("\n") { text += "\n" }
             bytes += s.utf8.count
+            own.append(s)
             page += 1
         }
         let pieces = text.isEmpty ? [] : chunk(text, settings: settings, origin: .paged(starts), wholeDocument: false).map { p -> TextPiece in
             guard start > 0, p.locator.hasPrefix("Page "), let n = Int(p.locator.dropFirst(5)) else { return p }
             return TextPiece(text: p.text, locator: "Page \(n + start)")
         }
+        // This turn's pages its text does not carry, pictured with it; while the image kind is not
+        // in, left to the enrichment (addPagePictures).
+        var pictures: [IndexedChunk] = []
+        let drawn = PDFPagePictures.select(file.url, pages: start ..< page) { Substring(own[$0 - start]) }
+        if !drawn.isEmpty {
+            if deferredKinds?().contains(.image) == true {
+                item.enrichFailed = true
+                store.enrichLedger.backfilled = false
+            } else {
+                guard let made = pictureChunks(file, PDFPagePictures(doc: doc, pages: drawn), first: 0, known: [:],
+                                               maxDimension: settings.maxImageDimension) else { return .failed }
+                pictures = made
+            }
+        }
         let last = page >= pageCount
-        guard storeTurn(item, pieces, cursor: &c, last: last, settings: settings) else { return .failed }
+        guard storeTurn(item, pieces, pictures: pictures, cursor: &c, last: last, settings: settings) else { return .failed }
         c.unit = page
         return last ? .done : .more
     }
@@ -3581,6 +3653,7 @@ public final class Indexer: @unchecked Sendable {
             // A scan's pages wait for the image phase: returned before embedding, never an empty
             // result (acceptCompleted would delete the file).
             if case .pdfScan = item.payload, deferred.contains(.image) { return }
+            if case .document(_, _, let pictures, _) = item.payload, deferred.contains(.image), !(pictures is PDFPagePictures) { return }
             switch item.payload {
             case .text(let pieces) where !pieces.isEmpty:
                 let fid = tNextFid; tNextFid += 1
@@ -3807,7 +3880,7 @@ public final class Indexer: @unchecked Sendable {
             if let ck = item.contentKey, !streams.inProgress(item.file.path) {
                 keyBuf.append((item.file.path, ck, item.file.modified, item.file.size))
                 if item.enrichable, !item.enrichFailed, !item.unchanged {
-                    ledgerBuf.append(EnrichLedger.key(digest: StoreSchema.contentDigestHex(ck), path: item.file.path))
+                    ledgerBuf.append(EnrichLedger.key(digest: StoreSchema.contentDigestHex(ck), path: item.file.path, textPDF: Self.isTextPDF(item)))
                 }
                 // Flush eagerly (small rows, one txn): keys must be VISIBLE for later files in the
                 // same pass to dedup against - a media phase is often well under a few hundred
@@ -3834,9 +3907,11 @@ public final class Indexer: @unchecked Sendable {
         if FileExtractor.imageExtensions.contains(ext) { return settings.hqMediaTags ? oneImage * 6 : oneImage }
         if FileExtractor.videoExtensions.contains(ext) { return max(1, settings.maxVideoFrames) * oneImage }
         if FileExtractor.audioExtensions.contains(ext) { return 64_000_000 }   // mel + frame stack, rough
-        if FileExtractor.pdfExtensions.contains(ext) || FileExtractor.officeExtensions.contains(ext) {
-            // Page-text buffers / attributed-string conversion. Scans no longer rasterize at
-            // decode (the embed stage streams pages in bounded groups), so no per-page term.
+        if FileExtractor.pdfExtensions.contains(ext) || FileExtractor.officeExtensions.contains(ext)
+            || FileExtractor.documentExtensions.contains(ext) {
+            // Page-text buffers / attributed-string conversion / a sheet's XML. Scans no longer
+            // rasterize at decode (the embed stage streams pages in bounded groups), and a deck's
+            // slide pictures are files on disk until it reads them, so no per-page term.
             return 64_000_000
         }
         // Plain text / code: chunking materializes a Character array (~16B/Character) for the
@@ -3990,9 +4065,31 @@ public final class Indexer: @unchecked Sendable {
             }
             let pieces = chunk(text, settings: settings, origin: .paged(pageStarts))
             recordIdentifiers(pieces, contentKey: contentKey)
+            // The pages its text does not carry, drawn beside it as a deck's slides are.
+            if let pictures = PDFPagePictures.of(file.url, text: text, pageStarts: pageStarts) {
+                let item = DecodedItem(file: file, kind: kind,
+                                       payload: .document(pieces, keys: pieces.map { chunkKey($0.text, settings: settings) }, pictures: pictures,
+                                                          maxDimension: settings.maxImageDimension),
+                                       meta: meta, contentKey: contentKey)
+                item.enrichable = true
+                return item
+            }
             let item = DecodedItem(file: file, kind: kind, payload: .text(pieces), contentKey: contentKey)
             item.enrichable = true   // located by today's rule: the enrichment has nothing to move
             return item
+        case .document(let pages, let drawn):
+            // Each page's words at the page, and a deck's slides drawn, as Quick Look previews them.
+            // A deck that Quick Look cannot draw is indexed by its words alone, as any text is.
+            let pieces = documentPieces(pages, settings: settings)
+            let pictures = FileExtractor.slideExtensions.contains(file.ext.lowercased())
+                ? drawn ?? DocumentPictures.render(file.url, maxDimension: settings.maxImageDimension) : nil
+            if pieces.isEmpty, pictures == nil { return DecodedItem(file: file) }
+            recordIdentifiers(pieces, contentKey: contentKey)
+            guard let pictures else { return DecodedItem(file: file, kind: kind, payload: .text(pieces), contentKey: contentKey) }
+            return DecodedItem(file: file, kind: kind,
+                               payload: .document(pieces, keys: pieces.map { chunkKey($0.text, settings: settings) }, pictures: pictures,
+                                                  maxDimension: settings.maxImageDimension),
+                               meta: meta, contentKey: contentKey)
         case .scannedPDF(let pageCount):
             let item = DecodedItem(file: file, kind: kind,
                                    payload: .pdfScan(pageCount: pageCount, maxDimension: settings.maxImageDimension), meta: meta, contentKey: contentKey)
@@ -4073,6 +4170,8 @@ public final class Indexer: @unchecked Sendable {
             let cut = Indexer.contentDefinedChunking ? Indexer.cutterParams(settings).fingerprint
                                                      : "c\(settings.maxCharsPerChunk)|o\(chunkOverlap)"
             fp = "\(cut)|d\(settings.maxImageDimension)"   // d: scanned-PDF render size
+                // g1: a deck or workbook read a page at a time, a deck's slides drawn.
+                + (FileExtractor.documentExtensions.contains(ext) ? "|g1" : "")
         // t1: a screenshot is indexed with its text.
         case .image: fp = "d\(settings.maxImageDimension)" + (settings.screenText && isScreenshot(file.path) ? "|t1" : "")
         // v2: uniform frame sampling + 240 s segmentation (pre-upgrade rows must not alias).
@@ -4242,6 +4341,15 @@ public final class Indexer: @unchecked Sendable {
             return out
         case .pdfScan(let pageCount, let maxDimension):
             return embedScannedPDF(file: file, pageCount: pageCount, maxDimension: maxDimension)
+        case .document(let pieces, let keys, let pictures, let maxDimension):
+            // A PDF's words do not wait for its pictures: while the image kind is not in, they are
+            // stored alone, and the enrichment adds the pictures once it is (addPagePictures).
+            if pictures is PDFPagePictures, deferredKinds?().contains(.image) == true {
+                item.enrichFailed = true
+                store.enrichLedger.backfilled = false
+                return embedDocument(file: file, kind: kind, pieces: pieces, keys: keys, pictures: nil, maxDimension: maxDimension)
+            }
+            return embedDocument(file: file, kind: kind, pieces: pieces, keys: keys, pictures: pictures, maxDimension: maxDimension)
         case .audioSegments(let mel, let frames, let reader):
             return embedStreamedAudio(file: file, kind: kind, firstMel: mel, firstFrames: frames,
                                       reader: reader, duration: meta.duration, prior: item.priorVectors)
@@ -4381,57 +4489,191 @@ public final class Indexer: @unchecked Sendable {
     /// page up front, which is why it was capped at 8 pages.
     func embedScannedPDF(file: CrawledFile, pageCount: Int, maxDimension: Int, pages: Range<Int>? = nil) -> [IndexedChunk] {   // internal for tests
         guard let doc = PDFDocument(url: file.url) else { return [] }
-        let firstPage = pages?.lowerBound ?? 0
-        let lastPage = Swift.min(pageCount, pages?.upperBound ?? pageCount)
+        let range = (pages?.lowerBound ?? 0) ..< Swift.min(pageCount, pages?.upperBound ?? pageCount)
+        // PDFKit rendering is not concurrency-safe per document: pictures are drawn one group at a
+        // time (embedPagePictures waits for the prefetch before starting the next one), so `doc` is
+        // only ever rendered from by one thread at a time.
+        let box = ScanPrefetchBox(doc: doc)
+        guard let embedded = embedPagePictures(range, picture: {
+            FileExtractor.renderPDFPage(box.doc, index: $0, maxDimension: maxDimension)
+        }) else { return [] }
+        // kind 'scan', not the file's detection kind ('text'): vision-embedded pages are their own
+        // modality in the index - filterable, and targetable by future scan-specific processing
+        // (OCR). Old rows are re-labeled by the store's one-time migration (migrateScanKind), which
+        // matches THIS write pattern. Per-PAGE tags as the snippet ("invoice, table, signature").
+        return embedded.map { e in
+            IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: FileKind.scan.rawValue,
+                         chunkIndex: e.page, snippet: e.snippet, embedding: e.vector,
+                         locator: pageCount > 1 ? "Page \(e.page + 1)" : "")
+        }
+    }
+
+    /// PAGE PICTURES OF ANY NUMBER, `scanPageGroup` at a time: the next group drawn and patchified
+    /// on a background queue while the GPU embeds this one, each group freed once embedded, so a
+    /// 500-page scan or a 300-slide deck holds two groups at most. A scanned PDF's pages and a
+    /// document's slides and sheets come through here. `known`: vectors (with their snippets) the
+    /// file already has for a page's tower input (Indexer.imagePayloadKey), taken instead of a
+    /// forward; with `key`, each page's key is computed and returned. A group the tower cannot embed
+    /// leaves its pages out. nil when cancelled.
+    func embedPagePictures(_ pages: Range<Int>, picture: @escaping (Int) -> CGImage?,
+                           key: ((OmniVisionPreprocess.RawPatches) -> String)? = nil,
+                           known: [String: (vector: [Float], snippet: String)] = [:])
+        -> [(page: Int, vector: [Float], snippet: String, key: String)]? {
+        final class Prefetch: @unchecked Sendable { var result: [(page: Int, raw: OmniVisionPreprocess.RawPatches)] = [] }
         let group = scanPageGroup
-        // PDFKit rendering is not concurrency-safe per document: prep() calls are sequenced (the
-        // loop waits for the prefetch before starting the next one), so `doc` is only ever
-        // rendered from by one thread at a time.
         func prep(_ range: Range<Int>) -> [(page: Int, raw: OmniVisionPreprocess.RawPatches)] {
             var result: [(Int, OmniVisionPreprocess.RawPatches)] = []
             for i in range {
                 if isCancelled { break }
                 autoreleasepool {
-                    if let img = FileExtractor.renderPDFPage(doc, index: i, maxDimension: maxDimension) {
-                        result.append((i, OmniVisionPreprocess.preprocessRaw(img)))
-                    }
+                    if let img = picture(i) { result.append((i, OmniVisionPreprocess.preprocessRaw(img))) }
                 }
             }
             return result
         }
-        var out: [IndexedChunk] = []
-        var nextStart = min(firstPage + group, lastPage)
-        var current = prep(firstPage ..< nextStart)
+        var out: [(page: Int, vector: [Float], snippet: String, key: String)] = []
+        var nextStart = min(pages.lowerBound + group, pages.upperBound)
+        var current = prep(pages.lowerBound ..< nextStart)
         let prefetchQ = DispatchQueue(label: "omni.indexer.scan-prefetch")
-        while !current.isEmpty || nextStart < lastPage {
-            if isCancelled { return [] }
-            // Kick off the next group's render+patchify while the GPU embeds the current one.
-            let box = ScanPrefetchBox(doc: doc)
+        while !current.isEmpty || nextStart < pages.upperBound {
+            if isCancelled { return nil }
+            // Kick off the next group's picture + patchify while the GPU embeds the current one.
+            let box = Prefetch()
             let sync = DispatchGroup()
-            if nextStart < lastPage {
-                let range = nextStart ..< min(nextStart + group, lastPage)
+            if nextStart < pages.upperBound {
+                let range = nextStart ..< min(nextStart + group, pages.upperBound)
                 nextStart = range.upperBound
                 sync.enter()
                 prefetchQ.async { box.result = prep(range); sync.leave() }
             }
-            if !current.isEmpty, let (vecs, tags) = embedder.embedImagesTagged(current.map { $0.raw }) {
-                for (k, vec) in vecs.enumerated() where k < current.count {
-                    let page = current[k].page
-                    // kind 'scan', not the file's detection kind ('text'): vision-embedded pages
-                    // are their own modality in the index - filterable, and targetable by future
-                    // scan-specific processing (OCR). Old rows are re-labeled by the store's
-                    // one-time migration (migrateScanKind), which matches THIS write pattern.
-                    // Per-PAGE tags as the snippet ("invoice, table, signature") when available.
-                    out.append(IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: FileKind.scan.rawValue,
-                                            chunkIndex: page, snippet: Self.imageSnippet(tags, at: k, fallback: file.name),
-                                            embedding: vec,
-                                            locator: pageCount > 1 ? "Page \(page + 1)" : ""))
+            let keys = current.map { key?($0.raw) ?? "" }
+            let fresh = current.indices.filter { keys[$0].isEmpty || known[keys[$0]] == nil }
+            var embedded: [Int: (vector: [Float], snippet: String)] = [:]
+            if !fresh.isEmpty, let (vecs, tags) = embedder.embedImagesTagged(fresh.map { current[$0].raw }) {
+                for (k, vec) in vecs.enumerated() where k < fresh.count {
+                    embedded[fresh[k]] = (vec, Self.imageSnippet(tags, at: k, fallback: ""))
+                }
+            }
+            for (j, c) in current.enumerated() {
+                if let e = embedded[j] ?? (keys[j].isEmpty ? nil : known[keys[j]]) {
+                    out.append((c.page, e.vector, e.snippet, keys[j]))
                 }
             }
             sync.wait()
             current = box.result
         }
-        return isCancelled ? [] : out
+        return isCancelled ? nil : out
+    }
+
+    /// A DECK, embedded whole: its pieces on the text tower (each at its slide, a vector the index
+    /// already holds for a piece's key taken back), then each slide's picture on the image tower, as
+    /// a scanned page is (kind 'scan', so it lives under the Text toggle and on the media scale), at
+    /// the same locator as its text. A slide whose picture is unchanged since the file was last
+    /// indexed keeps its vector. [] when cancelled, as every embed is.
+    func embedDocument(file: CrawledFile, kind: String, pieces: [TextPiece], keys: [String], pictures: (any PagePictures)?, maxDimension: Int) -> [IndexedChunk] {
+        var out: [IndexedChunk] = []
+        if !pieces.isEmpty {
+            let keyed = zip(pieces, keys).map { (text: $0.text, key: $1) }
+            var groups: [[(text: String, key: String)]] = []
+            var i = 0
+            while i < keyed.count { groups.append(Array(keyed[i ..< min(i + textBatchSize, keyed.count)])); i += textBatchSize }
+            let vecs = embedGroupsReusing(groups, width: textBatchSize).flatMap { $0 }
+            guard !isCancelled, vecs.count == pieces.count, vecs.allSatisfy({ !$0.isEmpty && Self.isFinite($0) }) else { return [] }
+            for (j, piece) in pieces.enumerated() {
+                out.append(IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: kind,
+                                        chunkIndex: j, snippet: snippet(piece.text), embedding: vecs[j],
+                                        locator: piece.locator, chunkKey: keys[j]))
+            }
+        }
+        guard let pictures else { return isCancelled ? [] : out }
+        let known = settingsForceFresh || !store.hasIndexedFile(file.path) ? [:] : Self.knownPictures(store.storedChunks(path: file.path) ?? [])
+        guard let drawn = pictureChunks(file, pictures, first: out.count, known: known, maxDimension: maxDimension) else { return [] }
+        return isCancelled ? [] : out + drawn
+    }
+
+    /// A file's stored page pictures by key, for `pictureChunks` to take instead of a forward.
+    static func knownPictures(_ rows: [IndexedChunk]) -> [String: (vector: [Float], snippet: String)] {
+        var known: [String: (vector: [Float], snippet: String)] = [:]
+        for c in rows where c.kind == FileKind.scan.rawValue && !c.chunkKey.isEmpty { known[c.chunkKey] = (c.embedding, c.snippet) }
+        return known
+    }
+
+    /// Page pictures on the image tower, as a scanned page's are (kind 'scan', so they live under
+    /// the Text toggle and on the media scale), each at its page's locator, numbered from `first`;
+    /// a picture `known` by its key is not embedded again. nil when cancelled.
+    func pictureChunks(_ file: CrawledFile, _ pictures: any PagePictures, first: Int,
+                       known: [String: (vector: [Float], snippet: String)], maxDimension: Int) -> [IndexedChunk]? {
+        let dim = embedder.dim, side = maxDimension, labels = pictures.labels
+        guard let embedded = embedPagePictures(0 ..< labels.count, picture: {
+            pictures.image($0, maxDimension: side)
+        }, key: { Self.documentPictureKey($0, maxDimension: side, dim: dim) }, known: known) else { return nil }
+        return embedded.map { e in
+            IndexedChunk(path: file.path, modified: file.modified, size: file.size, kind: FileKind.scan.rawValue,
+                         chunkIndex: first + e.page, snippet: e.snippet, embedding: e.vector,
+                         locator: labels[e.page], chunkKey: e.key)
+        }
+    }
+
+    /// A page picture's key: what the image tower sees, as a still's (imagePayloadKey).
+    static func documentPictureKey(_ raw: OmniVisionPreprocess.RawPatches, maxDimension: Int, dim: Int) -> String {
+        let grid = raw.gridTHW.map { "\($0.0)x\($0.1)x\($0.2)" }.joined(separator: ",")
+        return raw.pixels.withUnsafeBytes { p in
+            ChunkKey.media(kind: .scan, slices: [Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: p.baseAddress!), count: p.count, deallocator: .none)],
+                           preprocess: "d\(maxDimension)|g\(grid)", dim: dim)
+        }
+    }
+
+    /// A deck's or a workbook's pieces, each at its page. A slide (or a Numbers sheet's text) is cut
+    /// as converted text is. A sheet of cells is cut by ROWS: every piece opens with the sheet's
+    /// name and its header row, its rows a line each (" | " between cells), located by the cells it
+    /// holds ("Budget A12:F40"). A row cut alone would read as numbers with no names; repeating the
+    /// first row is what keeps "Cabinets | 4200" findable as a cost.
+    /// A QUARTER OF A CHUNK A PIECE: one row among 48 others was outvoted by them (the eval's four
+    /// named items among 700 look-alike parts; sheet MRR at 1,800 / 900 / 450 characters: Nano
+    /// 0.750 / 0.900 / 1.000, Small 0.800 / 1.000 / 1.000, every other tag the same). A hit then
+    /// names about ten rows. 33 real workbooks: ~2,000 pieces instead of ~500, ~10% more text embedded.
+    func documentPieces(_ pages: [DocumentPage], settings: IndexSettings) -> [TextPiece] {
+        let limit = max(200, settings.maxCharsPerChunk / 4)
+        var out: [TextPiece] = []
+        for page in pages {
+            guard let header = page.rows.first else {
+                let text = page.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !text.isEmpty { out += chunk(text, settings: settings, origin: .opaque).map { TextPiece(text: $0.text, locator: page.label) } }
+                continue
+            }
+            func line(_ r: SheetRow) -> String { r.cells.map(\.value).joined(separator: " | ") }
+            // A header past half a piece is cut there: whole, a wide sheet's would crowd out the rows
+            // under it (a piece is embedded to 512 tokens).
+            let head = page.label + "\n" + line(header).prefix(limit / 2)
+            func locator(_ rows: ArraySlice<SheetRow>) -> String {
+                let cols = rows.flatMap { $0.cells.map(\.column) }
+                let lo = OfficeDocument.columnName(cols.min() ?? 1), hi = OfficeDocument.columnName(cols.max() ?? 1)
+                return "\(page.label) \(lo)\(rows.first!.row):\(hi)\(rows.last!.row)"
+            }
+            var start = 0, size = head.count
+            func flush(_ end: Int) {
+                guard end > start else { return }
+                let rows = page.rows[start ..< end]
+                let body = rows.drop { $0.row == header.row }.map(line).joined(separator: "\n")
+                out.append(TextPiece(text: body.isEmpty ? head : head + "\n" + body, locator: locator(rows)))
+                start = end; size = head.count
+            }
+            for (i, row) in page.rows.enumerated() {
+                let n = (row.row == header.row ? 0 : line(row).count + 1)
+                if n > limit {
+                    // A row longer than a piece: cut alone, every part at that row.
+                    flush(i)
+                    let at = locator(page.rows[i ... i])
+                    out += chunk(line(row), settings: settings, origin: .opaque).map { TextPiece(text: head + "\n" + $0.text, locator: at) }
+                    start = i + 1
+                    continue
+                }
+                if size + n > limit { flush(i) }
+                size += n
+            }
+            flush(page.rows.count)
+        }
+        return out
     }
 
     /// `wholeDocument`: false for one turn of a long PDF, which is never cut by page (that is for a

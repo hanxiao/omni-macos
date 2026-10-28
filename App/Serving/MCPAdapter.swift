@@ -651,13 +651,13 @@ enum MCPAdapter {
         [
             "name": "read_file",
             "title": "Read the text of an indexed file",
-            "description": "DOCUMENTS ONLY: the text Omni read from an indexed text, code, PDF, Word, Pages, RTF or Keynote file, a stretch at a time (PDF pages, lines, or characters). For reading past a search result in formats you may not open yourself. Audio, video and images have no text to read; scans: use ocr.",
+            "description": "DOCUMENTS ONLY: the text Omni read from an indexed text, code, PDF, Word, Pages, RTF, Keynote, PowerPoint, Excel or Numbers file, a stretch at a time (pages, lines, or characters; a slide or a sheet is a page). For reading past a search result in formats you may not open yourself. Audio, video and images have no text to read; scans: use ocr.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
                     "path": ["type": "string", "description": "Absolute path of a file Omni has indexed."],
-                    "page": ["type": "integer", "minimum": 1, "description": "PDF: first page (default 1)."],
-                    "line": ["type": "integer", "minimum": 1, "description": "Text and code: first line (default 1)."],
+                    "page": ["type": "integer", "minimum": 1, "description": "PDF, deck or workbook: first page, slide or sheet (default 1)."],
+                    "line": ["type": "integer", "minimum": 1, "description": "Text and code: first line (default 1). A workbook: first row of the sheet `page` names (a hit's \"Stock A508:D518\" is row 508)."],
                     "offset": ["type": "integer", "minimum": 0, "description": "First character, for documents (default 0)."],
                     "max_chars": ["type": "integer", "minimum": 100, "maximum": 20000, "description": "Default 4000."]
                 ] as [String: Any],
@@ -695,10 +695,15 @@ enum MCPAdapter {
                 ? "\(path): \(s.unit) \(s.start) of \(s.total)"
                 : "\(path): \(plural) \(s.start)-\(s.end) of \(s.total)"
             if s.unit == "character" { head = "\(path): characters \(s.start)-\(s.end) of \(s.total)" }
-            if let next = s.next { head += "; next: \(s.unit == "character" ? "offset" : s.unit)=\(next)" } else { head += "; end of file" }
+            if s.unit == "row", let sheet = s.page { head += " in sheet \(sheet)" }
+            if let next = s.next {
+                head += "; next: " + (s.unit == "character" ? "offset=\(next)" : s.unit == "row" ? "page=\(s.page ?? 1), line=\(next)" : "\(s.unit)=\(next)")
+            } else { head += s.unit == "row" ? "; end of sheet" : "; end of file" }
             return answer(id: id, [["type": "text", "text": head + "\n\n" + s.text]], cli: cli) {
-                ["path": path, "unit": s.unit, "start": s.start, "end": s.end, "total": s.total,
-                 "next": s.next.map { $0 as Any } ?? NSNull(), "text": s.text]
+                var out: [String: Any] = ["path": path, "unit": s.unit, "start": s.start, "end": s.end, "total": s.total,
+                                          "next": s.next.map { $0 as Any } ?? NSNull(), "text": s.text]
+                if let sheet = s.page { out["page"] = sheet }
+                return out
             }
         }
     }

@@ -1,5 +1,5 @@
 {
-  "version": "eval-bed-1",
+  "version": "eval-bed-2",
   "docs": [
     {"path": "Documents/Travel/Tokyo itinerary.md", "text": "# Tokyo, five days in October\n\nDay 1: arrive at Haneda in the afternoon, check in near Asakusa, walk to Senso-ji temple and the Nakamise shopping street in the evening.\n\nDay 2: day trip to Kamakura. Take the Yokosuka line from Tokyo station, visit the Great Buddha at Kotoku-in, then walk the hiking trail to Zeniarai Benten shrine. Back in Tokyo for dinner in Shinjuku.\n\nDay 3: Hakone. Romancecar from Shinjuku, ropeway over Owakudani, overnight at a ryokan with an onsen.\n\nDay 4: back to Tokyo, teamLab in the afternoon, sushi at Tsukiji outer market.\n\nDay 5: souvenirs in Ginza, train to Haneda for the 18:05 flight home."},
     {"path": "Documents/Home/Lease agreement 2026.docx", "text": "RESIDENTIAL LEASE AGREEMENT\n\nLease ID: LS-55120\n\nThis agreement is made between the landlord, Maria Okafor, and the tenant, for the apartment at 18 Linden Street, Unit 4B.\n\nTerm: twelve months beginning February 1, 2026.\n\nRent: the monthly rent is 2,350 US dollars, due on the first day of each month. A late fee of 75 dollars applies after the fifth day.\n\nSecurity deposit: the tenant pays a security deposit of 4,700 dollars, equal to two months of rent, refundable within 30 days of move-out.\n\nPets: one cat is permitted. Smoking is not permitted anywhere on the property.\n\nUtilities: water and trash are included; electricity and internet are paid by the tenant."},
@@ -52,6 +52,20 @@
     ]},
     {"path": "Documents/Finance/Invoice INV-2041.pdf", "pages": [
       "INVOICE INV-2041\nNorthwind Design Studio\nClient: Lindqvist Outdoor AB\nWebsite redesign, phases one and two\nDesign and prototyping: 2,900.00 EUR\nFront-end development: 1,920.00 EUR\nTotal due: 4,820.00 EUR\nPayment due by 2026-10-30. Bank transfer to the account on file."
+    ]},
+    {"path": "Documents/Clubs/Club newsletter autumn.pdf", "figures": {"2": "/Library/User Pictures/Sports/Football.heic"}, "pages": [
+      "Riverside Sports Club, autumn newsletter. The annual general meeting is on 14 November in the clubhouse. Membership fees stay the same for next year, and the new changing rooms open in January.",
+      "Photos from Saturday. Thanks to everyone who came to the open day and helped set up the stands.",
+      "Volunteers wanted. We need two more people to run the bar on match days, and a new treasurer from March."
+    ]},
+    {"path": "Documents/Shopping/Beauty shop flyer.pdf", "figures": {"2": "/Library/User Pictures/Fun/Smack.heic"}, "pages": [
+      "Opening hours. Monday to Friday 9 to 19, Saturday 10 to 16. Free parking behind the shop.",
+      "New in store from March. Ask our staff for a free sample."
+    ]},
+    {"path": "Documents/Home/Boathouse lease.pdf", "scannedPages": [2], "pages": [
+      "Boathouse lease. Tenant: Mara Lindgren. Lake Pier 4, berth 12. Rent 180 EUR a month, paid quarterly.",
+      "EXTENSION AGREEMENT\nThe lease of the boathouse at Lake Pier 4 is extended until 31 December 2029.\nSigned: Mara Lindgren, Harbour Office",
+      "House rules. No engines are run inside the boathouse. Keys go back to the harbour office at the end of the lease."
     ]},
     {"path": "Scans/Scan 2026-09-14.pdf", "scanned": true, "pages": [
       "BLUE BOTTLE COFFEE\nHayes Valley\n2 Cappuccino      11.00\n1 Croissant        4.50\nTax                1.40\nTOTAL             16.90\nVISA ****4421\nThank you!"
@@ -175,6 +189,18 @@
       ["El domingo fuimos al mercado de frutas del barrio.", "La biblioteca amplía su horario durante los exámenes.", "Este verano hizo mucho calor en el sur.", "El partido de baloncesto terminó en la prórroga.", "La panadería de la esquina cierra los lunes.", "Mañana empieza el curso de fotografía."]
     ]
   },
+  "offices": [
+    {"path": "Documents/Shop/Orders export 2026.csv", "src": "office/orders.csv"},
+    {"path": "Documents/Work/Board update November.pptx", "src": "office/board-update.pptx"},
+    {"path": "Documents/School/Volcanoes class talk.pptx", "src": "office/volcanoes.pptx"},
+    {"path": "Dokumente/Arbeit/Messeauftritt Hannover.pptx", "src": "office/messeauftritt.pptx"},
+    {"path": "Documents/Home/Wedding planning.xlsx", "src": "office/wedding.xlsx"},
+    {"path": "Documents/Finance/Car loan.xlsx", "src": "office/car-loan.xlsx"},
+    {"path": "Documents/Work/Spare parts inventory.xlsx", "src": "office/inventory.xlsx"},
+    {"path": "Documents/Garden/Rainfall 2026.xlsx", "src": "office/rainfall.xlsx"},
+    {"path": "Documents/Clubs/Chess club.numbers", "src": "office/chess-club.numbers"},
+    {"path": "Documents/Bike/Bike log.numbers", "src": "office/bike.numbers"}
+  ],
   "queries": [
     {"q": "a penguin", "tag": "image", "expect": ["Pictures/2025/IMG_0412.heic", "Movies/Zoo trip.mp4@t0"]},
     {"q": "black and white striped animal", "tag": "image", "expect": ["Pictures/2025/IMG_0413.heic", "Movies/Zoo trip.mp4@t240"]},
@@ -249,6 +275,9 @@
     {"q": "company revenue growth by quarter", "tag": "pdf-page", "expect": ["Documents/Notes/Annual notes 2026.pdf@p1"]},
     {"q": "when to plant tomato seedlings outside", "tag": "pdf-page", "expect": ["Documents/Notes/Annual notes 2026.pdf@p4"]},
     {"q": "practicing open guitar chords", "tag": "pdf-page", "expect": ["Documents/Notes/Annual notes 2026.pdf@p5"]},
+    {"q": "american football lying on grass", "tag": "pdf-figure", "expect": ["Documents/Clubs/Club newsletter autumn.pdf@p2"]},
+    {"q": "red lipstick kiss print", "tag": "pdf-figure", "expect": ["Documents/Shopping/Beauty shop flyer.pdf@p2"]},
+    {"q": "boathouse lease extended until 2029", "tag": "pdf-figure", "expect": ["Documents/Home/Boathouse lease.pdf@p2"]},
     {"q": "coffee shop receipt", "tag": "scan", "expect": ["Scans/Scan 2026-09-14.pdf"]},
     {"q": "cappuccino and croissant", "tag": "scan", "expect": ["Scans/Scan 2026-09-14.pdf"]},
     {"q": "reminder to pick up milk and eggs", "tag": "audio", "expect": ["Recordings/Voice memo 1.m4a"]},
@@ -300,6 +329,33 @@
     {"q": "Tokyo itinerary", "tag": "name", "expect": ["Documents/Travel/Tokyo itinerary.md"]},
     {"q": "lease agreement", "tag": "name", "expect": ["Documents/Home/Lease agreement 2026.docx"]},
     {"q": "Mietvertrag", "tag": "name", "expect": ["Dokumente/Wohnung/Mietvertrag Berlin.txt"]},
-    {"q": "sailing log", "tag": "name", "expect": ["Documents/Books/Sailing log 2025.pdf"]}
+    {"q": "sailing log", "tag": "name", "expect": ["Documents/Books/Sailing log 2025.pdf"]},
+    {"q": "how much did monthly churn fall", "tag": "deck", "expect": ["Documents/Work/Board update November.pptx@s2"]},
+    {"q": "conveyor upgrade in the Gdansk warehouse", "tag": "deck", "expect": ["Documents/Work/Board update November.pptx@s3"]},
+    {"q": "support desk in Montreal", "tag": "deck", "expect": ["Documents/Work/Board update November.pptx@s5"]},
+    {"q": "which eruption was heard thousands of kilometres away", "tag": "deck", "expect": ["Documents/School/Volcanoes class talk.pptx@s2"]},
+    {"q": "how to build a model volcano with baking soda", "tag": "deck", "expect": ["Documents/School/Volcanoes class talk.pptx@s4"]},
+    {"q": "Wie hoch ist die Standmiete für die Messe", "tag": "deck", "expect": ["Dokumente/Arbeit/Messeauftritt Hannover.pptx@s4"]},
+    {"q": "Messestand in Halle 7", "tag": "deck", "expect": ["Dokumente/Arbeit/Messeauftritt Hannover.pptx@s2"]},
+    {"q": "an archery target", "tag": "deck-pic", "expect": ["Documents/Work/Board update November.pptx@s4"]},
+    {"q": "a white rose", "tag": "deck-pic", "expect": ["Documents/School/Volcanoes class talk.pptx@s3"]},
+    {"q": "a yin yang symbol", "tag": "deck-pic", "expect": ["Dokumente/Arbeit/Messeauftritt Hannover.pptx@s3"]},
+    {"q": "which table is Priya Raman sitting at", "tag": "sheet", "expect": ["Documents/Home/Wedding planning.xlsx@cGuests:21"]},
+    {"q": "deposit for the wedding flowers", "tag": "sheet", "expect": ["Documents/Home/Wedding planning.xlsx@cVendors"]},
+    {"q": "who is the lender for my car loan", "tag": "sheet", "expect": ["Documents/Finance/Car loan.xlsx@cSummary"]},
+    {"q": "interest rate on the car loan", "tag": "sheet", "expect": ["Documents/Finance/Car loan.xlsx@cSummary"]},
+    {"q": "titanium camping kettle bin location", "tag": "sheet", "expect": ["Documents/Work/Spare parts inventory.xlsx@cStock:512"]},
+    {"q": "SKU-48213", "tag": "sheet", "expect": ["Documents/Work/Spare parts inventory.xlsx@cStock:512"]},
+    {"q": "which bin is the brass ship's bell in", "tag": "sheet", "expect": ["Documents/Work/Spare parts inventory.xlsx@cStock:96"]},
+    {"q": "how many carbon fibre tripods are in stock", "tag": "sheet", "expect": ["Documents/Work/Spare parts inventory.xlsx@cStock:261"]},
+    {"q": "cast iron dutch oven", "tag": "sheet", "expect": ["Documents/Work/Spare parts inventory.xlsx@cStock:641"]},
+    {"q": "wettest month of the year rainfall", "tag": "sheet", "expect": ["Documents/Garden/Rainfall 2026.xlsx@cRain"]},
+    {"q": "who ordered the hand-painted porcelain teapot", "tag": "csv", "expect": ["Documents/Shop/Orders export 2026.csv@c:141", "Documents/Shop/Orders export 2026.csv@L51-141"]},
+    {"q": "vintage brass telescope order amount", "tag": "csv", "expect": ["Documents/Shop/Orders export 2026.csv@c:456", "Documents/Shop/Orders export 2026.csv@L366-456"]},
+    {"q": "cedar wood sauna bucket", "tag": "csv", "expect": ["Documents/Shop/Orders export 2026.csv@c:702", "Documents/Shop/Orders export 2026.csv@L612-702"]},
+    {"q": "ORD-77310", "tag": "csv", "expect": ["Documents/Shop/Orders export 2026.csv@c:861", "Documents/Shop/Orders export 2026.csv@L771-861"]},
+    {"q": "chess rating of Lena Hofmann", "tag": "numbers", "expect": ["Documents/Clubs/Chess club.numbers@cMembers"]},
+    {"q": "who won the first round of the chess tournament", "tag": "numbers", "expect": ["Documents/Clubs/Chess club.numbers@cTournament"]},
+    {"q": "when were tubeless tyres fitted on the bike", "tag": "numbers", "expect": ["Documents/Bike/Bike log.numbers@cService"]}
   ]
 }

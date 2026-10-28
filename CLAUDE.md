@@ -47,6 +47,18 @@ codebase were already measured there, and many were rejected.
     by default (`OMNI_BACKBONE_DTYPE` / `OMNI_BACKBONE_BF16=0` for fp32) and stores the vision
     tower in fp16, the dtype it computes in (fp32 recompute for a non-finite pass).
   - Indexer: crawler + text extraction + SQLite vector store + cosine search.
+  - Decks and workbooks (`.pptx`, `.xlsx`, `.numbers`) a page at a time (`OfficeDocument`): a
+    slide's words at "Slide 3", a sheet cut by rows (a quarter of a chunk) with its header atop every
+    piece at "Guests A12:E21"; a slide's picture beside its words (kind scan), drawn as Quick Look previews it by the
+    `omni-pages` helper (Sources/OmniPages, in Contents/Helpers: WebKit wants a main thread). A
+    Numbers sheet's words come from that preview. Sheets get no picture (index.md, "Decks and
+    workbooks").
+  - A text PDF's pages its text does not carry (no text of their own, or images over 30% of the
+    page: `PDFPagePictures`) pictured beside its words, kind scan at "Page N", through the same
+    embed as slides; not every page (index.md, "PDF pages as pictures").
+  - A CSV or TSV stays text, cut a line at a time: a sheet's cut found its rows only at a quarter of
+    a chunk, 3.6x the index time of a new CSV, and a full chunk cost 43% and found nothing more
+    (index.md, "PDF pages as pictures": CSV AS TABLES).
   - Neural Engine mode (Settings > Performance > Use the Neural Engine (ANE); every install starts on
     the GPU), all or nothing - nothing of Omni's on the GPU: the store's scans and the folder map on
     the CPU (`OmniCompute`), each kind moving over as its functions compile (text, then images and
@@ -87,7 +99,7 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (880 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (893 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|delfolders|
@@ -97,8 +109,8 @@ codebase were already measured there, and many were rejected.
 - The benchmark (Settings > Benchmark this Mac; testing.md, "The benchmark"): `omni-verify bench
   <nano model> [--scale 0.05]` runs the same suite headless on generated data. Run the scaled smoke
   first; a full run is minutes on a wide Mac and longer on a small one.
-- Search QUALITY: `omni-verify evalbed /Volumes/han2tb/omni-eval` once, then `omni-verify eval <model>
-  /Volumes/han2tb/omni-eval [--json out] [--tag t]` - 125 labeled queries through the app's
+- Search QUALITY: `omni-verify evalbed /Volumes/han2tb/omni-eval-2` once, then `omni-verify eval <model>
+  /Volumes/han2tb/omni-eval-2 [--json out] [--tag t]` - 155 labeled queries through the app's
   own search, scored at the right place and the right file. Any ranking change is judged here, A/B on
   the same cached index; baselines in docs/notes/roadmap.md. `--queries Tools/eval/queries-generated.json`
   adds 315 known-item and 40 absent queries; `--distractors ~/Documents,~/Downloads,~/Desktop` indexes
@@ -334,7 +346,10 @@ codebase were already measured there, and many were rejected.
   selection and rescore; ties by file id), and the programs without their rotated copies (Nano's
   labels packed, waited-on batches let in, programs loaded from the cache: compiled forms follow the
   path), the 512-token cut measured and kept, the one-time build ready per kind, and agents' second
-  searches (serving.log latency on the live app, transcripts, exact strings).
+  searches (serving.log latency on the live app, transcripts, exact strings), and decks and workbooks
+  (slides and sheets a page at a time, the slide pictures Quick Look draws, the three-arm eval), and
+  PDF pages as pictures (PDF tables and CSV tables measured and not built; read_file on CRLF lines;
+  the new formats through MCP, CLI and HTTP).
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
   and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names, Shortcuts,

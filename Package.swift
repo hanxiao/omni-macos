@@ -8,6 +8,7 @@ let package = Package(
         .library(name: "OmniKit", targets: ["OmniKit"]),
         .library(name: "OmniLink", targets: ["OmniLink"]),
         .executable(name: "omni", targets: ["omni"]),
+        .executable(name: "omni-pages", targets: ["omni-pages"]),
         .executable(name: "omni-verify", targets: ["omni-verify"]),
         .executable(name: "ocr-verify", targets: ["ocr-verify"]),
         .executable(name: "profbench", targets: ["profbench"]),
@@ -51,6 +52,12 @@ let package = Package(
         .executableTarget(
             name: "omni",
             path: "Sources/OmniCLI"
+        ),
+        // Draws a deck's slides and a workbook's sheets as Quick Look previews them, for their page
+        // pictures (DocumentPictures). AppKit and WebKit only; shipped inside the app bundle.
+        .executableTarget(
+            name: "omni-pages",
+            path: "Sources/OmniPages"
         ),
         .executableTarget(
             name: "omni-verify",

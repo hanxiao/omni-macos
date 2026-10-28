@@ -1355,7 +1355,10 @@ extension SearchHit {
         case FileKind.video.rawValue: return locator.isEmpty ? "Video" : "Frame" + at
         case FileKind.audio.rawValue: return (fileKind == FileKind.video.rawValue ? "Speech" : "Audio") + at
         case FileKind.image.rawValue: return locator.isEmpty ? "Picture" : locator
-        case FileKind.scan.rawValue: return locator.isEmpty ? "Scanned page" : "Scanned " + locator.lowercased()
+        case FileKind.scan.rawValue:
+            // A deck's slide or a workbook's sheet found by its picture: where, as its text says it.
+            if fileKind == FileKind.text.rawValue { return locator.isEmpty ? "Page" : locator }
+            return locator.isEmpty ? "Scanned page" : "Scanned " + locator.lowercased()
         default:
             if fileKind == FileKind.image.rawValue { return "Words in the image" }
             return locator.isEmpty ? "Text" : locator

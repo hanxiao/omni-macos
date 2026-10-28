@@ -41,8 +41,9 @@ public final class EnrichLedger: @unchecked Sendable {
         }
     }
 
-    /// What the enrichment covers. s1: screenshots, videos, long audio, multi-page PDFs; s2: scans.
-    static let scope = "s2"
+    /// What the enrichment covers. s1: screenshots, videos, long audio, multi-page PDFs; s2: scans;
+    /// s3: text PDFs' page pictures (`key(digest:path:textPDF:)`).
+    static let scope = "s3"
 
 
     private func resetLocked() {
@@ -90,6 +91,12 @@ public final class EnrichLedger: @unchecked Sendable {
 
     /// The ledger's key for a file's content.
     public static func key(digest: String, path: String) -> String { digest + "|" + path }
+
+    /// f1: a text PDF's pages its text does not carry are pictured (PDFPagePictures, addPagePictures).
+    /// A text PDF recorded before them is not done for that, and is done again, once; nothing else is.
+    public static func key(digest: String, path: String, textPDF: Bool) -> String {
+        key(digest: digest, path: path) + (textPDF ? "|f1" : "")
+    }
 
     public func record(_ digests: [String]) {
         guard !digests.isEmpty else { return }

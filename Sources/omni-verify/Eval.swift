@@ -28,7 +28,8 @@ import OmniKit
 //
 // SCORING. A query lists acceptable answers; the rank is the first hit that is one of them. An
 // answer may name a place: `@p2` the page, `@t240` the media segment starting there, `@L100-200` a
-// chunk starting on one of those lines - a hit on the right file at the wrong place does not count.
+// chunk starting on one of those lines, `@s3` a deck's slide, `@cGuests` a sheet and `@cGuests:21`
+// the piece of it holding row 21 - a hit on the right file at the wrong place does not count.
 // R@1, R@5, R@10 and MRR per tag and overall.
 
 struct EvalSpec: Decodable {
@@ -40,6 +41,10 @@ struct EvalSpec: Decodable {
         let longPages: Int?
         let filler: String?
         let facts: [String: String]?
+        /// A picture drawn on a page below its words, by page number ("2": a picture's path).
+        let figures: [String: String]?
+        /// Pages of a text PDF drawn as scans, with no text layer of their own.
+        let scannedPages: [Int]?
     }
     struct Shot: Decodable { let path: String; let title: String; let lines: [String] }
     struct Speech: Decodable { let path: String; let voice: String; let text: String }
@@ -68,6 +73,9 @@ struct EvalSpec: Decodable {
     let videos: [Video]
     let longText: [LongText]
     let distractors: Distractors
+    /// Decks, workbooks and Numbers documents, copied from `src` (beside bed.json; Tools/eval/office.py).
+    struct Office: Decodable { let path: String; let src: String }
+    let offices: [Office]?
     let queries: [Query]
 }
 
@@ -132,6 +140,9 @@ enum EvalCommand {
             try mux(video: silent, audio: audio, to: out)
         }
         for l in spec.longText { try writeLongText(l, to: try dest(l.path)) }
+        for o in spec.offices ?? [] {
+            try fm.copyItem(at: specURL.deletingLastPathComponent().appendingPathComponent(o.src), to: try dest(o.path))
+        }
         try writeDistractors(spec.distractors, tree: tree)
 
         try specData.write(to: out.appendingPathComponent("bed.json"))
@@ -175,9 +186,9 @@ enum EvalCommand {
         }
         var box = CGRect(x: 0, y: 0, width: 612, height: 792)
         guard let ctx = CGContext(url as CFURL, mediaBox: &box, nil) else { throw Failure("pdf context \(url.path)") }
-        for text in pages {
+        for (n, text) in zip(1..., pages) {
             ctx.beginPDFPage(nil)
-            if p.scanned == true {
+            if p.scanned == true || p.scannedPages?.contains(n) == true {
                 // A scan: the page is a picture of text, with no text layer for the extractor to read.
                 let scale: CGFloat = 150.0 / 72.0
                 let w = Int(612 * scale), h = Int(792 * scale)
@@ -188,6 +199,10 @@ enum EvalCommand {
                 bmp.scaleBy(x: scale, y: scale)
                 drawText(text, in: CGRect(x: 150, y: 200, width: 320, height: 500), ctx: bmp, size: 14)
                 if let img = bmp.makeImage() { ctx.draw(img, in: box) }
+            } else if let picture = p.figures?[String(n)] {
+                // Its words at the top, the picture below them over about half the page.
+                drawText(text, in: CGRect(x: 72, y: 560, width: 468, height: 160), ctx: ctx, size: 12)
+                ctx.draw(try loadImage(picture), in: CGRect(x: 86, y: 72, width: 440, height: 470))
             } else {
                 drawText(text, in: box.insetBy(dx: 72, dy: 72), ctx: ctx, size: 12)
             }
@@ -726,6 +741,19 @@ enum EvalCommand {
         guard parts.count == 2 else { return true }
         let place = parts[1]
         if place.hasPrefix("p"), let page = Int(place.dropFirst()) { return hit.locator == "Page \(page)" }
+        if place.hasPrefix("s"), let slide = Int(place.dropFirst()) { return hit.locator == "Slide \(slide)" }
+        if place.hasPrefix("c") {
+            // A sheet ("Guests", its picture) or a piece of it ("Guests A1:E20"), and with `:row`
+            // only the piece whose rows hold that one.
+            // A CSV's sheet has no name: `@c:141`, its pieces located by their cells alone.
+            let want = place.dropFirst().split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            guard want[0].isEmpty || hit.locator == want[0] || hit.locator.hasPrefix(want[0] + " ") else { return false }
+            guard want.count == 2, let row = Int(want[1]) else { return true }
+            let cells = hit.locator.dropFirst(want[0].isEmpty ? 0 : want[0].count + 1).split(separator: ":")
+            let rows = cells.map { Int($0.drop { $0.isLetter }) }
+            guard rows.count == 2, let lo = rows[0], let hi = rows[1] else { return false }
+            return (lo ... hi).contains(row)
+        }
         if place.hasPrefix("t"), let t = Double(place.dropFirst()) { return seconds(hit.locator) == t }
         if place.hasPrefix("L") {
             let r = place.dropFirst().split(separator: "-").compactMap { Int($0) }

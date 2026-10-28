@@ -440,3 +440,15 @@ soundtrack at 0.271). The weaker-match fold, measured on the same eval, shows 4.
 query and folds 2 answers (1 in the top 10). The default is All now, in the window and for MCP and
 REST; "Only Strong Matches" and `score:` / `min_score` still set a floor. The FAQ and the MCP
 `min_score` description say so.
+
+### Eval baselines, eval-bed-2 (2026-10-27, 155 queries)
+
+The bed gains three decks, four workbooks, two Numbers documents and a CSV export
+(Tools/eval/office), three PDFs with a page their text does not carry, and 30 queries for them
+(index.md, "Decks and workbooks", "PDF pages as pictures"); /Volumes/han2tb/omni-eval-2. Fresh
+indexes, ALL MRR Nano 0.890-0.893, Small 0.923 (2026-10-28, CSV cut a line at a time); per new
+tag, Nano / Small: deck 1.000 / 1.000, deck-pic 1.000 / 1.000, sheet (10) 1.000 / 1.000, numbers
+0.667 / 1.000, pdf-figure 1.000 / 1.000, csv 0.500 / 0.625 (a table cut: index.md, "CSV AS TABLES"). The older tags score against the new files as competitors: image 0.771 / 0.910 (a slide's
+picture is a picture), the lease queries against the new lease PDF, the rest as on eval-bed-1. One
+Korean voice-memo query sits on a near tie between two recordings and flips between rank 1 and 2
+from run to run.
