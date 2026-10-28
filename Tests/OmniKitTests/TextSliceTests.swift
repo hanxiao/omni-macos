@@ -31,6 +31,17 @@ final class TextSliceTests: XCTestCase {
         XCTAssertTrue(why.contains("500 lines"))
     }
 
+    /// Windows line ends ("\r\n", one Character in Swift): lines numbered as the index numbers them,
+    /// so a hit's "Line 857" is the line read_file reads.
+    func testLinesOfAFileWithWindowsLineEnds() throws {
+        let url = dir.appendingPathComponent("orders.csv")
+        try ("Order,City\r\n" + (2 ... 900).map { "ORD-\($0),City \($0 % 7)" }.joined(separator: "\r\n") + "\r\n")
+            .write(to: url, atomically: true, encoding: .utf8)
+        let s = try slice(TextSlice.read(path: url.path, line: 857, maxChars: 60))
+        XCTAssertEqual(s.start, 857)
+        XCTAssertTrue(s.text.hasPrefix("ORD-857,City 3\nORD-858,"), s.text)
+    }
+
     /// Past the 2 MB extraction cap: the index streams such a file to its end, so a search can name
     /// a line the extractor's text never reaches. Read straight from the mapped bytes instead.
     func testLinesOfAFilePastTheExtractionCap() throws {

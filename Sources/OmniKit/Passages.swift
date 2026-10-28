@@ -397,7 +397,8 @@ public enum TextSlice {
         default: return .unreadable("Omni found no text in this file")
         }
         if FileExtractor.textExtensions.contains(ext), offset == nil {
-            let lines = whole.split(separator: "\n", omittingEmptySubsequences: false)
+            // Lines as the index counts them (Character.isNewline): "\r\n" is one Character, never "\n".
+            let lines = whole.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
             if let l = line, l > lines.count { return .unreadable("line \(l) is past the end (\(lines.count) lines)") }
             let first = max(1, line ?? 1)
             var text = "", last = first - 1
