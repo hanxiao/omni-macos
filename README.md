@@ -18,9 +18,9 @@
   </a>
 </p>
 
-Text, code, PDFs, images, audio and video in one vector space, so any query finds any kind of
-file. The embedding model is `jina-embeddings-v5-omni`, ported to MLX-Swift and running
-in-process on the GPU. No Python, no server, no cloud.
+Text, code, PDFs, slides, spreadsheets, images, audio and video in one vector space, so any query
+finds any kind of file. The embedding model is `jina-embeddings-v5-omni`, ported to MLX-Swift and
+running in-process on the GPU. No Python, no server, no cloud.
 
 ## Install
 

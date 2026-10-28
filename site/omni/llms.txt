@@ -1,6 +1,6 @@
 # Omni
 
-> Omni is a native macOS app for semantic search over the files on a Mac: text, code, PDFs (scanned ones through on-device OCR), images, audio and video, in one embedding space. Everything runs on the Mac; nothing is uploaded. Agents reach it through a command line, MCP or HTTP.
+> Omni is a native macOS app for semantic search over the files on a Mac: text, code, PDFs (scanned ones through on-device OCR), slides, spreadsheets, images, audio and video, in one embedding space. Everything runs on the Mac; nothing is uploaded. Agents reach it through a command line, MCP or HTTP.
 
 ## For agents
 

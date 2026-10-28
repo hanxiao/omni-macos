@@ -105,7 +105,7 @@
         },
         {
           "q": "What do \"Page 3\" or \"Line 1240\" on a result mean?",
-          "a": "Where the best-matching passage is in the file: a page for PDFs, a line for text and code. In list view, a text result expands to show its matching passages. The percentage is cosine similarity, shown as 0-100%.",
+          "a": "Where the best-matching passage is in the file: a page for PDFs, a slide for decks, a sheet and its cells for workbooks (\"Guests A12:E21\"), a line for text and code. In list view, a text result expands to show its matching passages. The percentage is cosine similarity, shown as 0-100%.",
           "shortcut": ""
         }
       ]
@@ -145,7 +145,7 @@
         },
         {
           "q": "How are long documents and scanned PDFs handled?",
-          "a": "Text is read up to 2 MB per file and split into chunks, all of which are indexed. A PDF with no text layer is indexed page by page as images.",
+          "a": "Text is read up to 2 MB per file and split into chunks, all of which are indexed. A PDF with no text layer is indexed page by page as images, and so are the pages of a text PDF that its text does not carry, such as a scanned page or a full-page photo. A deck is indexed by each slide's words and picture, a workbook sheet by sheet.",
           "shortcut": ""
         },
         {
@@ -321,7 +321,7 @@
         },
         {
           "q": "Which MCP tools are available?",
-          "a": "Eleven: search, search_inline, read_file, file_status, tag_image, ocr, get_linked_file, list_sources, add_source, pause_source, and remove_source. They return paths, scores, the passage that matched, tags, and transcripts; read_file returns a document's text by page, line, or offset, including Word, Pages, and Keynote files.",
+          "a": "Eleven: search, search_inline, read_file, file_status, tag_image, ocr, get_linked_file, list_sources, add_source, pause_source, and remove_source. They return paths, scores, the passage that matched, tags, and transcripts; read_file returns a document's text by page, line, or offset, including Word, Pages, Keynote, PowerPoint, Excel, and Numbers files, a slide or a sheet at a time.",
           "shortcut": ""
         },
         {
