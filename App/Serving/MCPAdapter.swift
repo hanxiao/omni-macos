@@ -76,8 +76,11 @@ enum MCPAdapter {
                 schema["additionalProperties"] = false
                 t["inputSchema"] = schema
             }
-            guard let name = tool["name"] as? String, let ex = examples[name] else { return t }
-            t["_meta"] = [examplesMetaKey: ex]
+            guard let name = tool["name"] as? String else { return t }
+            var meta: [String: Any] = [:]
+            if let ex = examples[name] { meta[examplesMetaKey] = ex }
+            if let bare = bareWords[name] { meta[CLIProtocol.bareWordsKey] = bare }
+            if !meta.isEmpty { t["_meta"] = meta }
             return t
         }
     }
@@ -86,6 +89,9 @@ enum MCPAdapter {
     /// the one place they live stays true to the schema: `omni <tool> --help` renders them as
     /// commands, and an MCP client may show them as they are.
     static let examplesMetaKey = CLIProtocol.examplesKey
+    /// The parameter `omni <tool>` gives the bare words to, for a tool with no required one:
+    /// `omni add_source ~/Projects` was refused as "takes no bare arguments".
+    private static let bareWords = ["add_source": "path"]
     nonisolated(unsafe) private static let examples: [String: [[String: Any]]] = [   // immutable
         "search": [
             ["query": "invoice from anthropic in february"],
@@ -699,7 +705,9 @@ enum MCPAdapter {
             if let next = s.next {
                 head += "; next: " + (s.unit == "character" ? "offset=\(next)" : s.unit == "row" ? "page=\(s.page ?? 1), line=\(next)" : "\(s.unit)=\(next)")
             } else { head += s.unit == "row" ? "; end of sheet" : "; end of file" }
-            return answer(id: id, [["type": "text", "text": head + "\n\n" + s.text]], cli: cli) {
+            // The command line prints the header to stderr: `omni read_file x > x.md` is the text alone.
+            let blocks = cli ? [diagnostic(head), ["type": "text", "text": s.text]] : [["type": "text", "text": head + "\n\n" + s.text]]
+            return answer(id: id, blocks, cli: cli) {
                 var out: [String: Any] = ["path": path, "unit": s.unit, "start": s.start, "end": s.end, "total": s.total,
                                           "next": s.next.map { $0 as Any } ?? NSNull(), "text": s.text]
                 if let sheet = s.page { out["page"] = sheet }
@@ -748,6 +756,7 @@ enum MCPAdapter {
                 "isError": true
             ])
         }
+        if let err = FileStatusAdapter.relativePath(paths) { return toolError(id: id, "file_status failed: " + err) }
         let rows = FileStatusAdapter.rows(for: paths, backend: backend)
 
         let content: [[String: Any]] = rows.enumerated().map { i, row in
@@ -810,7 +819,8 @@ enum MCPAdapter {
         if queued {
             if snap.paused { return "NOT indexed yet: queued, but indexing is PAUSED in Omni until the user resumes it (File > Resume Indexing)" }
             if let held = snap.heldBy { return "NOT indexed yet: queued, waiting while \(held)" }
-            let since = snap.waitingSince.map { " since " + SourcesSnapshot.clock($0) } ?? ""
+            // The queue's oldest change, not this file's: it is the only time the queue keeps.
+            let since = snap.waitingSince.map { ", behind changes waiting since " + SourcesSnapshot.clock($0) } ?? ""
             return "NOT indexed yet: queued for indexing\(since)"
         }
         if source.indexing {
@@ -870,6 +880,7 @@ enum MCPAdapter {
                 "isError": true
             ])
         }
+        if let err = FileStatusAdapter.relativePath(paths) { return toolError(id: id, "tag_image failed: " + err) }
         let recompute = (args["recompute"] as? Bool) ?? false
         let topK = (args["top_k"] as? Int) ?? OmniTagger.topK
 
@@ -901,7 +912,7 @@ enum MCPAdapter {
             } else if !tags.isEmpty {
                 line = "\(i + 1). \(p)  \(tags.joined(separator: ", "))"
             } else if row["indexed"] as? Bool == false {
-                line = "\(i + 1). \(p)  NOT indexed (pass recompute=true to tag it now)"
+                line = "\(i + 1). \(p)  NOT indexed (tag it now with recompute)"
             } else if row["taggable"] as? Bool == false {
                 line = "\(i + 1). \(p)  not an image (only images, scanned pages and video carry tags)"
             } else {

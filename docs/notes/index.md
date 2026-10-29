@@ -3327,3 +3327,42 @@ all, and a page that is mostly a photo or a chart was found only by its caption.
   scan, an inline page image as a scan's); `ext` takes pptx, xlsx and numbers; `kinds: text` holds
   the slide pictures (text implies scan); read_file reads a slide, a sheet from a row under its
   header, and (with the fix above) a CRLF file at any line; file_status counts the new chunks.
+
+## The served surfaces reviewed by an agent (2026-10-29)
+
+Another agent drove MCP, the `omni` CLI and REST against 0.19.6 and read the router and adapters.
+Every finding below was reproduced on an isolated 0.19.6 instance over a generated corpus (15
+"Invoice (N)" files, notes, a pair of copies), then checked on the fixed build over the same corpus.
+
+- CONTENT_KEY WAS THE DIGEST READ AS C TEXT. `dedup.key` is the 16-byte digest (a BLOB since v5);
+  `contentKeys` read it with `sqlite3_column_text` + `String(cString:)`: mojibake, cut at the first
+  zero byte (the agent counted 31,829 of 541,569 keys with a zero, 2,053 starting with one, so
+  `""`), and 110 (key, size) buckets of different files that agreed. ResultGrouping's exact tier
+  compares the same string, so files of one size whose keys cut short alike stacked as "exact"
+  copies. Now hex, as `contentDigests` already read it. 0.19.6: 0/8 rows 32 hex; fixed: 8/8.
+- A DENSE HIT HAD NO SIZE SINCE SCHEMA V4. The snippet fill set `size` from the chunk row; v4
+  (67505fe, 2026-08-11) narrowed the row and dropped it. A hit found by meaning carried 0: REST and
+  MCP rows had no `bytes` (0/8; the name matches had it), the results list's Size column was empty,
+  and grouping's size guards passed everything (0 is "unknown", comparable to any size). Every
+  dense constructor now takes the resident file size, as browse already did. ServedRowFieldsTests,
+  failing on the old code (10/10 hits size 0, every key not hex).
+- REST PAGES REPEATED ROWS. `/v1/search` cut its pool at top_k + offset; `fuseLexical` takes
+  min(topK, 24) name matches, so a small top_k admitted fewer of the tied "Invoice (N)" names and
+  the order moved from page to page: five pages of 3 had 1 repeat (grouped) and 7 (flat), and
+  neither equalled one call of 15. MCP never cut below 30 (fetch >= 90, so always 24 names). REST
+  now uses the tool's floor: pages equal one call, 0 repeats, and REST and MCP give the same order.
+- REST IGNORED TOP-LEVEL FILTERS: `{"query": ..., "ext": "md"}` returned .txt too, and any unknown
+  field was taken silently. The filters are now read flat (as the MCP tool takes them) or from
+  `filters`, not both, and an unknown field is a 400 naming what the endpoint takes. The response
+  adds `offset` and `ranked`, as `omni search --json` has.
+- Smaller, each reproduced: GET on a POST route is a 405 with `Allow: POST` (was 404); the 413 body
+  is the error envelope (was a bare string); `/v1/embeddings` names the model that embedded (it
+  echoed any `model`, "nope" included); `/v1/files/status`, `/v1/files/tags`, `file_status` and
+  `tag_image` refuse a relative path (read as rooted, "docs/CLI.md" came back not indexed);
+  `omni read_file` prints its header to stderr (`> x.md` is the text alone; MCP clients still get
+  one block); `omni pause_source <key> --paused false` takes `false` as the flag's value (it was
+  joined into the key); `omni add_source <path>` takes the bare path (`_meta`
+  io.hanxiao.omni/bare); `tag_image`'s hint names `recompute`, not `recompute=true`; a queued file's
+  `file_status` says "behind changes waiting since", the queue's time, not the file's.
+- Not changed: `structuredContent` only for the CLI is the earlier measured decision ("The index
+  that paused itself"); `/v1/embeddings` still takes any `model`, since OpenAI clients send their own.

@@ -309,6 +309,11 @@ func arguments(for tool: [String: Any], _ words: [String]) throws -> [String: An
         case "boolean":
             if negated { out[p.name] = false }
             else if let inline { out[p.name] = !["false", "0", "no"].contains(inline.lowercased()) }
+            // `--paused false`: the word is the flag's value, not a bare argument (it was joined
+            // into pause_source's key).
+            else if i + 1 < words.count, ["true", "false"].contains(words[i + 1].lowercased()) {
+                i += 1; out[p.name] = words[i].lowercased() == "true"
+            }
             else { out[p.name] = true }
         case "integer":
             let v = try next()

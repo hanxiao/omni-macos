@@ -252,7 +252,7 @@ final class HTTPServer: @unchecked Sendable {
             if self.drain(on: conn, buffer: buffer.data) { return }
 
             if buffer.data.count > self.maxBody && !self.mayBuffer(buffer.data) {
-                self.write(HTTPResponse.json(["error": "payload too large"], status: 413), to: conn, keepAlive: false) {
+                self.write(HTTPResponse.json(["error": ["message": "payload too large: the body is over \(self.maxBody / 1_048_576) MB", "type": "invalid_request_error"]], status: 413), to: conn, keepAlive: false) {
                     conn.cancel()
                 }
                 return
@@ -301,7 +301,7 @@ final class HTTPServer: @unchecked Sendable {
         do {
             parsed = try HTTPParse.tryParse(buffer)
         } catch HTTPError.payloadTooLarge {
-            write(HTTPResponse.json(["error": "payload too large"], status: 413), to: conn, keepAlive: false) {
+            write(HTTPResponse.json(["error": ["message": "payload too large: the body is over \(self.maxBody / 1_048_576) MB", "type": "invalid_request_error"]], status: 413), to: conn, keepAlive: false) {
                 conn.cancel()
             }
             return true

@@ -15,8 +15,10 @@ The MCP tools in `App/Serving/MCPAdapter.swift` are the interface. Everything el
 - SKILL.md is rendered from the server's `initialize` instructions plus `tools/list`
   (`Sources/OmniCLI/AgentSkill.swift`, compiled into both the app and the CLI). `omni skill` and
   Settings > Serving > SKILL.md print the same bytes.
-- REST `/v1/search` reads its `filters` with the same code as the MCP tool
-  (`App/Serving/SearchArgs.swift`); only the output format differs.
+- REST `/v1/search` reads its filters with the same code as the MCP tool
+  (`App/Serving/SearchArgs.swift`), flat as the tool takes them or in a `filters` object, and
+  refuses a field it does not take. It pages from the same pool (at least 30 deep), so a page is a
+  slice of the tool's ranking; only the output format differs.
 
 ## History
 

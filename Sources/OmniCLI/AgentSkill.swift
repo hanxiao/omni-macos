@@ -57,6 +57,8 @@ enum CLIProtocol {
     static let stderrKey = "io.hanxiao.omni/stderr"
     /// On a tool in tools/list: example arguments.
     static let examplesKey = "io.hanxiao.omni/examples"
+    /// On a tool in tools/list: the parameter the bare words go to when none is required.
+    static let bareWordsKey = "io.hanxiao.omni/bare"
 }
 
 /// A tool's examples (`_meta` in tools/list, MCPAdapter.examples), as command lines.
@@ -99,7 +101,7 @@ struct ToolSchema {
         let itemType: String
         let description: String
         let required: Bool
-        let positional: Bool        // the first required parameter takes the bare words
+        let positional: Bool        // takes the bare words: the first required parameter, or the tool's bareWordsKey one
         let enumValues: [String]
         var flag: String { name.replacingOccurrences(of: "_", with: "-") }
         var metavar: String {
@@ -129,6 +131,7 @@ struct ToolSchema {
         let props = schema["properties"] as? [String: Any] ?? [:]
         let required = schema["required"] as? [String] ?? []
         let first = required.first { (props[$0] as? [String: Any])?["type"] as? String != "object" }
+            ?? ((tool["_meta"] as? [String: Any])?[CLIProtocol.bareWordsKey] as? String).flatMap { props[$0] != nil ? $0 : nil }
         // Required first in the schema's order, then the rest by name: JSON objects carry no order.
         let names = required.filter { props[$0] != nil } + props.keys.filter { !required.contains($0) }.sorted()
         params = names.map { n in

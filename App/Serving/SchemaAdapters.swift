@@ -121,7 +121,9 @@ enum OpenAIJinaAdapter {
     static func handle(_ req: HTTPRequest, _ backend: any ServingBackend) -> HTTPResponse {
         guard let body = JSONBody.object(req) else { return badRequest("invalid JSON body") }
 
-        let model = (body["model"] as? String) ?? backend.modelName
+        // Any `model` is taken (OpenAI clients send their own default), but the answer names the
+        // model that embedded: echoing "nope" back labelled Omni's vectors as some other model's.
+        let model = backend.modelName
         guard let texts = flattenInput(body["input"]) else {
             // Silently dropping unrecognized items (token-id arrays, numbers, nulls) would return
             // fewer `data` entries than inputs with shifted indexes - corrupt for the caller.
@@ -356,12 +358,26 @@ enum SearchAdapter {
         // Refused, not clamped: a caller that asked for 5000 and got 200 read 200 as all there were.
         guard (1 ... 200).contains(topK) else { return badRequest("'top_k' must be between 1 and 200, got \(topK)") }
 
+        // A field this endpoint does not take is refused, not ignored: {"ext": "pdf"} beside the
+        // query returned .h and .py files, and nothing said the filter was dropped.
+        let unknown = body.keys.filter { !Self.fields.contains($0) && !SearchArgs.keys.contains($0) }.sorted()
+        guard unknown.isEmpty else {
+            return badRequest("unknown field\(unknown.count == 1 ? "" : "s") \(unknown.map { "'\($0)'" }.joined(separator: ", ")); "
+                              + "/v1/search takes \((Self.fields.subtracting(["filters"]).sorted() + SearchArgs.keys.sorted()).joined(separator: ", "))")
+        }
         // Read by the same code as the MCP tool (SearchArgs): kinds are checked, folders
-        // normalized, `ext` cleaned, and a date may be epoch seconds or ISO 8601.
+        // normalized, `ext` cleaned, and a date may be epoch seconds or ISO 8601. Flat, as the
+        // tool takes them, or in a `filters` object (the earlier form), not both.
+        let flat = body.filter { SearchArgs.keys.contains($0.key) }
         var filter = SearchFilter()
         if let raw = body["filters"] {
             guard let filters = raw as? [String: Any] else { return badRequest("'filters' must be an object") }
+            guard flat.isEmpty else { return badRequest("give the filters at the top level or in 'filters', not both") }
             let (parsed, err) = SearchArgs.filter(filters)
+            if let err { return badRequest(err) }
+            filter = parsed
+        } else if !flat.isEmpty {
+            let (parsed, err) = SearchArgs.filter(flat)
             if let err { return badRequest(err) }
             filter = parsed
         }
@@ -376,7 +392,10 @@ enum SearchAdapter {
         let offset = max(0, min((body["offset"] as? Int) ?? 0, 200))
         let sort = (body["sort"] as? String)?.lowercased() ?? "relevance"
         guard sort == "relevance" || sort == "date" else { return badRequest("'sort' must be 'relevance' or 'date'") }
-        let deep = min(topK + offset, 400)
+        // The MCP tool's pool: at least `summaryPool` deep whatever the page, so a page is a slice
+        // of one ranking. Cut to top_k + offset, a small top_k fetched fewer name matches
+        // (fuseLexical) and tied copies reordered from page to page.
+        let deep = min(max(topK + offset, MCPAdapter.summaryPool), 400)
         let fetch = group ? min(deep * 3, 600) : deep
         let (hits, vector) = backend.searchReturningVector(query, topK: fetch, filter: filter, surface: .rest)
         var pool = backend.groupedResults(hits, enabled: group, limit: deep)
@@ -389,8 +408,11 @@ enum SearchAdapter {
             passages = textPassages(groups.map(\.representative), query: query, vector: vector, width: min(width, 2000), backend: backend)
         }
         return HTTPResponse.json(["query": query, "results": rows(groups, backend: backend, passages: passages),
-                                  "grouped": group])
+                                  "grouped": group, "offset": offset, "ranked": pool.count])
     }
+
+    /// This endpoint's own fields; the filters are SearchArgs.keys.
+    static let fields: Set<String> = ["query", "top_k", "offset", "sort", "group_duplicates", "max_snippet", "filters"]
 
     /// Each text hit's matching passage (ServingBackend.passages), nil for the rest. Shared with
     /// the MCP search tool.
@@ -476,8 +498,19 @@ enum FileStatusAdapter {
         paths = paths.filter { !$0.isEmpty }
         if paths.isEmpty { return badRequest("'paths' (array of absolute file paths) is required") }
         if paths.count > servingMaxInputs { return badRequest("'paths' exceeds \(servingMaxInputs) items") }
+        if let err = FileStatusAdapter.relativePath(paths) { return badRequest(err) }
 
         return HTTPResponse.json(["files": rows(for: paths, backend: backend)])
+    }
+
+    /// Why these paths cannot be looked up, or nil: a relative one has no folder to be in, and
+    /// read as rooted ("docs/CLI.md" as "/docs/CLI.md") it came back "not indexed".
+    static func relativePath(_ paths: [String]) -> String? {
+        guard let p = paths.first(where: {
+            let t = ($0.trimmingCharacters(in: .whitespaces) as NSString).expandingTildeInPath
+            return !t.hasPrefix("/") && !t.contains("://")
+        }) else { return nil }
+        return "'paths' takes absolute paths (got \"\(p)\")"
     }
 
     /// One status row per input path, input order preserved. Shared with the MCP file_status tool.
@@ -639,6 +672,7 @@ enum FileTagsAdapter {
         paths = paths.filter { !$0.isEmpty }
         if paths.isEmpty { return badRequest("'paths' (array of absolute file paths) is required") }
         if paths.count > servingMaxInputs { return badRequest("'paths' exceeds \(servingMaxInputs) items") }
+        if let err = FileStatusAdapter.relativePath(paths) { return badRequest(err) }
 
         return HTTPResponse.json(["files": rows(for: paths, backend: backend)])
     }

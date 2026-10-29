@@ -92,8 +92,18 @@ struct Router: Sendable {
             }
         }
 
+        if Self.postRoutes.contains(route) || route.hasPrefix("/v1beta/models/") {
+            var r = HTTPResponse.json(["error": ["message": "\(route) takes POST, not \(req.method)", "type": "invalid_request_error"]],
+                                      status: 405)
+            r.headers["Allow"] = "POST"
+            return r
+        }
         return notFound(for: route)
     }
+
+    /// The routes above that answer POST only: another method on one is a 405, not "no route".
+    static let postRoutes: Set<String> = ["/v1/embeddings", "/v1/embed", "/v2/embed", "/v1/search", "/v1/files/status",
+                                          "/v1/files/tags", "/v1/tag", "/v1/chat/completions", "/v1/ocr"]
 
     // MARK: - Foreign requests
 

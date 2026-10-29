@@ -10,6 +10,12 @@ import OmniKit
 /// documented form) and `modified_after`/`modified_before` (ISO 8601, MCP's). Results are still
 /// rendered per surface (JSON for REST, text for agents); only the reading is shared.
 enum SearchArgs {
+    /// Every filter `filter(_:)` reads: what REST /v1/search takes at its top level beside its own
+    /// fields, as the MCP tool takes them.
+    static let keys: Set<String> = ["min_score", "kinds", "folder", "folders", "modified_after", "since",
+                                    "modified_before", "until", "ext", "exclude_folders", "exclude_ext",
+                                    "tags", "exclude_tags", "filename"]
+
     /// The filter `a` asks for, or why it cannot be applied (a message naming the fix).
     static func filter(_ a: [String: Any]) -> (SearchFilter, String?) {
         var filter = SearchFilter()

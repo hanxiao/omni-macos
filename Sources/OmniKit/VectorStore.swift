@@ -58,8 +58,8 @@ public struct SearchHit: Sendable, Equatable {
     public var width: Int = 0
     public var height: Int = 0
     public var duration: Double = 0
-    /// Byte size of the file VERSION that was indexed (from the chunk row, filled lazily with the
-    /// snippet for the winners only); 0 = unknown (row predates the size column).
+    /// Byte size of the file VERSION that was indexed (the files row, resident with its modified
+    /// time); 0 = unknown. Grouping's exact and near tiers both compare it.
     public var size: Int = 0
     /// Position of the best-matching chunk inside the file ("Page 3", "Line 1240"); "" if n/a.
     public var locator: String = ""
@@ -4566,8 +4566,12 @@ public final class VectorStore: @unchecked Sendable {
                 // fileIDByPath takes the directory AND the name. Binding the whole path to the first
                 // left the name unbound, so this matched nothing - MCP's content_key was empty.
                 bindPath(stmt, 1, p)
-                if sqlite3_step(stmt) == SQLITE_ROW, let k = sqlite3_column_text(stmt, 0) {
-                    out[p] = (String(cString: k), sqlite3_column_double(stmt, 1))
+                // The key is the 16-byte digest (a BLOB), as hex: read as C text it stopped at the
+                // first zero byte, so 1 file in 256 had "" and unrelated files of one size stacked
+                // as copies.
+                if sqlite3_step(stmt) == SQLITE_ROW, let k = sqlite3_column_blob(stmt, 0) {
+                    let key = Data(bytes: k, count: Int(sqlite3_column_bytes(stmt, 0))).map { String(format: "%02x", $0) }.joined()
+                    out[p] = (key, sqlite3_column_double(stmt, 1))
                 }
             }
             return out
@@ -7406,7 +7410,8 @@ public final class VectorStore: @unchecked Sendable {
             let r = rows[Int(w.row)]
             return SearchHit(path: pathOf(r), score: w.score, snippet: "", kind: kindOf(r),
                              chunkIndex: r.chunkIndex, modified: metaOf(r).modified,
-                             width: Int(metaOf(r).width), height: Int(metaOf(r).height), duration: metaOf(r).duration, locator: "",
+                             width: Int(metaOf(r).width), height: Int(metaOf(r).height), duration: metaOf(r).duration,
+                             size: Int(metaOf(r).size), locator: "",
                              chunkCount: Int(fileChunkCount[Int(fileID[Int(w.row)])]))
         }
     }
@@ -8270,7 +8275,8 @@ public final class VectorStore: @unchecked Sendable {
         return order.map { (f, score) -> SearchHit in
             let r = rows[Int(candRow[f]!)]
             return SearchHit(path: pathOf(r), score: score, snippet: "", kind: kindOf(r), chunkIndex: r.chunkIndex, modified: metaOf(r).modified,
-                             width: Int(metaOf(r).width), height: Int(metaOf(r).height), duration: metaOf(r).duration, locator: "",
+                             width: Int(metaOf(r).width), height: Int(metaOf(r).height), duration: metaOf(r).duration,
+                             size: Int(metaOf(r).size), locator: "",
                              chunkCount: Int(fileChunkCount[Int(f)]))
         }
     }
@@ -8420,7 +8426,8 @@ public final class VectorStore: @unchecked Sendable {
             let ri = Int(heapRow[idx])
             let r = rows[ri]
             return SearchHit(path: tables.path(r), score: heapScore[idx], snippet: "", kind: tables.kind(r), chunkIndex: r.chunkIndex, modified: tables.meta(r).modified,
-                             width: Int(tables.meta(r).width), height: Int(tables.meta(r).height), duration: tables.meta(r).duration, locator: "",
+                             width: Int(tables.meta(r).width), height: Int(tables.meta(r).height), duration: tables.meta(r).duration,
+                             size: Int(tables.meta(r).size), locator: "",
                              chunkCount: Int(rowCount[Int(fileID[ri])]))
         }
         if let tA, let tB {
@@ -8442,7 +8449,8 @@ public final class VectorStore: @unchecked Sendable {
             if !dot.isFinite { continue }
             if let e = best[tables.path(r)], e.score >= dot { continue }
             best[tables.path(r)] = SearchHit(path: tables.path(r), score: dot, snippet: "", kind: tables.kind(r), chunkIndex: r.chunkIndex, modified: tables.meta(r).modified,
-                                     width: Int(tables.meta(r).width), height: Int(tables.meta(r).height), duration: tables.meta(r).duration, locator: "")
+                                     width: Int(tables.meta(r).width), height: Int(tables.meta(r).height), duration: tables.meta(r).duration,
+                                     size: Int(tables.meta(r).size), locator: "")
             fid[tables.path(r)] = r.fid
         }
         return Array(best.values).sorted { $0.score != $1.score ? $0.score > $1.score : fid[$0.path]! < fid[$1.path]! }
