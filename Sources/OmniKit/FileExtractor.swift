@@ -28,6 +28,18 @@ public enum FileKind: String, Sendable, CaseIterable {
         }
     }
 
+    /// One file's kind, for a row's Kind column: a picture is an "Image", not "Images" (the
+    /// category `title` names, in Settings and the filter menu).
+    public var singular: String {
+        switch self {
+        case .image: return "Image"
+        case .video: return "Video"
+        case .audio: return "Audio"
+        case .text: return "Text"
+        case .scan: return "Scan"
+        }
+    }
+
     public var symbol: String {
         switch self {
         case .image: return "photo"
@@ -162,10 +174,29 @@ public enum FileExtractor {
 
     // MARK: - Text
 
+    /// BYTES, NOT TEXT: a NUL in the first 8,000 bytes, the test git and grep use. No text
+    /// encoding Omni reads (UTF-8, or Latin-1 when not) puts a NUL in text, so a file with one is
+    /// a binary that happens to carry a text extension - 200 KB of random bytes named .txt was
+    /// indexed as 103 chunks of Latin-1 noise (full test 2026-11-03). A UTF-16 or UTF-32 byte-order
+    /// mark is text with NULs in it, and is left to the reading it always had.
+    public static func looksBinary(_ head: Data) -> Bool {
+        let b = head.prefix(8000)
+        if b.starts(with: [0xFF, 0xFE]) || b.starts(with: [0xFE, 0xFF]) || b.starts(with: [0x00, 0x00, 0xFE, 0xFF]) { return false }
+        return b.contains(0)
+    }
+
+    /// `looksBinary` on the file's first bytes; false when it cannot be read.
+    public static func looksBinary(_ url: URL) -> Bool {
+        guard let h = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? h.close() }
+        return looksBinary((try? h.read(upToCount: 8000)) ?? Data())
+    }
+
     private static func extractText(_ url: URL) throws -> ExtractedContent {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
         let data = handle.readData(ofLength: maxTextBytes)
+        if looksBinary(data) { return .empty }
         // A file larger than maxTextBytes is cut at the cap, which can split a multi-byte UTF-8
         // codepoint at the boundary. String(data:.utf8) then returns nil and we would fall through to
         // isoLatin1, decoding the ENTIRE file as Latin-1 mojibake (every CJK/emoji char garbled). When
@@ -186,6 +217,9 @@ public enum FileExtractor {
 
     private static func extractPDF(_ url: URL, maxImageDimension: Int) throws -> ExtractedContent {
         guard let doc = PDFDocument(url: url) else { throw OmniError.extraction("cannot open PDF \(url.lastPathComponent)") }
+        // A PDF that needs a password to open shows nothing to read and nothing to see: its pages
+        // came out blank, and it was indexed as a one-page scan of them (full test 2026-11-03).
+        if doc.isLocked { return .empty }
         let pageCount = doc.pageCount
         guard pageCount > 0 else { return .empty }
         // Per-page text (not doc.string) so chunk offsets map back to page numbers exactly.

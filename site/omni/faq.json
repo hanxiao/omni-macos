@@ -256,7 +256,7 @@
         },
         {
           "q": "How do I control what is recorded?",
-          "a": "Settings > History: Add searches to history (Automatically, When I press Return, or Only when I bookmark), Save serving history for agent and API searches, and Keep history for 3, 7, 14, or 31 days (default 31). Clear... removes all recents and keeps bookmarks.",
+          "a": "Settings > History: Add searches to history (Automatically, When I press Return, or Only when I bookmark), Save serving history for agent and API searches, and Keep history for 3, 7 or 14 days, 1 month (the default), or forever. Clear... removes all recents and keeps bookmarks.",
           "shortcut": ""
         }
       ]

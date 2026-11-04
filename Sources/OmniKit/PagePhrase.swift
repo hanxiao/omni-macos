@@ -61,6 +61,25 @@ public enum PagePhrase {
         return nil
     }
 
+    /// THE PAGE A PASSAGE STARTS ON: the 1-based page of `doc` near `page` - the chunk's own
+    /// first, then out to `reach` either side - whose words hold the passage's first words. A
+    /// chunk's locator is the page holding most of the chunk, so the part of it a row shows, the
+    /// window that matched, can sit on the page before: a sentence at the foot of page 238 of a
+    /// 300-page book showed as "Page 239" (full test 2026-11-03). Only the passage's opening run is
+    /// looked for, so a window running over a page break is on the page it starts on. Nil when no
+    /// page near holds it (the locator stands).
+    public static func page(of passage: String, in doc: PDFDocument, near page: Int, reach: Int = 2) -> Int? {
+        let keys = lead(passage, count: 6)
+        guard keys.count >= 3 else { return nil }
+        var order = [page]
+        for d in 1 ... max(1, reach) { order += [page - d, page + d] }
+        for p in order where p >= 1 && p <= doc.pageCount {
+            let raw = autoreleasepool { doc.page(at: p - 1)?.string ?? "" }
+            if span(of: keys, in: words(raw)) != nil { return p }
+        }
+        return nil
+    }
+
     /// The phrase for the passage `snippet` of `page` (zero-based); nil for a page without a usable
     /// line (a scan).
     ///

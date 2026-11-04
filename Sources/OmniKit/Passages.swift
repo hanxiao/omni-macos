@@ -221,7 +221,7 @@ public final class PassageRecovery: @unchecked Sendable {
             guard let t else { continue }
             if t.count <= width { out[chosen[j]] = Passage(text: t, opensChunk: true) } else { long.append((chosen[j], t)) }
         }
-        guard !long.isEmpty else { return out }
+        guard !long.isEmpty else { return located(out, items) }
         var abandoned = false
         let best = PassageWindow.best(long.map(\.text), width: width, query: query, cache: windowVectors) { ws in
             let t0 = Date()
@@ -232,7 +232,50 @@ public final class PassageRecovery: @unchecked Sendable {
         }
         guard !abandoned else { return items.map { _ in nil } }
         for (k, l) in long.enumerated() { out[l.i] = Passage(text: best[k], opensChunk: l.text.hasPrefix(best[k])) }
+        return located(out, items)
+    }
+
+    /// Each PDF passage with the page it starts on (`PagePhrase.page`), which need not be its
+    /// chunk's: a chunk's locator is the page holding most of it, and the sentence that matched at
+    /// the foot of page 238 of a 300-page book was shown, served and opened as "Page 239" (full test
+    /// 2026-11-03). Pages near the chunk's own are read; a few documents stay open, and an answer is
+    /// kept by chunk and window, since both are fixed by their text.
+    private func located(_ found: [Passage?], _ items: [(path: String, chunk: Int, locator: String)]) -> [Passage?] {
+        var out = found
+        for i in items.indices {
+            guard let p = out[i], items[i].locator.hasPrefix("Page "), let n = Int(items[i].locator.dropFirst(5)),
+                  FileExtractor.pdfExtensions.contains((items[i].path as NSString).pathExtension.lowercased()) else { continue }
+            let key = "\(items[i].path)|\(items[i].locator)|\(p.text.prefix(80))"
+            let cached = lock.withLock { pageOfWindow[key] }
+            if let cached { out[i]?.locator = cached; continue }
+            guard let doc = pdf(items[i].path) else { continue }
+            // One reader at a time: a PDFDocument is not to be read from two threads at once.
+            let at = pdfLock.withLock { PagePhrase.page(of: p.text, in: doc, near: n) }.map { "Page \($0)" } ?? items[i].locator
+            lock.withLock {
+                if pageOfWindow.count > 8192 { pageOfWindow.removeAll(keepingCapacity: true) }
+                pageOfWindow[key] = at
+            }
+            out[i]?.locator = at
+        }
         return out
+    }
+    private var pageOfWindow: [String: String] = [:]
+    private let pdfLock = NSLock()
+    private var openPDFs: [(key: String, doc: PDFDocument)] = []
+
+    /// The document, opened at most once among the last four asked for (by path and version).
+    private func pdf(_ path: String) -> PDFDocument? {
+        guard !FileExtractor.isDataless(path),
+              let m = (try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date else { return nil }
+        let key = "\(path)|\(m.timeIntervalSince1970)"
+        if let d = lock.withLock({ openPDFs.first { $0.key == key }?.doc }) { return d }
+        guard let d = PDFDocument(url: URL(fileURLWithPath: path)) else { return nil }
+        lock.withLock {
+            openPDFs.removeAll { $0.key == key }
+            openPDFs.insert((key, d), at: 0)
+            if openPDFs.count > 4 { openPDFs.removeLast() }
+        }
+        return d
     }
 
     /// Characters of a held chunk's tiles not yet embedded; nil when its text is not held.
@@ -322,6 +365,9 @@ public final class PassageRecovery: @unchecked Sendable {
 public struct Passage: Sendable, Equatable {
     public let text: String
     public let opensChunk: Bool
+    /// Where the text is: for a PDF, the page it starts on ("Page 238"), else nil (the hit's own
+    /// locator stands).
+    public var locator: String? = nil
 }
 
 /// What recovering a stored chunk's text needs of it: its KEY (the digest of its exact text and its

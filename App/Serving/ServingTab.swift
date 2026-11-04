@@ -67,6 +67,9 @@ struct ServingTab: View {
                              subtitle: "~/.claude/skills/omni-local-search/SKILL.md",
                              text: skillMarkdown, saveAs: "SKILL.md")
         }
+        .onReceive(NotificationCenter.default.publisher(for: AppDelegate.dismissSheetsForQuit)) { _ in
+            showMCPSheet = false; showSkillSheet = false
+        }
     }
 
     // MARK: - Server

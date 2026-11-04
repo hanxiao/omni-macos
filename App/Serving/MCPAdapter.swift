@@ -2,6 +2,7 @@ import Foundation
 import OmniKit
 import UniformTypeIdentifiers
 import ImageIO
+import PDFKit
 import AppKit
 
 /// MCP (Model Context Protocol) endpoint: JSON-RPC 2.0 over streamable HTTP at POST /mcp.
@@ -375,7 +376,7 @@ enum MCPAdapter {
         // and returns the next ten, and no ranking is held between calls.
         let poolSize = min(max(k + offset, Self.summaryPool), 190)
         let (hits, pool, groups, passages, tQueued, tRan) = await ServedWork.run {
-            () -> ([SearchHit], [ResultGroup], [ResultGroup], [String?], Date, Date) in
+            () -> ([SearchHit], [ResultGroup], [ResultGroup], [Passage?], Date, Date) in
             let tQueued = Date()
             let (hits, vector) = backend.searchReturningVector(query, topK: group ? min(poolSize * 3, 300) : poolSize, filter: filter, surface: surface)
             var pool = backend.groupedResults(hits, enabled: group, limit: poolSize)
@@ -432,7 +433,8 @@ enum MCPAdapter {
             let weaker = reps.indices.map { offset + $0 < poolWeak.count ? poolWeak[offset + $0] : false }
             for (i, h) in reps.enumerated() {
                 let score = Int((max(0, min(1, h.score)) * 100).rounded())
-                let loc = h.locator.isEmpty ? "" : ", \(h.locator)"
+                let locator = passages[i]?.locator ?? h.locator
+                let loc = locator.isEmpty ? "" : ", \(locator)"
                 // Resolution/duration/size suffix on media hits only (text hits stay clean):
                 // lets the reading agent weigh quality without a follow-up call.
                 let isTextKind = h.fileKind == FileKind.text.rawValue
@@ -453,7 +455,7 @@ enum MCPAdapter {
                 if weaker[i] { meta += ", weaker match" }
                 var text = "\(offset + i + 1). \(h.path)  (\(h.fileKind), \(score)%\(loc)\(meta))"
                 if maxSnippet > 0 {
-                    let snippet = oneLine(passages[i] ?? h.snippet)
+                    let snippet = oneLine(passages[i]?.text ?? h.snippet)
                     if !snippet.isEmpty { text += "\n   \(String(snippet.prefix(maxSnippet)))" }
                 }
                 content.append(["type": "text", "text": text])
@@ -593,8 +595,12 @@ enum MCPAdapter {
         // Each passage is the chunk's own text now, not its stored 220-character opening: the
         // whole chunk when it fits `max_snippet`, else the window of it that matches the query.
         if maxSnippet > 0 {
-            let texts = backend.passages(for: hits.map { ($0.path, $0.chunkIndex, $0.locator) }, query: query, vector: nil, width: maxSnippet)
-            for i in hits.indices { if let t = texts[i] { hits[i].snippet = t } }
+            let found = backend.passages(for: hits.map { ($0.path, $0.chunkIndex, $0.locator) }, query: query, vector: nil, width: maxSnippet)
+            for i in hits.indices {
+                guard let p = found[i] else { continue }
+                hits[i].snippet = p.text
+                if let l = p.locator { hits[i].locator = l }
+            }
         }
 
         var content: [[String: Any]] = []
@@ -834,7 +840,23 @@ enum MCPAdapter {
         if snap.paused {
             return "NOT indexed yet: indexing is PAUSED in Omni until the user resumes it (File > Resume Indexing)"
         }
-        return "NOT indexed: created in the last few seconds, skipped by an ignore rule or a kind turned off in Settings, or a file Omni could not read"
+        // The file is in an indexed folder, so these are about a file Omni was asked to read. The
+        // one line for every case left an empty file and one Omni may not open reading the same.
+        let attrs = try? FileManager.default.attributesOfItem(atPath: real)
+        if (attrs?[.size] as? Int) == 0 { return "NOT indexed: the file is empty" }
+        if !FileManager.default.isReadableFile(atPath: real) {
+            return "NOT indexed: its permissions do not let Omni read it"
+        }
+        if ext.lowercased() == "pdf", PDFDocument(url: URL(fileURLWithPath: real))?.isLocked == true {
+            return "NOT indexed: the PDF is password-protected"
+        }
+        if FileExtractor.textExtensions.contains(ext.lowercased()), FileExtractor.looksBinary(URL(fileURLWithPath: real)) {
+            return "NOT indexed: its contents are binary, not text"
+        }
+        if let m = attrs?[.modificationDate] as? Date, m.timeIntervalSinceNow > -10 {
+            return "NOT indexed yet: changed in the last few seconds"
+        }
+        return "NOT indexed: skipped by an ignore rule or a kind turned off in Settings, or Omni could not read its contents"
     }
 
     // MARK: - The tag_image tool
@@ -1168,13 +1190,38 @@ enum MCPAdapter {
         return nil
     }
 
+    /// The arguments that name files or folders on this Mac, by tool. `get_linked_file`'s path is on
+    /// another Mac, and a source's `key` is copied from list_sources.
+    static let localPathArguments: [String: Set<String>] = [
+        "search": ["folder", "folders", "exclude_folders"], "search_inline": ["paths"], "file_status": ["paths"],
+        "tag_image": ["paths"], "read_file": ["path"], "ocr": ["path"], "add_source": ["path"],
+    ]
+
+    /// A relative path typed at the command line is in the shell's folder. Read from `/` (the app's
+    /// own folder), `omni read_file notes.txt` run beside the file said "/notes.txt is not in
+    /// Omni's index" (full test 2026-11-03). Other clients send absolute paths and are not touched.
+    static func resolvingRelativePaths(_ args: [String: Any], tool: String, cwd: String) -> [String: Any] {
+        guard let keys = localPathArguments[tool], cwd.hasPrefix("/") else { return args }
+        func resolve(_ v: String) -> String {
+            let t = v.trimmingCharacters(in: .whitespaces)
+            guard !t.isEmpty, !t.hasPrefix("/"), !t.hasPrefix("~"), !t.contains("://") else { return v }
+            return normalizeStorePath((cwd as NSString).appendingPathComponent(t))
+        }
+        var out = args
+        for k in keys {
+            if let one = out[k] as? String { out[k] = resolve(one) }
+            else if let many = out[k] as? [Any] { out[k] = many.map { ($0 as? String).map(resolve) ?? $0 } }
+        }
+        return out
+    }
+
     /// `tools/call`, for either era: the arguments checked against the tool's schema, then the tool.
     static func callTool(id: Any, params: [String: Any], _ backend: any ServingBackend,
                          sources: SourcesControl?, surface: ServedSurface) async -> HTTPResponse {
         guard let name = params["name"] as? String else {
             return HTTPResponse.json(jsonRPCError(id: id, code: -32602, message: "missing tool name"))
         }
-        let args = params["arguments"] as? [String: Any] ?? [:]
+        var args = params["arguments"] as? [String: Any] ?? [:]
         // AN ARGUMENT THE TOOL DOES NOT TAKE IS AN ERROR, naming the ones it does. `topK` for
         // `top_k` - the slip every agent makes - used to be ignored without a word, and the call
         // ran with the default instead of what was asked.
@@ -1191,6 +1238,9 @@ enum MCPAdapter {
         // diagnostic blocks marked for stderr. Every other client's answer is unchanged.
         let cli = (params["_meta"] as? [String: Any])?[cliMetaKey] as? Bool == true
         let surface: ServedSurface = cli ? .cli : surface
+        if cli, let cwd = (params["_meta"] as? [String: Any])?[CLIProtocol.cwdKey] as? String {
+            args = resolvingRelativePaths(args, tool: name, cwd: cwd)
+        }
         switch name {
         case "search":        return await callSearch(id: id, args: args, backend: backend, sources: sources, surface: surface, cli: cli)
         case "search_inline", "file_status", "tag_image", "read_file":

@@ -99,7 +99,7 @@ codebase were already measured there, and many were rejected.
   `./Scripts/sync-metallib.sh`: SwiftPM does not compile Metal, so omni-verify, ocr-verify and the
   test bundle load a COPY of the app's kernels, which goes stale whenever MLX moves.
 - Tests: `swift build --build-tests && swift test --skip-build` with `OMNI_MODEL_DIR=<small model
-  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (894 tests). A
+  snapshot>` and `OMNI_NANO_MODEL_DIR=~/Library/Application Support/Omni/nano` (906 tests). A
   `[load_safetensors] Failed to open` from the external volume is transient: re-run.
 - Embedding parity: `omni-verify <modelDir> Fixtures/text_fixtures.json` (cosine >= 0.999, ids exact).
 - Heavy writes vs search: `mutbench <clone>/index.sqlite --crud <update|rename|delpaths|delfolder|delfolders|
@@ -142,6 +142,8 @@ codebase were already measured there, and many were rejected.
 - Watcher queue under churn and agent load: `Tools/agenteval/drain-soak.sh <app> <new scratch> [min]
   [port]` - generated corpus, churn, four searching clients, a sentinel every 20 s; a sentinel unindexed
   after 240 s is a STALL. With `OMNI_PERF_SCRIPT="repeat:2000;block:cpu:450"` 0.18.0 parks itself.
+- Open-vocabulary tags on the COCO photos (roadmap.md, "Image tags"): `omni-verify tagopen <model>
+  /Volumes/han2tb/openclaw-backup/workspace/dataroom-image-tagging <out.json> "%@" [template...]`.
 - Kernel probes (index.md, "The kernel review"): `omni-verify towerops [windows] [win] [heads] [dim]`
   (one vision attention block piece by piece), `projab [M] [hidden] [inter]` (backbone projections
   separate vs fused), `audiomem <model> <audioDir>` (MLX peak of a batched audio embed).
@@ -350,7 +352,10 @@ codebase were already measured there, and many were rejected.
   (slides and sheets a page at a time, the slide pictures Quick Look draws, the three-arm eval), and
   PDF pages as pictures (PDF tables and CSV tables measured and not built; read_file on CRLF lines;
   the new formats through MCP, CLI and HTTP), and the served surfaces reviewed by an agent (content
-  keys read as hex, dense hits' sizes, REST pages from the tool's pool, flat filters refused or read).
+  keys read as hex, dense hits' sizes, REST pages from the tool's pool, flat filters refused or read),
+  and a removal cut short by a quit (owed in the index, finished at the next open), and a full
+  test's findings (`in:` by a folder's name, binaries named .txt, locked PDFs, a PDF passage's own
+  page, the CLI's relative paths).
 - `ui.md` - native look and behaviour: search field chips, folder browser and columns, toolbar by
   mode, Liquid Glass, scroll edge, menus, settings, OCR workspace panes, drag-out, packages surveyed
   and rejected, macOS 14/15 toolbar, site, the shortcuts window and Finder folder names, Shortcuts,
@@ -360,9 +365,18 @@ codebase were already measured there, and many were rejected.
   squeezed by the centre item and Preview searching other words (#31, #32; `omni-verify pagephrase`),
   search history without a cap (`historybench`, history.json), and renders per step (`counts[...]` on
   each perf-script line: the menu bar out of the App's body, a flag per sidebar row, the pie in whole
-  percent).
+  percent), and a first-run review checked claim by claim (row icons in QuickLook's icon mode, chips
+  from pasted qualifiers, the label cache's own slice, the 1,280 x 800 first window, the OCR find bar
+  as a top bar; the slow first query that was the review's own harness), and the second review (the
+  results footer frozen by the always-equal list, Close Document as `reset()`, sidebar rows marked only
+  for the exact scope, `in:` by the sidebar's name, a linked Mac's row icon, the storage row polled),
+  and the third (the Settings window kept on screen when a taller pane grows it), and the fixes
+  reviewed before release (the word at the caret, plain-query spaces, word breaks, a row marked on Back),
+  and a full test of the candidate (quit with a sheet open, the header's scroll edge, history scopes,
+  the paused mark, the OCR rail and find, the search text in dark mode).
 - `testing.md` - UI tests and their traps, chaos suites, perf tour, hangwatch and the main-thread
-  stall investigations, the agent eval.
+  stall investigations, the agent eval, and two traps in driving a copy as a new user (preferences
+  outside `CFFIXED_USER_HOME`, a driver that waits on the main queue).
 - `link.md` - Linked Macs: pairing, the TLS link, search across Macs, the measurements and the
   security checks against a real app.
 - Also: `docs/OCR.md` (the OCR port's design and numbers), `docs/schema-v5.md`, `docs/clipboard.md`,

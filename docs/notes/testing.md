@@ -745,9 +745,11 @@ watchdog). Three modes of `Tools/agenteval/agenteval.py`, stdlib only:
     all three, 17 of 27 search-step blocks at 90 ms or more, median 146; without the filter menu 8,
     median 106, the rest ~69; without sort/view 3, the rest ~75; without the bookmark 17, median 129.
     The filter menu and the sort/view group are ~60-75 ms each to insert, the bookmark little.
-  - SO THEY ARRIVE IN TURN: `toolbarHasResults` follows `hasResults` a frame (16 ms) later, and
-    `toolbarShowsSortView` a frame after that, while leaving stays in the results' own frame (spread
-    over frames, a clear only paid for more toolbar passes: 20 clears a run over 100 ms against 3-8).
+  - SO THEY ARRIVE IN TURN (since 2026-11-03 `resultControlsShown` / `sortViewShown`, and kept once
+    shown: ui.md, "A full test of the release candidate"): `toolbarHasResults` follows `hasResults`
+    a frame (16 ms) later, and `toolbarShowsSortView` a frame after that, while leaving stays in the
+    results' own frame (spread over frames, a clear only paid for more toolbar passes: 20 clears a
+    run over 100 ms against 3-8).
     `ContentView` keeps reading `hasResults` - its empty states must not lag. Interleaved UI stress,
     10 rounds, threshold 100 ms, the build before vs this one: blocks over 100 ms 45/70 vs 22/45, over
     150 ms 25/21 vs 0/0, max 210/226 vs 139/121 ms, total blocked 6.8/9.2 vs 2.4/4.9 s; in the typing
@@ -776,3 +778,17 @@ watchdog). Three modes of `Tools/agenteval/agenteval.py`, stdlib only:
   disk: Small on /Volumes/han2tb put up "OmniChaos would like to access files on a removable volume",
   the app sat behind it at "model 0%" (footprint 48 MB) and three tests failed on the 240 s timeout.
   Never answer it; copy the model.
+
+## Two traps in driving a copy as a new user (2026-11-01)
+
+From checking an agent's first-run review (ui.md, "A first-run review, checked claim by claim"):
+- `CFFIXED_USER_HOME` DOES NOT KEEP PREFERENCES OUT OF THE REAL HOME. The renamed copy's defaults
+  (`NSWindow Frame main`, the split view's frames) were written to ~/Library/Preferences/<its bundle
+  id>.plist, and the next copy launched under the same id restored the first one's 1,000 x 660 window
+  even after `defaults delete`. A first launch is a bundle id that has never run (here
+  io.hanxiao.omni.review2 opened at 1,280 x 800); delete the test domains afterwards.
+- A DRIVER THAT WAITS ON THE MAIN QUEUE DELAYS EVERY MAINACTOR JOB. The review's in-app driver ran
+  its `wait` as `RunLoop.run(until:)` inside a main-queue timer handler: the run loop spins, AppKit
+  draws, but the main queue cannot drain, so a search's `MainActor.run` sat until the wait ended -
+  results 2-4 s after a 12 ms store search, read as a slow first query. Hangwatch stays silent (the
+  main thread is not blocked). Wait outside the app, and poll a quick read instead.

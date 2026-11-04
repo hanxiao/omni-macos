@@ -25,7 +25,7 @@ extension AppModel {
     /// THIS Mac (or this Mac's Recents, its clipboard, a Photos source) is a question about this
     /// Mac only.
     var searchesLinkedMacs: Bool {
-        linkedScope != nil || (filterFolders.isEmpty && !filterRecents && browsedPhotoSource == nil)
+        linkedScope != nil || (filterFolders.isEmpty && filterFolderNames.isEmpty && !filterRecents && browsedPhotoSource == nil)
     }
 
     /// Start the linked Macs' half of a search. Called by `search()` after it bumps the token.

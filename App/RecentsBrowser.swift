@@ -177,7 +177,7 @@ struct RecentsBrowser: View {
         }
         .onChange(of: selected) { _, p in if let p { proxy.scrollTo(p) } }
         .environment(\.defaultMinListRowHeight, BrowserMetrics.rowHeight)
-        .modifier(SoftTopScrollEdge())
+        .modifier(SoftTopScrollEdge(underHeader: true))
         .alternatingRowBackgrounds()
         .listStyle(.inset)
         }
@@ -191,7 +191,7 @@ struct RecentsBrowser: View {
             Text(Self.folderName(item.path))
                 .help(item.path.hasPrefix("photos://") ? "Photos"
                       : (item.path as NSString).deletingLastPathComponent)
-        case .kind: Text(FileKind(rawValue: item.kind)?.title ?? "--")
+        case .kind: Text(FileKind(rawValue: item.kind)?.singular ?? "--")
         case .dateIndexed:
             Text(item.indexedAt > 0
                  ? Date(timeIntervalSince1970: item.indexedAt).formatted(date: .abbreviated, time: .shortened)

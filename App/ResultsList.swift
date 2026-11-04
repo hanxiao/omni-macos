@@ -248,9 +248,9 @@ struct ResultsList<Footer: View>: View {
             }
             // Keys: ContentKeyMonitor on the body. Right/left disclose/collapse the selected
             // row's passages - the Finder list-view convention for expandable rows.
-            // SOFT SCROLL EDGE: content blurs under the toolbar's glass instead of clipping at a
-            // hard line. Applied to the scroll view ITSELF, which is what the modifier looks for.
-            .modifier(SoftTopScrollEdge())
+            // The SCROLL EDGE under the column header (SoftTopScrollEdge). Applied to the scroll
+            // view ITSELF, which is what the modifier looks for.
+            .modifier(SoftTopScrollEdge(underHeader: true))
             // Keep the selected row on screen as it moves (so arrowing past the fold scrolls).
             .onChange(of: model.selection) { _, sel in
                 guard let sel else { return }
@@ -603,8 +603,10 @@ struct ResultsList<Footer: View>: View {
 /// not the results - a search starting and finishing, the stats of a running index, the query
 /// itself - and each time it built a new list whose footer closure SwiftUI cannot compare, so the
 /// list and every visible row (each with an eagerly built context menu) re-ran: ~2 ms a row, 50 rows
-/// in a tall window. Everything the list shows, the footer included, is read from the model inside
-/// its own body, so observation re-renders it exactly when one of those values changes.
+/// in a tall window. Everything the list shows is read from the model inside its own body, so
+/// observation re-renders it exactly when one of those values changes. THE FOOTER TOO: it has to be
+/// a view that reads the model itself (`ResultsFooter`). One built from values in the caller's body
+/// is frozen at the values the list was created with, since a new list is never taken.
 /// A context menu that is built once the pointer has been over its row, not for every visible row
 /// on every render.
 ///
@@ -780,7 +782,7 @@ extension ResultRow {
         case .tags:
             Text(hit.showsTags && hit.snippet != fileName ? hit.snippet : "")
         case .kind:
-            Text(FileKind(rawValue: hit.fileKind)?.title ?? "")
+            Text(FileKind(rawValue: hit.fileKind)?.singular ?? "")
         case .folder:
             // The folder's name, as Recents shows it; the whole location on hover.
             let location = PhotoActions.location(hit.path, sources: model.photoSources)
@@ -811,6 +813,34 @@ extension ResultRow {
 /// placeholder, never "No passages": conflating the two flashed the empty state for the fetch's
 /// duration before the real rows swapped in.
 struct PassagesView: View {
+    /// A stored snippet is the chunk's first `defaultSnippetLength` characters, cut wherever that
+    /// fell: "executed in p" (review 2026-11-01). At the cap it ends before its last word when that
+    /// word runs to the cut; the fade below already says there is more. Words by the system's word
+    /// breaks, not spaces: Chinese and Japanese have none between words, and cut at the last space a
+    /// 220-character Chinese snippet with one early space showed its first three characters. A
+    /// snippet that is one word stays whole. Shorter snippets are the whole chunk and stay as they
+    /// are. Display only: open-at-passage reads the snippet itself. Cached: the word breaks cost
+    /// 16 us for an English snippet and 183 us for a Chinese one, and the view re-renders per hover.
+    static func wholeWords(_ snippet: String) -> String {
+        guard snippet.count >= Indexer.defaultSnippetLength else { return snippet }
+        if let hit = wholeWordsCache.object(forKey: snippet as NSString) { return hit as String }
+        var last: Range<String.Index>?
+        snippet.enumerateSubstrings(in: snippet.startIndex ..< snippet.endIndex,
+                                    options: [.byWords, .reverse, .substringNotRequired]) { _, r, _, stop in
+            last = r; stop = true
+        }
+        var out = snippet
+        if let r = last, r.upperBound == snippet.endIndex {
+            let kept = snippet[..<r.lowerBound]
+            if let end = kept.lastIndex(where: { !$0.isWhitespace }) { out = String(kept[...end]) }
+        }
+        wholeWordsCache.setObject(out as NSString, forKey: snippet as NSString)
+        return out
+    }
+    private static let wholeWordsCache: NSCache<NSString, NSString> = {
+        let c = NSCache<NSString, NSString>(); c.countLimit = 512; return c
+    }()
+
     let passages: [ChunkHit]?
     var fileName: String = ""
     var path: String = ""
@@ -834,7 +864,7 @@ struct PassagesView: View {
                             Text(p.locator).font(.caption2.weight(.medium)).foregroundStyle(.tertiary)
                         }
                         if !p.snippet.isEmpty, p.snippet != fileName {
-                            Text(p.snippet)
+                            Text(Self.wholeWords(p.snippet))
                                 .font(.body).foregroundStyle(.secondary)
                                 .lineLimit(3)
                                 // The fade signals there is more text before/after the excerpt -
@@ -1307,12 +1337,17 @@ private struct MarqueeSelect: ViewModifier {
 }
 
 
-/// `.soft` on Tahoe, nothing anywhere else: the scroll-edge effect that lets content blur under the
-/// toolbar's Liquid Glass rather than clip at its boundary.
+/// The top scroll-edge effect on Tahoe, nothing anywhere else. `.soft` lets content blur under the
+/// toolbar's Liquid Glass rather than clip at its boundary. A list under a pinned column header
+/// takes `.automatic` instead, the HIG's style for pinned table headers ("a more opaque visual
+/// separation"): under `.soft` the row scrolled beneath the header stayed legible through its
+/// titles, "note-02683.txt" behind "Name" in light and dark (full test 2026-11-03, three arms side
+/// by side: automatic leaves a faint blur, hard an opaque band).
 struct SoftTopScrollEdge: ViewModifier {
+    var underHeader = false
     func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
-            content.scrollEdgeEffectStyle(.soft, for: .top)
+            content.scrollEdgeEffectStyle(underHeader ? .automatic : .soft, for: .top)
         } else {
             content
         }

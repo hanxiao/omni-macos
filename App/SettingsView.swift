@@ -39,6 +39,7 @@ struct SettingsView: View {
         .frame(width: 480)
         .frame(maxHeight: Self.maxHeight)
         .fixedSize(horizontal: false, vertical: true)
+        .background(KeepOnScreen())
         // ONE TYPE SYSTEM FOR EVERY PANE, so a new row does not invent a sixth style:
         //   row text (labels, values)            body; values .secondary
         //   detail line under a row, legends     .caption, .secondary (red/orange only for errors)
@@ -61,6 +62,42 @@ struct SettingsView: View {
             .flatMap { ($0 as? String).flatMap(Double.init) }.map { CGFloat($0) }
             ?? NSScreen.main?.visibleFrame.height ?? 900
         return max(400, screen - 140)
+    }
+}
+
+/// THE WINDOW STAYS ON THE SCREEN when a taller pane grows it. A pane's resize keeps the window's
+/// top edge, so Performance, chosen in the window as it first opens on Files, reached 147 pt below
+/// the bottom of a 1,080 pt screen: its Benchmark section was off screen and no scroll could reach
+/// it (review 2026-11-02). The height is capped already (#30); this moves the window up by what
+/// went past the usable bottom. A move by the user is not a resize and is left alone.
+private struct KeepOnScreen: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { Watcher() }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    final class Watcher: NSView {
+        nonisolated(unsafe) private var observer: NSObjectProtocol?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+            observer = nil
+            guard let window else { return }
+            observer = NotificationCenter.default.addObserver(forName: NSWindow.didResizeNotification,
+                                                              object: window, queue: .main) { [weak self] _ in
+                // After the resize, not inside it.
+                DispatchQueue.main.async { MainActor.assumeIsolated { self?.fit() } }
+            }
+        }
+
+        private func fit() {
+            guard let w = window, let usable = w.screen?.visibleFrame else { return }
+            var f = w.frame
+            guard f.minY < usable.minY else { return }
+            f.origin.y = min(usable.minY, usable.maxY - f.height)
+            w.setFrame(f, display: true, animate: true)
+        }
+
+        deinit { if let observer { NotificationCenter.default.removeObserver(observer) } }
     }
 }
 
@@ -972,6 +1009,7 @@ private struct DiskBreakdown: View {
         case "Snippets":        return .pink
         case "Scan codes":      return .teal
         case "Filename index":  return .mint
+        case "Image labels":    return .indigo
         default:                return .gray
         }
     }
@@ -1099,7 +1137,7 @@ private struct HistoryTab: View {
                     Text("3 days").tag(3)
                     Text("7 days").tag(7)
                     Text("14 days").tag(14)
-                    Text("31 days").tag(31)
+                    Text("1 month").tag(31)
                     Text("Forever").tag(AppModel.keepHistoryForever)
                 }
                 .help("Bookmarks are never removed")
@@ -1119,6 +1157,7 @@ private struct HistoryTab: View {
             }
         }
         .formStyle(.grouped)
+        .onReceive(NotificationCenter.default.publisher(for: AppDelegate.dismissSheetsForQuit)) { _ in confirmClear = false }
         .confirmationDialog("Clear all recent searches?", isPresented: $confirmClear) {
             Button("Clear search history", role: .destructive) { model.clearSearchHistory() }
             Button("Cancel", role: .cancel) {}
@@ -1201,6 +1240,14 @@ private struct IndexTab: View {
                             Text("Frees \(ByteSize.file(m.bytesToReclaim)) when it finishes.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                        }
+                    }
+                    // Polled while it is on screen: nothing else reports progress once indexing
+                    // stops. The row goes when the work is done, and the poll with it.
+                    .task {
+                        while !Task.isCancelled {
+                            await model.refreshStorageMigration()
+                            try? await Task.sleep(for: .seconds(2))
                         }
                     }
                 }
@@ -1430,13 +1477,16 @@ private struct OCRModelRow: View {
 }
 
 /// What the OCR model is asked to do. The model itself lives in Storage, beside the embedding
-/// model, because that is where its four and a half gigabytes are.
+/// model, because that is where its four and a half gigabytes are - and its row is here too, the
+/// same view: someone who opens the OCR tab to turn transcription on found no model and no way to
+/// get one (review 2026-11-01).
 private struct OCRTab: View {
     @State private var batch = OCRSession.Settings.batchWidth
 
     var body: some View {
         Form {
             Section {
+                OCRModelRow()
                 Picker("Pages at once", selection: $batch) {
                     Text("Automatic").tag(0)
                     Text("One").tag(1)

@@ -170,7 +170,7 @@ struct PhotoSourceBrowser: View {
             // Arrow keys, since the List no longer owns the selection.
             .onChange(of: selected) { _, p in if let p { proxy.scrollTo(p) } }
             .environment(\.defaultMinListRowHeight, BrowserMetrics.rowHeight)
-            .modifier(SoftTopScrollEdge())
+            .modifier(SoftTopScrollEdge(underHeader: true))
             .alternatingRowBackgrounds()
             .listStyle(.inset)
         }
@@ -207,7 +207,7 @@ struct PhotoSourceBrowser: View {
 
     @ViewBuilder private func cell(_ col: BrowserColumn, _ hit: SearchHit) -> some View {
         switch col {
-        case .kind: Text(FileKind(rawValue: hit.fileKind)?.title ?? "--")
+        case .kind: Text(FileKind(rawValue: hit.fileKind)?.singular ?? "--")
         case .dateModified: Text(Date(timeIntervalSince1970: hit.modified).formatted(date: .abbreviated, time: .shortened))
         case .size: Text(hit.size > 0 ? ByteSize.file(hit.size) : "--")
         default: Text("--")

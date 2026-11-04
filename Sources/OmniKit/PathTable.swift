@@ -84,6 +84,49 @@ struct PathTable: Sendable {
         return dirBlob.withUnsafeBufferPointer { body(UnsafeBufferPointer(rebasing: $0[s ..< e])) }
     }
 
+    /// Every folder holding indexed files whose path ends in the components of `name` ("Edge",
+    /// "Edge/deep"), whatever case: the folders an `in:` value names when it is a folder's NAME,
+    /// the way the results' Folder column shows it. One pass over the directories (279k on a
+    /// 2.7M-file index), comparing bytes for an ASCII name and Strings otherwise.
+    func folders(named name: String) -> Set<String> {
+        let parts = name.split(separator: "/").filter { !$0.isEmpty }
+        guard !parts.isEmpty else { return [] }
+        let needle = "/" + parts.joined(separator: "/") + "/"
+        var out = Set<String>()
+        if needle.utf8.allSatisfy({ $0 < 0x80 }) {
+            let nb = Array(needle.lowercased().utf8)
+            for d in 0 ..< dirCount {
+                withDirBytes(d) { db in
+                    guard db.count >= nb.count else { return }
+                    var k = 0
+                    while k + nb.count <= db.count {
+                        var j = 0
+                        while j < nb.count {
+                            var c = db[k + j]
+                            if c >= 0x41, c <= 0x5A { c += 0x20 }
+                            if c != nb[j] { break }
+                            j += 1
+                        }
+                        if j == nb.count {
+                            out.insert(String(decoding: UnsafeBufferPointer(rebasing: db[0 ..< k + nb.count - 1]), as: UTF8.self))
+                        }
+                        k += 1
+                    }
+                }
+            }
+        } else {
+            for d in 0 ..< dirCount {
+                let dir = withDirBytes(d) { String(decoding: $0, as: UTF8.self) }
+                var from = dir.startIndex
+                while let r = dir.range(of: needle, options: [.caseInsensitive], range: from ..< dir.endIndex) {
+                    out.insert(String(dir[..<dir.index(before: r.upperBound)]))
+                    from = dir.index(after: r.lowerBound)
+                }
+            }
+        }
+        return out
+    }
+
     /// A file's name bytes: the path after its last "/".
     @inline(__always) func withNameBytes<R>(_ i: Int, _ body: (UnsafeBufferPointer<UInt8>) -> R) -> R {
         let s = nameStart(i), e = nameEnd[i]

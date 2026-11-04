@@ -99,11 +99,14 @@ struct OCRView: View {
                 DocumentTabs()
                 Divider()
             }
-            // On the transcript, not the stack: over the stack it sat on the tab strip.
+            // On the transcript, not the stack: over the stack it sat on the tab strip. A bar in
+            // the top safe area, not an overlay: floating over the text it hid the first line
+            // (review 2026-11-01, "# RECEIPT No. 4821" half covered), where now the text starts
+            // below it and scrolls under it, as Safari's find bar pushes the page down.
             content
-                .overlay(alignment: .top) {
+                .modifier(TopBar {
                     if !session.find.isEmpty { FindBar() }
-                }
+                })
         }
             .overlay(alignment: .bottom) {
                 if session.readoutVisible { ProgressReadout() }
@@ -355,6 +358,13 @@ struct PageRail: View {
             .onChange(of: session.visibleIndex) { _, id in
                 guard let id, session.isBusy else { return }
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(id, anchor: .center) }
+            }
+            // Once the run is over, the page it marks is brought into view when the mark moves -
+            // a find step pages away, a page picked by the keyboard - by the least scroll that
+            // shows it (no anchor): a page already on screen does not move under the reader.
+            .onChange(of: session.railSelection) { _, id in
+                guard let id, !session.isBusy else { return }
+                withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(id) }
             }
         }
         .accessibilityLabel("Pages")
@@ -906,7 +916,15 @@ private struct SourceEditor: NSViewRepresentable {
             // view is TextKit 2, and the geometry of a range it has not laid out yet is not there
             // to be read.
             let next = source.offsets.values.filter { $0 > offset }.min() ?? length
-            text.scrollRangeToVisible(NSRange(location: offset, length: max(1, next - offset - 1)))
+            let range = NSRange(location: offset, length: max(1, next - offset - 1))
+            // A text view just filled has no size and nothing laid out, and scrolled then it stayed at
+            // the top: as a run ended and this editor took over, the transcript went back to page 1
+            // while the navigator marked page 40 (full test 2026-11-03). Once it is on screen, it goes.
+            if reload {
+                DispatchQueue.main.async { [weak text] in text?.scrollRangeToVisible(range) }
+            } else {
+                text.scrollRangeToVisible(range)
+            }
         }
 
         /// The nth occurrence, counted the way `OCRSession.rebuildMatches` counts them: in order

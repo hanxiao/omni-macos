@@ -2553,7 +2553,6 @@ public final class Indexer: @unchecked Sendable {
         }
         return best
     }
-    nonisolated(unsafe) static var pageByPage = ProcessInfo.processInfo.environment["OMNI_PAGE_CHUNKS"] == "1"   // A/B, settled below
     /// A short multi-page PDF cut by page (`chunk`); off only in the labeled eval's leave-one-out arm
     /// (`omni-verify eval --no-pdf-pages`).
     nonisolated(unsafe) public static var shortPDFByPage = true
@@ -3996,6 +3995,9 @@ public final class Indexer: @unchecked Sendable {
         // cuts it (streamedPieces) - not through FileExtractor, which trims the file's ends - so its
         // chunks and keys are the ones its first index made and every unchanged vector is reused.
         if category == .text, Self.streamsText(file, settings: settings) {
+            // A binary with a text extension is not read as text (looksBinary); one read whole is
+            // caught where FileExtractor reads it.
+            if FileExtractor.looksBinary(file.url) { return DecodedItem(file: file) }
             if turns || file.size > FileExtractor.maxTextBytes {
                 return DecodedItem(file: file, kind: kind, payload: .textStream, meta: meta, contentKey: contentKey)
             }

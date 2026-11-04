@@ -173,15 +173,25 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
     /// PATH was the noise, not the folder, so the leaf comes back and the rest stays gone.
     /// Nil when the search had no `in:`, or when the label already IS the folder name (a
     /// pure-filter search, where repeating it would just stutter).
+    ///
+    /// The same holds for the other filters: `kyoto type:image`, `ext:md kyoto`, `kyoto sort:date`
+    /// and `kyoto score:40%` were four rows reading "kyoto" (full test 2026-11-03). Without a folder,
+    /// the first filter is shown the way the field's chip writes it ("type:image", "+1" for more).
     var displayScope: String? {
         guard !isFile else { return nil }
         let parsed = SearchQueryParser.parse(displayText)
-        guard let folder = parsed.qualifiers.first(where: { $0.key == "in" && !$0.negated }) else { return nil }
-        let leaf = SpecialFolder.name(forPath: folder.value)
-        guard !leaf.isEmpty, leaf != displayLabel else { return nil }
-        // Middle-elided, for the same reason the search field's chip is: the generated folders in
-        // this tree differ only in their SUFFIX, so a tail truncation renders siblings identically.
-        return AppModel.SearchToken.elided(leaf)
+        if let folder = parsed.qualifiers.first(where: { $0.key == "in" && !$0.negated }) {
+            let leaf = SpecialFolder.name(forPath: folder.value)
+            guard !leaf.isEmpty, leaf != displayLabel else { return nil }
+            // Middle-elided, for the same reason the search field's chip is: the generated folders in
+            // this tree differ only in their SUFFIX, so a tail truncation renders siblings identically.
+            return AppModel.SearchToken.elided(leaf)
+        }
+        // A pure-filter search already reads as its values; the words are what a filter qualifies.
+        guard !parsed.semanticText.trimmingCharacters(in: .whitespaces).isEmpty,
+              let first = parsed.qualifiers.first else { return nil }
+        let chip = AppModel.SearchToken(key: first.key, value: first.value, negated: first.negated).label
+        return parsed.qualifiers.count > 1 ? chip + " +\(parsed.qualifiers.count - 1)" : chip
     }
 }
 
@@ -459,21 +469,22 @@ final class AppModel {
             let has = !rawResults.isEmpty
             if has != hasResults {
                 hasResults = has
-                if !has {
-                    // Leaving: in the same frame as the results, as always - spread over frames, a
-                    // clear only paid for more toolbar passes (UI stress: 20 clears over 100 ms a run
-                    // against 3-8).
-                    if toolbarHasResults { toolbarHasResults = false }
-                    if toolbarShowsSortView { toolbarShowsSortView = false }
-                } else {
+                // The result controls arrive with the first results and then STAY (Han,
+                // 2026-11-03): a box cleared and typed into again, or cleared and left, no longer
+                // takes them out and puts them back. Each insertion was SwiftUI building and AppKit
+                // tiling three toolbar items, ~185 ms of main thread over two frames; kept, a search
+                // from an empty box costs 297 -> 110 ms (perf-script steps, interleaved). Before the
+                // first search the toolbar is as it was. (A second's linger came first: journey
+                // blocks over 100 ms 22.7 -> 19.7 a run; a clear then a pause still paid in full.)
+                if has, !sortViewShown {
                     // Arriving: a frame later, and the sort/view group a frame after that (see
-                    // toolbarHasResults). Each re-reads the state, so a clear in between wins.
+                    // resultControlsShown). Each re-reads the state, so a clear in between wins.
                     DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(16)) { [weak self] in
                         guard let self, self.hasResults else { return }
-                        if !self.toolbarHasResults { self.toolbarHasResults = true }
+                        if !self.resultControlsShown { self.resultControlsShown = true }
                         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(16)) { [weak self] in
-                            guard let self, self.hasResults, !self.toolbarShowsSortView else { return }
-                            self.toolbarShowsSortView = true
+                            guard let self, self.hasResults, !self.sortViewShown else { return }
+                            self.sortViewShown = true
                         }
                     }
                 }
@@ -485,14 +496,14 @@ final class AppModel {
     /// ask only this, and each new result set is a new array: reading `rawResults` itself re-ran
     /// them on every search (~500 ms of main thread per result set, measured).
     private(set) var hasResults = false
-    /// `hasResults` for the toolbar's result controls, ONE FRAME LATER. The first result set after a
-    /// clear inserted those controls in the same display cycle that laid the results out: one main-
-    /// thread block of ~145-185 ms, 40% of it the toolbar building and tiling three items (testing.md,
-    /// "UI stress"). Apart, the results draw first and the controls arrive in the next cycle.
-    private(set) var toolbarHasResults = false
+    /// The toolbar's result controls have appeared: set ONE FRAME after the first results, and kept
+    /// (see `rawResults`). In the same display cycle that laid the results out, inserting them was one
+    /// main-thread block of ~145-185 ms, 40% of it the toolbar building and tiling three items
+    /// (testing.md, "UI stress"). Apart, the results draw first and the controls arrive in the next.
+    private(set) var resultControlsShown = false
     /// And the sort/view group one cycle after the filter menu: SwiftUI builds each item's menus and
     /// segmented control as it appears, ~60-75 ms apiece, and together they were one ~146 ms block.
-    private(set) var toolbarShowsSortView = false
+    private(set) var sortViewShown = false
     var searching = false {
         // A stats refresh skipped for this search is owed, and the one-shot callers (pass end,
         // tag batch, purge, folder removal) have no next tick to pay it - see refreshIndexStats.
@@ -555,6 +566,8 @@ final class AppModel {
     private func pickPage(for path: String, then: @escaping @MainActor () -> Void) {
         guard path.lowercased().hasSuffix(".pdf"), !RemotePath.isRemote(path), let h = searchHit(for: path),
               h.locator.hasPrefix("Page "), let store, let engine, let qv = lastQueryVector else { then(); return }
+        // The row's passage already names its page: the page of the words on screen is the one to open.
+        guard passagePages["\(path)\u{1}\(h.chunkIndex)"] == nil else { then(); return }
         let pageVectors = passageRecovery?.windowVectors
         if pagePickToken != resultsToken { pagePickToken = resultsToken; pagePicked = [] }
         guard pagePicked.insert(path).inserted else { then(); return }
@@ -582,6 +595,9 @@ final class AppModel {
     /// stored opening. Open-at-the-match reads the snippet too, and is better for it: the phrase it
     /// hands Preview is now the matching one.
     @ObservationIgnored private var passageCache: [String: String] = [:]
+    /// The page each PDF row's passage starts on (`Passage.locator`), by the same key: the row
+    /// shows, opens and previews the page of the words it shows.
+    @ObservationIgnored private var passagePages: [String: String] = [:]
     @ObservationIgnored private var passageCacheQuery = ""
     private static let passageQueue = DispatchQueue(label: "omni.result-passages", qos: .userInitiated)
     private static let latestPassageJob = OSAllocatedUnfairLock(initialState: 0)
@@ -590,13 +606,20 @@ final class AppModel {
     static let passageRows = 24
 
     private func withPassages(_ hits: [SearchHit], resolved: String) -> [SearchHit] {
-        if passageCacheQuery != resolved { passageCacheQuery = resolved; passageCache = [:] }
+        if passageCacheQuery != resolved { passageCacheQuery = resolved; passageCache = [:]; passagePages = [:] }
         guard !passageCache.isEmpty else { return hits }
         return hits.map { h in
-            guard let t = passageCache["\(h.path)\u{1}\(h.chunkIndex)"], h.snippet != t else { return h }
-            var h = h; h.snippet = t; return h
+            let key = "\(h.path)\u{1}\(h.chunkIndex)"
+            guard let t = passageCache[key] else { return h }
+            let page = passagePages[key]
+            guard h.snippet != t || (page != nil && h.locator != page) else { return h }
+            var h = h; h.snippet = t
+            if let page { h.locator = page }
+            return h
         }
     }
+
+
 
     private func fillPassages(_ hits: [SearchHit], resolved: String) {
         guard let recovery = passageRecovery, let engine, let qv = lastQueryVector else { return }
@@ -633,12 +656,16 @@ final class AppModel {
             }
             guard current(), found.contains(where: { $0 != nil }) else { return }
             // An excerpt from inside the chunk reads as continued, as Mail and Spotlight show one.
-            let out = zip(items, found).compactMap { it, p in p.map { (it, $0.opensChunk ? $0.text : "\u{2026}" + $0.text) } }
+            let out = zip(items, found).compactMap { it, p in
+                p.map { (it, $0.opensChunk ? $0.text : "\u{2026}" + $0.text, $0.locator) }
+            }
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     guard let self, self.passageCacheQuery == resolved else { return }
-                    for (it, text) in out {
-                        self.passageCache["\(it.path)\u{1}\(it.chunk)"] = AppModel.oneLine(text)
+                    for (it, text, page) in out {
+                        let key = "\(it.path)\u{1}\(it.chunk)"
+                        self.passageCache[key] = AppModel.oneLine(text)
+                        if let page { self.passagePages[key] = page }
                     }
                     let updated = self.withPassages(self.rawResults, resolved: resolved)
                     if updated != self.rawResults { self.rawResults = updated }
@@ -1627,10 +1654,30 @@ final class AppModel {
     /// Matching passages (ranked chunks) of a file for the current query. Runs off the main actor:
     /// rankChunks does a queue.sync linear scan over all rows, which would stall the UI on a large
     /// index when a row is expanded.
+    /// A file's best chunks for the query, each shown by its passage: the window of it closest to
+    /// the query, on the page that window is on - what the row itself shows for its top chunk. The
+    /// stored opening of a chunk is its first 220 characters, so the panel showed the top of each
+    /// chunk and the matched sentence never appeared (full test 2026-11-03). Within the rows' budget;
+    /// a chunk past it keeps its opening.
     func passages(for path: String) async -> [ChunkHit] {
         if RemotePath.isRemote(path) { return await passagesRemote(path) }
         guard let store, let v = lastQueryVector else { return [] }
-        return await Task.detached(priority: .userInitiated) { store.rankChunks(v, path: path) }.value
+        let recovery = passageRecovery, engine = engine
+        return await Task.detached(priority: .userInitiated) {
+            let ranked = store.rankChunks(v, path: path)
+            guard let recovery, let engine, !ranked.isEmpty else { return ranked }
+            let items = ranked.map { (path: path, chunk: $0.chunkIndex, locator: $0.locator) }
+            let found = recovery.passages(items, query: v, width: Indexer.defaultSnippetLength,
+                                          budgetMs: PassageRecovery.rowsBudgetMs, shed: false) {
+                engine.embedPassages($0, waiting: true)
+            }
+            return ranked.indices.map { i in
+                guard let p = found[i] else { return ranked[i] }
+                return ChunkHit(chunkIndex: ranked[i].chunkIndex, score: ranked[i].score,
+                                snippet: AppModel.oneLine(p.opensChunk ? p.text : "\u{2026}" + p.text),
+                                locator: p.locator ?? ranked[i].locator)
+            }
+        }.value
     }
 
     var indexState: IndexState = .idle
@@ -2012,6 +2059,11 @@ final class AppModel {
     /// appear. Both were parsed and then dropped, so `-in:~/Library` - the FAQ's own example of an
     /// exclusion - scoped the search TO ~/Library, and `-ext:pdf` meant `ext:pdf`.
     var filterFoldersExclude: [URL] = [] { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    /// `in:` / `-in:` values that name a folder by its NAME ("Edge", "Edge/deep") rather than a
+    /// path or a root: the store resolves them at search time to every indexed folder so named
+    /// (SearchFilter.folderNames). Kept as typed; the box spells them back the same way.
+    var filterFolderNames: [String] = [] { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    var filterFolderNamesExclude: [String] = [] { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     var filterExtExclude: String = "" { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
     /// Explicit `filename:` intent. Not a filter - it does not exclude anything - but a request for
     /// the filename channel to lead the ranking. Kept beside the filters because it arrives through
@@ -2436,6 +2488,20 @@ final class AppModel {
     /// One-time storage migration: rows already converted, rows total, bytes still to reclaim.
     /// nil when there is nothing to do, so a finished index shows no banner at all.
     var storageMigration: (done: Int, total: Int, bytesToReclaim: Int64)? = nil
+    private func assignStorageMigration(_ m: (done: Int, total: Int, bytesToReclaim: Int64)?) {
+        if storageMigration.map({ [$0.done, $0.total, Int($0.bytesToReclaim)] })
+            != m.map({ [$0.done, $0.total, Int($0.bytesToReclaim)] }) {
+            storageMigration = m
+        }
+    }
+    /// The migration's progress alone, for the row that shows it. The stats tick that brings it
+    /// stops with indexing, and on a new index the stamp that finishes the work lands two seconds
+    /// after the last write: the row sat at "0%" until the next pass (review 2026-11-02).
+    func refreshStorageMigration() async {
+        guard let store else { return }
+        let m = await Task.detached(priority: .utility) { store.storageMigration }.value
+        assignStorageMigration(m)
+    }
     /// On-disk cost per file. The index is not one file, and a single number for it reads as though
     /// it were - after the migration the database is the smallest of the three that matter.
     var diskUse: [VectorStore.DiskUse.Entry] = []
@@ -3416,8 +3482,22 @@ final class AppModel {
         guard hits.count > 1, !groupingKeys.isEmpty || !groupingVectors.isEmpty else {
             return hits.map { ResultGroup(members: [$0], reason: .single) }
         }
-        return ResultGrouping.group(hits: hits, vectors: groupingVectors, contentKeys: groupingKeys,
-                                    nearEnabled: groupNearDuplicates)
+        let groups = ResultGrouping.group(hits: hits, vectors: groupingVectors, contentKeys: groupingKeys,
+                                          nearEnabled: groupNearDuplicates)
+        guard !groupingCopies.isEmpty else { return groups }
+        // An exact stack takes the copies its pool left out: the same bytes (key and size), found
+        // the same way, so each is its representative at another path.
+        let shown = Set(hits.map(\.path))
+        return groups.map { g in
+            guard g.reason == .exact, let key = groupingKeys[g.representative.path]?.key,
+                  let all = groupingCopies[key] else { return g }
+            let rep = g.representative
+            let more = all.filter { !shown.contains($0.path) && $0.size == rep.size }
+                .map { rep.copy(at: $0.path, modified: $0.modified, size: $0.size) }
+            guard !more.isEmpty else { return g }
+            var g = g; g.members += more.sorted { $0.path < $1.path }
+            return g
+        }
     }
 
     private func recomputeResults() {
@@ -3448,7 +3528,9 @@ final class AppModel {
         // sort first by name. Grouping only ever runs over hits that already passed the threshold,
         // so a copy below the cut can never resurrect its stack.
         let collapsed = collapse(above)
-        if collapsedCount != above.count - collapsed.count { collapsedCount = above.count - collapsed.count }
+        // Every copy a stack holds beyond the one shown, those outside the result pool too.
+        let stacked = collapsed.reduce(0) { $0 + $1.count - 1 }
+        if collapsedCount != stacked { collapsedCount = stacked }
         var ordered: [ResultGroup]
         // Each order in its own direction; ties keep the relevance order the store produced.
         func text(_ g: ResultGroup) -> String {
@@ -3569,13 +3651,21 @@ final class AppModel {
         if fileQuery == nil, !instantSearchEnabled {
             guard (query.isEmpty ? rawQuery : query) == resolvedQuery else { return }
         }
+        backgroundRefreshPending = true
         scheduleSearch()
     }
+
+    /// A refresh the index asked for, not the user (`refreshSearchAfterBackgroundChange`): it keeps
+    /// the Recents the search started with (`recentsScope`, SearchFilter.recentsPaths).
+    @ObservationIgnored private var backgroundRefreshPending = false
+    /// The Recents a user's search started with, by what that search was (query and filters).
+    @ObservationIgnored private var recentsScope: (sig: String, paths: Set<String>)?
 
     var filtersActive: Bool {
         !filterKinds.isEmpty || !filterFolders.isEmpty || filterRecents
             || !filterExt.isEmpty || !filterTags.isEmpty || !filterTagsExclude.isEmpty
             || !filterExtExclude.isEmpty || !filterFoldersExclude.isEmpty
+            || !filterFolderNames.isEmpty || !filterFolderNamesExclude.isEmpty
             || dateRange != .any
             || minScore != Self.defaultMinScore
     }
@@ -4315,11 +4405,12 @@ final class AppModel {
         // Built in locals from the defaults and written once each, only where it changed: a reset
         // followed by a re-set wrote every filter twice per keystroke even when nothing moved.
         var kinds: Set<FileKind> = [], ext = "", filename = "", tags = "", tagsExclude = ""
-        var extExclude = "", foldersExclude: [URL] = []
+        var extExclude = "", foldersExclude: [URL] = [], names: [String] = [], namesExclude: [String] = []
         var date = DateRange.any, score = Self.defaultMinScore, sort = SortOrder.relevance
         func commitFilters(folders: [URL], recents: Bool) {
             assign(\.filterKinds, kinds); assign(\.filterExt, ext); assign(\.filterFolders, folders)
             assign(\.filterExtExclude, extExclude); assign(\.filterFoldersExclude, foldersExclude)
+            assign(\.filterFolderNames, names); assign(\.filterFolderNamesExclude, namesExclude)
             assign(\.filterFilename, filename); assign(\.filterRecents, recents)
             assign(\.filterTags, tags); assign(\.filterTagsExclude, tagsExclude)
             assign(\.dateRange, date); assign(\.minScore, score); assign(\.sortOrder, sort)
@@ -4372,11 +4463,18 @@ final class AppModel {
             // ACCUMULATES, like `tag:` above and unlike every other qualifier: `in:A in:B` means
             // both folders. Last-one-wins silently dropped A, which is the shape of issue #18.
             case "in":
+                // A value that is neither a path nor a root's name is a folder's name, for the store.
+                let name = Self.folderName(qual.value)
                 if qual.negated {
-                    if qual.value.lowercased() != "recents", let url = Self.resolveFolder(qual.value),
-                       !foldersExclude.contains(url) { foldersExclude.append(url) }
+                    if qual.value.lowercased() != "recents" {
+                        for url in resolveFolders(qual.value) where !foldersExclude.contains(url) { foldersExclude.append(url) }
+                        if let name, resolveFolders(qual.value).isEmpty, !namesExclude.contains(name) { namesExclude.append(name) }
+                    }
                 } else if qual.value.lowercased() == "recents" { recents = true }
-                else if let url = Self.resolveFolder(qual.value), !folders.contains(url) { folders.append(url) }
+                else {
+                    for url in resolveFolders(qual.value) where !folders.contains(url) { folders.append(url) }
+                    if let name, resolveFolders(qual.value).isEmpty, !names.contains(name) { names.append(name) }
+                }
             case "filename": filename = qual.negated ? "" : qual.value
             case "date": if let d = DateRange(rawValue: qual.value.lowercased()) { date = d }
             case "after": if let d = Self.mapAfter(qual.value) { date = d }
@@ -4404,6 +4502,7 @@ final class AppModel {
     private func resetAllFilters() {
         filterKinds = []; filterExt = ""; filterFolders = []; filterFilename = ""; filterRecents = false
         filterTags = ""; filterTagsExclude = ""; filterExtExclude = ""; filterFoldersExclude = []
+        filterFolderNames = []; filterFolderNamesExclude = []
         dateRange = .any; minScore = Self.defaultMinScore; sortOrder = .relevance
     }
 
@@ -4448,6 +4547,8 @@ final class AppModel {
         if filterRecents { parts.append("in:Recents") }
         for f in filterFolders { parts.append("in:" + Self.quoteIfNeeded(f.path)) }
         for f in filterFoldersExclude { parts.append("-in:" + Self.quoteIfNeeded(f.path)) }
+        for n in filterFolderNames { parts.append("in:" + Self.quoteIfNeeded(n)) }
+        for n in filterFolderNamesExclude { parts.append("-in:" + Self.quoteIfNeeded(n)) }
         if dateRange != .any { parts.append("date:" + dateRange.rawValue) }
         if minScore != Self.defaultMinScore { parts.append("score:\(Int((minScore * 100).rounded()))%") }
         if sortOrder != .relevance { parts.append("sort:" + (sortOrder == .name ? "name" : "date")) }
@@ -4552,11 +4653,25 @@ final class AppModel {
         return t.hasPrefix(".") ? String(t.dropFirst()) : t
     }
 
-    private static func resolveFolder(_ s: String) -> URL? {
+    /// An `in:` value's folders: an indexed folder by the name the sidebar shows it under (the
+    /// root's own URL, so the scope is that row's), else the value as a path. Neither - a folder's
+    /// own name - is none here: `folderName` hands it to the store.
+    private func resolveFolders(_ s: String) -> [URL] {
+        let named = SearchQueryParser.folderPaths(named: s, roots: roots.map { ($0.path, SpecialFolder.name(for: $0)) })
+        if !named.isEmpty {
+            return named.map { p in roots.first { $0.path == p } ?? URL(fileURLWithPath: p, isDirectory: true) }
+        }
         var p = s.trimmingCharacters(in: .whitespaces)
-        guard !p.isEmpty else { return nil }
-        if p == "~" || p.hasPrefix("~/") { p = (p as NSString).expandingTildeInPath }
-        return URL(fileURLWithPath: p)
+        guard p.hasPrefix("/") || p == "~" || p.hasPrefix("~/") else { return [] }
+        if p.hasPrefix("~") { p = (p as NSString).expandingTildeInPath }
+        return [URL(fileURLWithPath: p)]
+    }
+
+    /// An `in:` value that is not a path: a folder's name, or a root's (resolveFolders takes those).
+    nonisolated static func folderName(_ s: String) -> String? {
+        let t = s.trimmingCharacters(in: .whitespaces)
+        guard !t.isEmpty, !t.hasPrefix("/"), !t.hasPrefix("~") else { return nil }
+        return t
     }
 
     private func currentFilter() -> SearchFilter {
@@ -4567,6 +4682,8 @@ final class AppModel {
         f.ext = filterExt.isEmpty ? nil : filterExt
         f.excludeExts = filterExtExclude.split(separator: ",").map(String.init).filter { !$0.isEmpty }
         f.excludeFolders = filterFoldersExclude.map(\.path)
+        f.folderNames = filterFolderNames
+        f.excludeFolderNames = filterFolderNamesExclude
         f.filenameQuery = filterFilename.isEmpty ? nil : filterFilename
         f.since = dateRange.since
         // Terms only; the store resolves them to path sets on its own queue (cached), so no
@@ -5275,6 +5392,7 @@ final class AppModel {
             // A folder renamed or moved while Omni was closed. No pass of its own: the launch pass
             // below covers the new path, while the old rows are still there to reuse.
             followMovedFolders(kick: false)
+            finishOwedRemovals(store)
             startClipboard()
             restartWatcher()
             // Off the main thread: it lists the shared temporary directory, which measured 2.7 s of
@@ -5556,10 +5674,7 @@ final class AppModel {
                 self.refreshDeniedRoots()
                 self.assign(\.dbPath, path)
                 self.assign(\.dbSizeBytes, size)
-                if self.storageMigration.map({ [$0.done, $0.total, Int($0.bytesToReclaim)] })
-                    != migration.map({ [$0.done, $0.total, Int($0.bytesToReclaim)] }) {
-                    self.storageMigration = migration
-                }
+                self.assignStorageMigration(migration)
                 self.assign(\.diskUse, disk)
                 if let lastTs { self.assign(\.lastIndexed, Date(timeIntervalSince1970: lastTs)) }
                 // Require engineDim > 0: before the engine reports its dimension the fingerprint is
@@ -6080,11 +6195,14 @@ final class AppModel {
         guard let store else { return }
         if indexState == .indexing || !activeRoots.isEmpty || fsReconcileInFlight {
             pendingRootRemovals.insert(key)
+            Task.detached(priority: .utility) { store.oweRemoval([key]) }
             indexer?.cancel()
             return
         }
+        let keep = roots.map(\.path)
         Task.detached {
-            store.deleteUnderFolder(key)
+            store.oweRemoval([key])
+            Self.dropRemovedFolder(key, keeping: keep, store: store)
             store.compact()
             await MainActor.run {
                 self.refreshIndexStats(store)
@@ -6410,12 +6528,15 @@ final class AppModel {
             // re-insert vectors); deleting now just races its re-insertion. Defer the delete and
             // cancel - the pass's completion drops the vectors once it has stopped, then resumes.
             pendingRootRemovals.insert(url.path)
+            // Owed in the index from now, in case the app quits before the pass winds down.
+            Task.detached(priority: .utility) { store.oweRemoval([url.path]) }
             indexer?.cancel()
         } else {
             // Drop that folder's vectors so removed folders stop appearing in results, then
             // reclaim the disk space those rows held (SQLite keeps freed pages until VACUUM).
             let keep = roots.map(\.path)
             Task.detached {
+                store.oweRemoval([url.path])   // VectorStore.owedRemovals; the drop settles it
                 Self.dropRemovedFolder(url.path, keeping: keep, store: store)
                 await self.afterBulkDelete(store)
                 store.compact()
@@ -6574,7 +6695,10 @@ final class AppModel {
     /// With nothing to keep it is the folder delete it always was. Otherwise the files go through
     /// `deletePaths`, the sliced delete, as the ignore-rule prune does. This also covers "/", which
     /// `deleteUnderFolder` refuses as a whole-index wipe.
+    ///
+    /// Settles the removal the index was owed (VectorStore.owedRemovals) once the rows are gone.
     nonisolated static func dropRemovedFolder(_ folder: String, keeping roots: [String], store: VectorStore) {
+        defer { store.settleRemoval([folder]) }
         let keep = roots.filter { $0 != folder && RootScope.covers(folder, $0) }
         guard !keep.isEmpty else { store.deleteUnderFolder(folder); return }
         var drop = Set<String>()
@@ -6582,6 +6706,26 @@ final class AppModel {
             if RootScope.covers(folder, path), !keep.contains(where: { RootScope.covers($0, path) }) { drop.insert(path) }
         }
         store.deletePaths(drop)
+    }
+
+    /// Removals a quit, a crash or an update's relaunch cut short (VectorStore.owedRemovals), finished
+    /// at open as the removal would have finished them. A key inside a source again (added back
+    /// before its delete ran) is that source's and keeps its rows. Not deferred behind a pass as
+    /// removeRoot's delete is: no pass crawls what is no source, so there is no re-insert to race.
+    private func finishOwedRemovals(_ store: VectorStore) {
+        let keep = roots.map(\.path), photos = Set(photoSources.map(\.key))
+        Task.detached(priority: .utility) {
+            let owed = store.owedRemovals
+            guard !owed.isEmpty else { return }
+            let back = owed.filter { k in photos.contains(k) || keep.contains { RootScope.covers($0, k) } }
+            store.settleRemoval(back)
+            let drop = owed.filter { !back.contains($0) }
+            omniPerfLog("owed removals at open: \(drop.count) to finish, \(back.count) added back")
+            guard !drop.isEmpty else { return }
+            for k in drop { Self.dropRemovedFolder(k, keeping: keep, store: store) }
+            await self.afterBulkDelete(store)
+            store.compact()
+        }
     }
 
     private func requeuePromoted(_ promoted: [URL]) {
@@ -6878,6 +7022,7 @@ final class AppModel {
         [filterKinds.map(\.rawValue).sorted().joined(separator: ","),
          filterFolder?.path ?? "", filterExt, filterFilename, filterTags, filterTagsExclude,
          filterExtExclude, filterFoldersExclude.map(\.path).joined(separator: ">"),
+         filterFolderNames.joined(separator: ">"), filterFolderNamesExclude.joined(separator: ">"),
          dateRange.rawValue, String(sortOrder.hashValue)].joined(separator: "\u{1}")
     }
 
@@ -6887,6 +7032,9 @@ final class AppModel {
     /// nudge and every sort change, so it must never touch the store itself.
     @ObservationIgnored private var groupingKeys: [String: (key: String, modified: Double)] = [:]
     @ObservationIgnored private var groupingVectors: [String: [Float]] = [:]
+    /// Every copy on this Mac of a content key two or more hits share, as the search's filter allows
+    /// (`VectorStore.copies`): an exact stack holds them all, not only the ones in the result pool.
+    @ObservationIgnored private var groupingCopies: [String: [(path: String, modified: Double, size: Int)]] = [:]
 
     /// Load the collapsing inputs for `hits` on a background task, then republish the derived
     /// results. Called after the hits themselves are on screen: grouping is a refinement of a list
@@ -6905,9 +7053,12 @@ final class AppModel {
     private func loadGroupingInputs(for hits: [SearchHit], token: String) {
         // A linked Mac's file has no row in this store; copies are only stacked within this Mac.
         let hits = hits.filter { !RemotePath.isRemote($0.path) }
-        guard let store, hits.count > 1 else { groupingKeys = [:]; groupingVectors = [:]; return }
+        guard let store, hits.count > 1 else { groupingKeys = [:]; groupingVectors = [:]; groupingCopies = [:]; return }
         let paths = hits.map(\.path)
         let wantNear = groupNearDuplicates
+        var scope = currentFilter()
+        scope.excludeFolders.append(AppModel.clipboardDirectory.path)
+        let filter = scope
         // A file can only group with one of the SAME kind and extension (the clustering's own
         // guards), so a hit whose (kind, ext) bucket has no other member can never be part of a
         // stack and its vector is never read. Exact, not heuristic - it applies the guard earlier -
@@ -6920,13 +7071,18 @@ final class AppModel {
         let cached = vectorCache
         let missing = wantNear ? groupable.filter { cached[$0] == nil } : []
         Task { [weak self] in
-            let loaded = await Task.detached(priority: .userInitiated) { () -> ([String: (key: String, modified: Double)], [String: [Float]], Double, Double) in
+            let loaded = await Task.detached(priority: .userInitiated) { () -> ([String: (key: String, modified: Double)], [String: [Float]], Double, Double, [String: [(path: String, modified: Double, size: Int)]]) in
                 let t0 = DispatchTime.now().uptimeNanoseconds
                 let keys = store.contentKeys(paths: paths)
                 let t1 = DispatchTime.now().uptimeNanoseconds
                 let vecs = missing.isEmpty ? [:] : store.pooledVectors(paths: missing)
                 let t2 = DispatchTime.now().uptimeNanoseconds
-                return (keys, vecs, Double(t1 - t0) / 1e6, Double(t2 - t1) / 1e6)
+                // Only a key two hits share can stack; its copies outside the pool are one indexed read.
+                var seen: [String: Int] = [:]
+                for k in keys.values { seen[k.key, default: 0] += 1 }
+                let shared = seen.filter { $0.value > 1 }.map(\.key)
+                let copies = shared.isEmpty ? [:] : store.copies(ofContentKeys: shared, filter: filter)
+                return (keys, vecs, Double(t1 - t0) / 1e6, Double(t2 - t1) / 1e6, copies)
             }.value
             if omniMemLogEnabled {
                 FileHandle.standardError.write(Data(String(format: "[group] paths=%d missing=%d keys=%.1fms vectors=%.1fms\n",
@@ -6935,6 +7091,7 @@ final class AppModel {
             await MainActor.run {
                 guard let self, self.resultsToken == token else { return }   // superseded search
                 self.groupingKeys = loaded.0
+                self.groupingCopies = loaded.4
                 self.vectorCache.merge(loaded.1) { _, new in new }
                 // Over the cap, keep exactly the current page rather than dropping everything:
                 // wholesale clearing throws away the vectors the very next keystroke needs.
@@ -7031,9 +7188,10 @@ final class AppModel {
 
     /// Drop this Mac's folder and Recents scopes without re-running anything; the box follows.
     func clearLocalScopeQuietly() {
-        guard !filterFolders.isEmpty || filterRecents else { return }
+        guard !filterFolders.isEmpty || !filterFolderNames.isEmpty || filterRecents else { return }
         suppressFilterEffects = true
         filterFolders = []
+        filterFolderNames = []
         filterRecents = false
         suppressFilterEffects = false
         syncBoxFromFilters(reSearch: false)
@@ -7061,7 +7219,22 @@ final class AppModel {
             cancelFolderVizFit()
         }
         if queryError != nil { queryError = nil }   // a no-op write still re-renders the window
-        let filter = currentFilter()
+        var scoped = currentFilter()
+        let background = backgroundRefreshPending
+        backgroundRefreshPending = false
+        if filterRecents {
+            let sig = (fileQuery?.url.path ?? query) + "\u{1}" + filterSignature() + "\u{1}\(recentsLimit)"
+            if background, let s = recentsScope, s.sig == sig {
+                scoped.recentsPaths = s.paths
+            } else if !background {
+                let limit = recentsLimit
+                Task.detached(priority: .utility) { [weak self] in
+                    let paths = store.recentPaths(limit: limit)
+                    await MainActor.run { self?.recentsScope = (sig, paths) }
+                }
+            }
+        }
+        let filter = scoped
         searchToken += 1
         let token = searchToken
         searchStartedAt = Date()
@@ -8355,7 +8528,7 @@ final class AppModel {
     /// the index stayed paused for good: no file event drained, no folder caught up, nothing said
     /// why. Seen on a real Mac after an afternoon of agent traffic (index.md, "The index that
     /// paused itself").
-    private var userPaused = false
+    private(set) var userPaused = false
     /// Index runs launched and not yet back on the main actor: the full pass (counted from before
     /// its prelude), a catch-up, a watcher reconcile, a tag batch. The proof the watchdog needs:
     /// with none outstanding, a flag that claims work in flight is one nothing will ever clear.

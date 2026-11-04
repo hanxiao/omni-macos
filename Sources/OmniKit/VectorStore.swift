@@ -86,6 +86,16 @@ public struct SearchHit: Sendable, Equatable {
     }
 }
 
+extension SearchHit {
+    /// This hit, for a byte-identical copy of its file elsewhere: what was found in one is in the other.
+    public func copy(at path: String, modified: Double, size: Int) -> SearchHit {
+        var h = SearchHit(path: path, score: score, snippet: snippet, kind: kind, chunkIndex: chunkIndex, modified: modified)
+        h.width = width; h.height = height; h.duration = duration; h.size = size; h.locator = locator
+        h.chunkCount = chunkCount; h.lift = lift; h.modelScale = modelScale; h.via = via
+        return h
+    }
+}
+
 /// One matching passage (chunk) within a file.
 public struct ChunkHit: Sendable, Identifiable {
     public let chunkIndex: Int
@@ -93,6 +103,9 @@ public struct ChunkHit: Sendable, Identifiable {
     public let snippet: String
     public let locator: String
     public var id: Int { chunkIndex }
+    public init(chunkIndex: Int, score: Float, snippet: String, locator: String) {
+        self.chunkIndex = chunkIndex; self.score = score; self.snippet = snippet; self.locator = locator
+    }
 }
 
 /// One matching passage when the search spans an explicit SET of files (so it carries its
@@ -103,7 +116,7 @@ public struct InlineChunkHit: Sendable {
     public let chunkIndex: Int
     public let score: Float
     public var snippet: String
-    public let locator: String
+    public var locator: String
 }
 
 /// Per-FILE mean-pooled, L2-normalized fp32 vectors for a folder, used by the folder embedding
@@ -255,6 +268,11 @@ public struct SearchFilter: Sendable {
     /// Resolved by the store at search entry into the same allow set tag terms use, so every
     /// search route honours it the way it honours `tag:`; nil means no such scope.
     public var recentsLimit: Int? = nil
+    /// The Recents a search STARTED with, for its live refreshes: with this set, `recentsLimit` scopes
+    /// to these paths instead of the newest files now. A folder indexing under an open Recents search
+    /// replaced its whole scope a refresh at a time, and the 100% match of a Find Similar left the
+    /// list without a word (full test 2026-11-03). A new search takes a new Recents.
+    public var recentsPaths: Set<String>? = nil
     /// Folders whose files never appear: `-in:` in the search box, and the clipboard history on the
     /// served surfaces, so an agent on the machine cannot search what the user copied. A byte-prefix
     /// clause exactly like `folderPrefixes`, NOT a resolved path set: it used to be resolved into
@@ -263,12 +281,20 @@ public struct SearchFilter: Sendable {
     public var excludeFolders: [String] = [] {
         didSet { excludeSlashBytes = excludeFolders.map { Array(($0 + "/").utf8) } }
     }
+    /// `in:` and `-in:` values that are a folder's NAME, not a path or a root's name: `in:Edge`,
+    /// the way the results' Folder column shows it. The store resolves each at search entry into
+    /// every indexed folder of that name (`PathTable.folders(named:)`), added to `folderPrefixes`
+    /// / `excludeFolders`; a name no folder has scopes to nothing. Read as a path from `/`, such a
+    /// value matched nothing and said nothing (full test 2026-11-03).
+    public var folderNames: [String] = []
+    public var excludeFolderNames: [String] = []
     private(set) var excludeSlashBytes: [[UInt8]] = []
     /// `-ext:` - extensions (no dot) whose files never appear.
     public var excludeExts: [String] = []
     /// A clause the store resolves into a path set at search entry.
     var needsPathSets: Bool {
         !tagTerms.isEmpty || !tagExcludeTerms.isEmpty || recentsLimit != nil
+            || !folderNames.isEmpty || !excludeFolderNames.isEmpty
     }
     /// Any clause decided per FILE from its path. The ONE predicate every search route asks before
     /// building or consulting a per-file mask; four routes each kept their own copy of it, and a
@@ -4552,6 +4578,60 @@ public final class VectorStore: @unchecked Sendable {
     /// sidecar row whose modified matches the live chunk rows (a stale row from an older app
     /// rewriting chunks must not mislabel). Bounded by the caller (search winners, <= 200);
     /// PK lookups only, no vector data touched.
+    /// Every indexed file whose content key is one of `keys` (as `contentKeys` writes them, hex) and
+    /// that `filter` lets through, with its modified time and size: the copies of a file wherever
+    /// they are. A result page holds only the copies inside its pool, so 121 identical pictures
+    /// stacked as "120 copies" (full test 2026-11-03).
+    public func copies(ofContentKeys keys: [String], filter: SearchFilter) -> [String: [(path: String, modified: Double, size: Int)]] {
+        guard !keys.isEmpty else { return [:] }
+        return queue.sync {
+            guard dbOpen() else { return [:] }
+            let f = filter.needsPathSets ? resolveTagFilterLocked(filter) : filter
+            var out: [String: [(path: String, modified: Double, size: Int)]] = [:]
+            var st: OpaquePointer?
+            guard sqlite3_prepare_v2(db, """
+                SELECT d.path, f.name, f.kind, f.modified, k.size FROM dedup k
+                  JOIN files f ON f.id = k.file_id JOIN dirs d ON d.id = f.dir_id
+                 WHERE k.key = ?1 AND EXISTS(SELECT 1 FROM \(rowTableShared) c WHERE c.file_id = f.id)
+                 LIMIT 10000;
+                """, -1, &st, nil) == SQLITE_OK else { return [:] }
+            defer { sqlite3_finalize(st) }
+            for key in Set(keys) {
+                let bytes = Self.hexBytes(key)
+                guard !bytes.isEmpty else { continue }
+                sqlite3_reset(st); sqlite3_clear_bindings(st)
+                _ = bytes.withUnsafeBytes { sqlite3_bind_blob(st, 1, $0.baseAddress, Int32(bytes.count), SQLITE_TRANSIENT) }
+                while sqlite3_step(st) == SQLITE_ROW {
+                    guard let d = sqlite3_column_text(st, 0), let n = sqlite3_column_text(st, 1) else { continue }
+                    let dir = String(cString: d)
+                    let path = dir.hasSuffix("/") ? dir + String(cString: n) : dir + "/" + String(cString: n)
+                    let kind = sqlite3_column_text(st, 2).map { String(cString: $0) } ?? ""
+                    let modified = sqlite3_column_double(st, 3)
+                    guard f.accepts(path: path, kind: kind, modified: modified) else { continue }
+                    out[key, default: []].append((path, modified, Int(sqlite3_column_int64(st, 4))))
+                }
+            }
+            return out
+        }
+    }
+
+    /// "0a1b..." as bytes; empty for anything that is not hex.
+    static func hexBytes(_ hex: String) -> [UInt8] {
+        let c = Array(hex.utf8)
+        guard c.count % 2 == 0 else { return [] }
+        var out: [UInt8] = []
+        out.reserveCapacity(c.count / 2)
+        func v(_ x: UInt8) -> UInt8? {
+            switch x { case 48 ... 57: return x - 48; case 97 ... 102: return x - 87; case 65 ... 70: return x - 55; default: return nil }
+        }
+        var i = 0
+        while i < c.count {
+            guard let hi = v(c[i]), let lo = v(c[i + 1]) else { return [] }
+            out.append(hi << 4 | lo); i += 2
+        }
+        return out
+    }
+
     public func contentKeys(paths: [String]) -> [String: (key: String, modified: Double)] {
         guard !paths.isEmpty else { return [:] }
         return queue.sync {
@@ -4887,6 +4967,9 @@ public final class VectorStore: @unchecked Sendable {
             // sitting still - the mirror image of the 99%-forever case the flag above prevents, and
             // worse than useless: the bytes it promises are not duplicated anywhere yet, so there
             // is nothing to free. They are the ONLY copy of those vectors until the file exists.
+            // Since every index maps the named file (2026-10-09) this passes from the first write,
+            // and a new index reports here for the ~2 s until its first stamp: true, and brief, as
+            // long as the reader asks again (the app's Storage row polls while it is shown).
             guard flat16.isPersistent else { return nil }
             // POSITIONS, because that is the unit the claim advances in. Against `rows.count` the
             // bar tops out at the SHARE ratio and sits there: on an index where a tenth of the
@@ -8025,7 +8108,8 @@ public final class VectorStore: @unchecked Sendable {
             // just now joins Recents, and the scope with it.
             let key = "\u{1}recents:\(n)"
             let recents: Set<String>
-            if let cached = tagFilterCache[key] { recents = cached }
+            if let pinned = f.recentsPaths { recents = pinned }
+            else if let cached = tagFilterCache[key] { recents = cached }
             else {
                 recents = recentPathsLocked(limit: n)
                 if tagFilterCache.count >= Self.tagFilterCacheCap { tagFilterCache.removeAll(keepingCapacity: true) }
@@ -8034,7 +8118,35 @@ public final class VectorStore: @unchecked Sendable {
             out.tagAllow = out.tagAllow.map { $0.intersection(recents) } ?? recents
         }
         if !f.tagExcludeTerms.isEmpty { out.tagDeny = pathsMatchingTagTermsLocked(f.tagExcludeTerms) }
+        if !f.folderNames.isEmpty {
+            let named = f.folderNames.flatMap { foldersNamedLocked($0) }
+            // Any of the folders, as `in:A in:B` is; a name no folder has adds none, and with no
+            // other folder in the scope nothing matches.
+            if named.isEmpty, f.folderPrefixes.isEmpty { out.tagAllow = [] }
+            out.folderPrefixes += named.filter { !f.folderPrefixes.contains($0) }
+            out.folderNames = []
+        }
+        if !f.excludeFolderNames.isEmpty {
+            out.excludeFolders += f.excludeFolderNames.flatMap { foldersNamedLocked($0) }.filter { !f.excludeFolders.contains($0) }
+            out.excludeFolderNames = []
+        }
         return out
+    }
+
+    /// `PathTable.folders(named:)`, sorted, in the tag cache: the same row changes clear it, so a
+    /// folder indexed just now is found by its name at the next search.
+    private func foldersNamedLocked(_ name: String) -> [String] {
+        let key = "\u{1}folder:" + name.lowercased()
+        if let cached = tagFilterCache[key] { return cached.sorted() }
+        let found = filePaths.folders(named: name)
+        if tagFilterCache.count >= Self.tagFilterCacheCap { tagFilterCache.removeAll(keepingCapacity: true) }
+        tagFilterCache[key] = found
+        return found.sorted()
+    }
+
+    /// The newest `limit` files, as an `in:Recents` search scopes to now (SearchFilter.recentsPaths).
+    public func recentPaths(limit: Int) -> Set<String> {
+        queue.sync { recentPathsLocked(limit: limit) }
     }
 
     /// The paths `recentlyIndexed` lists, read on the store's own connection: this runs on the
@@ -13722,6 +13834,44 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    // MARK: - Removals owed
+
+    /// Folders and Photos sources taken out of Omni whose rows are not all deleted yet, by root key.
+    /// A removal is a change to the user's list and then a delete that can take minutes (the
+    /// 2.35M-file folder, 478 s), and a quit, a crash or an update's relaunch between the two left
+    /// the rest of the folder searchable with no sidebar row to remove it by (review 2026-11-02:
+    /// 24,039 rows of a 40,003-file folder after a quit 0.2 s later). Kept beside the rows, so the
+    /// next open finishes the delete; read and written in one queue hold, so a removal noted while
+    /// another settles is not lost.
+    static let owedRemovalsKey = "owed_removals"
+    public var owedRemovals: [String] { queue.sync { owedRemovalsLocked() } }
+    public func oweRemoval(_ keys: [String]) { updateOwedRemovals { $0.union(keys) } }
+    public func settleRemoval(_ keys: [String]) { updateOwedRemovals { $0.subtracting(keys) } }
+
+    private func owedRemovalsLocked() -> [String] {
+        guard let raw = metaGetLocked(Self.owedRemovalsKey), let data = raw.data(using: .utf8),
+              let keys = try? JSONSerialization.jsonObject(with: data) as? [String] else { return [] }
+        return keys
+    }
+
+    private func updateOwedRemovals(_ change: (Set<String>) -> Set<String>) {
+        queue.sync {
+            guard dbOpen() else { return }
+            let before = Set(owedRemovalsLocked())
+            let after = change(before)
+            guard after != before else { return }
+            if after.isEmpty { exec("DELETE FROM meta WHERE key = '\(Self.owedRemovalsKey)';"); return }
+            guard let data = try? JSONSerialization.data(withJSONObject: after.sorted(), options: .withoutEscapingSlashes),
+                  let json = String(data: data, encoding: .utf8) else { return }
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?);", -1, &stmt, nil) == SQLITE_OK else { return }
+            sqlite3_bind_text(stmt, 1, Self.owedRemovalsKey, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 2, json, -1, SQLITE_TRANSIENT)
+            sqlite3_step(stmt)
+        }
+    }
+
     public func sizeBytes() -> Int64 { queue.sync { onDiskBytes() } }
 
     /// What the index costs on disk, split by the file that holds it.
@@ -13761,23 +13911,27 @@ public final class VectorStore: @unchecked Sendable {
         // The database plus its journal: one logical thing, and the WAL is transient enough that
         // listing it separately would just look like a leak.
         let dbBytes = size(base) + size(base + "-wal") + size(base + "-shm")
-        // FOUR slices, each named for what the bytes ARE rather than for the layer they belong to:
+        // FIVE slices, each named for what the bytes ARE rather than for the layer they belong to:
         // "Database" and "Search indexes" were true of half the folder and told a reader nothing.
         // Grouping is by content, so the two scan-tier files sit together and the two lookup
         // caches sit together, and the irreplaceable pair stays separate because that is the
         // distinction the chart exists to show.
         let scanCodes = size(base + ".quant") + size(base + ".rows")
         // The lookups: filenames, identifiers (IDIndex), the enrichment ledger, the long-file
-        // cursors and time-left costs, and the image-label cache under whichever name its weights
-        // and label list give it (tags-d768-<weights>-<labels>.cache) - all rebuilt from the files.
+        // cursors and time-left costs - all rebuilt from the files.
         let names = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
         var lookupNames: [String] = ["streams.json", "costs.json"]
         for side in [".names", ".ids", ".enriched"] {
             lookupNames += [base + side, base + side + "-wal", base + side + "-shm"]
         }
-        let tagPrefix = "tags-d\(dim)"
-        for n in names where n.hasPrefix(tagPrefix) && (n.hasSuffix(".cache") || n.hasSuffix(".prior")) { lookupNames.append(n) }
         let lookups = lookupNames.reduce(Int64(0)) { $0 + size($1) }
+        // THE IMAGE-LABEL CACHE IS ITS OWN SLICE, under whichever name its weights and label list
+        // give it (tags-d768-<weights>-<labels>.cache). It is the vocabulary's vectors, one size
+        // for every index (39 MB on Nano): filed under the filename index, a new index of 43 files
+        // read "Filename index 39.8 MB" for a 32 KB filename index (review 2026-11-01).
+        let tagPrefix = "tags-d\(dim)"
+        let labelNames = names.filter { $0.hasPrefix(tagPrefix) && ($0.hasSuffix(".cache") || $0.hasSuffix(".prior")) }
+        let labels = labelNames.reduce(Int64(0)) { $0 + size($1) }
         // VECTORS THE DATABASE IS STILL HOLDING count as vectors, not as snippets.
         //
         // A vector is durable in `pending_vecs` until the .vecs file can answer for it, and below
@@ -13805,11 +13959,13 @@ public final class VectorStore: @unchecked Sendable {
             .init(name: "Scan codes", bytes: scanCodes, irreplaceable: false,
                   detail: "1-bit codes the first-stage scan reads, plus the slot map"),
             .init(name: "Filename index", bytes: lookups, irreplaceable: false,
-                  detail: "filename and identifier search, image labels"),
+                  detail: "filename and identifier search"),
+            .init(name: "Image labels", bytes: labels, irreplaceable: false,
+                  detail: "the tag vocabulary's vectors, the same for every index"),
         ]
         // Anything else in the folder, so nothing is invisible. The model directory is excluded:
         // it is not the index, and it is reported in its own right elsewhere.
-        let known = Set(lookupNames
+        let known = Set(lookupNames + labelNames
             + [base, base + "-wal", base + "-shm", base + ".vecs", base + ".quant", base + ".rows",
                "nano", "query-images", ".omniignore"])
         var otherBytes: Int64 = 0
@@ -13824,7 +13980,7 @@ public final class VectorStore: @unchecked Sendable {
         if !otherNames.isEmpty, let i = entries.firstIndex(where: { $0.name == "Filename index" }) {
             // Anything unrecognised joins the last slice rather than earning its own: it is almost
             // always nothing, and a permanent near-zero segment is noise. The name does not change
-            // for it - the tooltip names the files, so the legend stays four stable labels.
+            // for it - the tooltip names the files, so the legend keeps its stable labels.
             entries[i] = .init(name: entries[i].name, bytes: entries[i].bytes + otherBytes, irreplaceable: false,
                                detail: entries[i].detail + ", plus " + otherNames.sorted().joined(separator: ", "))
         }

@@ -777,6 +777,12 @@ asides. MCP clients get their docs from the tool descriptors and the initialize 
   200 pages: MLX peak 25.0 -> 16.5 GB, 636 -> 678 tok/s, digest 69c75ca3faff9f0d unchanged.
   In the app, back to back: footprint 15-20 GB for the whole run and 7.6 GB after, against
   23 -> 188 GB and 179 GB after.
+  Re-measured for a review that read the lifted compute limit as "nothing bounds the cache"
+  (2026-11-02): a six-page scan in the app, footprint every 250 ms, alternating twice: peak 18 GB at
+  this Mac's 16 GB bound, 10 GB at the 1 GB bound a Mac of 16 GB or less gets (`OMNI_OCR_CACHE_GB=1`),
+  the same 318 tokens at 43-48 tok/s, and 6.75 GB after either run (the OCR model stays while OCR
+  mode is on). Its suggested cap at half of RAM is the compute cap measured above, which halved
+  throughput.
 - `decodeContinuous` held every admitted page's pixels and visual features until the document
   returned; it now keeps only ids and grid after admission. Pages are rendered when admitted
   (`transcribeBatched(sources:)`, `PreparedPage.source`), not all before the first token; a page

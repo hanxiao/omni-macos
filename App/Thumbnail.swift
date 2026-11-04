@@ -60,12 +60,21 @@ struct Thumbnail: View {
     var corner: CGFloat = 6
     @State private var image: NSImage?
 
+    /// A list row's tile: the size Finder's list view draws a file's icon at.
+    static let rowSide: CGFloat = 24
+
+    /// AT ROW SIZE A DOCUMENT IS ITS ICON, as in Finder's list view: QuickLook's icon mode, the
+    /// page with its border, drawn whole. Its plain thumbnail is a white page (a square of white
+    /// with the text at the top, for a note) that the filled tile cropped to a band: on a white
+    /// row, a 2-3 px grey sliver (review 2026-11-01). Pictures and videos keep the filled tile.
+    private var asIcon: Bool { side <= Self.rowSide && !Self.isPicture(path) }
+
     var body: some View {
         ZStack {
             if let image {
                 Image(nsImage: image)
                     .resizable()
-                    .aspectRatio(contentMode: .fill)
+                    .aspectRatio(contentMode: asIcon ? .fit : .fill)
             } else {
                 Image(nsImage: ThumbnailCache.shared.fallbackIcon(for: path))
                     .resizable()
@@ -82,8 +91,24 @@ struct Thumbnail: View {
         .task(id: "\(path)@\(Int(side))") { await load() }
     }
 
+    /// Drawn as a picture at every size: what the image decoder reads, a Photos asset, a video.
+    nonisolated static func isPicture(_ path: String) -> Bool {
+        if PhotoLibrary.Ref(path) != nil { return true }
+        let ext = (path as NSString).pathExtension.lowercased()
+        return imageExts.contains(ext) || (UTType(filenameExtension: ext)?.conforms(to: .movie) ?? false)
+    }
+
     private func load() async {
-        let key = "\(path)@\(Int(side))"
+        let icon = asIcon
+        // A PLAIN-TEXT FILE AT ROW SIZE IS ITS TYPE'S ICON, which is what Finder's list view draws
+        // for one: the page with ruled lines. QuickLook's icon mode drew its preview, a blank page
+        // with a tiny type label, faint at 1x (darkest pixel 220 of 255); compared on one screen
+        // with Finder's list, 2026-11-03. Notes, code and logs; documents keep their previews.
+        if icon, FileExtractor.textExtensions.contains((path as NSString).pathExtension.lowercased()) {
+            image = ThumbnailCache.shared.fallbackIcon(for: path)
+            return
+        }
+        let key = "\(path)@\(Int(side))\(icon ? "i" : "")"
         if let cached = ThumbnailCache.shared.image(key) { image = cached; return }
         // This view is reused for a new path on scroll (the cell is the same struct, `path` changes);
         // drop the prior file's thumbnail so a cache miss shows the fallback icon, not a stale image.
@@ -91,12 +116,15 @@ struct Thumbnail: View {
         let scale = NSScreen.main?.backingScaleFactor ?? 2
         let maxPixel = Swift.max(32, Int((side * scale).rounded()))
         // A linked Mac's file is not here: that Mac renders the thumbnail from its own copy, the
-        // same way it would for its own window, and sends the picture.
+        // same way it would for its own window, and sends the picture. Not a document's at row size:
+        // what comes back is its page (a JPEG, a white square for a note) where a local row draws
+        // the icon, so the row keeps the type's icon, as Finder does for a file it cannot preview.
         let cg: CGImage?
         if RemotePath.isRemote(path) {
+            guard !icon else { return }
             cg = await RemoteFiles.shared.thumbnail(path, maxPixel: maxPixel)
         } else {
-            cg = await Self.render(path: path, maxPixel: maxPixel, side: side, scale: scale)
+            cg = await Self.render(path: path, maxPixel: maxPixel, side: side, scale: scale, icon: icon)
         }
         guard let cg, !Task.isCancelled else { return }
         let img = NSImage(cgImage: cg, size: NSSize(width: CGFloat(cg.width) / scale,
@@ -107,7 +135,9 @@ struct Thumbnail: View {
 
     /// The thumbnail of a file on this Mac (or a Photos asset), at `maxPixel` for a tile of `side`
     /// points: the row's own picture, and what this Mac sends a linked Mac that asks for one.
-    nonisolated static func render(path: String, maxPixel: Int, side: CGFloat, scale: CGFloat) async -> CGImage? {
+    /// `icon`: the document as QuickLook's icon mode draws it (see `asIcon`), not its page.
+    nonisolated static func render(path: String, maxPixel: Int, side: CGFloat, scale: CGFloat,
+                                   icon: Bool = false) async -> CGImage? {
         // A Photos asset has no file to read: PhotoKit serves the thumbnail, from the same local
         // cache Photos.app draws its own grid from. Network access stays OFF - scrolling results
         // must never start an iCloud download - so an asset that is not on this Mac falls through
@@ -138,7 +168,7 @@ struct Thumbnail: View {
         // photo library would queue real downloads into the 4 decode slots (or stall them offline).
         // QuickLook below serves its cached thumbnail for evicted files without materializing,
         // exactly like Finder. stat is exempt from materialization (TN3150), so the check is free.
-        if (Self.imageExts.contains(ext) || ext == "pdf") && !FileExtractor.isDataless(path) {
+        if (Self.imageExts.contains(ext) || (ext == "pdf" && !icon)) && !FileExtractor.isDataless(path) {
             let isPDF = ext == "pdf"
             let cg = await Self.decodeBounded {
                 isPDF ? Self.pdfThumbnail(url, maxPixel: maxPixel) : Self.imageThumbnail(url, maxPixel: maxPixel)
@@ -163,6 +193,7 @@ struct Thumbnail: View {
             scale: scale,
             representationTypes: .all
         )
+        request.iconMode = icon
         // IMPORTANT: keep the QuickLook completion handler inside withCheckedContinuation, whose body is
         // @Sendable (non-isolated). A handler written in a @MainActor context would inherit MainActor
         // isolation; QuickLook calls it on its OWN dispatch queue, and the Swift runtime then traps

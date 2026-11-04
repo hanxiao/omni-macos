@@ -195,9 +195,19 @@ struct FolderBrowser: View {
                 HStack(spacing: 0) {
                     // 16pt, Finder's list-view icon size. 18 was a touch larger and, with the row
                     // insets below, was what made our rows a 26pt pitch against Finder's 20.
-                    Image(nsImage: icon(entry)).resizable()
-                        .frame(width: BrowserMetrics.icon, height: BrowserMetrics.icon)
-                        .padding(.trailing, BrowserMetrics.iconGap)
+                    // A file's row icon is the one the search list draws (a picture's own image, a
+                    // document as QuickLook's icon mode draws it), not its type's: a folder of
+                    // photos listed as a column of identical PNG icons (full test 2026-11-03).
+                    // Folders keep their own icons.
+                    Group {
+                        if entry.isDirectory {
+                            Image(nsImage: icon(entry)).resizable()
+                        } else {
+                            Thumbnail(path: entry.url.path, side: BrowserMetrics.icon, corner: 3)
+                        }
+                    }
+                    .frame(width: BrowserMetrics.icon, height: BrowserMetrics.icon)
+                    .padding(.trailing, BrowserMetrics.iconGap)
                     Text(entry.name).lineLimit(1).truncationMode(.middle)
                         .foregroundStyle(isSelected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
                     Spacer(minLength: 8)
@@ -272,7 +282,7 @@ struct FolderBrowser: View {
             // to it either.
             .onChange(of: selected) { _, url in if let url { proxy.scrollTo(url) } }
             .environment(\.defaultMinListRowHeight, BrowserMetrics.rowHeight)
-            .modifier(SoftTopScrollEdge())
+            .modifier(SoftTopScrollEdge(underHeader: true))
             .alternatingRowBackgrounds()
             // INSET, for the right-click highlight - see the note on `listCore` above, which is
             // where that trade is argued.
@@ -314,7 +324,7 @@ struct FolderBrowser: View {
     @ViewBuilder private func cell(_ col: BrowserColumn, _ e: Entry) -> some View {
         switch col {
         case .kind:
-            Text(e.isDirectory ? "Folder" : (FileKind(rawValue: e.kind)?.title ?? "--"))
+            Text(e.isDirectory ? "Folder" : (FileKind(rawValue: e.kind)?.singular ?? "--"))
         case .dateModified:
             Text(e.isDirectory ? "--" : e.modified.formatted(date: .abbreviated, time: .shortened))
         case .dateAdded:

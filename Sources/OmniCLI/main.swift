@@ -484,7 +484,8 @@ do {
         if words.contains("--help-all") { print(toolHelp(tool, full: true), terminator: ""); exit(Exit.ok) }
         if words.contains("--help") || words.contains("-h") { print(toolHelp(tool, full: false), terminator: ""); exit(Exit.ok) }
         let result = try rpc("tools/call", ["name": first, "arguments": try arguments(for: tool, words),
-                                            "_meta": [CLIProtocol.cliKey: true]])
+                                            "_meta": [CLIProtocol.cliKey: true,
+                                                      CLIProtocol.cwdKey: FileManager.default.currentDirectoryPath]])
         let content = result["content"] as? [[String: Any]] ?? []
         // A tool's error is about the command: stderr, in this command's terms, exit 1.
         if result["isError"] as? Bool ?? false {

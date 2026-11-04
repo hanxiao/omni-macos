@@ -12,9 +12,10 @@ import OmniLink
 /// - SEVERAL FILES: grabbing a selected item drags the whole selection, as Finder does; grabbing an
 ///   unselected one selects it and drags it alone. The images pile under the pointer with the
 ///   system's count badge.
-/// - NEVER A MOVE (owner's decision): the session offers copy, link and generic, so a drop in a
-///   Finder folder on the same disk copies and Option-Command makes an alias. Omni is a view onto
-///   files that live elsewhere; a drag must not take one out of its folder.
+/// - NEVER A MOVE (owner's decision): a plain drag offers copy and generic, so a drop in a Finder
+///   folder on the same disk copies; with Option-Command held it offers a link, and the drop makes
+///   an alias (see sourceOperationMaskFor). Omni is a view onto files that live elsewhere; a drag
+///   must not take one out of its folder.
 /// - NOTHING INSIDE OMNI: within the app the mask is empty, so a result cannot be dropped back onto
 ///   the search area or the sidebar. That accidental drop is why rows used to be non-draggable.
 /// - PHOTOS ASSETS have no file until one is exported, so they go as file promises and are written
@@ -71,9 +72,14 @@ final class FileDrag: NSObject, @preconcurrency NSDraggingSource {
         return ThumbnailCache.shared.fallbackIcon(for: path)
     }
 
+    /// A plain drop COPIES; Option-Command makes an alias. Offered a link beside the copy, Finder made
+    /// an alias of every plain drop (macOS 15, through real drags in a VM: any offer with `.link`
+    /// aliased, `.copy` and `.copy` + `.generic` copied, 0.19.8 included), so the link is offered only
+    /// while Option-Command is held - AppKit asks again as the modifiers change.
     func draggingSession(_ session: NSDraggingSession,
                          sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
-        context == .outsideApplication ? [.copy, .link, .generic] : []
+        guard context == .outsideApplication else { return [] }
+        return NSEvent.modifierFlags.isSuperset(of: [.option, .command]) ? [.link] : [.copy, .generic]
     }
 
     func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint,

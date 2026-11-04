@@ -143,6 +143,24 @@ run). The way within that design is the talk's "B--ngram": extend high-scoring v
 and re-score the candidates with the same scoring function. Not done yet. Kept from the attempt: the
 cache is named by its label list too, and the Storage pane counts it.
 
+FRAGMENTS, MEASURED (2026-11-03). A word-start piece that only begins a word ("refriger", "fauc",
+"squir", "gymn"; "gard", "stagn", "mon" on the full test's pictures) is a label like any other. On
+the 150 COCO photos through the indexer's path (`omni-verify tagopen`, 5-crop, prior seeded), ~2% of
+tags are such pieces (5.7% counting every non-word that begins a dictionary word; the dictionary is
+the yardstick only). Five ways to tell them from words with the model alone, none good enough:
+- The labels embedded as "a photo of a %@." (the study's COCO prompt): fragments 9.9% -> 16.7% of
+  tags, a GT category among the five 0.420 -> 0.273.
+- Nearest label: a fragment's is its completion (fauc -> faucet 0.98, refriger -> refrigerator
+  0.95), but so is a word's (tree -> trees 0.92, car -> carro 0.97). One-way (the completion's own
+  nearest is elsewhere) catches gard and mon, misses stagn, advoc, ult, eng, and flags sun, logic.
+- A label's cosine to itself in a template: dictionary words vs the rest AUC 0.56-0.59.
+- The input token table (norm, cosine to the mean): AUC 0.54-0.61.
+- Showing the longer of two near-identical NMS duplicates (cos >= 0.85-0.95): it pluralizes words
+  (train -> trains, sidewalk -> sidewalks), fragments 43 -> 40-43, category hit 0.420 -> 0.407.
+The model reads a fragment as its word; nothing it computes says which of the two is the word.
+ACCEPTED (Han, 2026-11-03): fragments stay, the open vocabulary's price; no word list, no second
+model as an oracle.
+
 ### Principle review (Han, 2026-10-14: reuse the pipeline, no ad-hoc or language-specific rules, show every UI change)
 
 - KindWords (word lists in ten languages) is gone. The kind a query asks for is read from its vector:

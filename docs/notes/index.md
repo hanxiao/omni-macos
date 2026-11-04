@@ -3366,3 +3366,61 @@ Every finding below was reproduced on an isolated 0.19.6 instance over a generat
   `file_status` says "behind changes waiting since", the queue's time, not the file's.
 - Not changed: `structuredContent` only for the CLI is the earlier measured decision ("The index
   that paused itself"); `/v1/embeddings` still takes any `model`, since OpenAI clients send their own.
+
+## A removal cut short by a quit (review 2026-11-02)
+
+Removing a folder (or a Photos source) changed the user's list at once and deleted its rows after,
+in a detached task or, with a pass running, from `pendingRootRemovals` once the pass had stopped;
+both lived only in memory, and a quit `_exit`s without waiting. A quit, a crash or an update's
+relaunch in between left the rest of the folder in the index, and nothing ever removed it: the
+launch pass reconciles only under the roots it crawls, by design (a settings reset must never purge
+an index). Reproduced on 0.19.8's tree: a 40,003-file folder removed and Quit 0.2 s later, 24,039
+rows left, and after the relaunch the sidebar listed only the other folder while a search returned
+91 of the removed one's files (`Big` in the Folder column). The 2.35M-file folder takes 478 s, so
+the window is minutes on a real index; a model reload cleared the pending set the same way.
+
+The removal is now owed in the index (`VectorStore.owedRemovals`, meta `owed_removals`, one queue
+hold per read-modify-write) from the moment it is asked until `dropRemovedFolder` has deleted the
+rows. The open after the launch-ready point finishes what is owed (`finishOwedRemovals`), through
+the same drop, unless the key lies inside a source again (added back before its delete ran), which
+keeps its rows. Measured on the same folder: removed and Quit 0.2 s later (23,875 rows left), the
+relaunch logged `owed removals at open: 1 to finish`, the search returned only the kept folder and
+the key was gone; removed, Quit, and relaunched with the folder added back: `0 to finish, 1 added
+back`, 24,453 rows kept as unchanged and only the 15,550 already deleted embedded again.
+
+NOT DONE: an index whose preferences were reset (the reviewer's case: its test copies keep
+preferences outside the index, and a launch without the folder list showed rows with no source).
+The index does not record its sources, so nothing can prove which folders they were; reading roots
+back from the rows' paths would be a guess.
+
+## A full test's findings in the store and the served surfaces (2026-11-03)
+
+- `in:` BY A FOLDER'S OWN NAME. The results' Folder column shows a folder by its name, and `in:Edge`
+  typed from it was read as the path "/Edge": no results and no word why (the box's own chip read
+  `in:Inbox` while browsing, which typed by hand did the same). A value that is neither a path nor
+  a root's name is now a name (`SearchFilter.folderNames` / `excludeFolderNames`), resolved at
+  search entry with the tag terms to every indexed folder whose path ends in its components, any
+  case (`PathTable.folders(named:)`, one pass over the resident directories, cached with the tag
+  sets); a name no folder has matches nothing. FullTestFixesTests pins both reducers.
+- A BINARY WITH A TEXT EXTENSION IS NOT TEXT: 200 KB of random bytes named .txt became 103 chunks of
+  Latin-1 noise. A NUL in the first 8,000 bytes (git's and grep's test; no encoding Omni reads puts
+  one in text) leaves it unread, whole or streamed; a UTF-16 or UTF-32 byte-order mark is text. A
+  PDF that needs a password is not indexed: its pages came out blank and it was a one-page "scan".
+  `file_status` says which of these a file is, and empty and unreadable apart. An index that already
+  holds such a file keeps its rows until the file changes: they are noise, not damage, and finding
+  them would mean reading every text file again.
+- A PDF PASSAGE CARRIES THE PAGE IT STARTS ON. A chunk's locator is the page holding most of it, so
+  the sentence that matched at the foot of page 238 was shown, served and opened as "Page 239", and
+  an agent reading page 239 did not find it. `PassageRecovery.passages` locates each PDF window by
+  its opening words on the pages near its chunk's (`PagePhrase.page`), kept by chunk and window, four
+  documents open at most; the rows, the passages panel (which now shows each chunk's window, not its
+  stored opening), PDF page pick, `search`, REST and `search_inline` all take it.
+- `omni` RESOLVES RELATIVE PATHS in the shell's folder: it sends its working directory in `_meta`
+  and the server resolves the path arguments of a CLI call against it (`read_file notes.txt` had
+  answered "/notes.txt is not in Omni's index"). Other clients are untouched.
+- `VectorStore.copies(ofContentKeys:filter:)`: every copy of a content key the filter allows, one
+  indexed read (`idx_dedup_key`), for a stack to hold its copies outside the result pool; and
+  `SearchFilter.recentsPaths`, a Recents scope taken when a search started, kept by its refreshes
+  while files index (ui.md, "A full test of the release candidate").
+- INDEX TIME: 6,797 files in 74.8 s against 74.5-75.1 before (the NUL test reads 8 KB of a long
+  text file before it streams; short ones are tested where they are read).

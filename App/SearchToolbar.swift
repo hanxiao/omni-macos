@@ -5,9 +5,14 @@ import OmniKit
 /// The window toolbar outside search's OCR mode. A modifier of its own so that SwiftUI re-runs it
 /// only when something it shows changes: as part of `ContentView.body` it was rebuilt on every
 /// evaluation of the window, and each rebuild made AppKit re-lay out the items.
+///
+/// EACH ITEM IS A VIEW OF ITS OWN, and this body reads only what adds or removes an item. Every
+/// item's content used to be built here, so everything it showed was read here too: a row clicked
+/// (the share item's state), a query with a filter (the whole filter menu), a bookmark, a sort -
+/// any one of them rebuilt every item, and AppKit laid the toolbar out again. Counted per step,
+/// a filtered query rebuilt all six items; now the one whose state changed redraws.
 struct SearchToolbar: ViewModifier {
     @Environment(AppModel.self) private var model: AppModel
-    @Environment(OCRSession.self) private var ocr
     @Binding var columns: NavigationSplitViewVisibility
     /// What the detail pane is browsing, decided by `ContentView` (a query always wins).
     let browse: BrowseMode
@@ -27,21 +32,195 @@ struct SearchToolbar: ViewModifier {
         if #available(macOS 26.0, *) { return .primaryAction } else { return .automatic }
     }
 
-    /// Whether the back/forward chevrons have anything to show. Also decides whether the leading
-    /// toolbar item gets a Liquid Glass background on Tahoe - an empty item must not draw one.
-    private var showsHistoryControls: Bool {
-        // NOT IN OCR MODE. This trail is the SEARCH history; stepping it while reading a transcript
-        // changes a result set you cannot see, and leaves the chevrons looking like page navigation
-        // for the document - which they are not. OCR has its own page rail for that.
-        model.phase == .ready && !model.ocrMode && (model.canGoBack || model.canGoForward)
+    /// A TITLED `Label`, not a bare `Image`, and that is load-bearing rather than cosmetic. On
+    /// Sequoia a toolbar item whose label carries no title gets no intrinsic size and the item
+    /// collapses: dumped from a live macOS 15 toolbar, this button and its three neighbours each
+    /// measured 10x10 while `search.open` and `search.share` beside them - built with
+    /// `Label(title, systemImage:)` - measured 33x28 and 29x28. macOS 26 sizes either form, which
+    /// is why it looked fine here. The toolbar renders the icon alone on both, so nothing changes
+    /// visually; the title is what AppKit sizes from, and it is also what the overflow menu and
+    /// VoiceOver read.
+    private var sidebarToggleButton: some View {
+        Button {
+            withAnimation(.easeOut(duration: 0.2)) {
+                columns = columns == .detailOnly ? .all : .detailOnly
+            }
+        } label: {
+            Label("Hide or show the sidebar", systemImage: "sidebar.leading")
+        }
+        .help("Hide or show the sidebar")
+        .accessibilityLabel("Hide or show the sidebar")
+        .accessibilityIdentifier("sidebar.toggle")
     }
 
-    /// Only rendered inside an item that exists solely when `showsHistoryControls` is true, so
-    /// there is no empty state here and no need for the 1pt clear fillers an always-present item
-    /// used to carry against AppKit's "ambiguous width" warning.
-    /// The leading navigation group: back/forward when there is somewhere to go, then the name of
-    /// whatever is being browsed. 10pt between them - Finder's gap, measured at 11.
-    @ViewBuilder private var navAndTitle: some View {
+    /// Search by a file, and share what is selected - the same pair, in the same order, that OCR
+    /// mode puts next to its own search field (`ocr.open`, `ocr.share`). This USED to be a glyph
+    /// installed inside the search field itself, which had two problems: it was invisible as an
+    /// affordance, and it had to hide whenever the field held text, so it disappeared exactly when
+    /// a query was on screen. A toolbar button is always there and always the same size.
+    /// Tahoe lays the trailing cluster out after its `ToolbarSpacer`. macOS 14/15 have no spacer
+    /// that survives (a SwiftUI `Spacer` item is dropped, an injected `.flexibleSpace` is pruned on
+    /// every state change, and a stretched item's width request pushes its neighbours into the
+    /// overflow menu), so there the trailing items say `.primaryAction`, which puts them on the
+    /// trailing side of the leading group. Verified on macOS 15.7 in a VM.
+    private var trailingPlacement: ToolbarItemPlacement {
+        if #available(macOS 26.0, *) { return .automatic }
+        return .primaryAction
+    }
+
+    @ToolbarContentBuilder private var fileActions: some ToolbarContent {
+        ToolbarItem(id: "search.open", placement: trailingPlacement) {
+            Button { model.searchByFilePanel() } label: {
+                // `folder`, the same symbol OCR's Open Document uses. The two are the same verb.
+                Label("Search by File\u{2026}", systemImage: "folder")
+            }
+            .help("Search by File  \u{21e7}\u{2318}O")
+            .accessibilityLabel("Search by File")
+        }
+        ToolbarItem(id: "search.share", placement: trailingPlacement) { ShareItem() }
+    }
+
+    /// The four leading controls, emitted at whatever placement the running system actually
+    /// renders. See the note at the call site for why Sequoia cannot have `.navigation`.
+    ///
+    /// OCR mode sits next to the sidebar toggle because it switches what the content area IS - the
+    /// same class of thing as showing or hiding the sidebar - rather than acting on results; in the
+    /// trailing cluster it drifted with the search field's width. It is deliberately NOT gated on
+    /// `phase == .ready`: transcription reads a dropped file and writes Markdown, touching neither
+    /// the vector index nor the embedding model, so gating it on the index would strand the feature
+    /// exactly when it is most useful - while a large index loads.
+    ///
+    /// Serving is here for the same reason: a global mode of the app, on until turned off, rather
+    /// than an action on whatever is on screen. Same switch as Settings > Serving, never a second
+    /// source of truth.
+    @ToolbarContentBuilder
+    private func leadingModeItems(_ placement: ToolbarItemPlacement) -> some ToolbarContent {
+        ToolbarItem(id: "sidebar.mode", placement: placement) { sidebarToggleButton }
+        ToolbarItem(id: "ocr.mode", placement: placement) { OCRModeItem() }
+        ToolbarItem(id: "serve.mode", placement: placement) { ServeItem() }
+    }
+
+    @ToolbarContentBuilder private var toolbar: some ToolbarContent {
+        // No explicit sidebar toggle: Sequoia's system toggle (next to the traffic lights, like
+        // Finder) lives and dies with the split-view TRACKING SEPARATOR item, which this app keeps
+        // (transparent - see the tuner). Hiding the title does NOT collapse it; only removing the
+        // separator item does. An explicit button here therefore always duplicates the system one.
+        // Finder-style back/forward at the leading edge of the content toolbar. The window's title TEXT
+        // is hidden (WindowTitleHider), so the chevrons own the leading edge with no "Omni" label. The
+        // toolbar ITEM is unconditional and wraps the chevrons in an always-present HStack: a directly
+        // conditional .navigation item reorders unpredictably, whereas the always-present HStack holds a
+        // stable leading slot and the conditional chevrons inside it just appear/vanish. Progressive
+        // disclosure: the chevrons show only once there's somewhere to go, so the idle state is empty
+        // here. Cmd-[ / Cmd-] match Finder and Safari; each chevron disables independently at the end of
+        // its trail. Grouped so on Tahoe they share one Liquid Glass pill.
+        // OCR mode sits next to the sidebar toggle, at the leading edge. It switches what the
+        // content area IS - the same class of thing as showing or hiding the sidebar - rather
+        // than acting on results, and in the trailing cluster it drifted with the search field's
+        // width and stranded itself mid-toolbar whenever the sidebar was collapsed.
+        //
+        // Deliberately NOT gated on `phase == .ready`: transcription reads a dropped file and
+        // writes Markdown, and touches neither the vector index nor the embedding model. Gating
+        // it on the index would strand the feature exactly when it is most useful - while a large
+        // index loads, or when another copy of Omni holds it open.
+        // THE SAME PLACEMENT ON EVERY SYSTEM, VERIFIED ON macOS 15.7 (tart VM, 2026-09-22). The
+        // leading items were moved to `.primaryAction` pre-Tahoe on the theory that Sequoia drops
+        // `.navigation` items, and then given titled labels on the theory that an untitled label
+        // cannot be sized. Neither was the cause: the items were present and collapsed to 10x10
+        // because the TOOLBAR WAS REBUILT - the root swapped whole split views between modes and
+        // the detail swapped its content under a Group - and macOS 14/15 do not size SwiftUI items
+        // in a rebuilt toolbar. With one stable split view and a ZStack owner (see `body` and
+        // `split`) they measure 34x28 / 31x28 / 29x28 at launch and through OCR on/off cycles, at
+        // the leading edge where Tahoe puts them.
+        leadingModeItems(.navigation)
+        if #available(macOS 26.0, *) {
+            ToolbarItem(id: "nav.title", placement: .navigation) { NavTitleItem(browse: browse) }
+                .sharedBackgroundVisibility(.hidden)
+        } else {
+            ToolbarItem(id: "nav.title", placement: .navigation) { NavTitleItem(browse: browse) }
+            // macOS 14/15: the window title is hidden (the tuner), and the title item was what
+            // filled the free space - without it the search field packed against the leading
+            // buttons. An empty centre item takes that job: AppKit gives a principal item flexible
+            // room on both sides. Checked on 15.7 in search, results and OCR mode; the window keeps
+            // its name "Omni" for the Window menu and Mission Control.
+            // AppKit keeps a centre item centred by shrinking what is beside it, the search field
+            // first; the tuner holds the field at its own width, so the centre item gives way (#31).
+            ToolbarItem(id: "center", placement: .principal) { Color.clear.frame(width: 1, height: 1) }
+        }
+        // Flexible space after back/forward pushes every other control to the trailing edge (chevrons
+        // own the left, everything else is right-aligned), and on Tahoe it's also the correct separator
+        // between Liquid Glass toolbar groups - the leading chevron pill and the trailing control pills
+        // read as distinct glass surfaces.
+        if #available(macOS 26.0, *) {
+            ToolbarSpacer(.flexible)
+        }
+        // NO SPACER PRE-TAHOE, AND NONE IS NEEDED ANY MORE. This used to say the tuner inserted an
+        // AppKit `.flexibleSpace` item to do the same job; it did once, and 692c238 took that
+        // machinery out with the in-field search-by-file button while leaving the claim here - so
+        // the comment described code that had not existed for a while. A SwiftUI
+        // `ToolbarItem { Spacer() }` is genuinely dropped on macOS 14/15 (verified against the live
+        // NSToolbar's item list), which is why the AppKit item was there.
+        //
+        // Pre-Tahoe the trailing cluster is `.primaryAction` instead - see `trailingPlacement`.
+        // Bookmark the current search. The only way into History when recording is set to "Only when
+        // I bookmark", and a quick save otherwise. Appears once there's a search to keep.
+        if model.phase == .ready, !model.ocrMode, model.hasActiveSearch {
+            ToolbarItem(placement: .primaryAction) { BookmarkItem() }
+        }
+        // Progressive disclosure: the filter/sort/view chrome appears with the first results - hidden,
+        // not greyed out, during onboarding and in the idle state before any search - and then STAYS
+        // while the window searches (AppModel.resultControlsShown: taking it out at every clear and
+        // putting it back at the next search was ~185 ms of main thread a time; Han, 2026-11-03).
+        // In an empty box it still acts: it sets the next search's filters, order and view.
+        // Exception: the filter menu is reachable whenever a filter is active, before any search too.
+        // NOT WHILE BROWSING. Entering a folder sets `filterFolder`, which makes `filtersActive`
+        // true, so this menu used to appear over a browser whose listing it cannot change - the
+        // browser lists indexed children, not filtered results. Inert chrome. (The star stays:
+        // bookmarking a browsed folder saves a state you can actually return to.)
+        // `resultControlsShown` FIRST: while it holds, `filtersActive` is never read here, so a
+        // filter turned on or off redraws the menu's own item and nothing else.
+        if model.phase == .ready, !model.ocrMode, !showsBrowser, browse != .clipboardOff,
+           model.resultControlsShown || model.filtersActive {
+        // Filter joins sort/view in the trailing placement so on Tahoe the three result controls
+        // share ONE Liquid Glass pill (search-by-file + bookmark form the other). filterPlacement
+        // keeps filter leading on pre-26 so the Sequoia toolbar layout is unchanged.
+        ToolbarItem(placement: filterPlacement) { FilterItem() }
+        }
+        // Result presentation - sort + view.
+        //
+        // SORT IS SEARCH-ONLY. It orders RESULTS, which are ranked; a browser sorts by clicking a
+        // column header (see FolderBrowser) and this menu does nothing there. It used to be shown
+        // while browsing, where it was inert chrome.
+        //
+        // VIEW IS BOTH. A listing is a list of things with a name and a date whichever way you
+        // arrived at it, and both browsers draw a gallery - which nothing could switch to while
+        // the Photos browser was missing from this condition.
+        // A browser is never shown with results; the search's own controls are out while it is.
+        if model.phase == .ready, !model.ocrMode, showsBrowser, !model.hasResults {
+            ToolbarItem(id: "browse.view", placement: .primaryAction) { ViewModePicker() }
+        }
+        if model.phase == .ready, !model.ocrMode, !showsBrowser, model.sortViewShown {
+        ToolbarItem(placement: .primaryAction) { SortViewItem() }
+        }
+        // LAST, so it sits immediately before the search field - the slot OCR mode puts the same
+        // pair in. Not in OCR mode: that mode has its own Open Document and Share, for the
+        // document rather than for the index.
+        if model.phase == .ready, !model.ocrMode {
+            if #available(macOS 26.0, *) { ToolbarSpacer(.fixed) }
+            fileActions
+        }
+    }
+}
+
+// MARK: - Items
+
+/// The leading navigation group: back/forward when there is somewhere to go, then the name of
+/// whatever is being browsed. 10pt between them - Finder's gap, measured at 11.
+private struct NavTitleItem: View {
+    @Environment(AppModel.self) private var model: AppModel
+    @Environment(OCRSession.self) private var ocr
+    let browse: SearchToolbar.BrowseMode
+
+    var body: some View {
         HStack(spacing: 0) {
             // A completely empty toolbar item has zero intrinsic size and AppKit logs an
             // "ambiguous width/height" warning for it on every layout pass, so 1pt of clear keeps
@@ -55,6 +234,15 @@ struct SearchToolbar: ViewModifier {
             browseTitle
             Color.clear.frame(width: 1, height: 1)
         }
+    }
+
+    /// Whether the back/forward chevrons have anything to show. Also decides whether the leading
+    /// toolbar item gets a Liquid Glass background on Tahoe - an empty item must not draw one.
+    private var showsHistoryControls: Bool {
+        // NOT IN OCR MODE. This trail is the SEARCH history; stepping it while reading a transcript
+        // changes a result set you cannot see, and leaves the chevrons looking like page navigation
+        // for the document - which they are not. OCR has its own page rail for that.
+        model.phase == .ready && !model.ocrMode && (model.canGoBack || model.canGoForward)
     }
 
     /// The chevrons' own Liquid Glass capsule, since the toolbar item they sit in deliberately
@@ -158,45 +346,99 @@ struct SearchToolbar: ViewModifier {
                 .help(t.help)
         }
     }
+}
 
-    /// A TITLED `Label`, not a bare `Image`, and that is load-bearing rather than cosmetic. On
-    /// Sequoia a toolbar item whose label carries no title gets no intrinsic size and the item
-    /// collapses: dumped from a live macOS 15 toolbar, this button and its three neighbours each
-    /// measured 10x10 while `search.open` and `search.share` beside them - built with
-    /// `Label(title, systemImage:)` - measured 33x28 and 29x28. macOS 26 sizes either form, which
-    /// is why it looked fine here. The toolbar renders the icon alone on both, so nothing changes
-    /// visually; the title is what AppKit sizes from, and it is also what the overflow menu and
-    /// VoiceOver read.
-    private var sidebarToggleButton: some View {
-        Button {
-            withAnimation(.easeOut(duration: 0.2)) {
-                columns = columns == .detailOnly ? .all : .detailOnly
-            }
-        } label: {
-            Label("Hide or show the sidebar", systemImage: "sidebar.leading")
-        }
-        .help("Hide or show the sidebar")
-        .accessibilityLabel("Hide or show the sidebar")
-        .accessibilityIdentifier("sidebar.toggle")
-    }
+private struct OCRModeItem: View {
+    @Environment(AppModel.self) private var model: AppModel
 
-    private var ocrToggleButton: some View {
+    var body: some View {
+        // On is a FILLED accent circle with a white glyph, the way Preview draws Markup while
+        // it is on. The fill is drawn INSIDE the label rather than by `.borderedProminent`: a
+        // prominent button takes a background of its own, which broke this item out of the
+        // glass capsule it shares with the sidebar toggle.
         // No `withAnimation` on the change: the two modes are different content, not a moved view,
         // and animating the swap made the whole pane slide in from the window's leading edge.
         ToolbarToggle(isOn: Binding(get: { model.ocrMode }, set: { model.ocrMode = $0 }),
                       symbol: "text.viewfinder",
                       title: model.ocrMode ? "Back to search" : "Transcribe a document")
+            .help(model.ocrMode ? "Back to search  \u{2318}\u{2325}O" : "Transcribe a document  \u{2318}\u{2325}O")
+            .accessibilityLabel(model.ocrMode ? "Back to search" : "Transcribe a document")
+            .accessibilityIdentifier("ocr.toggle")
+    }
+}
+
+private struct ServeItem: View {
+    @Environment(AppModel.self) private var model: AppModel
+
+    var body: some View {
+        ToolbarToggle(isOn: Binding(get: { model.serving.isOn },
+                                    set: { model.serving.enabled = $0 }),
+                      symbol: "network",
+                      title: "Serve over HTTP")
+            .disabled(model.serving.pausedForBenchmark)
+            .help(servingHelp)
+            .accessibilityLabel("Serve over HTTP")
     }
 
-    /// Either browser is on screen. The two are one mode as far as the toolbar is concerned.
+    /// Names the port when it is actually listening, because that is what a reader needs next. No
+    /// "click to stop": it is a toggle, and its filled state already says which way it is.
+    private var servingHelp: String {
+        model.serving.pausedForBenchmark ? "Off while the benchmark runs"
+            : model.serving.state == .running ? "Serving on port \(model.serving.port)" : "Serve over HTTP"
+    }
+}
 
-    /// Gallery first, then list - Finder's order (icon view, list view, ...), and the order this
-    /// app's own shortcuts already use: Cmd-1 gallery, Cmd-2 list. The segments used to run the
-    /// other way round, so the control contradicted both Finder and the View menu above it.
-    ///
-    /// Shared by the search cluster and the browser's, which is the point: one control, one place
-    /// to change it, and no way for the two to end up offering different segments.
-    private var viewPicker: some View {
+private struct BookmarkItem: View {
+    @Environment(AppModel.self) private var model: AppModel
+
+    var body: some View {
+        Button { model.toggleBookmarkCurrentSearch() } label: {
+            // No explicit color in the unbookmarked state, so the toolbar can dim it like every
+            // other button when the window resigns key (e.g. while Settings is open). Yellow is
+            // applied only when bookmarked, where the lit status color is intentional.
+            // Titled, so the item sizes on Sequoia - see sidebarToggleButton.
+            if model.currentSearchIsBookmarked {
+                Label("Remove Bookmark", systemImage: "star.fill").foregroundStyle(.yellow)
+            } else {
+                Label("Bookmark Search", systemImage: "star")
+            }
+        }
+        // Cmd-D is owned by the File-menu "Bookmark Search" command (single owner, avoids a
+        // duplicate-shortcut conflict); the tooltip names it, and accessibilityLabel is what
+        // VoiceOver reads and what the toolbar-overflow menu shows for this icon-only button.
+        .help(model.currentSearchIsBookmarked ? "Remove Bookmark  \u{2318}D" : "Bookmark Search  \u{2318}D")
+        .accessibilityLabel(model.currentSearchIsBookmarked ? "Remove Bookmark" : "Bookmark Search")
+    }
+}
+
+private struct ShareItem: View {
+    @Environment(AppModel.self) private var model: AppModel
+
+    var body: some View {
+        // The system share sheet, not a menu of our own - same as OCR's. Disabled rather than
+        // hidden when nothing is selected, so the group does not change width as you click
+        // around; that is how the OCR group behaves too.
+        // A button that builds the share list when clicked, not a ShareLink holding it: see
+        // the File menu's Share. Holding it re-laid out the toolbar on every arrow press.
+        Button { SelectionShare.present(model.selectedURLsOrdered) } label: {
+            Label("Share\u{2026}", systemImage: "square.and.arrow.up")
+        }
+        // Both states say something true and useful: what it will do, or what is missing.
+        .help(model.menuSelection.count == 0 ? "Select a file to share" : "Share the selection")
+        .disabled(model.menuSelection.count == 0)
+    }
+}
+
+/// Gallery first, then list - Finder's order (icon view, list view, ...), and the order this
+/// app's own shortcuts already use: Cmd-1 gallery, Cmd-2 list. The segments used to run the
+/// other way round, so the control contradicted both Finder and the View menu above it.
+///
+/// Shared by the search cluster and the browser's, which is the point: one control, one place
+/// to change it, and no way for the two to end up offering different segments.
+private struct ViewModePicker: View {
+    @Environment(AppModel.self) private var model: AppModel
+
+    var body: some View {
         Picker("View", selection: Binding(get: { model.viewMode }, set: { model.viewMode = $0 })) {
             Image(systemName: "square.grid.2x2").accessibilityLabel("Gallery view").tag(ResultViewMode.grid)
             Image(systemName: "list.bullet").accessibilityLabel("List view").tag(ResultViewMode.list)
@@ -209,245 +451,51 @@ struct SearchToolbar: ViewModifier {
         .fixedSize()
         .help("Switch between list and gallery")
     }
+}
 
-    /// Search by a file, and share what is selected - the same pair, in the same order, that OCR
-    /// mode puts next to its own search field (`ocr.open`, `ocr.share`). This USED to be a glyph
-    /// installed inside the search field itself, which had two problems: it was invisible as an
-    /// affordance, and it had to hide whenever the field held text, so it disappeared exactly when
-    /// a query was on screen. A toolbar button is always there and always the same size.
-    /// Tahoe lays the trailing cluster out after its `ToolbarSpacer`. macOS 14/15 have no spacer
-    /// that survives (a SwiftUI `Spacer` item is dropped, an injected `.flexibleSpace` is pruned on
-    /// every state change, and a stretched item's width request pushes its neighbours into the
-    /// overflow menu), so there the trailing items say `.primaryAction`, which puts them on the
-    /// trailing side of the leading group. Verified on macOS 15.7 in a VM.
-    private var trailingPlacement: ToolbarItemPlacement {
-        if #available(macOS 26.0, *) { return .automatic }
-        return .primaryAction
-    }
+private struct SortViewItem: View {
+    @Environment(AppModel.self) private var model: AppModel
 
-    @ToolbarContentBuilder private var fileActions: some ToolbarContent {
-        ToolbarItem(id: "search.open", placement: trailingPlacement) {
-            Button { model.searchByFilePanel() } label: {
-                // `folder`, the same symbol OCR's Open Document uses. The two are the same verb.
-                Label("Search by File\u{2026}", systemImage: "folder")
-            }
-            .help("Search by File  \u{21e7}\u{2318}O")
-            .accessibilityLabel("Search by File")
-        }
-        ToolbarItem(id: "search.share", placement: trailingPlacement) {
-            // The system share sheet, not a menu of our own - same as OCR's. Disabled rather than
-            // hidden when nothing is selected, so the group does not change width as you click
-            // around; that is how the OCR group behaves too.
-            // A button that builds the share list when clicked, not a ShareLink holding it: see
-            // the File menu's Share. Holding it re-laid out the toolbar on every arrow press.
-            Button { SelectionShare.present(model.selectedURLsOrdered) } label: {
-                Label("Share\u{2026}", systemImage: "square.and.arrow.up")
-            }
-            // Both states say something true and useful: what it will do, or what is missing.
-            .help(model.menuSelection.count == 0 ? "Select a file to share" : "Share the selection")
-            .disabled(model.menuSelection.count == 0)
-        }
-    }
-
-    /// Names the port when it is actually listening, because that is the thing a user needs next.
-    /// Names the port when it is actually listening, because that is what a reader needs next. No
-    /// "click to stop": it is a toggle, and its filled state already says which way it is.
-    private var servingHelp: String {
-        model.serving.pausedForBenchmark ? "Off while the benchmark runs"
-            : model.serving.state == .running ? "Serving on port \(model.serving.port)" : "Serve over HTTP"
-    }
-
-    /// The four leading controls, emitted at whatever placement the running system actually
-    /// renders. See the note at the call site for why Sequoia cannot have `.navigation`.
-    ///
-    /// OCR mode sits next to the sidebar toggle because it switches what the content area IS - the
-    /// same class of thing as showing or hiding the sidebar - rather than acting on results; in the
-    /// trailing cluster it drifted with the search field's width. It is deliberately NOT gated on
-    /// `phase == .ready`: transcription reads a dropped file and writes Markdown, touching neither
-    /// the vector index nor the embedding model, so gating it on the index would strand the feature
-    /// exactly when it is most useful - while a large index loads.
-    ///
-    /// Serving is here for the same reason: a global mode of the app, on until turned off, rather
-    /// than an action on whatever is on screen. Same switch as Settings > Serving, never a second
-    /// source of truth.
-    @ToolbarContentBuilder
-    private func leadingModeItems(_ placement: ToolbarItemPlacement) -> some ToolbarContent {
-        ToolbarItem(id: "sidebar.mode", placement: placement) { sidebarToggleButton }
-        ToolbarItem(id: "ocr.mode", placement: placement) {
-            // On is a FILLED accent circle with a white glyph, the way Preview draws Markup while
-            // it is on. The fill is drawn INSIDE the label rather than by `.borderedProminent`: a
-            // prominent button takes a background of its own, which broke this item out of the
-            // glass capsule it shares with the sidebar toggle.
-            ocrToggleButton
-                .help(model.ocrMode ? "Back to search  \u{2318}\u{2325}O" : "Transcribe a document  \u{2318}\u{2325}O")
-                .accessibilityLabel(model.ocrMode ? "Back to search" : "Transcribe a document")
-                .accessibilityIdentifier("ocr.toggle")
-        }
-        ToolbarItem(id: "serve.mode", placement: placement) {
-            ToolbarToggle(isOn: Binding(get: { model.serving.isOn },
-                                        set: { model.serving.enabled = $0 }),
-                          symbol: "network",
-                          title: "Serve over HTTP")
-                .disabled(model.serving.pausedForBenchmark)
-                .help(servingHelp)
-                .accessibilityLabel("Serve over HTTP")
-        }
-    }
-
-    @ToolbarContentBuilder private var toolbar: some ToolbarContent {
-        // No explicit sidebar toggle: Sequoia's system toggle (next to the traffic lights, like
-        // Finder) lives and dies with the split-view TRACKING SEPARATOR item, which this app keeps
-        // (transparent - see the tuner). Hiding the title does NOT collapse it; only removing the
-        // separator item does. An explicit button here therefore always duplicates the system one.
-        // Finder-style back/forward at the leading edge of the content toolbar. The window's title TEXT
-        // is hidden (WindowTitleHider), so the chevrons own the leading edge with no "Omni" label. The
-        // toolbar ITEM is unconditional and wraps the chevrons in an always-present HStack: a directly
-        // conditional .navigation item reorders unpredictably, whereas the always-present HStack holds a
-        // stable leading slot and the conditional chevrons inside it just appear/vanish. Progressive
-        // disclosure: the chevrons show only once there's somewhere to go, so the idle state is empty
-        // here. Cmd-[ / Cmd-] match Finder and Safari; each chevron disables independently at the end of
-        // its trail. Grouped so on Tahoe they share one Liquid Glass pill.
-        // OCR mode sits next to the sidebar toggle, at the leading edge. It switches what the
-        // content area IS - the same class of thing as showing or hiding the sidebar - rather
-        // than acting on results, and in the trailing cluster it drifted with the search field's
-        // width and stranded itself mid-toolbar whenever the sidebar was collapsed.
-        //
-        // Deliberately NOT gated on `phase == .ready`: transcription reads a dropped file and
-        // writes Markdown, and touches neither the vector index nor the embedding model. Gating
-        // it on the index would strand the feature exactly when it is most useful - while a large
-        // index loads, or when another copy of Omni holds it open.
-        // THE SAME PLACEMENT ON EVERY SYSTEM, VERIFIED ON macOS 15.7 (tart VM, 2026-09-22). The
-        // leading items were moved to `.primaryAction` pre-Tahoe on the theory that Sequoia drops
-        // `.navigation` items, and then given titled labels on the theory that an untitled label
-        // cannot be sized. Neither was the cause: the items were present and collapsed to 10x10
-        // because the TOOLBAR WAS REBUILT - the root swapped whole split views between modes and
-        // the detail swapped its content under a Group - and macOS 14/15 do not size SwiftUI items
-        // in a rebuilt toolbar. With one stable split view and a ZStack owner (see `body` and
-        // `split`) they measure 34x28 / 31x28 / 29x28 at launch and through OCR on/off cycles, at
-        // the leading edge where Tahoe puts them.
-        leadingModeItems(.navigation)
+    var body: some View {
         if #available(macOS 26.0, *) {
-            ToolbarItem(id: "nav.title", placement: .navigation) { navAndTitle }
-                .sharedBackgroundVisibility(.hidden)
-        } else {
-            ToolbarItem(id: "nav.title", placement: .navigation) { navAndTitle }
-            // macOS 14/15: the window title is hidden (the tuner), and the title item was what
-            // filled the free space - without it the search field packed against the leading
-            // buttons. An empty centre item takes that job: AppKit gives a principal item flexible
-            // room on both sides. Checked on 15.7 in search, results and OCR mode; the window keeps
-            // its name "Omni" for the Window menu and Mission Control.
-            // AppKit keeps a centre item centred by shrinking what is beside it, the search field
-            // first; the tuner holds the field at its own width, so the centre item gives way (#31).
-            ToolbarItem(id: "center", placement: .principal) { Color.clear.frame(width: 1, height: 1) }
-        }
-        // Flexible space after back/forward pushes every other control to the trailing edge (chevrons
-        // own the left, everything else is right-aligned), and on Tahoe it's also the correct separator
-        // between Liquid Glass toolbar groups - the leading chevron pill and the trailing control pills
-        // read as distinct glass surfaces.
-        if #available(macOS 26.0, *) {
-            ToolbarSpacer(.flexible)
-        }
-        // NO SPACER PRE-TAHOE, AND NONE IS NEEDED ANY MORE. This used to say the tuner inserted an
-        // AppKit `.flexibleSpace` item to do the same job; it did once, and 692c238 took that
-        // machinery out with the in-field search-by-file button while leaving the claim here - so
-        // the comment described code that had not existed for a while. A SwiftUI
-        // `ToolbarItem { Spacer() }` is genuinely dropped on macOS 14/15 (verified against the live
-        // NSToolbar's item list), which is why the AppKit item was there.
-        //
-        // Pre-Tahoe the trailing cluster is `.primaryAction` instead - see `trailingPlacement`.
-        // Bookmark the current search. The only way into History when recording is set to "Only when
-        // I bookmark", and a quick save otherwise. Appears once there's a search to keep.
-        if model.phase == .ready, !model.ocrMode, model.hasActiveSearch {
-            ToolbarItem(placement: .primaryAction) {
-                Button { model.toggleBookmarkCurrentSearch() } label: {
-                    // No explicit color in the unbookmarked state, so the toolbar can dim it like every
-                    // other button when the window resigns key (e.g. while Settings is open). Yellow is
-                    // applied only when bookmarked, where the lit status color is intentional.
-                    // Titled, so the item sizes on Sequoia - see sidebarToggleButton.
-                    if model.currentSearchIsBookmarked {
-                        Label("Remove Bookmark", systemImage: "star.fill").foregroundStyle(.yellow)
-                    } else {
-                        Label("Bookmark Search", systemImage: "star")
-                    }
-                }
-                // Cmd-D is owned by the File-menu "Bookmark Search" command (single owner, avoids a
-                // duplicate-shortcut conflict); the tooltip names it, and accessibilityLabel is what
-                // VoiceOver reads and what the toolbar-overflow menu shows for this icon-only button.
-                .help(model.currentSearchIsBookmarked ? "Remove Bookmark  \u{2318}D" : "Bookmark Search  \u{2318}D")
-                .accessibilityLabel(model.currentSearchIsBookmarked ? "Remove Bookmark" : "Bookmark Search")
-            }
-        }
-        // Progressive disclosure: the filter/sort/view chrome appears only once there are results
-        // to act on - hidden, not greyed out, during onboarding and the idle/empty states.
-        // Exception: keep the filter menu reachable whenever a filter is active, so a filter that
-        // hides every result can still be cleared (otherwise the menu vanishes with the results).
-        // NOT WHILE BROWSING. Entering a folder sets `filterFolder`, which makes `filtersActive`
-        // true, so this menu used to appear over a browser whose listing it cannot change - the
-        // browser lists indexed children, not filtered results. Inert chrome. (The star stays:
-        // bookmarking a browsed folder saves a state you can actually return to.)
-        if model.phase == .ready, !model.ocrMode, !showsBrowser, browse != .clipboardOff,
-           model.toolbarHasResults || model.filtersActive {
-        // Filter joins sort/view in the trailing placement so on Tahoe the three result controls
-        // share ONE Liquid Glass pill (search-by-file + bookmark form the other). filterPlacement
-        // keeps filter leading on pre-26 so the Sequoia toolbar layout is unchanged.
-        ToolbarItem(placement: filterPlacement) {
-            filterMenu.disabled(!model.hasIndexedFiles)
-        }
-        }
-        // Result presentation - sort + view.
-        //
-        // SORT IS SEARCH-ONLY. It orders RESULTS, which are ranked; a browser sorts by clicking a
-        // column header (see FolderBrowser) and this menu does nothing there. It used to be shown
-        // while browsing, where it was inert chrome.
-        //
-        // VIEW IS BOTH. A listing is a list of things with a name and a date whichever way you
-        // arrived at it, and both browsers draw a gallery - which nothing could switch to while
-        // the Photos browser was missing from this condition.
-        if model.phase == .ready, !model.ocrMode, showsBrowser, !model.toolbarHasResults {
-            ToolbarItem(id: "browse.view", placement: .primaryAction) { viewPicker }
-        }
-        if model.phase == .ready, !model.ocrMode, model.toolbarShowsSortView {
-        ToolbarItem(placement: .primaryAction) {
-            if #available(macOS 26.0, *) {
-                // Tahoe: the inline sort menu + segmented view toggle render and overflow cleanly.
-                ControlGroup {
-                    Menu {
-                        Picker("Sort By", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
-                            ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
-                        }
-                    } label: { Image(systemName: "arrow.up.arrow.down") }
-                    .help("Sort by \(model.sortOrder.title)")
-                    .accessibilityLabel("Sort results")
-
-                    viewPicker
-                }
-            } else {
-                // Sequoia and earlier: a ControlGroup of a menu + segmented picker overflows into an
-                // empty, icon-less toolbar dropdown. Use one compact labeled menu instead so it always
-                // shows its icon and survives overflow.
+            // Tahoe: the inline sort menu + segmented view toggle render and overflow cleanly.
+            ControlGroup {
                 Menu {
-                    Picker("View", selection: Binding(get: { model.viewMode }, set: { model.viewMode = $0 })) {
-                        Label("as Gallery", systemImage: "square.grid.2x2").tag(ResultViewMode.grid)
-                        Label("as List", systemImage: "list.bullet").tag(ResultViewMode.list)
-                    }
-                    Divider()
                     Picker("Sort By", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
                         ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
                     }
-                } label: {
-                    Label("View Options", systemImage: "slider.horizontal.3")
-                }
-                .help("Sort and view")
+                } label: { Image(systemName: "arrow.up.arrow.down") }
+                .help("Sort by \(model.sortOrder.title)")
+                .accessibilityLabel("Sort results")
+
+                ViewModePicker()
             }
+        } else {
+            // Sequoia and earlier: a ControlGroup of a menu + segmented picker overflows into an
+            // empty, icon-less toolbar dropdown. Use one compact labeled menu instead so it always
+            // shows its icon and survives overflow.
+            Menu {
+                Picker("View", selection: Binding(get: { model.viewMode }, set: { model.viewMode = $0 })) {
+                    Label("as Gallery", systemImage: "square.grid.2x2").tag(ResultViewMode.grid)
+                    Label("as List", systemImage: "list.bullet").tag(ResultViewMode.list)
+                }
+                Divider()
+                Picker("Sort By", selection: Binding(get: { model.sortOrder }, set: { model.sortOrder = $0 })) {
+                    ForEach(SortOrder.allCases) { Text($0.title).tag($0) }
+                }
+            } label: {
+                Label("View Options", systemImage: "slider.horizontal.3")
+            }
+            .help("Sort and view")
         }
-        }
-        // LAST, so it sits immediately before the search field - the slot OCR mode puts the same
-        // pair in. Not in OCR mode: that mode has its own Open Document and Share, for the
-        // document rather than for the index.
-        if model.phase == .ready, !model.ocrMode {
-            if #available(macOS 26.0, *) { ToolbarSpacer(.fixed) }
-            fileActions
-        }
+    }
+}
+
+private struct FilterItem: View {
+    @Environment(AppModel.self) private var model: AppModel
+
+    var body: some View {
+        filterMenu.disabled(!model.hasIndexedFiles)
     }
 
     private var filterKinds: [FileKind] {

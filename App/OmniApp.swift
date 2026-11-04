@@ -25,6 +25,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// is still Cmd-Q, which is the one gesture that means it.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
+    /// QUIT QUITS, SHEET OR NOT. AppKit's `terminate:` does nothing while a window has a sheet
+    /// attached - no delegate call, no beep, the Quit item still enabled (probed with a bare
+    /// NSApplication: it returned with the sheet up, and ran once the sheet was ended) - so Cmd-Q,
+    /// the menu, the Dock's Quit and a logout were all ignored while the Go to Folder or "Linked
+    /// with" sheet was open (full test 2026-11-03). The obvious ways round it do not work here:
+    /// SwiftUI runs its own NSApplication subclass (`AppKitApplication`, read back from the running
+    /// app) and ignores Info.plist's NSPrincipalClass; it does not run a menu command's action while
+    /// that command's window shows a sheet; and a sheet ended from AppKit is presented again, since
+    /// SwiftUI's state still says it is shown (logged: ended, then attached again). So `terminate:`
+    /// on the app's own class - the one call every quit makes - asks each sheet's owner to close it
+    /// (`dismissSheetsForQuit`), and runs once none is attached: at most a second and a half later.
+    /// Nothing a sheet holds outlives a quit anyway.
+    static let dismissSheetsForQuit = Notification.Name("io.hanxiao.omni.dismissSheetsForQuit")
+
+    private static func letQuitEndSheets() {
+        guard let app = NSApp, let cls = object_getClass(app) else { return }
+        let sel = #selector(NSApplication.terminate(_:))
+        guard let method = class_getInstanceMethod(cls, sel) else { return }
+        typealias Terminate = @convention(c) (AnyObject, Selector, AnyObject?) -> Void
+        nonisolated(unsafe) let original = unsafeBitCast(class_getMethodImplementation(cls, sel), to: Terminate.self)
+        let closingSheets: @convention(block) (AnyObject, AnyObject?) -> Void = { app, sender in
+            nonisolated(unsafe) let app = app, sender = sender
+            MainActor.assumeIsolated {
+                func sheetsOpen() -> Bool { NSApp.windows.contains { $0.attachedSheet != nil } }
+                guard sheetsOpen() else { return original(app, sel, sender) }
+                NotificationCenter.default.post(name: dismissSheetsForQuit, object: nil)
+                let deadline = Date().addingTimeInterval(1.5)
+                func attempt() {
+                    if sheetsOpen(), Date() < deadline {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { MainActor.assumeIsolated { attempt() } }
+                    } else {
+                        original(app, sel, sender)
+                    }
+                }
+                attempt()
+            }
+        }
+        class_replaceMethod(cls, sel, imp_implementationWithBlock(closingSheets), method_getTypeEncoding(method))
+    }
+
+    /// The quit Apple event - the Dock's Quit, a logout or restart, `quit app "Omni"` - goes
+    /// through `terminate:` too. AppKit's own handler checked for the sheet itself and answered
+    /// "User canceled" (-128) without calling it.
+    @objc func handleQuitEvent(_ event: NSAppleEventDescriptor, withReplyEvent reply: NSAppleEventDescriptor) {
+        MainActor.assumeIsolated { NSApp.terminate(nil) }
+    }
+
+
     /// ...and clicking the Dock icon (or picking the app in the Window menu, or opening it again
     /// from Spotlight) brings it back. `hasVisibleWindows` is false exactly in the case this
     /// exists for: the window was closed but the process is still running.
@@ -86,6 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Runs in `applicationWillFinishLaunching`, before the store is opened, so the redundant
     /// process exits without ever touching the index.
     func applicationWillFinishLaunching(_ notification: Notification) {
+        Self.letQuitEndSheets()
         // The ARGUMENT domain, for the same reason as AppModel.isolatedByLaunchArgument: reading
         // the key itself meant a user who moved their index in Settings lost the single-instance
         // guard too, so two copies could fight over the one index it is here to protect.
@@ -104,6 +153,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Services > Search in Omni, for text selected in any app (Info.plist NSServices).
         NSApp.servicesProvider = self
+        NSAppleEventManager.shared().setEventHandler(self, andSelector: #selector(handleQuitEvent(_:withReplyEvent:)),
+                                                     forEventClass: AEEventClass(kCoreEventClass),
+                                                     andEventID: AEEventID(kAEQuitApplication))
         // The other half of the single-instance guard: a redundant launch nudges us before it
         // exits, and this is what turns that into a visible window.
         DistributedNotificationCenter.default().addObserver(
@@ -214,6 +266,11 @@ struct OmniApp: App {
                 .sheet(isPresented: $showGoToFolder) {
                     GoToFolderSheet().environment(model)
                 }
+                .onReceive(NotificationCenter.default.publisher(for: AppDelegate.dismissSheetsForQuit)) { _ in
+                    showGoToFolder = false
+                    model.activeSheet = nil; model.showPhotoPicker = false; model.showPhotoDenied = false
+                    model.remoteError = nil; model.pendingDisable = nil   // alerts are sheets too
+                }
                 .onAppear {
                     ocr.willRun = { [weak model] in model?.beginOCRRun() }
                     ocr.didFinishRun = { [weak model] in model?.endOCRRun() }
@@ -287,7 +344,11 @@ struct OmniApp: App {
                 .frame(minWidth: 820, minHeight: 520)
                 .task { Updater.checkOnLaunchIfDue() }   // silent once-a-day check; prompts only if newer
         }
-        .defaultSize(width: 1000, height: 660)
+        // The size the results were laid out for: the default columns fit 1,280 pt (ui.md, "Search
+        // rows against the sidebar"), and at 1,000 the first search pushed Search by File and Share
+        // into the toolbar's overflow and cut off the Folder column (review 2026-11-01). A smaller
+        // screen gets the window clamped to it, as any window is.
+        .defaultSize(width: 1280, height: 800)
         .windowResizability(.contentMinSize)
         .commands { OmniCommands(model: model, ocr: ocr, showGoToFolder: $showGoToFolder) }
 

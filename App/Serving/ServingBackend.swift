@@ -64,7 +64,7 @@ protocol ServingBackend: Sendable {
     /// For each hit, the part of its chunk that matches `query`, at most `width` characters: the
     /// whole chunk when it fits, else its best window (PassageWindow). nil where there is no text to
     /// recover (media, a file changed since it was indexed) - the caller shows the stored snippet.
-    func passages(for hits: [(path: String, chunk: Int, locator: String)], query: String, vector: [Float]?, width: Int) -> [String?]
+    func passages(for hits: [(path: String, chunk: Int, locator: String)], query: String, vector: [Float]?, width: Int) -> [Passage?]
     /// Rank passages WITHIN an explicit set of files/folders. Embeds `query` (high priority)
     /// and scores against the already-indexed chunk vectors of those paths only.
     func searchInline(_ query: String, paths: [String], topK: Int, surface: ServedSurface) -> [InlineChunkHit]
@@ -162,7 +162,7 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
         return (hits.filter { Double($0.score) / $0.lift >= VectorStore.relevanceFloor($0, base: floor) }, vec)
     }
 
-    func passages(for hits: [(path: String, chunk: Int, locator: String)], query: String, vector: [Float]?, width: Int) -> [String?] {
+    func passages(for hits: [(path: String, chunk: Int, locator: String)], query: String, vector: [Float]?, width: Int) -> [Passage?] {
         guard let recovery = passageRecovery, width > 0, !hits.isEmpty else { return hits.map { _ in nil } }
         let t0 = omniPerfEnabled ? Date() : nil
         let q = vector ?? engine.embedQuery(query)
@@ -182,7 +182,7 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
             omniPerfLog(String(format: "passages hits=%d shown=%d windows=%d total=%.0fms",
                                hits.count, out.compactMap { $0 }.count, windows, -t0.timeIntervalSinceNow * 1000))
         }
-        return out.map { $0?.text }
+        return out
     }
 
     /// A FOLDER IS READ AT MOST THIS FAR: each file's text is read for the phrase, so a scope of

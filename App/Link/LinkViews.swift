@@ -289,7 +289,7 @@ struct RemoteBrowser: View {
     /// size, a file no file count.
     @ViewBuilder private func cell(_ col: BrowserColumn, _ c: LinkWire.Child) -> some View {
         switch col {
-        case .kind: Text(c.folder ? "Folder" : (FileKind(rawValue: c.kind)?.title ?? "--"))
+        case .kind: Text(c.folder ? "Folder" : (FileKind(rawValue: c.kind)?.singular ?? "--"))
         case .dateModified:
             Text(c.modified > 0 ? Date(timeIntervalSince1970: c.modified).formatted(date: .abbreviated, time: .shortened) : "--")
         case .size: Text(!c.folder && c.size > 0 ? ByteSize.file(c.size) : "--")

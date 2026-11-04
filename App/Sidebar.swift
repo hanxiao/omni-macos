@@ -140,6 +140,9 @@ struct Sidebar: View {
     /// of this view, and a new object there makes each re-creation by the window a changed view, so
     /// the sidebar re-ran with every window render (18 times while typing a sentence, 2026-10-26).
     @State private var selectionFlags: SidebarSelectionFlags?
+    /// A row marked because the scope came back to its place (Back, a typed `in:`), not clicked:
+    /// the place is already on screen, so the click's work (enter it, a navigation stop) is skipped.
+    @State private var markedOnly: SidebarSelection?
     @State private var folds = SidebarFolds.load()
 
 
@@ -281,6 +284,10 @@ struct Sidebar: View {
         // highlights (folders are acted on via context menu / Delete).
         .onChange(of: folds) { _, f in f.save() }
         .onChange(of: selection) { _, sel in
+            if let marked = markedOnly {
+                markedOnly = nil
+                if marked == sel { return }
+            }
             if case .history(let id) = sel, let item = model.searchHistory.first(where: { $0.id == id }) {
                 // If it couldn't run (e.g. a file query whose file is gone), drop the selection so the
                 // row isn't left stuck-highlighted and a re-click still fires.
@@ -389,6 +396,26 @@ struct Sidebar: View {
     /// Drop the history selection when it no longer matches the active query (text or file), so the
     /// row isn't left stuck-selected (which would make a re-click a no-op).
     private func reconcileSelection() {
+        // A PLACE'S ROW IS SELECTED WHILE THE SEARCH IS SCOPED TO EXACTLY THAT PLACE, as Finder's
+        // sidebar marks the folder the window shows. Clearing the box (or a subfolder entered from
+        // the browser) left the row highlighted, and a click on a selected row changes nothing, so
+        // it was dead until another row was clicked (review 2026-11-02). And marked again when the
+        // scope comes back to it, as Back from a subfolder does in Finder.
+        let scope = model.filterFolders.map(\.path)
+        switch selection {
+        case .folder(let url) where scope != [url.path]: selection = nil
+        case .clipboard where scope != [AppModel.clipboardDirectory.path]: selection = nil
+        case .recents where !model.filterRecents: selection = nil
+        default: break
+        }
+        if selection == nil, model.fileQuery == nil, model.linkedScope == nil {
+            var place: SidebarSelection?
+            if model.filterRecents { place = scope.isEmpty ? .recents : nil }
+            else if scope == [AppModel.clipboardDirectory.path] { place = .clipboard }
+            else if scope.count == 1, let root = model.roots.first(where: { $0.path == scope[0] }) { place = .folder(root) }
+            if let place { markedOnly = place; selection = place }
+            return
+        }
         guard case .history(let id) = selection else { return }
         // Match HistoryItem.id, which keys text items on the full typed string (rawQuery), not the
         // semantic remainder - otherwise a query with qualifiers would never match its own row.
@@ -544,12 +571,26 @@ private struct HistoryRowLabel: View {
             } else {
                 Image(systemName: "magnifyingglass").sidebarTint(on, else: Color.secondary).frame(width: 16)
             }
-            Text(item.displayLabel).lineLimit(1).truncationMode(item.isFile ? .middle : .tail)
+            let words = Text(item.displayLabel).lineLimit(1).truncationMode(item.isFile ? .middle : .tail)
                 .sidebarTint(on, else: .primary)
-                .layoutPriority(1)            // the words the reader typed survive; the scope gives way first
             if let scope = item.displayScope {
-                Text(scope).font(.caption).foregroundStyle(.tertiary)
-                    .lineLimit(1).truncationMode(.tail)
+                // THE SCOPE WHOLE OR NOT AT ALL. It is there to tell one folder's search from
+                // another's, and given way to the words a character at a time it read "c" for
+                // "code" (full test 2026-11-03). So: both whole; else the words cut, keeping room
+                // for a dozen characters, beside the whole scope; else the words alone (the whole
+                // query is on hover).
+                let folder = Text(scope).font(.caption).foregroundStyle(.tertiary).lineLimit(1).fixedSize()
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 7) { words.fixedSize(); folder }
+                    HStack(spacing: 7) {
+                        words.frame(minWidth: 0, idealWidth: 96, alignment: .leading)
+                        folder
+                    }
+                    words
+                }
+                .layoutPriority(1)
+            } else {
+                words.layoutPriority(1)       // the words the reader typed survive; the glyph gives way first
             }
             Spacer(minLength: 0)
             if hovered {
@@ -774,6 +815,7 @@ private struct PhotoSourceRow: View {
 
     private var photoHelp: String {
         if model.isFolderPaused(path: source.key) { return "This source is paused" }
+        if model.userPaused { return "Indexing is paused: File > Resume Indexing" }
         if let rp = model.progress.perRoot[source.key], rp.total > 0, rp.done < rp.total {
             return "Indexing \(rp.done.formatted()) / \(rp.total.formatted()) items"
         }
@@ -789,7 +831,7 @@ private struct PhotoSourceRow: View {
             Text(source.title).lineLimit(1).truncationMode(.middle)
                 .sidebarTint(selected, else: .primary)
             Spacer()
-            if model.isFolderPaused(path: source.key) {
+            if model.isFolderPaused(path: source.key) || model.userPaused {   // as FolderRow
                 if let c = model.folderFileCounts[source.key], c > 0 {
                     Text(c.formatted()).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
                 }
@@ -969,9 +1011,11 @@ private struct FolderRow: View {
                 // The fold chevron takes the badge column under the pointer and while folded, as on
                 // a linked Mac; the count is back when the pointer leaves an open folder.
                 FoldChevron(open: open)
-            } else if model.isFolderPaused(url) {
-                // Paused: indexing skips this folder. Show the count it already has,
-                // plus a pause glyph so the stopped state is unambiguous.
+            } else if model.isFolderPaused(url) || model.userPaused {
+                // Paused: indexing skips this folder - this one, or every folder while the user has
+                // paused indexing (File > Pause Indexing), which said so nowhere in the window: a
+                // folder stopped a third of the way in read as done (full test 2026-11-03). Show
+                // the count it already has, plus a glyph so the stopped state is unambiguous.
                 if model.hasIndexedFiles, let c = model.folderFileCounts[url.path], c > 0 {
                     Text(c.formatted()).font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
                 }
@@ -1015,6 +1059,7 @@ private struct FolderRow: View {
         // While this folder indexes, the row tooltip shows live progress;
         // otherwise the full path (useful when the name is truncated).
         .help(model.isFolderPaused(url) ? "This folder is paused"
+              : model.userPaused ? "Indexing is paused: File > Resume Indexing"
               : ((RootIndexState.isActive(model, url) || model.isFolderQueued(url)) && !RootIndexState.isFinished(model, url) ? RootIndexState.indexingHelp(model, url) : url.path))
         // Native source-list management: right-click to act. IDENTICAL to the menu the browser
         // gives a folder - one builder, no list of items kept in step by hand; the root-only
@@ -1163,6 +1208,7 @@ private struct LinkedMacsSection: View {
             } header: {
                 SidebarHeader("Linked Macs")
             }
+            .onReceive(NotificationCenter.default.publisher(for: AppDelegate.dismissSheetsForQuit)) { _ in confirmUnlink = nil }
             .confirmationDialog(confirmUnlink.map { "Unlink \u{201C}\($0.name)\u{201D}?" } ?? "", isPresented: Binding(
                 get: { confirmUnlink != nil }, set: { if !$0 { confirmUnlink = nil } })) {
                 Button("Unlink", role: .destructive) {

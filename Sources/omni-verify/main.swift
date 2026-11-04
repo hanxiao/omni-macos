@@ -2026,6 +2026,64 @@ if args.count >= 5 && args[1] == "noisedump" {
 // end-to-end through the REAL encoder path, against the Python reference study's example
 // images (cat.jpg -> kitty/cosy/plush..., zebra.jpg -> zebra/stripes/...). First run builds
 // the label cache (~1-2 min, reused after; delete the file to rebuild).
+// Open-vocabulary tags on the COCO-150 photos, the indexer's own path (5-crop HQ, prior seeded and
+// accumulated), with the label matrix embedded through each template in turn ("%@" is the bare
+// label, as shipped): omni-verify tagopen <modelDir> <workspaceDir> <out.json> <template>...
+if args.count >= 6 && args[1] == "tagopen" {
+    let modelDir = URL(fileURLWithPath: args[2])
+    let ws = URL(fileURLWithPath: args[3])
+    let engine = try await OmniEngine.loadValidated(modelDir: modelDir, keepAudio: false)
+    let labels = OmniTagger.gatedLabels(modelDir: modelDir)
+    guard let gtData = try? Data(contentsOf: ws.appendingPathComponent("eval_gt.json")),
+          let gt = try? JSONSerialization.jsonObject(with: gtData) as? [String: [String]] else {
+        print("tagopen: no eval_gt.json in \(ws.path)"); exit(1)
+    }
+    let ids = Array(gt.keys).sorted()
+    var images: [(raw: OmniVisionPreprocess.RawPatches, crops: [OmniVisionPreprocess.RawPatches])] = []
+    for id in ids {
+        guard let src = CGImageSourceCreateWithURL(ws.appendingPathComponent("eval_imgs/\(id).jpg") as CFURL, nil),
+              let img = CGImageSourceCreateThumbnailAtIndex(src, 0, [
+                  kCGImageSourceCreateThumbnailFromImageAlways: true,
+                  kCGImageSourceCreateThumbnailWithTransform: true,
+                  kCGImageSourceThumbnailMaxPixelSize: 1568] as CFDictionary) else { print("missing \(id)"); exit(1) }
+        let crops = OmniTagger.cwrCropRects(width: img.width, height: img.height)
+            .compactMap { img.cropping(to: $0) }.map { OmniVisionPreprocess.preprocessRaw($0) }
+        images.append((OmniVisionPreprocess.preprocessRaw(img), crops))
+    }
+    var out: [String: [String: [String]]] = [:]
+    for arm in args[5...] {
+        let tpl = arm
+        var rows: [[Float]] = []
+        var i = 0
+        while i < labels.count {
+            let group = labels[i ..< min(i + 256, labels.count)].map { tpl.replacingOccurrences(of: "%@", with: $0) }
+            rows += engine.embedTextBatch(group, as: .passage)
+            i += 256
+        }
+        // Each arm from a fresh prior: the in-memory tagger's file is named by pid and label count,
+        // so the previous arm's frozen prior would otherwise be loaded.
+        try? FileManager.default.removeItem(at: FileManager.default.temporaryDirectory
+            .appendingPathComponent("omni-tagger-mem-\(ProcessInfo.processInfo.processIdentifier)-\(labels.count).prior"))
+        guard let tagger = OmniTagger(labels: labels, rows: rows) else { print("tagopen: tagger init failed"); exit(1) }
+        engine.seedTaggerPrior(tagger)
+        engine.tagger = tagger
+        var tags: [String: [String]] = [:]
+        let t0 = Date()
+        for (k, id) in ids.enumerated() {
+            guard let r = engine.embedImagesTaggedHQ([images[k].raw], crops: [images[k].crops]), let t = r.tags.first else {
+                print("tagopen: embed failed \(id)"); exit(1)
+            }
+            tags[id] = t
+        }
+        engine.tagger = nil
+        out[arm] = tags
+        print(String(format: "  %@: %d images (%.0fs)", arm, ids.count, -t0.timeIntervalSinceNow))
+    }
+    let data = try JSONSerialization.data(withJSONObject: out, options: [.sortedKeys])
+    try data.write(to: URL(fileURLWithPath: args[4]))
+    exit(0)
+}
+
 if args.count >= 4 && args[1] == "tagprobe" {
     let modelDir = URL(fileURLWithPath: args[2])
     let engine = try await OmniEngine.loadValidated(modelDir: modelDir, keepAudio: false)

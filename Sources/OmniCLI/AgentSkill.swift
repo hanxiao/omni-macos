@@ -55,6 +55,8 @@ enum CLIProtocol {
     static let cliKey = "io.hanxiao.omni/cli"
     /// On a content block: print it to stderr, not stdout.
     static let stderrKey = "io.hanxiao.omni/stderr"
+    /// On a tools/call from `omni`: the shell's folder, which a relative path argument is in.
+    static let cwdKey = "io.hanxiao.omni/cwd"
     /// On a tool in tools/list: example arguments.
     static let examplesKey = "io.hanxiao.omni/examples"
     /// On a tool in tools/list: the parameter the bare words go to when none is required.

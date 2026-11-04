@@ -1060,8 +1060,10 @@ toolbar to /tmp/omni-debug-toolbar.txt inside the VM. The nano model runs in the
 
 ## Dragging files out (owner's decisions, 2026-10-02)
 
-- A FILE DRAGGED OUT OF OMNI IS NEVER MOVED. The drag offers copy, link and generic, never move, so
-  a drop in a Finder folder on the same disk copies (Option-Command still makes an alias). Omni is a
+- A FILE DRAGGED OUT OF OMNI IS NEVER MOVED. A plain drag offers copy and generic, never move, so
+  a drop in a Finder folder on the same disk copies; with Option-Command held it offers a link, and
+  the drop makes an alias. (It offered copy, link and generic at once until 2026-11-03, and Finder
+  aliased every plain drop: measured with real drags in the macOS 15 VM, any offer with a link.) Omni is a
   view onto files that live elsewhere; a drag must not take one out of its folder.
 - COMMAND-C ON SELECTED FILES PUTS THE FILES ON THE CLIPBOARD, Finder-style, together with their
   paths as text: Command-V in a Finder folder copies the files, Command-V in a text field pastes the
@@ -1613,3 +1615,260 @@ states (idle, a result selected, a history row selected, a folder selected, clea
 pixel-identical to the build before. Unchanged on purpose: the prompt's rolling digits (0.3 s per stats tick, the design), the
 history section re-running once per batch of served searches (about 1.6 a second under agent load,
 ~15 ms each at 20,000 searches), the first results' toolbar insert (testing.md, "UI stress").
+
+## A first-run review, checked claim by claim (2026-11-01)
+
+An agent drove 0.19.8 as a new user (a renamed copy, its own home, 42 made-up files; REVIEW.md and
+docs/review-2026-11-01/) and reported 18 defects. Each was checked against this file, the code and a
+rerun of the copy, the old build and the new one on the same files.
+
+FIXED:
+- ROW ICONS ARE FINDER'S LIST-VIEW ICONS. At row size (`Thumbnail.rowSide`, 24pt) a document is
+  QuickLook's icon mode drawn whole: the page with its border. Its plain thumbnail is a white page
+  (for a note, a white square with the text at its top) and the filled 16pt tile cropped it to a
+  band, a 2-3 px grey sliver on a white row, every text, Markdown, source and CSV row since the
+  tile went to `.fill`. PDFs at row size take the same path instead of the page render. Pictures,
+  videos and Photos assets keep the filled tile, and every size above a row is unchanged. The well
+  the review asked for stays out (NO WELL BEHIND A THUMBNAIL, above): the icon's own border is
+  Finder's answer. Probe: `qlprobe.swift` in the session scratch, the same files with and without
+  `iconMode`, fill and fit.
+- A QUALIFIER BECOMES A CHIP ONCE WHITESPACE FOLLOWS IT, ANYWHERE (`SearchQueryParser.
+  hasFinishedQualifier`). The edit path promoted only when the whole box ended in a space, so text
+  that never did - pasted, or typed faster than the field reports each keystroke - kept
+  `type:video` as words: the old build searched "type:video lap" as prose with no filter
+  (`kinds=[]`, pictures in the list) and wrote a history row that showed "lap" with a filter mark.
+  The word being typed is still never promoted, nor a quoted value still open (`in:"my `). The space
+  that ended the word is kept after the re-parse, which joins words with one space and dropped a
+  trailing one ("photos type:image " then "beach" ran together). NOT REPRODUCED: the review's
+  "model promoted, field still shows the text" - in the old build and the new one, `type:image `
+  then a pause shows the chip.
+- STORAGE: "Image labels" is its own slice (the tag vocabulary's vectors, 39.3 MB on Nano, the same
+  for every index), so a new index of 42 files reads Filename index 362 KB, not 39.8 MB.
+- THE DEFAULT WINDOW IS 1,280 x 800, the size the columns were fitted to ("Search rows against the
+  sidebar"). At 1,000 x 660 the first search put Search by File and Share in the toolbar's overflow
+  and cut off the Folder column. Only a first launch sees it; a window that has been open keeps its
+  frame.
+- Settings > OCR shows the OCR model row too (the same view as Storage's), so the tab that turns
+  transcription on can also install the model.
+- THE OCR FIND BAR IS A TOP BAR (`TopBar`, safeAreaBar on Tahoe), not an overlay: over the text it
+  hid the first line ("# RECEIPT No. 4821" half covered in the split view). The transcript starts
+  below it and scrolls under it.
+- An expanded passage that is a stored snippet at its cap ends at its last whole word
+  (`PassagesView.wholeWords`): the 220-character opening was cut wherever it fell ("executed in p").
+  The review read it as text clipped at the pane's edge; it wraps, three lines and a fade.
+- Keep history for: "1 month" for the 31-day value (unchanged), as Safari words it.
+
+NOT BUGS (recorded decisions): Escape giving up focus (testing.md, "NOT BUGS"); stripes below the last
+row of a short listing (Finder does it, above); the `in:` chip while a folder is browsed (the browsed
+folder IS the filter, "The browsed folder is filterFolder"); one row and "Show N weaker matches"
+(roadmap.md item 6: in the review's corpus only one file is about barolo wine); the funnel on a
+filtered history row (its label drops the qualifiers on purpose; the twin rows were the unpromoted
+qualifier above). The toolbar during onboarding stays: hiding `.searchable` until the model is ready
+rebuilds the toolbar, which on macOS 14/15 comes back with every item collapsed (ContentView.body).
+
+NOT A BUG IN THE APP: the review's 5-7 s first query (store search 12 ms). Its harness's `wait` runs a
+nested run loop inside a main-queue timer handler, and while it spins the main queue cannot drain,
+so no MainActor job runs - the results sat waiting for the wait to end. Reproduced with the harness:
+`since-search` 2,159 and 4,167 ms beside `search total` 12-15 ms; with the waits taken outside the
+app the same steps landed in 1-61 ms, and a first query after launch, polled without waits, 0.69 s
+cold and 0.28 s warm. The stale "41 weaker matches" under a video filter was put down to the same
+artifact, wrongly: it was the footer below (second review).
+
+OPEN: a filter with no text (`type:video ` alone) shows the idle prompt rather than listing the
+matches. The tag-only box already lists through `store.listMatching`, which takes kinds and dates
+too, but it walks every row on the store queue: reusing it for a kind alone is a hold that grows with
+the index, to be timed on the bench clone (`mutbench`) before it is offered - a decision, not a fix. Tags of code words on screenshots ("imread", "fopen") are the vocabulary
+(roadmap.md, "Image tags"). The empty OCR page rail once open for ~5 s and clipboard names cut in the
+middle of their timestamp were not reproduced or not changed.
+
+## The second review: the fixed build (2026-11-02)
+
+The same agent drove the working tree with the fixes above as a new user, grown to 360 files, two
+instances linked, and reported eleven more (its REVIEW.md, outside the repo). Each was reproduced on
+the build it tested and checked again on the new one, same files, waits taken outside the app.
+
+FIXED:
+- THE FOOTER UNDER THE RESULTS WAS FROZEN (`ResultsFooter`). ResultsList is always equal (its
+  conformance: the window re-renders for many reasons that are not the results), so SwiftUI never
+  takes a new one, and its footer was a view built from `hiddenWeaker` and `collapsedCount` in
+  ContentView's body: the counts of the search that put the list on screen. "Show 44 weaker
+  matches" under `type:image espresso recipe`, which hides 6. Since 0.14.0. The footer is its own
+  view now and reads the model in its own body. The stale "41" of the first review was this.
+- CLOSE DOCUMENT IS `reset()`. `clear()` kept its own list of what to empty and left `documents` out:
+  the closed tab kept page ids into the emptied `pages`, and leaving OCR mode then read past the end
+  in `logDocumentState` (EXC_BREAKPOINT whenever OMNI_PERF_LOG is set; reproduced), and the find text
+  outlived the document. The log reads `visiblePages`, which checks its bounds.
+- A PLACE'S SIDEBAR ROW IS SELECTED WHILE THE SEARCH IS SCOPED TO EXACTLY THAT PLACE (folder,
+  Clipboard, Recents; `reconcileSelection`). Clearing the box left the row highlighted and a click
+  on a selected row changes nothing, so it was dead; inside a subfolder opened from the browser the
+  root's row was dead the same way. Finder's rule: the row is marked only while the window shows
+  that folder, and a click on it goes back.
+- `in:` TAKES THE SIDEBAR'S NAME (`SearchQueryParser.folderPaths`): `in:corpus`, `in:Documents/Taxes`,
+  the localized name too ("Dokumente"), resolved to that root's own URL. Read as a path it resolved
+  against the process's working directory and matched nothing, silently. A name no root has is still
+  read as a path; served surfaces keep refusing relative folders with a message.
+- A LINKED MAC'S DOCUMENT AT ROW SIZE IS THE TYPE'S ICON. The peer renders the plain thumbnail and
+  sends a JPEG: for a note, a white square where a local row draws QuickLook's icon. No request is
+  made for it now. Pictures and every larger size still come from the peer. The review's "blank
+  Folder column" was not so: it reads the peer's folder in both builds.
+- "OPTIMIZING STORAGE 0%" ON A NEW INDEX WAS A STALE VALUE. The store finishes a new index's coverage
+  about 2 s after the last write (headless: 0/129 right after 43 files, nil 4 s later; in the app
+  `vecs_covered_rows` 67 and `vecs_migrated` 1 under a row still at 0% minutes later), but the row
+  was read only on the stats tick, which stops with indexing. It polls while it is on screen
+  (`refreshStorageMigration`, every 2 s, the migration's three numbers only). The guard's comment
+  that a small index never maps the named vector file is out of date since every index maps it
+  (2026-10-09); the row can show briefly during a first index, and it is true then.
+
+NOT BUGS: `/v1/embed` and `/v2/embed` answer errors as `{"message": ...}` because they are the Cohere
+shape, as the Gemini routes answer Google's and `/v1/embeddings` OpenAI's; a client of one vendor's
+API reads that vendor's errors. A Photos source missing after a relaunch: an isolated run does not
+write preferences, by design; on a real install the source list persists.
+
+DECISIONS LEFT: a qualifier still being typed (`filename:report`, no space or Return yet) is searched
+as words for that moment. Promoting it on a pause makes chips from half words, the reason for the
+rule at the top of this file; applying it without a chip needs a search text apart from the field's.
+`omni search` prints this Mac's hits before a linked Mac's even when the linked one is the better
+match: they are in separate blocks because a linked path is read with `get_linked_file`, and across
+vector spaces the scores do not compare.
+
+## The third review: Settings below the screen (2026-11-02)
+
+The same agent checked the second round's fixes (all held) and reported three more. Settings >
+Performance "taller than a laptop screen": its height was the #30 cap at work (998 pt on this
+1,080 pt screen, the usable 1,050 less 140, the pane scrolling inside), but its POSITION was not
+kept. A pane's resize keeps the window's top edge, and the window opens on Files (617 pt, top at
+851), so choosing Performance put it at y = -147: the Benchmark section below the screen's edge,
+where no scroll reaches. Every taller pane did the same to a lesser degree. `KeepOnScreen` watches
+the Settings window's resizes and moves it up by what went past the usable bottom (y = 0 for
+Performance; every pane in turn stays inside). A move by the user is not a resize and is left
+alone. The removal cut short by a quit is in index.md; the OCR memory in ocr.md.
+
+## The three reviews' fixes, reviewed before release (2026-11-02)
+
+The fixes were driven again on a copy as a new user, each beside the build before it. Three
+regressions in them, and one gap:
+- A FILTER TYPED BETWEEN TWO WORDS BECAME A CHIP MID-WORD. The first review's fix promoted a finished
+  qualifier anywhere in the box, "finished" meaning followed by whitespace, so `beach type:i photos`
+  (the caret after the `i`) made the chip `type:i`, the box lost the word, and the next letters
+  landed at its end ("photosmage"). The word being typed is now the one the edit leaves the caret in
+  (`hasFinishedQualifier(_:previous:)`, from the common prefix and suffix of the two strings), and an
+  unchanged string is no edit: the field reports some keystrokes twice, and on the second the caret
+  read as the end of the box.
+- PLAIN-QUERY MODE DOUBLED EVERY SPACE after a qualifier-shaped word: the space kept after a promotion
+  was added to a box that plain-query mode already keeps verbatim (`plan  notes  `, two spaces each). Added only when
+  the text does not end in whitespace.
+- A PASSAGE CUT AT ITS LAST SPACE showed a 220-character Chinese snippet with one early space as its
+  first three characters. It ends before its last word by the system's word breaks
+  (`enumerateSubstrings(.byWords)`), kept whole when it is one word; cached, at 16 us an English
+  snippet and 183 us a Chinese one, since the view re-renders per hover.
+- BACK FROM A SUBFOLDER LEFT THE FOLDER'S ROW UNMARKED. The second review's fix unmarks a row whose
+  place the search leaves; nothing marked it when the scope came back. A row is now marked when the
+  scope is exactly its place (Back, a typed `in:`, `in:recents`), without the click's work: entering
+  the place again would add a navigation stop and lose Forward. Two folders under one name typed as
+  `in:corpus` mark neither.
+
+## A full test of the release candidate, and its findings fixed (2026-11-03)
+
+The candidate and 0.19.8 were driven side by side on ~37,000 generated files (awkward ones among
+them: empty, corrupt, locked, binary named .txt, a 300-page PDF, a 40-deep folder). Interleaved,
+nothing was slower or heavier than 0.19.8. What it found, and what was done:
+- QUIT DID NOTHING WITH A SHEET OPEN - Cmd-Q, the menu, the Dock, a logout. AppKit's `terminate:`
+  returns without a word while a window has a sheet attached (probed on a bare NSApplication: it
+  returned with the sheet up and ran once it was ended). None of the obvious fixes reach it in a
+  SwiftUI app: SwiftUI runs its own NSApplication subclass (`AppKitApplication`, read back from the
+  running app) and ignores NSPrincipalClass; it skips a menu command's action while that command's
+  window shows a sheet; and a sheet ended from AppKit is presented again, since SwiftUI's state
+  still says it is shown (logged: ended, then attached again, 4 of 5 quits still refused). So
+  `terminate:` on the app's own class asks each sheet's owner to close it
+  (`AppDelegate.dismissSheetsForQuit`), and runs once none is attached; the quit Apple event goes
+  through it too (AppKit's own handler answered "User canceled", -128). Cmd-Q, the menu and
+  `terminate` with Go to Folder open: 9 of 9; the quit event with and without a sheet: 6 of 6.
+- A LIST UNDER A COLUMN HEADER TAKES THE AUTOMATIC SCROLL EDGE. Under `.soft` the row scrolled
+  beneath the header stayed legible through its titles ("note-02683.txt" behind "Name", light and
+  dark). Three arms side by side: automatic leaves a faint blur, hard an opaque band. The HIG:
+  prefer automatic, "a more opaque visual separation for ... pinned table headers". The gallery,
+  with no header, keeps `.soft`.
+- A HISTORY ROW SHOWS ITS FOLDER WHOLE OR NOT AT ALL. Given way to the words a character at a time,
+  "code" read "c". `ViewThatFits`: both whole; else the words cut (room kept for about a dozen
+  characters) beside the whole folder; else the words alone, the query on hover.
+- A FOLDER'S FILE ROWS SHOW THE FILE'S OWN THUMBNAIL, as the search list's rows do (a folder of
+  photos was a column of identical PNG icons); folders keep their own icons. The Kind column says
+  "Image", not the category's "Images", in every list.
+- PAUSE INDEXING SAID SO NOWHERE IN THE WINDOW: a folder stopped a third of the way read as done.
+  While the user has paused, every folder carries the mark a paused folder already had (its count,
+  dimmed, and the outline triangle; "Indexing is paused: File > Resume Indexing" on hover).
+- THE OCR NAVIGATOR FOLLOWS FIND, and the transcript keeps its page when a run ends. Stepping
+  through matches moved the text pages away while the rail stayed where the run left it; the rail
+  now marks the match's page and scrolls it into view by the least it can. When a run ends, the
+  read-only transcript gives way to the editable one, which scrolled to its page before it had a
+  size and so stayed at page 1 while the rail marked page 40; it scrolls once on screen. AN EMPTY
+  RAIL IS FOLDED whoever unfolds it (once in four after Close Document, not reproduced in six
+  more, `ocr-rail-refold` and `tuner-sidebar-width` in the perf log if it ever is).
+- THE SEARCH TEXT FOLLOWS LIGHT AND DARK. The field editor kept the colour its text was typed in:
+  black on the dark field after a switch. Set back to the dynamic colour on an appearance change.
+- MEASURED, interleaved against 0.19.8 on clones of one index (g/f/o = 0.19.8, this build, this
+  build with the header edge, the history layout and the folder thumbnails switched back; the
+  journey of ten queries, 47 keys typed, a 5,000-file folder browsed and scrolled): query to
+  results p50 287 / 306 / 294 ms (0.19.8 alone ranged 265-321 across its runs, and the harness
+  answers on an 80 ms tick), blocks over 100 ms 20 / 19 / 19 a run, query and typing CPU the same.
+  The folder thumbnails cost +0.2 s of CPU over ten fast scrolls through 5,000 rows, with no more
+  blocks: what the search list's rows already pay. A first A/B on two different index copies read
+  44 blocks against 24; on clones of one index it did not reproduce.
+- THE RESULT CONTROLS STAY ONCE SHOWN (Han, 2026-11-03). They came out with the results and went
+  back in with the next set, so every search from an empty box re-tiled the toolbar (the block taken
+  apart in testing.md, "UI stress"). First kept a second after a clear: interleaved journeys, query to
+  results p50 297 -> 254 ms, main CPU over ten queries 5.5 -> 4.4 s, blocks over 100 ms 22.7 -> 19.7
+  a run; a clear followed by a pause still paid in full. Now filter and sort/view arrive with the first
+  results and stay while the window searches (`resultControlsShown`); the idle window before any
+  search is as it was, the bookmark still goes with the search, a browser shows its own view picker.
+  Steps, interleaved: a search from an empty box 275-321 -> 86-91 ms main CPU (the first of a
+  session still pays), a clear 83-88 -> 65-66 ms, a query typed a key at a time after a clear
+  902 -> 845 ms, blocks over 100 ms 7-8 -> 2-3 a run. Journeys, five pairs: blocks 16.2 -> 14.2 a run,
+  query CPU the same once the order alternates; typing 47 keys read +0.24 s of process CPU in all
+  five, where one profiled pair showed the same samples on the main thread and the others.
+- EACH TOOLBAR ITEM IS A VIEW OF ITS OWN (SearchToolbar). The modifier built every item's content,
+  so it read every item's state: counted per perf-script step, a filtered query rebuilt all six
+  items (bookmark, back/forward and title, share, filter menu, sort/view), a row click the same
+  through the share item's selection count. Now the modifier reads only what adds or removes an item
+  (`resultControlsShown` before `filtersActive`, so a filter change is not read there while results
+  stand) and a filtered query redraws the filter item alone. Interleaved journeys, three each:
+  blocks over 100 ms 19.0 -> 16.7 a run, time blocked 2.39 -> 2.11 s, query CPU 4.40 -> 4.01 s. The
+  toolbar is pixel-identical before and after in six states (idle, results, filtered, Recents, a
+  folder, OCR) on 26, 15.7 and 14.8, the text caret aside.
+- THE REST OF THE BLOCKS, TAKEN APART (Time Profiler on the journey and on 30 plain replacements;
+  `steps` = main CPU per perf-script step, two to three interleaved runs per arm):
+  - A new result set: SwiftUI's lazy stack sizing and placing rows is ~40% of the main thread
+    (`LazyHVStack.lengthAndSpacing`, `LazySubviewPlacements`); no one part of a row carries it. Each
+    switched off alone (the columns' ForEach unrolled, the iCloud badge, the geometry reports, the
+    gestures, the thumbnail) moved a step by less than its run-to-run spread (+-10 ms on 60-140).
+  - The first results after an empty box inserted the bookmark, filter and sort/view items: ~185 ms
+    over two frames. Kept in the toolbar from launch they cost nothing (first search 297 -> 110 ms
+    main CPU). Han's call (2026-11-03): they appear with the first results and then STAY while the
+    window searches (below). The filter menu
+    is ~90 ms of it (a plain button in its place: 205 ms, journey blocks 16 -> 12.3); its extension
+    list ~1.25 ms an extension (36 here, 76 on the bench index), `Text(verbatim:)` no faster. The
+    bookmark kept through the second of grace: no change.
+  - A 5,000-file folder: AppKit's automatic row heights for the inserted rows on entering it, and
+    `List` evaluating rows in its diff (the row closure, Swift metadata lookups), 100-230 ms a step.
+  - Settings opened the first time: ~160 ms, SwiftUI making the window.
+- A PLAIN-TEXT ROW IS ITS TYPE'S ICON at row size, the ruled page Finder's list view draws: compared
+  on the 1x screen of the macOS 15 VM, Finder's list and Omni's side by side, QuickLook's icon mode
+  drew a blank page with a tiny type label (the "faint" icon). Documents keep their previews.
+- A STACK HOLDS EVERY COPY: 121 identical pictures stacked as "120 copies" (the result pool). An
+  exact stack takes the copies of its content key the search's filter allows
+  (`VectorStore.copies`), so "121 copies" and "Move All 121 Copies to Trash".
+- A FILTERED HISTORY ROW SHOWS ITS FIRST FILTER as a folder-scoped one shows its folder:
+  "kyoto type:image", "kyoto ext:md", where four rows read "kyoto".
+- A RECENTS SEARCH KEEPS ITS RECENTS WHILE A FOLDER INDEXES: a Find Similar in Recents was replaced
+  by 76 freshly indexed notes 30 s into a 30,000-file folder (0.19.8); a live refresh now searches
+  the Recents the search started with (SearchFilter.recentsPaths), a new search the newest files.
+- DRAGGED OUT, A FILE IS COPIED: see "Dragging files out" (Finder aliased every plain drop).
+- ON macOS 15 (the Sequoia VM, 15.7.7): the PDF page, `in:` by name, history scopes, folder
+  thumbnails and Kind, the search text in dark mode, and Quit with a sheet (Cmd-Q, menu, quit
+  event) as on Tahoe; the toolbar and the browser beside 0.19.8, the same. Real system events in
+  the VM drove what this Mac's harness cannot: Search by File and Add... through Apple's open panel,
+  Cmd-V of text and of a picture, a file dragged in from Finder and results dragged out.
+- NOT CHANGED: Back/Forward appearing with the first search is the mode audit's rule (a control is
+  shown only where it does something); tag fragments ("mon", "gard") are words the tokenizer splits,
+  whose whole form is not a label: five more ways to tell them from words were measured on the
+  COCO photos and none holds (roadmap.md, "Image tags").

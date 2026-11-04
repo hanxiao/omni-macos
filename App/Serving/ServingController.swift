@@ -115,7 +115,11 @@ final class ServingController {
             let (hits, vector) = backend.searchReturningVector(query, topK: min(limit * 3, 150), filter: SearchFilter(), surface: .intent)
             let reps = backend.groupedResults(hits, enabled: true, limit: limit).map(\.representative)
             let passages = SearchAdapter.textPassages(reps, query: query, vector: vector, width: width, backend: backend)
-            return Array(zip(reps, passages)).map { (hit: $0.0, passage: $0.1) }
+            return Array(zip(reps, passages)).map { hit, p in
+                var hit = hit
+                if let l = p?.locator { hit.locator = l }
+                return (hit: hit, passage: p?.text)
+            }
         }
     }
 

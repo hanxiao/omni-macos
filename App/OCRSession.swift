@@ -266,9 +266,14 @@ final class OCRSession {
         didSet {
             guard find != oldValue else { return }
             activeMatch = 0
+            findLeads = !find.isEmpty
             rebuildMatches()
         }
     }
+    /// The last thing that moved the reader was find, not a page click: the navigator marks the
+    /// match's page, as Preview's sidebar does. It sat on the page the run left it at while the
+    /// text jumped to a match pages away (full test 2026-11-03).
+    private var findLeads = false
     /// Section id and the count of matches in it, in reading order.
     private(set) var matchSections: [Int] = []
     private(set) var matchCount = 0
@@ -283,6 +288,7 @@ final class OCRSession {
     func stepMatch(by delta: Int) {
         guard matchCount > 0 else { return }
         activeMatch = (activeMatch + delta + matchCount) % matchCount
+        findLeads = true
     }
 
     /// Recomputed when the query changes and as sections finish, so a match in a page that is
@@ -464,6 +470,8 @@ final class OCRSession {
     /// navigator always marks the page you are on, so it falls back to this tab's first page.
     var railSelection: Int? {
         guard let doc = visibleDocument else { return nil }
+        // A match's section is its page while the transcript is unedited (sectionIDs).
+        if findLeads, documentEdit == nil, let m = activeMatchSection, doc.pageIDs.contains(m) { return m }
         if let index = visibleIndex, doc.pageIDs.contains(index) { return index }
         return doc.pageIDs.first
     }
@@ -1045,9 +1053,10 @@ final class OCRSession {
     func logDocumentState(_ when: String) {
         guard omniPerfEnabled else { return }
         let ids = sectionIDs
-        let states = (visibleDocument?.pageIDs ?? []).map { id -> String in
+        let states = visiblePages.map { page -> String in
+            let id = page.id
             let st: String
-            switch pages[id].state {
+            switch page.state {
             case .done: st = "done"
             case .failed: st = "failed"
             case .running: st = "running"
@@ -1161,25 +1170,16 @@ final class OCRSession {
 
     func clear() {
         stoodDown = []
-        cancel()
+        // THE SAME TEARDOWN A NEW DROP DOES. This kept its own list and the list left `documents`
+        // out: the closed tab stayed with page ids into the emptied `pages`, so leaving OCR mode
+        // read past the end (`logDocumentState`, a crash under OMNI_PERF_LOG), and the find text
+        // outlived the document (review 2026-11-02). `reset()` bumps the token first, so the old
+        // run's writes cannot land in the emptied arrays.
+        reset()
         work?.cancel(); work = nil
-        // Past this point the old run's writes must not land: `pages` and `texts` are about to
-        // become empty, and an index it captured would be out of range.
-        runToken += 1
         readoutTimer?.cancel(); readoutTimer = nil
-        pages = []
-        texts = []
-        documentEdits = [:]
-        editSectionsByDocument = [:]
-        editBaseByDocument = [:]
         documentName = ""
-        selection = nil
-        userPinnedSelection = false
-        lastDoneIndex = nil
         readoutVisible = false
-        awaitingCache = []
-        runVariant = nil
-        notice = nil
         phase = .empty
     }
 
@@ -1191,6 +1191,7 @@ final class OCRSession {
         // waiting for the double-click window to close. Silent unless `-omni.hangwatch` is on.
         UIProbe.markEventAge("CLICK.select event age")
         guard pages.indices.contains(index) else { return }
+        findLeads = false
         if index == runningIndex {
             selection = nil
             userPinnedSelection = false

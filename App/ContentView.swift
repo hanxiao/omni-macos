@@ -34,13 +34,19 @@ struct ContentView: View {
         // The field holds the SEMANTIC text; finished filters live beside it as chips. A qualifier
         // becomes a chip only once a space ends it - mid-word, `type:i` has to stay editable text
         // or the chip is made from half a word and cannot be corrected.
+        let before = model.query
         model.setSemanticText(typed)
-        // ONLY when the finished word really is a qualifier. Re-parsing on every space also
+        // ONLY when a finished word really is a qualifier. Re-parsing on every space also
         // re-normalises the text, which swallowed the space itself and ran the next word into the
         // last one: "a very long" typed straight through arrived as "averylong".
-        if typed.last?.isWhitespace ?? false,
-           !SearchQueryParser.parse(typed).qualifiers.isEmpty {
+        if SearchQueryParser.hasFinishedQualifier(typed, previous: before) {
             model.promoteQualifiers()
+            // The parse joins words with one space and drops a trailing one. The space just typed
+            // is kept, or the next word runs into the last: "photos type:image " then "beach". Not
+            // twice: plain-text mode keeps the box verbatim, its space included.
+            if typed.last?.isWhitespace ?? false, let end = model.query.last, !end.isWhitespace {
+                model.setSemanticText(model.query + " ")
+            }
         }
         let raw = typed
         if !model.query.isEmpty, model.fileQuery != nil { model.fileQuery = nil; model.queryError = nil }
@@ -101,6 +107,13 @@ struct ContentView: View {
         .onChange(of: columns, initial: true) { _, c in
             let shown = c != .detailOnly
             if model.sidebarShown != shown { model.sidebarShown = shown }
+            // AN EMPTY PAGE RAIL STAYS FOLDED, whoever unfolds it. Folding it when the last
+            // document closes was not enough: once in four runs the rail came back empty ~3 s
+            // after Close Document and stayed (full test 2026-11-03), the unfolding not ours.
+            if shown, !ocrDrawerWanted {
+                omniPerfLog("ocr-rail-refold")
+                DispatchQueue.main.async { if !ocrDrawerWanted { columns = .detailOnly } }
+            }
         }
         // Spotlight-style: put the caret in the search field as soon as the app can search.
         .onChange(of: showsSearch, initial: true) { _, shows in if shows { focusSearchField() } }
@@ -335,7 +348,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             if model.hasListedResults {
                 // `.equatable()`: see the conformance on ResultsList.
-                ResultsList { belowThresholdFooter }.equatable()
+                ResultsList { ResultsFooter() }.equatable()
             } else if showsClipboardOff {
                 // The one status screen with a subtitle: it asks for a turn-on, and the title alone
                 // does not say what turning it on gets you.
@@ -367,28 +380,6 @@ struct ContentView: View {
     /// One title for the one action, wherever it is offered.
     static func weakerMatchesTitle(_ n: Int) -> String {
         "Show \(n.formatted()) weaker \(n == 1 ? "match" : "matches")"
-    }
-
-    @ViewBuilder private var belowThresholdFooter: some View {
-        // Collapsing is never silent: if the list is shorter than the matches behind it, the
-        // difference is stated here. Not a button - the copies are reachable from their own stack,
-        // and a global "un-collapse" would just restore the noise the feature removes.
-        if model.collapsedCount > 0 {
-            Text("\(model.collapsedCount) duplicate\(model.collapsedCount == 1 ? "" : "s") stacked into the results above")
-                .font(.caption).foregroundStyle(.tertiary)
-                .frame(maxWidth: .infinity)
-                .padding(.top, 8)
-        }
-        if model.hiddenWeaker > 0 {
-            // THE SAME BUTTON as the empty state's, same words, same style, same size - it is the
-            // same action, so it should not look like two. It was a `.plain` text label, and a
-            // plain button is hit only on its drawn glyphs: a click between the letters or beside
-            // them did nothing, which is how it "sometimes did not respond".
-            Button(Self.weakerMatchesTitle(model.hiddenWeaker)) { model.showWeakerMatches() }
-                .controlSize(.large)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 10)
-        }
     }
 
     private var showsBrowser: Bool { showsFolderBrowser || showsPhotoBrowser || showsRecents }
@@ -502,6 +493,37 @@ struct ContentView: View {
         }
     }
 
+}
+
+/// Below the last result: what the list is not showing, and the way to it.
+///
+/// ITS OWN VIEW, reading the model in its own body. Built in ContentView's body and handed to the
+/// always-equal ResultsList, it was frozen at the counts of the search that first put the list on
+/// screen: "Show 47 weaker matches" under a search hiding 5 (review 2026-11-02).
+private struct ResultsFooter: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        // Collapsing is never silent: if the list is shorter than the matches behind it, the
+        // difference is stated here. Not a button - the copies are reachable from their own stack,
+        // and a global "un-collapse" would just restore the noise the feature removes.
+        if model.collapsedCount > 0 {
+            Text("\(model.collapsedCount) duplicate\(model.collapsedCount == 1 ? "" : "s") stacked into the results above")
+                .font(.caption).foregroundStyle(.tertiary)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 8)
+        }
+        if model.hiddenWeaker > 0 {
+            // THE SAME BUTTON as the empty state's, same words, same style, same size - it is the
+            // same action, so it should not look like two. It was a `.plain` text label, and a
+            // plain button is hit only on its drawn glyphs: a click between the letters or beside
+            // them did nothing, which is how it "sometimes did not respond".
+            Button(ContentView.weakerMatchesTitle(model.hiddenWeaker)) { model.showWeakerMatches() }
+                .controlSize(.large)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 10)
+        }
+    }
 }
 
 /// A thin bar under the search field showing the qualifiers Omni parsed from the box (or the
@@ -771,7 +793,7 @@ private struct IdleSearchPrompt: View {
         // LINKED MACS COUNT, when the next search reaches them: every linked Mac online and
         // sharing, unless a folder on this Mac scopes it. Their files are in the number and their
         // moles beside this one, so the prompt says what the search box will cover.
-        let reach = model.linkedScope == nil && model.filterFolders.isEmpty ? model.link.searchable().count : 0
+        let reach = model.linkedScope == nil && model.filterFolders.isEmpty && model.filterFolderNames.isEmpty ? model.link.searchable().count : 0
         let total = model.indexedFiles + (reach > 0 ? model.link.searchableFiles : 0)
         SearchWaysPrompt(
             // With several folders scoped there is no browser to show (that needs exactly one),
@@ -986,6 +1008,19 @@ private struct WindowTitleHider: NSViewRepresentable {
             for o in observers { NotificationCenter.default.removeObserver(o) }
         }
 
+        /// THE SEARCH TEXT FOLLOWS LIGHT AND DARK. The field editor keeps the colour its text was
+        /// typed in: words typed in light mode stayed black on the dark field after a switch (Auto
+        /// at sunset, or System Settings), while words typed after it came out white (full test
+        /// 2026-11-03). The text's colour is set back to the dynamic one when the appearance changes.
+        override func viewDidChangeEffectiveAppearance() {
+            super.viewDidChangeEffectiveAppearance()
+            guard let item = window?.toolbar?.items.lazy.compactMap({ $0 as? NSSearchToolbarItem }).first,
+                  let editor = item.searchField.currentEditor() as? NSTextView,
+                  let storage = editor.textStorage, storage.length > 0 else { return }
+            storage.addAttribute(.foregroundColor, value: NSColor.controlTextColor,
+                                 range: NSRange(location: 0, length: storage.length))
+        }
+
         // nonisolated(unsafe): touched from notification closures that are main-thread in practice
         // (window updates, toolbar mutations); a stale read only coalesces one extra pass.
         nonisolated(unsafe) private var applyScheduled = false
@@ -1092,6 +1127,7 @@ private struct WindowTitleHider: NSViewRepresentable {
                   split.subviews.count >= 2 else { return }
             appliedWidth = sidebarWidth
             if abs(split.subviews[0].frame.width - sidebarWidth) > 1 {
+                omniPerfLog(String(format: "tuner-sidebar-width %.0f from %.0f", sidebarWidth, split.subviews[0].frame.width))
                 split.setPosition(sidebarWidth, ofDividerAt: 0)
             }
         }
@@ -1121,7 +1157,7 @@ private struct WindowTitleHider: NSViewRepresentable {
 /// A bar pinned in the top safe area, with scroll content passing under it. On Tahoe that is
 /// `safeAreaBar`, which is what lets the scroll edge effect apply; earlier systems just stack it.
 /// An EMPTY bar must cost nothing, so the modifier checks before it inserts one.
-private struct TopBar<Bar: View>: ViewModifier {
+struct TopBar<Bar: View>: ViewModifier {
     @ViewBuilder var bar: () -> Bar
 
     func body(content: Content) -> some View {
