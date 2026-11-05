@@ -260,7 +260,7 @@ Fixed in this pass:
   label, so a 340-character path rendered as a ten-line wrapped paragraph, five of them stacked
   taller than the window. The row is now `lineLimit(1)`, the label is `displayLabel`, and the
   folder is drawn as a chip; the COMPLETION is still the full query, so selecting one replays
-  everything. `displayScope` middle-elides through `SearchToken.elided` for the same reason the
+  everything. `scopeChip` middle-elides through `SearchToken.elided` for the same reason the
   field's chip does - sibling folders here differ only in their suffix.
 
   ON THE CHIP'S LOOK, since it will be asked again: native macOS suggestion lists (Spotlight,
@@ -287,9 +287,11 @@ which search it was. A pure-filter search with no words falls back to the qualif
 ("Documents, image"), never the raw string.
 
 Two things had to come back after that, because clean went too far:
-- `displayScope` - the `in:` folder's LAST COMPONENT, dimmed, after the label. Without it the same
-  word searched in eight folders is eight rows reading "model". The path was the noise, the folder
-  was not.
+- the `in:` folder's LAST COMPONENT, dimmed, after the label. Without it the same word searched in
+  eight folders is eight rows reading "model". REMOVED again (Han, 2026-11-05): "Clipboard" or a
+  folder after the words read as prose repeating the filter. The row is the words and, when
+  filtered, the glyph below; the whole query is on hover. The suggestion list keeps the chip
+  (`scopeChip`), since selecting one replays those filters.
 - a generic `line.3.horizontal.decrease` glyph on any filtered row (`tag:` keeps its own). With
   the qualifiers gone a filtered search and a bare one were identical.
 
@@ -1857,8 +1859,10 @@ nothing was slower or heavier than 0.19.8. What it found, and what was done:
 - A STACK HOLDS EVERY COPY: 121 identical pictures stacked as "120 copies" (the result pool). An
   exact stack takes the copies of its content key the search's filter allows
   (`VectorStore.copies`), so "121 copies" and "Move All 121 Copies to Trash".
-- A FILTERED HISTORY ROW SHOWS ITS FIRST FILTER as a folder-scoped one shows its folder:
-  "kyoto type:image", "kyoto ext:md", where four rows read "kyoto".
+- A FILTERED HISTORY ROW SHOWED ITS FIRST FILTER as a folder-scoped one showed its folder:
+  "kyoto type:image", "kyoto ext:md", where four rows read "kyoto". Both taken out (Han,
+  2026-11-05): the row is the words and the filter glyph. A file row lost its trailing kind glyph
+  too: its thumbnail already says what the file is.
 - A RECENTS SEARCH KEEPS ITS RECENTS WHILE A FOLDER INDEXES: a Find Similar in Recents was replaced
   by 76 freshly indexed notes 30 s into a 30,000-file folder (0.19.8); a live refresh now searches
   the Recents the search started with (SearchFilter.recentsPaths), a new search the newest files.

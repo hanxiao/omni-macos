@@ -467,7 +467,7 @@ struct ContentView: View {
                 Suggestion(label: item.displayLabel,
                            completion: item.displayText,
                            icon: item.bookmarked ? "star.fill" : "clock",
-                           chip: item.displayScope.map { "in:" + $0 })
+                           chip: item.scopeChip)
             }
         }
         // ONE ROW PER COMPLETION: the list is keyed by it, and a past search can be exactly a

@@ -79,7 +79,7 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case query, bookmarked, lastUsed, kinds, folder, ext, dateRange, sortOrder, rawQuery, filePath, fileKind, similar, source
+        case query, bookmarked, lastUsed, kinds, folder, ext, dateRange, sortOrder, rawQuery, filePath, similar, source
     }
 
     /// Every field after the first three is optional on the way in, so a row written by any earlier
@@ -96,14 +96,12 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
         sortOrder = try c.decodeIfPresent(String.self, forKey: .sortOrder) ?? "relevance"
         rawQuery = try c.decodeIfPresent(String.self, forKey: .rawQuery)
         filePath = try c.decodeIfPresent(String.self, forKey: .filePath)
-        fileKind = try c.decodeIfPresent(String.self, forKey: .fileKind)
         similar = try c.decodeIfPresent(Bool.self, forKey: .similar) ?? false
         source = try c.decodeIfPresent(String.self, forKey: .source) ?? HistorySource.app.rawValue
         refold()
     }
     // File-query fields (all optional/defaulted so existing persisted JSON decodes unchanged).
     var filePath: String? = nil       // set when the query is a file
-    var fileKind: String? = nil       // FileKind rawValue, for the row glyph
     var similar: Bool = false         // doc-vs-doc "find similar" vs query-by-file
     /// Defaulted, so every history item written before serving was remembered decodes unchanged.
     var source: String = HistorySource.app.rawValue
@@ -166,18 +164,13 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
         !isFile && !SearchQueryParser.parse(displayText).qualifiers.isEmpty
     }
 
-    /// The folder a search was scoped to, as its last component, shown dimmed after the label.
-    ///
-    /// Dropping the qualifiers made the list clean and made folder-scoped searches indist-
-    /// inguishable: the same word searched in eight folders is eight rows reading "model". The
-    /// PATH was the noise, not the folder, so the leaf comes back and the rest stays gone.
-    /// Nil when the search had no `in:`, or when the label already IS the folder name (a
-    /// pure-filter search, where repeating it would just stutter).
-    ///
-    /// The same holds for the other filters: `kyoto type:image`, `ext:md kyoto`, `kyoto sort:date`
-    /// and `kyoto score:40%` were four rows reading "kyoto" (full test 2026-11-03). Without a folder,
-    /// the first filter is shown the way the field's chip writes it ("type:image", "+1" for more).
-    var displayScope: String? {
+    /// The chip a past search's SUGGESTION carries after its label, written the way the field's
+    /// own chip writes it: its folder ("in:Documents"), else its first filter ("type:image", "+1"
+    /// for more). Selecting it replays those filters, so the suggestion says which. The sidebar
+    /// row shows no scope (Han, 2026-11-05).
+    /// Nil for a file, an unfiltered search, or a pure-filter search, whose label already IS its
+    /// values (repeating them would just stutter).
+    var scopeChip: String? {
         guard !isFile else { return nil }
         let parsed = SearchQueryParser.parse(displayText)
         if let folder = parsed.qualifiers.first(where: { $0.key == "in" && !$0.negated }) {
@@ -185,7 +178,7 @@ struct HistoryItem: Codable, Sendable, Identifiable, Equatable {
             guard !leaf.isEmpty, leaf != displayLabel else { return nil }
             // Middle-elided, for the same reason the search field's chip is: the generated folders in
             // this tree differ only in their SUFFIX, so a tail truncation renders siblings identically.
-            return AppModel.SearchToken.elided(leaf)
+            return "in:" + AppModel.SearchToken.elided(leaf)
         }
         // A pure-filter search already reads as its values; the words are what a filter qualifies.
         guard !parsed.semanticText.trimmingCharacters(in: .whitespaces).isEmpty,
@@ -3059,7 +3052,7 @@ final class AppModel {
             var item = HistoryItem(query: "", bookmarked: false, lastUsed: Date(),
                                    kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
                                    dateRange: ctx.dateRange, sortOrder: ctx.sort)
-            item.filePath = path; item.fileKind = fq.kind.rawValue; item.similar = fq.similar
+            item.filePath = path; item.similar = fq.similar
             placeHistory(item)
         }
         pruneHistory()
@@ -3162,7 +3155,7 @@ final class AppModel {
                 var item = HistoryItem(query: "", bookmarked: true, lastUsed: Date(),
                                        kinds: ctx.kinds, folder: ctx.folder, ext: ctx.ext,
                                        dateRange: ctx.dateRange, sortOrder: ctx.sort)
-                item.filePath = path; item.fileKind = fq.kind.rawValue; item.similar = fq.similar
+                item.filePath = path; item.similar = fq.similar
                 placeHistory(item)
             }
             persistHistory(); return

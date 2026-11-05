@@ -571,27 +571,12 @@ private struct HistoryRowLabel: View {
             } else {
                 Image(systemName: "magnifyingglass").sidebarTint(on, else: Color.secondary).frame(width: 16)
             }
-            let words = Text(item.displayLabel).lineLimit(1).truncationMode(item.isFile ? .middle : .tail)
+            // THE WORDS ALONE: no scope after them ("Clipboard", a folder, "type:image"). Han,
+            // 2026-11-05: a label repeating the filter is noise; the glyph below says a row is
+            // filtered and the whole query is on hover.
+            Text(item.displayLabel).lineLimit(1).truncationMode(item.isFile ? .middle : .tail)
                 .sidebarTint(on, else: .primary)
-            if let scope = item.displayScope {
-                // THE SCOPE WHOLE OR NOT AT ALL. It is there to tell one folder's search from
-                // another's, and given way to the words a character at a time it read "c" for
-                // "code" (full test 2026-11-03). So: both whole; else the words cut, keeping room
-                // for a dozen characters, beside the whole scope; else the words alone (the whole
-                // query is on hover).
-                let folder = Text(scope).font(.caption).foregroundStyle(.tertiary).lineLimit(1).fixedSize()
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 7) { words.fixedSize(); folder }
-                    HStack(spacing: 7) {
-                        words.frame(minWidth: 0, idealWidth: 96, alignment: .leading)
-                        folder
-                    }
-                    words
-                }
-                .layoutPriority(1)
-            } else {
-                words.layoutPriority(1)       // the words the reader typed survive; the glyph gives way first
-            }
+                .layoutPriority(1)       // the words the reader typed survive; the glyph gives way first
             Spacer(minLength: 0)
             if hovered {
                 // Under the pointer the trailing glyph gives way to Remove from
@@ -602,14 +587,11 @@ private struct HistoryRowLabel: View {
                 }
                 .buttonStyle(.plain)
                 .help("Remove from History")
-            } else if item.isFile, let k = item.fileKind, let fk = FileKind(rawValue: k), fk != .text {
-                Image(systemName: fk.symbol).font(.caption2).foregroundStyle(.tertiary)
-            } else if !item.isFile, item.isFiltered {
-                // Same trailing-glyph treatment as the file rows' kind symbol. It
-                // matters more now that the label drops the qualifiers: without it a
-                // filtered search and a bare one look identical. `tag:` keeps its own
-                // glyph; anything else gets the generic filter mark. The full query
-                // is still one hover away.
+            } else if item.isFiltered {
+                // The one trailing glyph. A file row has none: its thumbnail already says what
+                // the file is (Han, 2026-11-05). A filtered search does, since the label drops
+                // the qualifiers and without it a filtered search and a bare one look identical.
+                // `tag:` keeps its own glyph; anything else gets the generic filter mark.
                 let tagged = SearchQueryParser.parse(item.displayText)
                     .qualifiers.contains { $0.key == "tag" }
                 Image(systemName: tagged ? "tag" : "line.3.horizontal.decrease")
