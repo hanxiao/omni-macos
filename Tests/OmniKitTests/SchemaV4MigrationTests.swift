@@ -452,6 +452,30 @@ final class SchemaV4MigrationTests: XCTestCase {
         // that a genuine split/join regression would be caught.
     }
 
+    /// A v3 index reads as owing no backfill until the conversion has made the column. Asked only
+    /// before it, position reuse ran for the whole of the session that converts: the window
+    /// placeVectorLocked calls unreadable by either loader.
+    func testTheSessionThatConvertsAV3IndexStillOwesItsBackfill() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("v3-backfill-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+        _ = try makeV3Index(dbURL, files: 30)
+        XCTAssertEqual(scalar(open(dbURL), "PRAGMA user_version"), 3)
+        // v4-only, like the keys downgradeToV3 removes: no v3 index has this flag.
+        do { let db = open(dbURL); exec(db, "DELETE FROM meta WHERE key = 'chunk_slots_backfilled';"); sqlite3_close(db) }
+
+        let saved = VectorStore.slotBackfillSliceOverride
+        VectorStore.slotBackfillSliceOverride = 1   // leaves the window open to look at
+        defer { VectorStore.slotBackfillSliceOverride = saved }
+        let store = try VectorStore(dbURL: dbURL)
+        defer { store.close() }
+        XCTAssertEqual(scalar(open(dbURL), "PRAGMA user_version"), 4, "the index did not convert")
+        XCTAssertTrue(store.v4BackfillPendingForTest, "the window is open and the flag says it is not")
+        store.migrateSlotsToCompletion()
+        XCTAssertFalse(store.v4BackfillPendingForTest, "the flag did not come down with the backfill")
+    }
+
     /// Minimal embedder: this suite is about paths and bookkeeping, not vectors.
     final class StubEmbedder: Embedder, @unchecked Sendable {
         let dim: Int

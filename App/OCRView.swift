@@ -47,6 +47,8 @@ struct OCRView: View {
                     .task { model.refreshOCRInstalled() }
             case .needsModel:
                 ModelMissing().accessibilityIdentifier("ocr.needsmodel")
+                    // On appearing too: the model may have landed while this was out of OCR mode.
+                    .task(id: model.ocrInstalled) { session.modelArrived() }
             case .failed(let message):
                 // Explicitly, not via `default`: a failed run used to fall through to the
                 // workspace and render as "Preparing" forever, which is the worst possible

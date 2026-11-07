@@ -53,10 +53,11 @@ enum BulkDirWalker {
     /// the fastest published macOS implementation settled on for the same reason.
     private static let bufferBytes = 128 * 1024
 
-    /// Read one directory in as few syscalls as the kernel allows. Returns nil when the directory
-    /// cannot be opened at all (permissions, or it vanished mid-walk), which the caller treats as
-    /// empty rather than as an error - the same way the enumerator's errorHandler did.
-    static func list(_ dir: String, into buf: inout [UInt8]) -> [Entry]? {
+    /// Read one directory in as few syscalls as the kernel allows. nil when it cannot be opened at
+    /// all (permissions, a volume gone, or it vanished mid-walk); `complete` false when a read failed
+    /// part-way, so the entries are only some of what it holds. The walk goes on past either, but
+    /// says so: an unread folder is not an empty one (WalkOutcome).
+    static func list(_ dir: String, into buf: inout [UInt8]) -> (entries: [Entry], complete: Bool)? {
         let fd = open(dir, O_RDONLY | O_DIRECTORY, 0)
         guard fd >= 0 else { return nil }
         defer { close(fd) }
@@ -69,11 +70,13 @@ enum BulkDirWalker {
         attrs.fileattr = attrgroup_t(UInt32(ATTR_FILE_DATALENGTH))
 
         var out: [Entry] = []
+        var complete = true
         while true {
             let got: Int = buf.withUnsafeMutableBytes { raw -> Int in
                 Int(getattrlistbulk(fd, &attrs, raw.baseAddress, raw.count, 0))
             }
-            if got <= 0 { break }   // 0 = done; negative = error, and a partial listing is all we get
+            if got < 0 { complete = false }   // an error: what was read so far is all we get
+            if got <= 0 { break }
             buf.withUnsafeBytes { raw in
                 var base = raw.baseAddress!
                 for _ in 0 ..< got {
@@ -128,7 +131,7 @@ enum BulkDirWalker {
                 }
             }
         }
-        return out
+        return (out, complete)
     }
 
     /// Shared state for the pool. A class because every worker mutates it under one lock; the lock
@@ -138,6 +141,7 @@ enum BulkDirWalker {
         var stack: [String]
         var pending: Int          // directories claimed but not finished
         var stopped = false
+        var unreadable = Set<String>()
         init(_ roots: [String]) { stack = roots; pending = roots.count }
     }
 
@@ -183,13 +187,14 @@ enum BulkDirWalker {
     /// The split is the whole point. Filtering inside `deliver` looks equivalent and is not: it puts
     /// the most expensive per-file work back under one lock, and the pool goes from 7.9x to 2.1x -
     /// measured, after building it that way first.
+    @discardableResult
     static func walk<T>(roots: [String],
                         shouldContinue: () -> Bool,
                         shouldDescend: (String, Entry?) -> Bool,
                         keep: (String, Entry) -> T?,
-                        deliver: ([T]) -> Void) {
+                        deliver: ([T]) -> Void) -> WalkOutcome {
         let live = roots.filter { shouldDescend($0, nil) }
-        guard !live.isEmpty else { return }
+        guard !live.isEmpty else { return WalkOutcome() }
         preflight(live)
         let shared = Shared(live)
         let workers = min(workerCount, max(1, live.count * 4))
@@ -214,7 +219,8 @@ enum BulkDirWalker {
 
                 // Newest first within the folder too: the files go out in the order a first index
                 // should reach them. The bulk read already has every mtime; this is one small sort.
-                let entries = (list(dir, into: &buf) ?? []).sorted { $0.mtime > $1.mtime }
+                let listing = list(dir, into: &buf)
+                let entries = (listing?.entries ?? []).sorted { $0.mtime > $1.mtime }
                 var subdirs: [(path: String, mtime: Double)] = []
                 var kept: [T] = []
                 kept.reserveCapacity(entries.count)
@@ -228,6 +234,7 @@ enum BulkDirWalker {
                 }
 
                 shared.lock.lock()
+                if listing?.complete != true { shared.unreadable.insert(dir) }
                 if !kept.isEmpty { deliver(kept) }
                 // NEWEST FOLDER NEXT. The stack pops its last entry, so the children go on oldest
                 // first and the most recently changed one is walked next: a first index reaches what
@@ -243,5 +250,35 @@ enum BulkDirWalker {
                 shared.lock.unlock()
             }
         }
+        return WalkOutcome(stopped: shared.stopped, unreadableDirs: shared.unreadable)
+    }
+}
+
+/// WHAT A WALK CAN PROVE. The deletion sweep removes the rows of files a walk did not meet, so it
+/// has to know whether the walk looked: a walk that was stopped, or a folder it could not read, says
+/// nothing about the files it did not reach. Treating either as empty deleted rows for files still on
+/// disk (a subfolder's permission withdrawn, an I/O error part-way through a listing, a pass whose
+/// cancel was cleared while it wound down). Only a root with no files at all was protected.
+public struct WalkOutcome: Sendable {
+    /// `shouldContinue` said stop: the rest of the tree was never looked at.
+    public var stopped = false
+    /// Folders that could not be opened or listed in full. Whatever they hold is unknown.
+    public var unreadableDirs = Set<String>()
+
+    public init(stopped: Bool = false, unreadableDirs: Set<String> = []) {
+        self.stopped = stopped
+        self.unreadableDirs = unreadableDirs
+    }
+
+    /// Whether `path` sits in a folder this walk could not read. Walks the path's ancestors rather
+    /// than the set, so a tree of unreadable folders costs nothing per path.
+    public func isUnread(_ path: String) -> Bool {
+        guard !unreadableDirs.isEmpty else { return false }
+        var dir = (path as NSString).deletingLastPathComponent
+        while dir.count > 1 {
+            if unreadableDirs.contains(dir) { return true }
+            dir = (dir as NSString).deletingLastPathComponent
+        }
+        return false
     }
 }

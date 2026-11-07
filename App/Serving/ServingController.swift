@@ -20,12 +20,12 @@ final class ServingController {
     var pausedForBenchmark = false { didSet { reconcile() } }
     /// What the toolbar and the tab show: off while a benchmark holds it.
     var isOn: Bool { enabled && !pausedForBenchmark }
-    var scope: ServingScope = .local { didSet { persist(); if isRunning { restart() } } }
-    var port: Int = 51234 { didSet { persist(); if isRunning { restart() } } }
+    var scope: ServingScope = .local { didSet { persist(); restartIfServing() } }
+    var port: Int = 51234 { didSet { persist(); restartIfServing() } }
     // The auth closure snapshots the token at start, so a running server MUST restart to apply a
     // change - otherwise "switch to LAN, then generate a token" leaves the listener unauthenticated
     // while the UI shows a token set.
-    var bearerToken: String = "" { didSet { persist(); if isRunning { restart() } } }
+    var bearerToken: String = "" { didSet { persist(); restartIfServing() } }
 
     // MARK: Published runtime state (read-only for the view)
 
@@ -211,9 +211,18 @@ final class ServingController {
     private func reconcile() {
         if isOn, !isRunning, backend != nil {
             startServer()
-        } else if !isOn, isRunning {
+        } else if !isOn, isRunning || server != nil || state != .stopped {
+            // A server that failed is not running and is still here, with its failure on show.
             stopServer()
         }
+    }
+
+    /// A new port, scope or token applies now: to a running server, and to one that failed while
+    /// switched on, for which a new port is the retry. `isRunning` alone left "Port in use" standing
+    /// after the port was changed, until the next launch.
+    private func restartIfServing() {
+        let failed: Bool = switch state { case .portInUse, .failed: true; default: false }
+        if isRunning || (failed && isOn) { restart() }
     }
 
     private func restart() {
@@ -307,7 +316,7 @@ final class ServingController {
         server = nil
         isRunning = false
         boundAddress = ""
-        if state == .running { state = .stopped }
+        if state != .stopped { state = .stopped }
     }
 
     private func ingest(_ e: LogEntry) {

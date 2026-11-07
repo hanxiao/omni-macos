@@ -204,6 +204,17 @@ final class DecodedItem: @unchecked Sendable {
     /// records it once stored, unless an extra failed.
     var enrichable = false
     var enrichFailed = false
+    /// Decoding found something to embed, so an empty embed result means it was not embedded, not
+    /// that the file has nothing in it (Indexer.update's acceptCompleted).
+    var holdsContent: Bool {
+        switch payload {
+        case .empty: return false
+        case .text(let pieces): return !pieces.isEmpty
+        case .images(let images): return !images.isEmpty
+        case .imagePatches(let raws): return !raws.isEmpty
+        default: return true
+        }
+    }
     /// Waiting for its next turn: drop what only the first turn reads. The soundtrack reader a
     /// long video opened at decode is never read (its last turn opens one), and a long recording's
     /// payload reader and first mel are read only by its first turn (later turns seek their own).
@@ -1072,13 +1083,18 @@ public final class Indexer: @unchecked Sendable {
     /// - Parameter photos: Apple Photos slices to index alongside the folder roots. Each becomes a
     ///   root of its own (keyed `photos://<id>`) whose "files" are assets rather than paths on disk;
     ///   everything past the crawl treats them identically. See PhotoLibrary.
+    /// - Parameter cancelClearedByCaller: the caller called `resetCancelled()` when it committed this
+    ///   pass, so a cancel set since is meant for this pass and must stand. Clearing it here erased
+    ///   any cancel that landed between the caller's last check and this call: the pass ran on past
+    ///   a Pause, a removed folder or a store swap.
     public func index(roots: [URL], photos: [PhotoLibrary.Source] = [],
                       settings: IndexSettings = .default, force: Bool = false,
+                      cancelClearedByCaller: Bool = false,
                       onProgress: @escaping (IndexProgress) -> Void) {
         beginChunkReuse(settings)
         retextLargeFiles = store.metaGet(Self.textStreamMetaKey) != Self.longTextPolicy(settings)
         recutDataFiles = !settings.readLongDataFiles && store.metaGet(Self.textCutMetaKey) != "1"
-        queue.sync { cancelled = false; cancelReason = .discard }
+        if !cancelClearedByCaller { resetCancelled() }
         var p = IndexProgress()
         // The known-files snapshot is an O(rows) walk of the resident row table that shares no
         // resource with the filesystem crawl below, yet it ran strictly before the crawl. Compute it concurrently
@@ -1150,6 +1166,13 @@ public final class Indexer: @unchecked Sendable {
             /// were never swept. Their thumbnails then render as type icons, because the assets
             /// they point at no longer exist.
             var unreadablePhotoRoots: Set<String> = []
+            /// What the file walk could prove, once it has ended: see WalkOutcome. `stopped` is also
+            /// set by the Photos producer when it leaves a library part-listed.
+            var walk = WalkOutcome()
+            /// The pass has ended. A walker that was stuck when it did must stop when it wakes, even
+            /// if a later pass has cleared the cancel by then: nothing reads this queue any more.
+            var abandoned = false
+            var isAbandoned: Bool { lock.lock(); defer { lock.unlock() }; return abandoned }
             /// Producer threads still running. A count, not a flag: the Photos library is walked by
             /// a SECOND producer alongside the filesystem, and the consumer must not decide the
             /// crawl is over because one of them finished.
@@ -1217,7 +1240,7 @@ public final class Indexer: @unchecked Sendable {
                                       ownDataPaths: settings.ownDataPaths + sidecarPaths,
                                       ownDataExceptions: settings.ownDataExceptions)
             crawler.onPolicyFile = self.onPolicyFile
-            crawler.walk(shouldContinue: { !self.isCancelled }) { f in
+            let outcome = crawler.walk(shouldContinue: { !self.isCancelled && !feed.isAbandoned }) { f in
                     guard let r = rootOf(f.path) else { return }
                     feed.lock.lock()
                     // Wait for room - on a TIMED wait, which is the whole difference between a
@@ -1235,7 +1258,7 @@ public final class Indexer: @unchecked Sendable {
                     // threads wedge for the life of the process - along with a strong self and the
                     // whole queue. Pause is an ordinary user action, and on any corpus past the cap
                     // the producer is parked for most of the pass, so this is the common path.
-                    while feed.queued >= queueCap, !self.isCancelled {
+                    while feed.queued >= queueCap, !self.isCancelled, !feed.abandoned {
                         feed.lock.wait(until: Date().addingTimeInterval(0.1))
                     }
                     feed.pending[r, default: []].append(f)
@@ -1256,6 +1279,8 @@ public final class Indexer: @unchecked Sendable {
             // A root that yielded nothing still needs a total, or the sweep cannot tell "empty"
             // from "unreadable" - blindRoots is what protects an unreadable root from deletion.
             for r in filePaths { feed.totals[r] = counts[r] ?? 0 }
+            feed.walk.stopped = feed.walk.stopped || outcome.stopped
+            feed.walk.unreadableDirs.formUnion(outcome.unreadableDirs)
             feed.producers -= 1
             feed.lock.broadcast()
             feed.lock.unlock()
@@ -1269,13 +1294,14 @@ public final class Indexer: @unchecked Sendable {
             DispatchQueue.global(qos: .utility).async { [weak self] in
                 guard let self else { return }
                 var counts: [String: Int] = [:]
+                var stopped = false
                 for source in photos {
-                    if self.isCancelled { break }
+                    if self.isCancelled || feed.isAbandoned { stopped = true; break }
                     let key = source.key
                     let ok = PhotoLibrary.enumerate(source, kinds: settings.enabledKinds,
-                                                    isCancelled: { self.isCancelled }) { f in
+                                                    isCancelled: { self.isCancelled || feed.isAbandoned }) { f in
                         feed.lock.lock()
-                        while feed.queued >= queueCap, !self.isCancelled {
+                        while feed.queued >= queueCap, !self.isCancelled, !feed.abandoned {
                             feed.lock.wait(until: Date().addingTimeInterval(0.1))
                         }
                         feed.pending[key, default: []].append(f)
@@ -1288,6 +1314,7 @@ public final class Indexer: @unchecked Sendable {
                     // Not readable (access revoked, album deleted): leave its total at 0 so the
                     // sweep counts it a BLIND root and keeps its rows, exactly as for a folder
                     // whose permission was withdrawn.
+                    if self.isCancelled { stopped = true }
                     if !ok {
                         Self.log.error("photos: source \(key, privacy: .public) unreadable; skipping deletion sweep for it")
                         feed.lock.lock(); feed.unreadablePhotoRoots.insert(key); feed.lock.unlock()
@@ -1295,6 +1322,7 @@ public final class Indexer: @unchecked Sendable {
                 }
                 feed.lock.lock()
                 for r in photoPaths { feed.totals[r] = counts[r] ?? 0 }
+                feed.walk.stopped = feed.walk.stopped || stopped
                 feed.producers -= 1
                 feed.lock.broadcast()
                 feed.lock.unlock()
@@ -1317,12 +1345,15 @@ public final class Indexer: @unchecked Sendable {
             let q = feed.pending[r] ?? []
             return q[min(feed.cursor[r] ?? 0, q.count)...]
         }
-        func takeWave(max: Int) -> (files: [CrawledFile], newTotals: [String: Int]) {
+        func takeWave(max: Int) -> (files: [CrawledFile], newTotals: [String: Int], walkComplete: Bool) {
             feed.lock.lock()
             defer { feed.lock.unlock() }
             while !isCancelled, feed.walking,
                   rootPaths.allSatisfy({ (feed.pending[$0]?.count ?? 0) <= (feed.cursor[$0] ?? 0) }) {
-                feed.lock.wait()
+                // TIMED, for the producer's reason above: a cancel never touches this condition, so a
+                // walk stuck in a read of a dead volume held the pass, and everyone who has to wait
+                // for the pass to stop, for as long as the volume took.
+                _ = feed.lock.wait(until: Date().addingTimeInterval(0.25))
             }
             var wave: [CrawledFile] = []
             var progress = true
@@ -1347,7 +1378,7 @@ public final class Indexer: @unchecked Sendable {
                 }
             }
             feed.lock.broadcast()   // room made: wake the walk if the cap parked it
-            return (wave, feed.discovered)
+            return (wave, feed.discovered, !feed.walking && !feed.walk.stopped)
         }
 
 
@@ -1569,13 +1600,6 @@ public final class Indexer: @unchecked Sendable {
 
         var doneByRoot: [String: Int] = [:]
         func tick(_ path: String) {
-            // ONLY IF THE INDEX ALREADY KNOWS IT. The single reader iterates `known`, so a digest
-            // for a path that is not in there can never be looked at - it is pure ballast. That is
-            // not a rounding error: on a FIRST index `known` is empty, so the old set grew to the
-            // entire corpus to answer nothing, at exactly the moment the crawl, the encoder and the
-            // store are competing hardest for memory. One dictionary probe per crawled file, on a
-            // path that is about to be hashed anyway.
-            if known[path] != nil { seen.insert(pathDigest(path)) }
             // NO `currentPath` HERE ANY MORE. `tick` is called from a `defer`, so it runs when an
             // item is FINISHED - which made the caption name the file just completed rather than
             // the one being worked on. Invisible while files are quick, and a freeze exactly when
@@ -1702,9 +1726,14 @@ public final class Indexer: @unchecked Sendable {
                     store.enrichLedger.record([EnrichLedger.key(digest: StoreSchema.contentDigestHex(ck), path: path, textPDF: Self.isTextPDF(item))])
                 }
             case .failed:
-                // Cancelled: the cursor stays, and the next pass resumes there. Anything else (the
-                // file changed, a write failed): start over next time, as a changed file.
-                if !isCancelled {
+                // Cancelled: the cursor stays, and the next pass resumes there. A FIRST turn that
+                // failed stored nothing: start over next time.
+                //
+                // A LATER TURN KEEPS ITS CURSOR TOO. The earlier turns' rows carry the file's real
+                // date and size, and what marks them unfinished is the cursor alone: dropped, the
+                // file read as unchanged and stayed cut off at that turn until it next changed. A
+                // file that did change finds no cursor for its new version and starts over.
+                if !isCancelled, first {
                     streams.finish(path)
                     if let s = item.streamSource { try? FileManager.default.removeItem(at: s) }
                 }
@@ -1757,10 +1786,21 @@ public final class Indexer: @unchecked Sendable {
                 p.perRoot[r] = rp
                 onProgress(p)
             }
+            // Empty is not the same as over: a cancel wakes this with the walk stopped part-way.
             if wave.files.isEmpty {
-                walkFinished = true
+                walkFinished = wave.walkComplete
                 break
             }
+            // MET BY THE WALK, whatever the pipeline then makes of it. The sweep asks what the crawl
+            // did not find, and this was recorded when a file's turn FINISHED: a changed file whose
+            // read stalled is passed over before that point, read as not found, and lost its rows.
+            //
+            // ONLY IF THE INDEX ALREADY KNOWS IT. The single reader iterates `known`, so a digest for
+            // a path that is not in there can never be looked at - it is pure ballast. That is not a
+            // rounding error: on a FIRST index `known` is empty, so the old set grew to the entire
+            // corpus to answer nothing, at exactly the moment the crawl, the encoder and the store
+            // are competing hardest for memory.
+            for f in wave.files where known[f.path] != nil { seen.insert(pathDigest(f.path)) }
             if omniPerfEnabled, p.scanned == 0 {
                 omniPerfLog(String(format: "first-wave=%d files at %.2fs after pass start", wave.files.count, -passStart.timeIntervalSinceNow))
             }
@@ -2109,6 +2149,7 @@ public final class Indexer: @unchecked Sendable {
             let before = (offset: c.offset, written: c.written, unit: c.unit ?? 0, texts: textsEmbedded.value)
             let outcome = autoreleasepool { step(item, &c) }   // a pool per turn, as per consumed item
             settle(item, c, outcome, first: false)
+            if case .failed = outcome, !isCancelled { p.failed += 1 }
             // The turn's time and work, each in its own units.
             let dt = CFAbsoluteTimeGetCurrent() - t0
             if case .textStream = item.payload {
@@ -2128,6 +2169,12 @@ public final class Indexer: @unchecked Sendable {
             onProgress(p)
         }
 
+        // Read once, under the feed's lock: the walk's verdict, then whether anything since said stop.
+        feed.lock.lock()
+        let walkOutcome = feed.walk
+        feed.abandoned = true
+        feed.lock.broadcast()
+        feed.lock.unlock()
         if !isCancelled, walkFinished {
             for (r, total) in feed.totals {
                 var rp = p.perRoot[r] ?? RootProgress()
@@ -2144,8 +2191,7 @@ public final class Indexer: @unchecked Sendable {
         // THE CONSUMER IS THE ONLY THING THAT BROADCASTS, and this loop exits on `isCancelled`
         // without taking another wave - so a producer parked on a full queue at that moment is
         // never signalled again. The timed wait in the producer already bounds that, but this is
-        // the direct half of the fix: whoever stops last tells the other side.
-        feed.lock.lock(); feed.lock.broadcast(); feed.lock.unlock()
+        // the direct half of the fix: whoever stops last tells the other side (the broadcast above).
         let wasCancelled = isCancelled || !walkFinished
         if !wasCancelled {
             // Reconcile deletions, with three guards so we only remove files genuinely gone from
@@ -2164,6 +2210,8 @@ public final class Indexer: @unchecked Sendable {
             //     explicitly via deleteKind/deleteExtensions, so reconcile must stay out of it.
             //  3. Blind root: a root that crawled zero files is almost certainly unreadable
             //     (permission revoked, volume offline), not emptied. Skip its paths too.
+            //  4. Unread folder: one the walk could not open or list in full, anywhere in a root
+            //     that yielded other files. Its files were not found because nobody could look.
             func underPassRoots(_ path: String) -> Bool { rootOf(path) != nil }
             let blindRoots = Self.blindRoots(totals: feed.totals,
                                              photoRoots: Set(photoPaths),
@@ -2191,7 +2239,8 @@ public final class Indexer: @unchecked Sendable {
             }
             // Batch the deletion: one transaction + one in-memory rebuild, not one per path.
             let stale = Set(known.compactMap { (path, sf) -> String? in
-                guard !seen.contains(pathDigest(path)), underPassRoots(path), !inBlindRoot(path) else { return nil }
+                guard !seen.contains(pathDigest(path)), underPassRoots(path), !inBlindRoot(path),
+                      !walkOutcome.isUnread(path) else { return nil }
                 return inScope(path, sf.kind) || goneFromDisk(path) ? path : nil
             })
             if !stale.isEmpty {
@@ -2200,6 +2249,9 @@ public final class Indexer: @unchecked Sendable {
             }
             if !blindRoots.isEmpty {
                 Self.log.error("reconcile: \(blindRoots.count, privacy: .public) root(s) crawled empty; skipped deletion (likely no file-access permission)")
+            }
+            if !walkOutcome.unreadableDirs.isEmpty {
+                Self.log.error("reconcile: \(walkOutcome.unreadableDirs.count, privacy: .public) folder(s) unreadable; their rows are kept")
             }
         }
         drainScreenText()
@@ -3558,7 +3610,15 @@ public final class Indexer: @unchecked Sendable {
         var tAcc: [Int: (path: String, file: CrawledFile, kind: String, total: Int, done: [IndexedChunk])] = [:]
         var tNextFid = 0
         let tWindow = textBatchSize * 6
-        func acceptCompleted(_ path: String, _ raw: [IndexedChunk]) {
+        func acceptCompleted(_ path: String, _ raw: [IndexedChunk], couldNotEmbed: Bool = false) {
+            // EMPTY HAS TWO MEANINGS and only one of them deletes. A file that decoded to nothing has
+            // no content left; a file with content that came back with no vectors was not embedded
+            // (the tower unavailable or faulted, a page group that failed). Its rows stay, stale
+            // beating invisible, and the next pass tries it again: the stored size and date differ.
+            if raw.isEmpty, couldNotEmbed {
+                Self.log.error("could not embed, keeping what is indexed: \(path, privacy: .public)")
+                return
+            }
             var raw = raw
             if raw.contains(where: { !Self.isFinite($0.embedding) }) {
                 Self.nanReport(path, raw)
@@ -3628,7 +3688,7 @@ public final class Indexer: @unchecked Sendable {
             }
             guard let (vecs, tags) = self.embedder.embedImagesTaggedHQ(allRaws, crops: allCrops),
                   vecs.count == allRaws.count else {
-                for b in batch { acceptCompleted(b.file.path, []) }
+                for b in batch { acceptCompleted(b.file.path, [], couldNotEmbed: true) }
                 return
             }
             var off = 0
@@ -3715,7 +3775,8 @@ public final class Indexer: @unchecked Sendable {
                 while case .more = step, !self.isCancelled { step = self.pdfTextTurn(item, cursor: &c, pageCount: pageCount, settings: settings) }
                 if case .done = step { Self.recordFinishedKey(item, store: self.store); self.streams.finish(item.file.path) }
             default:
-                acceptCompleted(path, self.withExtras(item, self.embed(item), settings: settings))
+                acceptCompleted(path, self.withExtras(item, self.embed(item), settings: settings),
+                                couldNotEmbed: item.holdsContent)
             }
         }
         flushTextU(drainAll: true)

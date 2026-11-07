@@ -31,6 +31,26 @@ final class IndexRelocationTests: XCTestCase {
         return dir
     }
 
+    /// This Mac's identity on Linked Macs lives beside the index: a move that left it behind made a
+    /// new key at the next launch, and every linked Mac still pinned the old one.
+    func testTheLinkFolderMovesWithTheIndexAndKeepsItsPermissions() throws {
+        let src = try makeIndex("src"), dst = root.appendingPathComponent("dst", isDirectory: true)
+        try FileManager.default.createDirectory(at: dst, withIntermediateDirectories: true)
+        let link = src.appendingPathComponent("link", isDirectory: true)
+        try FileManager.default.createDirectory(at: link, withIntermediateDirectories: true)
+        let key = link.appendingPathComponent("identity")
+        try Data([1, 2, 3]).write(to: key)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: key.path)
+
+        try IndexRelocation.copy(from: src, to: dst)
+
+        let moved = dst.appendingPathComponent("link/identity")
+        XCTAssertEqual(try Data(contentsOf: moved), Data([1, 2, 3]))
+        XCTAssertEqual(try FileManager.default.attributesOfItem(atPath: moved.path)[.posixPermissions] as? NSNumber, 0o600,
+                       "a private key must stay private")
+        XCTAssertFalse(IndexRelocation.files(in: src).map(\.lastPathComponent).contains("link"), "not an index file")
+    }
+
     func testItFindsExactlyTheIndexFiles() throws {
         let dir = try makeIndex("src")
         // A stranger in the same folder must not be picked up.

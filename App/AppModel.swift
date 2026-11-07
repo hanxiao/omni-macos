@@ -4227,6 +4227,10 @@ final class AppModel {
         engineReloading = true
         defer { engineReloading = false }
         let dir = URL(fileURLWithPath: modelPath)
+        // A switch of model or index during the load: what was loaded is no longer what the app is
+        // on, and installing it put the old model under a store stamped for the new one.
+        let requestedModel = modelPath
+        func superseded() -> Bool { modelPath != requestedModel || self.store !== store }
         let towers = enabledKindTowers
         let loaded: OmniEngine
         do {
@@ -4237,9 +4241,13 @@ final class AppModel {
             return false   // the old engine keeps working
         }
         if overtaken() { omniPerfLog("engine reload dropped: back on the Neural Engine"); return false }
+        if superseded() { omniPerfLog("engine reload dropped: the model or index changed"); return false }
         // The swap happens only if the writers stopped. Reporting a reload that was not installed
         // sent the reconcile loop round again against the engine it had meant to replace.
+        var droppedWhileStopping = false
         let swapped = await withIndexingStopped {
+            // Checked again: the wait for the writers can be as long as the load.
+            if superseded() { droppedWhileStopping = true; return }
             self.engine = loaded
             self.clearQueryEmbedCache()
             self.applyComputeUnit()
@@ -4255,8 +4263,8 @@ final class AppModel {
             self.audioSupported = loaded.supportsAudio
             await self.ensureTagger()
         }
-        guard swapped else {
-            omniPerfLog("engine reload not installed: indexing did not stop")
+        guard swapped, !droppedWhileStopping else {
+            omniPerfLog("engine reload not installed: " + (swapped ? "the model or index changed" : "indexing did not stop"))
             return false
         }
         omniPerfLog("engine reloaded vision=\(loaded.supportsImages) audio=\(loaded.supportsAudio)")
@@ -5254,6 +5262,17 @@ final class AppModel {
                 indexingHolds += 1
                 oldIndexer?.cancel()
                 await waitUntilIndexWorkStops(seconds: 60)
+                // NOT PAST A RUN THAT IS STILL OUT. A pass that outlasted the wait kept writing, and
+                // the new pipeline started beside it on a reused store. A run always comes back (a
+                // cancel reaches it at its next batch, a stuck read gives up), and until it does the
+                // switch waits. Flags with no run behind them are leaks (see the drain watchdog),
+                // cleared below, so they are not waited for.
+                if runsOutstanding > 0 { omniPerfLog("switch waiting for \(runsOutstanding) index run(s) to stop") }
+                while runsOutstanding > 0 {
+                    await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { c.resume() }
+                    }
+                }
                 indexingHolds -= 1
                 indexGen += 1
                 indexState = .idle
@@ -5587,7 +5606,8 @@ final class AppModel {
         let reconcile = fsReconcileInFlight && !tagBackfillActive
         let eventsDue = !pendingFSPaths.isEmpty
             && (fsEventsWaitingSince.map { -$0.timeIntervalSinceNow > fsWaitLimit } ?? false)
-        let tagsDue = explicitRetagSince.map { -$0.timeIntervalSinceNow > Self.explicitRetagWait } ?? false
+        let tagsDue = explicitTagsCanRun
+            && (explicitRetagSince.map { -$0.timeIntervalSinceNow > Self.explicitRetagWait } ?? false)
         // A request is outstanding only while the indexer is still cancelled. One left set with no
         // cancel behind it - a catch-up that finished just as it landed, a cancel the next run's
         // reset cleared - turned this check off until some full pass happened to end.
@@ -5759,6 +5779,7 @@ final class AppModel {
             return "The index could not be moved: \(error.localizedDescription)"
         case .success:
             OmniPrefs.set(url.path, forKey: "omni.dbDir")
+            link.reopenAfterIndexMove()   // its folder moved too; see IndexRelocation.companionFolders
             phase = .loadingModel
             await bootstrap()
             return nil
@@ -6441,9 +6462,13 @@ final class AppModel {
         // Throughput in Settings, and the timer that enforces the event wait limit.
         startRateSampler()
         runsOutstanding += 1
+        // Cleared here, at the commit, like startIndexing: from this line the pass counts as running
+        // (activeRoots), and a removal or a Pause that cancels it before the task below gets a thread
+        // must stand. index() clearing it erased those.
+        indexer.resetCancelled()
         Task.detached(priority: .utility) {
             var statsClock = 0.0
-            indexer.index(roots: batch, photos: photoBatch, settings: settings, force: false) { p in
+            indexer.index(roots: batch, photos: photoBatch, settings: settings, force: false, cancelClearedByCaller: true) { p in
                 let now = CFAbsoluteTimeGetCurrent()
                 // Time-gate the stats refresh (was every 24 scanned files = dozens of full-store scans/sec
                 // on a fast crawl of a large index), matching the main pass's 1.5s cadence.
@@ -7958,7 +7983,8 @@ final class AppModel {
             // progress at most ~12x/sec and the heavy stats at most ~every 1.5s. (These clocks are
             // local to this single producer thread, so no cross-actor isolation is involved.)
             var progressClock = 0.0, statsClock = 0.0
-            indexer.index(roots: roots, photos: photos, settings: settings, force: force) { p in
+            // cancelClearedByCaller: reset above, at the commit. A cancel since then is for this pass.
+            indexer.index(roots: roots, photos: photos, settings: settings, force: force, cancelClearedByCaller: true) { p in
                 let now = CFAbsoluteTimeGetCurrent()
                 guard p.done || now - progressClock >= 0.08 else { return }
                 progressClock = now
@@ -8259,7 +8285,7 @@ final class AppModel {
         // read as deleted and its rows were dropped.
         let byPath = Dictionary(rawResults.map { ($0.path, $0.kind) }, uniquingKeysWith: { a, _ in a })
         let mediaPaths = paths.filter { p in
-            !ResultPath.isVirtual(p)
+            !ResultPath.isVirtual(p) && retagAllowed(p)
                 && media.contains(byPath[p] ?? FileExtractor.kind(forExtension: (p as NSString).pathExtension)?.rawValue ?? "")
         }
         guard !mediaPaths.isEmpty else { return }
@@ -8271,6 +8297,21 @@ final class AppModel {
         retagKickTask?.cancel()
         retagKickTask = nil
         scheduleTagBackfill()
+    }
+
+    /// Under a live, unpaused root. A path whose root was removed or paused must not be re-embedded:
+    /// update(force:) would re-INSERT rows deleteUnderFolder just removed, resurrecting the folder in
+    /// search results.
+    private func retagAllowed(_ p: String) -> Bool {
+        rootKey(for: p) != nil && !PhotoLibrary.isPhotoPath(p)
+            && !pausedRoots.contains(where: { p == $0 || p.hasPrefix($0 + "/") })
+    }
+
+    /// A tag batch could run if the pass made way for it. What a pass cannot clear by stopping (tags
+    /// off, no tagger, the image functions still compiling, an index waiting to be rebuilt) must not
+    /// count as a request that is due: the pass would be cancelled for it every few seconds.
+    private var explicitTagsCanRun: Bool {
+        imageTagsEnabled && engine?.tagger != nil && !neuralEngineHoldsMedia && !indexObsolete
     }
 
     /// Queue the untagged media among these search hits for a background re-tag, and arm a
@@ -8315,13 +8356,12 @@ final class AppModel {
               indexState != .indexing, indexState != .paused,
               activeRoots.isEmpty, !fsReconcileInFlight, pendingFSPaths.isEmpty || explicitRetagSince != nil,
               let engine, engine.tagger != nil, let indexer, let store else { return }
-        // Revalidate against LIVE roots: a path whose root was removed or paused since it was
-        // queued must not be re-embedded (update(force:) would re-INSERT rows deleteUnderFolder
-        // just removed, resurrecting the folder in search results).
-        pendingRetag.removeAll { p in
-            rootKey(for: p) == nil || PhotoLibrary.isPhotoPath(p)
-                || pausedRoots.contains(where: { p == $0 || p.hasPrefix($0 + "/") })
-        }
+        // Revalidate against LIVE roots: see retagAllowed.
+        pendingRetag.removeAll { !retagAllowed($0) }
+        // WITH THE REQUEST THEY BELONG TO. A pruned path's explicit request stayed set with nothing
+        // to serve it, and enforceEventWaitLimit then cancelled every later pass for it, for good.
+        explicitRetag.formIntersection(pendingRetag)
+        if explicitRetag.isEmpty { explicitRetagSince = nil }
         guard !pendingRetag.isEmpty else { return }
         let batch = Array(pendingRetag.prefix(Self.tagBackfillBatch))
         pendingRetag.removeFirst(batch.count)
@@ -8403,6 +8443,11 @@ final class AppModel {
         // Globally paused: keep the events buffered (resume's pass completion re-drains them).
         // Running update() now would also hit the stale cancel and silently DROP the batch.
         guard indexState != .paused else { return }
+        // A PASS STILL OWNS THE INDEXER, running or winding down from a cancel: its completion drains
+        // these. An OCR run ending or a Neural Engine stand-down lifting reaches here with the pass
+        // not yet back, and the reset below cleared the cancel under it: its walkers already stopped,
+        // it read as finished and swept every file they had not reached out of the index.
+        guard indexState != .indexing, activeRoots.isEmpty else { return }
         indexer.resetCancelled()   // a stale cancel from a removal/restart chain must not kill this batch
         // Only what still belongs to an indexed, unpaused folder - or is gone, since deleting its
         // rows is the only work left for it. A folder removed or paused while its events waited

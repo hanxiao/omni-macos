@@ -434,7 +434,7 @@ struct RemoteFetchStatus: View {
                 ProgressView(value: fraction).frame(width: 120)
                 Text("Downloading \u{201C}\((path as NSString).lastPathComponent)\u{201D}")
                     .lineLimit(1).truncationMode(.middle)
-                Button("Cancel") { model.remoteOpening = nil }.buttonStyle(.borderless)
+                Button("Cancel") { model.cancelRemoteOpen() }.buttonStyle(.borderless)
             }
             .font(.callout)
             .padding(.horizontal, 14).padding(.vertical, 8)

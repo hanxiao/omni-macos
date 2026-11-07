@@ -732,7 +732,8 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
 - FIXED: the ignore-defaults version was recorded before the store opened, so a refused open
   consumed the step and its prune would never run; it is recorded when the prune finishes now.
 - OPEN: the write-path race that records a hole while a re-add revives the content. The repair makes
-  the state survivable; the race itself is not yet found.
+  the state survivable; the race itself is not yet found. (2026-11-06: one route found and closed,
+  "The implicit state machines"; whether it is the only one is not proven.)
 
 ## The search model ships merged, from GitHub (2026-10-05)
 - The app downloaded the Hugging Face checkpoint and adapter and merged them on every load, on each
@@ -3424,3 +3425,75 @@ back from the rows' paths would be a guess.
   while files index (ui.md, "A full test of the release candidate").
 - INDEX TIME: 6,797 files in 74.8 s against 74.5-75.1 before (the NUL test reads 8 KB of a long
   text file before it streams; short ones are tested where they are read).
+
+## The implicit state machines (2026-11-06)
+
+An audit of every lifecycle held in flags, optionals, tokens and ordering found 177 of them. 23 were
+wrong in a way that matters; all 23 are fixed. What is worth keeping:
+
+- A CANCEL CLEARED WHILE A PASS WINDS DOWN DELETED THE INDEX. `drainPendingFSChanges` reset the cancel
+  with no check that a pass was still out: an OCR run ending or the Neural Engine stand-down lifting
+  reaches it then. The pass's walk had already stopped, so an empty queue read as a finished walk and
+  the sweep removed everything it had not reached. REPRODUCED in the app (0.19.9, isolated, 30,001
+  indexed files, 300 images at the front of the walk so the consumer is inside a GPU call, one
+  `stall:queue` then `ocrrun:on;wait:0.2;ocrrun:off`): 30,001 -> 751 files. This build: 30,301. Three
+  changes: the drain refuses while a pass owns the indexer, the walk reports that it stopped
+  (`WalkOutcome.stopped`, read by `takeWave`), and a pass that ends abandons its walkers.
+- WHAT THE SWEEP MAY CONCLUDE (SweepProofTests). A folder that cannot be opened or listed in full is
+  `WalkOutcome.unreadableDirs`, and its rows stay; the blind-root guard covered only a root with no
+  files at all. `seen` is recorded when a file is taken from the walk, not when its turn finishes: a
+  changed file whose read stalled was deleted. An existence check would have been wrong: a file a
+  nested ignore rule now excludes exists, and the sweep is what removes it.
+- EMPTY MEANS TWO THINGS. On the watcher path `[]` deleted a file whether it had no content or the
+  tower had failed, and one failed image batch deleted all 16. Only a payload that decoded to nothing
+  deletes now (`DecodedItem.holdsContent`). The full pass never deleted on empty.
+- A LATER TURN THAT FAILS KEEPS ITS CURSOR. The cursor is all that marks partial rows unfinished.
+- THE SESSION THAT PUBLISHES THE SPLIT HAS TWO MODELS. Resident rows are still v4, each on its own
+  position; `chunk.slot` names the lowest. Deleting the file on the lowest released a position a
+  surviving content still named: a hole on a live content, then, once the free list handed it out, the
+  old content scoring as the new one after a reopen. `repointSurvivorsOfReleasedLocked` moves the
+  survivor to a position a live row of its own reads, staged if that is past the claim. THIS IS A
+  ROUTE TO THE OPEN RACE in "the write-path race that records a hole" above; whether it is the only
+  one is not proven. `retireContentsSharingAPositionOnceLocked` sends any two contents already on one
+  position back to their files, once per index: 0.69 s on 6,213,798 contents, none on the bench index.
+- A KILL BETWEEN THE TWO TRANSACTIONS OF A WRITE left `chunk.slot = -1` for good, and the v4 drop's
+  proof refused on every attempt, though the comment said the next stamp would write it back. The
+  by-slot load writes back what it places, one position per content. On v4 the backfill reopens.
+- A RECLAIM'S RESUME ranks the column its plan read (`vecs_compact_column`, written with the marker): the
+  tables cannot say while both exist. A resume that cannot finish leaves the marker and the open answers
+  `storeUnavailable`, which the app waits out.
+- `beginTxnLocked` REPORTS FAILURE. Past `busy_timeout` under a split build or v4 drop, every later
+  statement ran in autocommit and failed in silence while memory dropped the rows: they came back at
+  the next open. First transactions now do nothing and are retried off the queue (`retryWhileLocked`,
+  `storeBusy`); a placement transaction carries on in memory with the slots unrecorded, which the
+  next open records, and statements fail at once rather than waiting per statement on the queue.
+- THE BACKFILL FLAG IS ASKED AGAIN AFTER THE v3 CONVERSION, which is what creates the column it asks about.
+- GENERATE TAGS IN A PAUSED FOLDER cancelled every later pass, for good: the request outlived the pruned
+  path. REPRODUCED: 16,443 cancelled passes in the 34 s after the folder was resumed. This build: 3
+  passes in the whole run, none cancelled.
+- VISUALIZE WITH THE FOLDER ROW SELECTED wiped itself (shipped in 0.19.9): the row taken off because
+  the scope moved went through the handler that clears the map. REPRODUCED: no `map fit` line in 0.19.9;
+  this build logs `map fit=1876ms` and keeps the folder.
+- "PORT IN USE" SURVIVED A NEW PORT. REPRODUCED: 0.19.9 never listens on the new port; this build does,
+  and switching off clears the failure.
+- The rest: a failed Neural Engine build deferred images, audio and video for good; a cancel in the
+  pass's prelude was erased by `index()` (`cancelClearedByCaller`); a malformed `pair.begin` held the
+  pairing slot; `.unlinked` outlived a new pairing; moving the index left `link/` behind
+  (`IndexRelocation.companionFolders`); a model switch waited 60 s and then started beside a run
+  still out; an engine reload installed a superseded model; the OCR model screen had no way out; a
+  cache answer dropped on leaving OCR mode stranded its pages; the folder browser's stale check
+  compared a value with itself; Cancel on a remote file only hid the label.
+
+NOT RUN: the OCR, engine reload, model switch, folder browser and remote Cancel fixes have no unit test
+(the app target has none) and windows too narrow to hit from a script: built and read, not reproduced.
+`Scripts/migration-chaos.sh` was not run, because it does `pkill -x Omni`.
+
+MEASURED, 0.19.10 against this build, on fresh clones of the 9.7M-row bench index, interleaved. Search
+digests identical (134b9ff183fd2f29, a5d92396d17c86a6, 45701c093aaaafe4, ca10cc003e695e91), on v4 and
+after the migration. Search p50 on a migrated clone 4.4 ms. `mutbench --crud delpaths 4000 64`: op 10.65 s
+against 10.42 s, search p50 74.0, 51.1 against 36.0, 40.0 ms. `update 2000 64`: search p50 72.1, 71.8
+against 72.7, 69.9 ms. Crawl of 43,179 files: 0.59, 0.41 s against 0.44, 0.40 s. Later opens 3.4 s in
+both. First open of a migrated index: 33.5, 35.0 s against 35.1, 38.1 s, of which the one-time check is
+0.69 s; the rest is not separated from noise at n=2. KILLED at 30, 120 and 240 s of the migration: 0 failing
+checks and the same digest each time; the 30 and 120 s kills landed before the split committed, the 240 s
+one after the migration had finished, so no kill landed between the publish and the drop.

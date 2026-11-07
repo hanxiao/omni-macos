@@ -874,7 +874,14 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             }
             return false
         }
-        guard #available(macOS 15.0, *), let name = Self.aneProgramName(config) else { return false }
+        // NO PROGRAMS, BACK ON THE GPU. The unit is set before the build, so a build that could not
+        // start left it on the Neural Engine with no phase: deferredKinds then held images, audio and
+        // video back for good, while the app said the Neural Engine was unavailable and ran on the GPU.
+        func stayOnGPU() -> Bool {
+            aneLock.withLock { _computeUnit = .gpu }
+            return false
+        }
+        guard #available(macOS 15.0, *), let name = Self.aneProgramName(config) else { return stayOnGPU() }
         if neuralEngineActive, neuralEnginePhase == .video { progress?(NeuralEngineBuild(fraction: 1, stage: .loading)); return true }
         let t0 = Date()
         progress?(NeuralEngineBuild(fraction: 0, stage: .writing))
@@ -886,7 +893,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                                              lengths: ANETextBackend.defaultLengths,
                                              blocks: ANEBlocks.settled(prefix + "_textblocks", cache: cache), program: name) else {
             omniPerfLog("ane: not available, everything stays on the GPU")
-            return false
+            return stayOnGPU()
         }
         if text.blockLengths.isEmpty { omniPerfLog("ane: no layer program, a sequence past \(text.maxLength) tokens runs on the GPU") }
         let visionProgram = imageEncoder != nil ? ANEBlocks.settled(prefix + "_vision", cache: cache) : nil

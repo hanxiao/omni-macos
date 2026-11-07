@@ -294,6 +294,9 @@ enum PerfScript {
                 "indexedFiles": model.indexedFiles,
                 "paused": model.isPaused,
                 "reconcileShown": model.reconcileShowsProgress,
+                "mapFolder": model.selectedFolderForViz?.path ?? "",
+                "filterFolders": model.filterFolders.map(\.path),
+                "servingState": "\(model.serving.state)",
             ]
             if let data = try? JSONSerialization.data(withJSONObject: payload) {
                 try? data.write(to: URL(fileURLWithPath: arg), options: .atomic)

@@ -21,6 +21,12 @@ public enum IndexRelocation {
         "index.sqlite.vecs", "index.sqlite.quant", "index.sqlite.rows",
     ]
 
+    /// Folders that live beside the index and go where it goes. `link` is this Mac's identity on
+    /// Linked Macs and the Macs it trusts (LinkController.linkDirectory follows the index folder). Not
+    /// index files, and not counted as such; left behind, the next launch made a new key and every
+    /// linked Mac went on pinning the old one, with nothing to say why.
+    public static let companionFolders = ["link"]
+
     public static func files(in dir: URL) -> [URL] {
         let fm = FileManager.default
         return fileNames.map { dir.appendingPathComponent($0) }.filter { fm.fileExists(atPath: $0.path) }
@@ -81,6 +87,14 @@ public enum IndexRelocation {
                     throw NSError(domain: "omni.relocate", code: 1, userInfo: [
                         NSLocalizedDescriptionKey: "\(f.lastPathComponent) did not copy completely."])
                 }
+                done.append(dest)
+            }
+            for name in companionFolders {
+                let from = src.appendingPathComponent(name, isDirectory: true)
+                guard fm.fileExists(atPath: from.path) else { continue }
+                let dest = dst.appendingPathComponent(name, isDirectory: true)
+                if fm.fileExists(atPath: dest.path) { try fm.removeItem(at: dest) }
+                try fm.copyItem(at: from, to: dest)
                 done.append(dest)
             }
         } catch {

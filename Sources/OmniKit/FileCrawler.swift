@@ -160,16 +160,17 @@ public struct FileCrawler: Sendable {
     /// `onFile` is called serially, but NOT necessarily on the calling thread: the fast engine runs
     /// a pool of readers and hands their results over one directory at a time under its own lock.
     /// Every caller here appends to a local array, which that guarantee covers.
-    public func walk(shouldContinue: () -> Bool = { true }, onFile: (CrawledFile) -> Void) {
-        if Self.useLegacyEngine { walkLegacy(shouldContinue: shouldContinue, onFile: onFile) }
-        else { walkBulk(shouldContinue: shouldContinue, onFile: onFile) }
+    @discardableResult
+    public func walk(shouldContinue: () -> Bool = { true }, onFile: (CrawledFile) -> Void) -> WalkOutcome {
+        if Self.useLegacyEngine { return walkLegacy(shouldContinue: shouldContinue, onFile: onFile) }
+        return walkBulk(shouldContinue: shouldContinue, onFile: onFile)
     }
 
     /// The fast engine: getattrlistbulk + a bounded pool. See BulkDirWalker for why it is shaped
     /// this way and what was measured. The POLICY below - what to descend into, what to keep - is
     /// identical to the legacy walk, and PackageProbe/hidden/symlink/volume handling exists purely
     /// so it stays identical; CrawlerParityTests holds the two to the same answer.
-    private func walkBulk(shouldContinue: () -> Bool, onFile: (CrawledFile) -> Void) {
+    private func walkBulk(shouldContinue: () -> Bool, onFile: (CrawledFile) -> Void) -> WalkOutcome {
         // REAL PATHS. FileManager's enumerator hands back paths with every symlink in the ROOT
         // already resolved (/var/... comes back as /private/var/...), and the fast walk builds its
         // paths by concatenation, so without this the two engines return the same files under
@@ -205,7 +206,7 @@ public struct FileCrawler: Sendable {
             resolved.first { path == $0.path || path.hasPrefix($0.path + "/") }?.path
         }
 
-        BulkDirWalker.walk(
+        return BulkDirWalker.walk(
             roots: resolved.map { $0.path },
             shouldContinue: shouldContinue,
             shouldDescend: { dir, entry in
@@ -241,16 +242,18 @@ public struct FileCrawler: Sendable {
             deliver: { batch in for f in batch { onFile(f) } })
     }
 
-    private func walkLegacy(shouldContinue: () -> Bool, onFile: (CrawledFile) -> Void) {
+    private func walkLegacy(shouldContinue: () -> Bool, onFile: (CrawledFile) -> Void) -> WalkOutcome {
+        final class Unread: @unchecked Sendable { var dirs = Set<String>() }
+        let unread = Unread()
         let fm = FileManager.default
         let keys: [URLResourceKey] = [.isDirectoryKey, .isRegularFileKey, .contentModificationDateKey, .fileSizeKey, .isPackageKey, .isHiddenKey]
         for root in roots {
             guard let en = fm.enumerator(at: root, includingPropertiesForKeys: keys,
-                                         options: [], errorHandler: { _, _ in true })
-            else { continue }
+                                         options: [], errorHandler: { url, _ in unread.dirs.insert(url.path); return true })
+            else { unread.dirs.insert(root.path); continue }
             let keySet = Set(keys)
             for case let url as URL in en {
-                if !shouldContinue() { return }
+                if !shouldContinue() { return WalkOutcome(stopped: true, unreadableDirs: unread.dirs) }
                 // Per-iteration pool: the enumerator vends autoreleased URLs and every
                 // resourceValues read allocates more Foundation objects behind them. Without a
                 // pool here they all pile up until the walk RETURNS - hundreds of thousands of
@@ -278,5 +281,6 @@ public struct FileCrawler: Sendable {
                 if let crawled { onFile(crawled) }
             }
         }
+        return WalkOutcome(unreadableDirs: unread.dirs)
     }
 }

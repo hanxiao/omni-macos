@@ -67,6 +67,16 @@ final class RemoteFiles: @unchecked Sendable {
         return try await task.value
     }
 
+    /// Stop a fetch in flight. Its slices stop at the other end too (LinkChannel.call), and the
+    /// partial file goes with the download's scope.
+    func cancel(_ remote: String) {
+        lock.withLock {
+            inflight[remote]?.cancel()
+            inflight[remote] = nil   // asked for again at once, it starts over rather than joining this one
+            progress[remote] = nil
+        }
+    }
+
     /// The same, blocking: for a file promise, which AppKit fulfils on its own operation queue.
     func fetchBlocking(_ remote: String) -> URL? {
         let out = LockedBox<URL?>(nil)

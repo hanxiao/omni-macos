@@ -205,6 +205,7 @@ public final class LinkNode: @unchecked Sendable {
                             theyAllowSearch: true, theyAllowFetch: true)
         peers.put(peer)
         queue.async { [self] in
+            relinkedLocked(peer.id)
             reconcileLocked()
             dial(peer.id)
             notify()
@@ -376,6 +377,15 @@ public final class LinkNode: @unchecked Sendable {
         }
     }
 
+    /// A new pairing replaces whatever the old link had come to. `.unlinked` outlived it, because a
+    /// dial only starts from `.offline`: the sheet said linked and the row said Unlinked until someone
+    /// pressed Reconnect.
+    private func relinkedLocked(_ id: String) {
+        guard let c = conns[id], c.state == .unlinked else { return }
+        c.state = .offline
+        c.backoff = 2
+    }
+
     private func connected(_ id: String, gen: Int, channel ch: LinkChannel, hello: HelloReply, conn: NWConnection) {
         guard let c = conns[id], c.generation == gen, running else { ch.close(); return }
         c.attempt = nil
@@ -446,7 +456,7 @@ public final class LinkNode: @unchecked Sendable {
 
     /// Bring `conn` to ready and wrap it, or throw. TLS 1.3 lets the client report ready before
     /// the server has judged its certificate; a refused client then sees its first request fail.
-    private func connect(_ conn: NWConnection, timeout: Double) async throws -> LinkChannel {
+    func connect(_ conn: NWConnection, timeout: Double) async throws -> LinkChannel {
         let q = queue
         let ch: LinkChannel = try await withCheckedThrowingContinuation { cont in
             let done = Locked(false)
@@ -590,6 +600,9 @@ public final class LinkNode: @unchecked Sendable {
             guard let self, let ch else { throw LinkError.closed }
             switch method {
             case "pair.begin":
+                // BEFORE THE SLOT. A begin that does not decode held it with no release installed:
+                // every later request heard "busy" until the app was relaunched.
+                let b = try msg.decode(PairBegin.self)
                 let ok: String? = self.queue.sync {
                     if !self.windowOpen { return "Open Link a Mac on \(self.config.name) first." }
                     if self.pairingInProgress { return "\(self.config.name) is busy linking another Mac." }
@@ -597,7 +610,6 @@ public final class LinkNode: @unchecked Sendable {
                     return nil
                 }
                 if let ok { throw LinkError.refused(ok) }
-                let b = try msg.decode(PairBegin.self)
                 st.begin = b
                 st.nonce = LinkPairing.nonce()
                 let c = self.queue.sync { self.config }
@@ -629,7 +641,7 @@ public final class LinkNode: @unchecked Sendable {
                                         allowSearch: true, allowFetch: true,
                                         theyAllowSearch: b.share, theyAllowFetch: b.share)
                     self.peers.put(peer)
-                    self.queue.async { self.reconcileLocked(); self.notify() }
+                    self.queue.async { self.relinkedLocked(peer.id); self.reconcileLocked(); self.notify() }
                     return try .json(PairResult(ok: true, reason: nil))
                 case .wrong:
                     return try .json(PairResult(ok: false, reason: "Wrong code."))

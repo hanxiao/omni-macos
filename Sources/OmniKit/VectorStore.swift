@@ -2710,9 +2710,7 @@ public final class VectorStore: @unchecked Sendable {
         // And whether a v4 backfill is still owed. Decided HERE because the rows present at open
         // are exactly the pre-existing ones - after this, every row written gets a slot and the
         // question would start answering about the wrong thing.
-        v4BackfillPending = hasColumnLocked("chunks", "slot") && !slotsBackfilled
-            && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsBackfilledKey)'") != 1
-            && scalarQuery("SELECT EXISTS(SELECT 1 FROM chunks WHERE slot < 0)") == 1
+        refreshV4BackfillPendingLocked()
 
         // A BRAND NEW INDEX IS BORN v5, HERE, because nothing else will do it. The split is
         // otherwise built from the coverage stamp, and the stamp needs rows - so an index with no
@@ -2810,6 +2808,11 @@ public final class VectorStore: @unchecked Sendable {
             // not touch a vector - new chunk ids ARE the old rowids, so every coverage claim, hole
             // and slot in .vecs still describes the same rows afterwards.
             migrateToV4Locked()
+            // ASKED AGAIN, AND THE CONVERSION IS WHY. The first answer was given before there was a
+            // `slot` column to ask about, so a v3 index read as owing nothing - and position reuse
+            // then ran for the whole of the session that converts it, the window placeVectorLocked
+            // calls unreadable by either loader.
+            refreshV4BackfillPendingLocked()
             // AFTER the conversion, because `slot` is a v4 column: the call made at the end of the
             // load ran against a v3 table that did not have one.
             backfillSlotsLocked()
@@ -2827,7 +2830,9 @@ public final class VectorStore: @unchecked Sendable {
         // so instead, so the app can show a real message rather than behaving strangely.
         if let why = queue.sync(execute: { coverageUnreadable }) {
             let unmappable = queue.sync { vectorFileUnmappable }
+            let resumeBlocked = queue.sync { reclaimResumeBlocked }
             abandon()
+            if resumeBlocked { throw OmniError.storeUnavailable("The index is busy finishing some maintenance.") }
             // A map can also fail because the file is SHORTER than the bookkeeping says, which is
             // the bookkeeping's problem, not the file's: only a lock held elsewhere or a file that
             // cannot be read is "unavailable" and waited out.
@@ -3114,7 +3119,7 @@ public final class VectorStore: @unchecked Sendable {
             // Holes first: this path's existing rows become tombstones after the commit below, and
             // the slots they keep have to be recorded inside the same transaction as their delete.
             let victims = pathIsPresentLocked(path) ? victimRowsForPathsLocked([path]) : []
-            beginTxnLocked()
+            guard beginTxnLocked() else { throw OmniError.storeBusy("\(path): the write lock is held") }
             recordAndReleaseLocked(releasedSlotsLocked(victims))
             deletePathLocked(path)
             let bfs = chunks.map { bf16Row($0.embedding) }   // fp32 -> bf16 once, reused for blob + memory
@@ -3149,10 +3154,10 @@ public final class VectorStore: @unchecked Sendable {
             // persistSlotsLocked's. A crash between them left a covered position with no hole and
             // no seated row - the shape the open-time audit refuses.
             var seen: [Data: Int32] = [:]
-            beginTxnLocked()
+            let placing = beginPlacementLocked()
             let assigned = appendChunksLocked(chunks, bfs: bfs, ids: written.residentIDs, seen: &seen)
             persistSlotsLocked(ids: written.rowIDs, contentIDs: written.contentIDs, slots: assigned)
-            exec("COMMIT;")
+            endPlacementLocked(placing)
             rowWindowAuditLocked("replace")
             // No invalidateBase(): a new path's rows append past baseRows and are scored as delta.
             // A pre-existing path already triggered removeRowsLocked above, which invalidates.
@@ -3266,7 +3271,7 @@ public final class VectorStore: @unchecked Sendable {
         let victims = keepExisting ? []
             : victimRowsForPathsLocked(Set(work.map { $0.path }.filter { pathIsPresentLocked($0) }))
         laps.lap("victims")
-        beginTxnLocked()
+        guard beginTxnLocked() else { throw OmniError.storeBusy("the write lock is held") }
         let released = releasedSlotsLocked(victims)
         laps.lap("released")
         recordAndReleaseLocked(released)
@@ -3312,7 +3317,7 @@ public final class VectorStore: @unchecked Sendable {
         // ONE map for the whole batch: see appendChunksLocked. Per file, two files in one
         // batch holding the same passage stored it twice.
         var seen: [Data: Int32] = [:]
-        beginTxnLocked()   // placement and slot records commit together - see replace()
+        let placing = beginPlacementLocked()   // placement and slot records commit together - see replace()
         for (wi, it) in work.enumerated() {
             let written = writtenByWork[wi] ?? WrittenChunks()
             let assigned = appendChunksLocked(it.chunks, bfs: bfs[wi], ids: written.residentIDs,
@@ -3325,7 +3330,7 @@ public final class VectorStore: @unchecked Sendable {
         }
         laps.lap("append")
         persistSlotsLocked(ids: allIDs, contentIDs: allContentIDs, slots: allSlots)
-        exec("COMMIT;")
+        endPlacementLocked(placing)
         laps.lap("slots")
         rowWindowAuditLocked("replaceMany")
         // No invalidateBase(): appended rows are scored as delta. Any pre-existing path in the
@@ -3345,10 +3350,10 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     public func deletePath(_ path: String) {
-        writeGate.hold { queue.sync {
-            guard dbOpen() else { return }
+        retryWhileLocked("delete") { writeGate.hold { queue.sync {
+            guard dbOpen() else { return true }
             let victims = victimRowsForPathsLocked([path])
-            beginTxnLocked()
+            guard beginTxnLocked() else { return false }
             recordAndReleaseLocked(releasedSlotsLocked(victims))
             deleteFileContentLocked(path)   // a removal drops the dedup entry; a replace keeps it
             pruneFileRowsLocked([path])
@@ -3357,7 +3362,8 @@ public final class VectorStore: @unchecked Sendable {
             removeRowsByPathsLocked([path])
             proactiveRefoldLocked()
             checkpointIfDueLocked()
-        } }
+            return true
+        } } }
     }
 
     // MARK: - Content dedup (identical bytes never embed twice)
@@ -3369,7 +3375,8 @@ public final class VectorStore: @unchecked Sendable {
         guard !entries.isEmpty else { return }
         writeGate.hold { queue.sync {
             guard dbOpen() else { return }
-            beginTxnLocked()
+            // Not recorded costs a later duplicate a re-embed, nothing more: see the note above.
+            guard beginTxnLocked() else { return }
             var stmt: OpaquePointer?
             if sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO dedup(file_id, key, modified, size) VALUES(?,?,?,?);", -1, &stmt, nil) == SQLITE_OK {
                 for e in entries {
@@ -3736,11 +3743,13 @@ public final class VectorStore: @unchecked Sendable {
             warmer.warm(files: pick.map { ($0.dir, $0.name) })
             let t = Date()
             var tHeld: Date?
-            writeGate.hold {
-                queue.sync {
-                    tHeld = Date()
-                    guard dbOpen() else { return }
-                    deletePathsLocked(Set(pick.map(\.path)))
+            retryWhileLocked("delete") {
+                writeGate.hold {
+                    queue.sync {
+                        tHeld = Date()
+                        guard dbOpen() else { return true }
+                        return deletePathsLocked(Set(pick.map(\.path)))
+                    }
                 }
             }
             let units = pick.reduce(0) { $0 + $1.rows + 1 }
@@ -3802,7 +3811,7 @@ public final class VectorStore: @unchecked Sendable {
         let victims = Array(live.sorted { rows[Int($0)].chunkIndex < rows[Int($1)].chunkIndex }.suffix(drop))
         let cutoff = rows[Int(victims[0])].chunkIndex
         var laps = Laps()
-        beginTxnLocked()
+        guard beginTxnLocked() else { return 0 }
         recordAndReleaseLocked(releasedSlotsLocked(victims))
         exec("CREATE TEMP TABLE IF NOT EXISTS split_aff(chunk_id INTEGER PRIMARY KEY);")
         exec("DELETE FROM split_aff;")
@@ -3930,11 +3939,12 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    private func deletePathsLocked(_ paths: Set<String>) {
+    /// False: the write lock is held and nothing happened (retryWhileLocked).
+    private func deletePathsLocked(_ paths: Set<String>) -> Bool {
         var laps = Laps()
         let victims = victimRowsForPathsLocked(paths)
         laps.lap("victims")
-        beginTxnLocked()
+        guard beginTxnLocked() else { return false }
         laps.lap("begin")
         let released = releasedSlotsLocked(victims)
         laps.lap("released")
@@ -3943,7 +3953,7 @@ public final class VectorStore: @unchecked Sendable {
         guard deleteFileContentsLocked(paths) else {
             rollbackTxnLocked()
             FileHandle.standardError.write(Data("[omni] delete aborted: could not stage the victims\n".utf8))
-            return
+            return true
         }
         laps.lap("contents")
         pruneFileRowsLocked(paths)
@@ -3961,6 +3971,7 @@ public final class VectorStore: @unchecked Sendable {
         checkpointIfDueLocked()
         laps.lap("ckpt")
         laps.print("deletePaths n=\(paths.count) rows=\(victims.count)")
+        return true
     }
 
     /// Every stored trace of these files except the `files` rows themselves (the caller prunes
@@ -4042,13 +4053,14 @@ public final class VectorStore: @unchecked Sendable {
         // BEHIND THE GATE like the slices: it runs right after them, which is when the Checkpointer
         // is most likely restarting the log, and outside the gate its BEGIN waited out that restart
         // on the store queue - 819 ms, a search behind it.
-        writeGate.hold { queue.sync {
-            guard dbOpen() else { return }
-            deleteUnderFolderLocked(folder)
-        } }
+        retryWhileLocked("folder delete") { writeGate.hold { queue.sync {
+            guard dbOpen() else { return true }
+            return deleteUnderFolderLocked(folder)
+        } } }
     }
 
-    private func deleteUnderFolderLocked(_ folder: String) {
+    /// False: the write lock is held and nothing happened (retryWhileLocked).
+    private func deleteUnderFolderLocked(_ folder: String) -> Bool {
         // Decided ONCE PER DIRECTORY, then read per row by file id: the same byte-prefix test
         // (plus canonical `==` for a folder that is itself a file) the per-row predicate ran,
         // without a path String per row.
@@ -4057,7 +4069,7 @@ public final class VectorStore: @unchecked Sendable {
         laps.lap("under")
         let victims = folderVictimsLocked(under)
         laps.lap("victims")
-        beginTxnLocked()
+        guard beginTxnLocked() else { return false }
         let released = releasedSlotsLocked(victims)
         laps.lap("released")
         recordAndReleaseLocked(released)
@@ -4088,7 +4100,7 @@ public final class VectorStore: @unchecked Sendable {
         guard built else {
             rollbackTxnLocked()
             FileHandle.standardError.write(Data("[omni] folder delete aborted: could not resolve the files under \(folder)\n".utf8))
-            return
+            return true
         }
         // THE SPLIT'S POINTERS GO TOO. A delete that leaves occurrence rows behind is worse
         // than a leak: file-level reuse reads occurrences, so a stale one makes the indexer
@@ -4127,6 +4139,7 @@ public final class VectorStore: @unchecked Sendable {
         checkpointIfDueLocked()
         laps.lap("ckpt")
         laps.print("deleteUnderFolder rows=\(victims.count)")
+        return true
     }
 
     /// Delete every chunk of a given file kind (used when a content type is disabled).
@@ -4199,9 +4212,9 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Drop all vectors (e.g. before a forced full reindex into a new embedding space).
     public func wipeChunks() {
-        writeGate.hold { queue.sync {
-            guard dbOpen() else { return }
-            beginTxnLocked()
+        retryWhileLocked("wipe") { writeGate.hold { queue.sync {
+            guard dbOpen() else { return true }
+            guard beginTxnLocked() else { return false }
             for t in StoreSchema.allTables { exec("DELETE FROM \(t);") }   // every row is an orphan now
             forgetReleasedLocked()
             bumpGenLocked()
@@ -4220,7 +4233,8 @@ public final class VectorStore: @unchecked Sendable {
             invalidateTagFilterCacheLocked()   // wipe bypasses fileChunkDec; keep the invariant
             dim = 0
             checkpointIfDueLocked()
-        } }
+            return true
+        } } }
     }
 
     /// The files the index knows, answerable by path WITHOUT a String per file.
@@ -9191,6 +9205,14 @@ public final class VectorStore: @unchecked Sendable {
     /// while they exist leaves an index neither loader can read.
     private var v4BackfillPending = false
 
+    private var reclaimResumeBlocked = false
+
+    private func refreshV4BackfillPendingLocked() {
+        v4BackfillPending = hasColumnLocked("chunks", "slot") && !slotsBackfilled
+            && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.slotsBackfilledKey)'") != 1
+            && scalarQuery("SELECT EXISTS(SELECT 1 FROM chunks WHERE slot < 0)") == 1
+    }
+
     /// The free list describes a NUMBERING. Anything that renumbers positions - a compaction, a
     /// reload, a wipe - leaves it describing one that no longer exists, so it is dropped rather
     /// than adjusted and rebuilt from the pointers the next time one is needed.
@@ -9255,8 +9277,10 @@ public final class VectorStore: @unchecked Sendable {
         // Observed live at chunk_slots_upto 6,000,000 of 9,773,836 with the out-of-order marker
         // already set, so this is reachable on a normal migration, not a contrived state. Appending
         // costs the file one position until the backfill lands, which is what v4 did for years.
+        // Nor while this write's slots cannot be recorded (beginPlacementLocked): a reuse has to clear
+        // its hole and owe its sync in the table.
         guard Self.freeListEnabled, dim > 0, v.count == dim,
-              !v4BackfillPending else {
+              !v4BackfillPending, !placementUnrecorded else {
             flat16.append(contentsOf: v); return lastAppendedSlot
         }
         ensureFreeSlotsLocked()
@@ -9542,6 +9566,10 @@ public final class VectorStore: @unchecked Sendable {
     // That is not a convenience: it means every live row's blob is already cleared, so the switch
     // needs no UPDATE over the chunk table at all, just two small writes to `meta`.
     private static let compactPendingKey = "vecs_compact_pending"
+    /// Which column the reclaim's plan read the live positions from ("chunk" or "chunks"). Beside
+    /// the marker, because a resume runs before any loader has decided, and with both tables present
+    /// (the sessions between the split's publish and the v4 drop) the tables cannot say.
+    private static let compactColumnKey = "vecs_compact_column"
     /// How much of the copy one turn of the queue writes. One write(2) cannot exceed INT_MAX on
     /// Darwin anyway, and this also bounds how long a search can wait behind the copy.
     ///
@@ -9871,7 +9899,53 @@ public final class VectorStore: @unchecked Sendable {
     /// `BEGIN IMMEDIATE` takes the write lock at BEGIN, which is where the busy handler DOES
     /// apply, so a contended write waits its turn instead of failing. Every other write
     /// transaction in this file already did it this way; the main one predated the idiom.
-    private func beginTxnLocked() { exec("BEGIN IMMEDIATE;") }
+    ///
+    /// AND IT CAN FAIL, which is the case the unchecked form got wrong. Past `busy_timeout` under a
+    /// split build or a v4 drop (one long transaction on another connection), every statement after
+    /// it ran in autocommit and failed in silence, while memory dropped the rows anyway: they came
+    /// back at the next open. False: nothing has happened, in SQLite or in memory, so the caller
+    /// stops there and the write is asked for again. Already inside a transaction is not a failure:
+    /// the caller's COMMIT closes it, as it always did.
+    private func beginTxnLocked() -> Bool {
+        sqlite3_get_autocommit(db) == 0 || execChecked("BEGIN IMMEDIATE;")
+    }
+
+    /// The second transaction of a write: where its vectors are placed and their slots recorded. The
+    /// first has committed, so the rows exist and memory has to take them whatever happens here. A
+    /// lock taken in the instant between the two leaves what a kill between them leaves (slots not
+    /// recorded, the blobs staged), which the next open puts right (loadBySlotLocked). Statements
+    /// fail at once meanwhile: one busy wait per statement, on the store queue, is a frozen search.
+    private func beginPlacementLocked() -> Bool {
+        if beginTxnLocked() { return true }
+        FileHandle.standardError.write(Data("[omni] slots not recorded: the write lock is held; the next open records them\n".utf8))
+        sqlite3_busy_timeout(db, 0)
+        placementUnrecorded = true
+        return false
+    }
+
+    private func endPlacementLocked(_ inTxn: Bool) {
+        if inTxn { exec("COMMIT;"); return }
+        sqlite3_busy_timeout(db, Self.busyTimeoutMillis)
+        placementUnrecorded = false
+    }
+
+    private static let busyTimeoutMillis: Int32 = 5000
+    private var placementUnrecorded = false
+
+    /// A write that could not take the lock changed nothing, so it can simply be asked again. Off the
+    /// store queue: a wait inside it would hold every search behind it. As long as the longest
+    /// maintenance transaction (the split build), the same bound Indexer.writeWaitingOutLocks has.
+    /// Still refused after that: the rows stay, in memory and in the table, and the next pass finds them.
+    private func retryWhileLocked(_ what: String, _ attempt: () -> Bool) {
+        let deadline = Date().addingTimeInterval(210)
+        while !attempt() {
+            guard Date() < deadline else {
+                FileHandle.standardError.write(Data("[omni] \(what) gave up: the write lock stayed held\n".utf8))
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.4)
+        }
+    }
 
     /// Roll back, and put the resident hole set back in step with the table.
     ///
@@ -9918,6 +9992,71 @@ public final class VectorStore: @unchecked Sendable {
     private func recordAndReleaseLocked(_ slots: [Int32]) {
         recordHolesLocked(slots)
         releaseFreeSlotsLocked(slots)
+        if splitBuilt, !residentIDsAreContents { releasedOverV4Rows = Set(slots) }
+    }
+
+    /// What this transaction released, in the session that published the split (below).
+    private var releasedOverV4Rows = Set<Int32>()
+
+    /// THE SESSION THAT PUBLISHES THE SPLIT HAS TWO MODELS OF WHERE A VECTOR LIVES. In memory rows are
+    /// still v4, and two rows holding one content each read their own position; in the table that
+    /// content has one, the lowest of them. A delete asks the resident model what it releases, so
+    /// removing the file on the lowest released the position the surviving content still names: a
+    /// hole on a live content, and once the free list handed the position out, the next open seated
+    /// the old content on the new vector. Silent, and the scores look plausible.
+    ///
+    /// So the survivors move to a position a live row of theirs really reads, which holds the same
+    /// bytes. Past the coverage claim the file does not answer for it yet, and only the representative
+    /// was staged when the split was published, so its blob goes in here. Only this session pays:
+    /// resident ids are contents from the next open on, and they agree.
+    private func repointSurvivorsOfReleasedLocked() {
+        guard !releasedOverV4Rows.isEmpty, splitBuilt, !residentIDsAreContents else { return }
+        var survivors: [(id: Int64, slot: Int32)] = []
+        var st: OpaquePointer?
+        if sqlite3_prepare_v2(db, "SELECT k.id, k.slot FROM chunk k WHERE k.id IN (SELECT chunk_id FROM split_aff) AND k.refs > 0 AND k.slot >= 0;",
+                              -1, &st, nil) == SQLITE_OK {
+            while sqlite3_step(st) == SQLITE_ROW {
+                let slot = sqlite3_column_int(st, 1)
+                if releasedOverV4Rows.contains(slot) { survivors.append((sqlite3_column_int64(st, 0), slot)) }
+            }
+        }
+        sqlite3_finalize(st); st = nil
+        guard !survivors.isEmpty else { return }
+        guard sqlite3_prepare_v2(db, """
+            SELECT d.path, f.name, o.ordinal FROM occurrence o
+              JOIN files f ON f.id = o.file_id JOIN dirs d ON d.id = f.dir_id WHERE o.chunk_id = ?;
+            """, -1, &st, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(st) }
+        for s in survivors {
+            sqlite3_reset(st)
+            sqlite3_bind_int64(st, 1, s.id)
+            var read: Int32 = -1
+            while read < 0, sqlite3_step(st) == SQLITE_ROW {
+                guard let dir = sqlite3_column_text(st, 0), let name = sqlite3_column_text(st, 1) else { continue }
+                let path = StoreSchema.joinPath(dir: String(cString: dir), name: String(cString: name))
+                let ordinal = Int(sqlite3_column_int(st, 2))
+                for r in victimRowsForPathsLocked([path]) where Int(rows[Int(r)].chunkIndex) == ordinal {
+                    let at = occSlot[Int(r)]
+                    if at >= 0, at != s.slot { read = at; break }
+                }
+            }
+            sqlite3_reset(st)
+            // No resident row yet: a file of this same batch, whose placement takes the position back
+            // (reclaimSharedSlotLocked).
+            guard read >= 0 else { continue }
+            exec("UPDATE chunk SET slot = \(read) WHERE id = \(s.id);")
+            guard Int(read) >= coveredRows, dim > 0, (Int(read) + 1) * dim <= flat16.count else { continue }
+            var ins: OpaquePointer?
+            if sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO pending_vecs(chunk_id, vec) VALUES(?, ?);", -1, &ins, nil) == SQLITE_OK {
+                sqlite3_bind_int64(ins, 1, s.id)
+                flat16.withUnsafeBufferPointer { buf in
+                    let bytes = UnsafeRawPointer(buf.baseAddress! + Int(read) * dim)
+                    _ = sqlite3_bind_blob(ins, 2, bytes, Int32(dim * MemoryLayout<UInt16>.size), SQLITE_TRANSIENT)
+                }
+                _ = sqlite3_step(ins)
+            }
+            sqlite3_finalize(ins)
+        }
     }
 
     private func recordHolesLocked(_ slots: [Int32], coveredOverride: Int? = nil) {
@@ -10164,6 +10303,27 @@ public final class VectorStore: @unchecked Sendable {
         return false
     }
 
+    /// Where the load put the rows that had no position, in the column they should have had it in.
+    /// Not written, they are placed again at every open, the v4 tables never drop (the proof refuses
+    /// a content with no position) and coverage never reaches their blobs. Failure costs nothing: they
+    /// are placed the same way next time.
+    private func writeBackPlacedLocked(_ placed: [Int64: Int32], table: String) {
+        guard !placed.isEmpty, execChecked("BEGIN IMMEDIATE;") else { return }
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(db, "UPDATE \(table) SET slot = ? WHERE id = ?;", -1, &st, nil) == SQLITE_OK else {
+            exec("ROLLBACK;")
+            return
+        }
+        for (id, pos) in placed {
+            sqlite3_reset(st)
+            sqlite3_bind_int(st, 1, pos)
+            sqlite3_bind_int64(st, 2, id)
+            guard sqlite3_step(st) == SQLITE_DONE else { exec("ROLLBACK;"); return }
+        }
+        exec("COMMIT;")
+    }
+
     private func loadBySlotLocked() -> Bool {
         guard dbOpen(), coveredRows > 0 else { return declineBySlot("no coverage claim") }
         let onSplit = splitBuilt
@@ -10204,6 +10364,13 @@ public final class VectorStore: @unchecked Sendable {
             guard unplaceable == 0 else {
                 return declineBySlot("\(expected - seated) row(s) have no slot and "
                                      + "\(unplaceable) of them have no vector to place either")
+            }
+            // v4, which the rank walk reads and which seats these rows without writing them down: the
+            // backfill's job, so it is reopened. Left at -1 the split's build refuses for ever.
+            if !onSplit {
+                exec("DELETE FROM meta WHERE key = '\(Self.slotsBackfilledKey)';")
+                slotsBackfilled = false
+                v4BackfillPending = true
             }
         }
         // ONLY ON A FOLDED INDEX, and the flag is the exact signal.
@@ -10292,6 +10459,7 @@ public final class VectorStore: @unchecked Sendable {
         // cannot land on a position another row owns; `unseatedPlaced` says whether any did.
         var appendCursor = highWater
         var unseatedPlaced = 0
+        var placedBack: [Int64: Int32] = [:]
         while ok, sqlite3_step(stmt) == SQLITE_ROW {
             let path = String(cString: sqlite3_column_text(stmt, 0))
             let kind = canonicalKind(kindTextLocked(stmt, 1))
@@ -10308,26 +10476,34 @@ public final class VectorStore: @unchecked Sendable {
                 // -1 means "not placed yet", not "broken". The row still has its blob - that is
                 // the whole reason a position has not been handed out yet - so the bytes are
                 // right here and the only thing missing is somewhere to put them. Placing it past
-                // every position the column names cannot collide with anything, and the ordinary
-                // slot persistence writes the assignment back on the next stamp.
+                // every position the column names cannot collide with anything, and it is written
+                // back below (the drop's proof refuses a content with no position, for ever).
                 //
                 // Refusing to open is the WORST available answer: the blob is the only copy of
                 // those bytes, and a user who re-indexes to escape the screen destroys them.
-                guard let blob = sqlite3_column_blob(stmt, 4),
-                      Int(sqlite3_column_bytes(stmt, 4)) >= bytesPerRow
-                else { ok = false; why = "a row past the covered prefix has no usable blob"; break }
-                pos = appendCursor
-                appendCursor += 1
-                if flat16.count < (pos + 1) * d {
-                    flat16.append(contentsOf: repeatElement(UInt16(0), count: (pos + 1) * d - flat16.count))
+                // ONE PLACE PER CONTENT: every occurrence of it comes through here, and a position
+                // apiece would hand the same content several, with one column to name them.
+                let id = sqlite3_column_int64(stmt, 11)
+                if onSplit, let at = placedBack[id] {
+                    pos = Int(at)
+                } else {
+                    guard let blob = sqlite3_column_blob(stmt, 4),
+                          Int(sqlite3_column_bytes(stmt, 4)) >= bytesPerRow
+                    else { ok = false; why = "a row past the covered prefix has no usable blob"; break }
+                    pos = appendCursor
+                    appendCursor += 1
+                    if flat16.count < (pos + 1) * d {
+                        flat16.append(contentsOf: repeatElement(UInt16(0), count: (pos + 1) * d - flat16.count))
+                    }
+                    flat16.withUnsafeMutableBufferPointer { buf in
+                        let src = blob.assumingMemoryBound(to: UInt16.self)
+                        for j in 0 ..< d { buf[pos * d + j] = src[j] }
+                    }
+                    while filled.count <= pos { filled.append(false) }
+                    filled[pos] = true
+                    unseatedPlaced += 1
+                    placedBack[id] = Int32(pos)
                 }
-                flat16.withUnsafeMutableBufferPointer { buf in
-                    let src = blob.assumingMemoryBound(to: UInt16.self)
-                    for j in 0 ..< d { buf[pos * d + j] = src[j] }
-                }
-                while filled.count <= pos { filled.append(false) }
-                filled[pos] = true
-                unseatedPlaced += 1
             } else {
                 guard pos < highWater else {
                     ok = false; why = "a row claims position \(pos), past the high water \(highWater)"; break
@@ -10436,6 +10612,7 @@ public final class VectorStore: @unchecked Sendable {
             return false
         }
         residentIDsAreContents = onSplit
+        writeBackPlacedLocked(placedBack, table: slotTable)
         // THE POSITIONS THE SPLIT FREED, WRITTEN DOWN, on the first open that reads it.
         //
         // The build collapses duplicates in SQLite and does not touch a vector, so this is the
@@ -11263,6 +11440,38 @@ public final class VectorStore: @unchecked Sendable {
             + "released them, and \(files) file(s) will be re-embedded on the next pass\n").utf8))
         return contents.count
     }
+
+    /// TWO CONTENTS ON ONE POSITION, which an upgrade could leave behind (repointSurvivorsOfReleasedLocked).
+    /// One of them scores as the other, plausibly, and no later step would notice. Which one the bytes
+    /// belong to cannot be proven from the index, so neither is trusted: their keys are retired, as
+    /// above, and their files marked changed, so the next pass embeds them afresh. Once per index,
+    /// after the check has run clean or the repair has committed: the fix that stops new ones is in the
+    /// same build, and a scan of the content table is not worth paying at every open.
+    private func retireContentsSharingAPositionOnceLocked() {
+        guard dbOpen(), sqlite3_get_autocommit(db) != 0, metaGetLocked(Self.sharedPositionsCheckedKey) != "1" else { return }
+        var ids: [Int64] = []
+        var st: OpaquePointer?
+        if sqlite3_prepare_v2(db, """
+            SELECT c.id FROM chunk c WHERE c.slot IN
+              (SELECT slot FROM chunk WHERE slot >= 0 GROUP BY slot HAVING COUNT(*) > 1);
+            """, -1, &st, nil) == SQLITE_OK {
+            while sqlite3_step(st) == SQLITE_ROW { ids.append(sqlite3_column_int64(st, 0)) }
+        }
+        sqlite3_finalize(st)
+        let list = ids.map(String.init).joined(separator: ",")
+        guard execChecked("BEGIN IMMEDIATE;"),
+              ids.isEmpty || execChecked("UPDATE chunk SET key = CAST(X'FFFFFFFF' || CAST(key AS BLOB) AS BLOB) WHERE id IN (\(list));"),
+              ids.isEmpty || execChecked("UPDATE files SET modified = -1 WHERE id IN (SELECT DISTINCT file_id FROM occurrence WHERE chunk_id IN (\(list)));"),
+              // A new generation, so the row sidecar is not adopted over these files' old dates.
+              ids.isEmpty || execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('mutation_gen','\(mutationGen + 1)');"),
+              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.sharedPositionsCheckedKey)','1');"),
+              execChecked("COMMIT;")
+        else { rollbackTxnLocked(); return }
+        if ids.isEmpty { return }
+        mutationGen += 1
+        FileHandle.standardError.write(Data("[omni] repaired: \(ids.count) contents shared a position; their files will be re-embedded on the next pass\n".utf8))
+    }
+    private static let sharedPositionsCheckedKey = "chunk_shared_positions_checked"
 
     /// The coverage claim could not be read. Says so loudly and changes NOTHING on disk.
     ///
@@ -12111,6 +12320,7 @@ public final class VectorStore: @unchecked Sendable {
         defer { exec("PRAGMA synchronous=NORMAL;") }
         guard execChecked("BEGIN IMMEDIATE;"),
               execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.compactPendingKey)','\(newCount)');"),
+              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.compactColumnKey)','\(residentIDsAreContents || !hasTableLocked("chunks") ? "chunk" : "chunks")');"),
               execChecked("COMMIT;")
         else {
             rollbackTxnLocked()
@@ -12125,6 +12335,7 @@ public final class VectorStore: @unchecked Sendable {
         guard rename(vecCompactURL.path, vecSidecarURL.path) == 0 else {
             FileHandle.standardError.write(Data("[omni] slot reclaim: rename failed, index unchanged\n".utf8))
             exec("DELETE FROM meta WHERE key = '\(Self.compactPendingKey)';")
+            exec("DELETE FROM meta WHERE key = '\(Self.compactColumnKey)';")
             try? FileManager.default.removeItem(at: vecCompactURL)
             loadIntoMemory()   // the mapping is gone; the claim still holds, so rebuild from it
             return false
@@ -12141,6 +12352,7 @@ public final class VectorStore: @unchecked Sendable {
               execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(newCount)');"),
               execChecked("DELETE FROM vec_holes;"),
               execChecked("DELETE FROM meta WHERE key = '\(Self.compactPendingKey)';"),
+              execChecked("DELETE FROM meta WHERE key = '\(Self.compactColumnKey)';"),
               execChecked("COMMIT;")
         else {
             // The file is already the compacted one, so the claim MUST follow it. Leaving the marker
@@ -12181,7 +12393,8 @@ public final class VectorStore: @unchecked Sendable {
     /// this file already has one of those too many.
     ///
     /// Must run inside the caller's transaction, with the claim it belongs to.
-    private func renumberSlotsByRankLocked() -> Bool {
+    /// `plannedOnContents`: what the reclaim's plan read, when a resume knows it (compactColumnKey).
+    private func renumberSlotsByRankLocked(plannedOnContents: Bool? = nil) -> Bool {
         guard dbOpen() else { return true }
         // "NO SLOT COLUMN" MEANT "NOTHING TO RENUMBER" WHILE `chunks` WAS THE ONLY PLACE A
         // POSITION LIVED. On a v5-only index there is no `chunks` at all, and returning true
@@ -12203,7 +12416,7 @@ public final class VectorStore: @unchecked Sendable {
         // still v4 and `chunks.slot` is what the reclaim planned over. Once `chunks` is gone
         // there is no window and no choice - and the resume path runs at OPEN, before any loader
         // has set `residentIDsAreContents`, so it has to be the table test that answers there.
-        let onSplit = residentIDsAreContents || !hasTableLocked("chunks")
+        let onSplit = plannedOnContents ?? (residentIDsAreContents || !hasTableLocked("chunks"))
         let liveSlots = onSplit ? "SELECT DISTINCT slot FROM chunk WHERE slot >= 0"
                                 : "SELECT DISTINCT slot FROM chunks WHERE slot >= 0"
         // AND THE OLD COLUMN IS NOT RENUMBERED WITH IT - it is skipped entirely. Under the split
@@ -12236,31 +12449,42 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Finish or abandon a reclaim that a crash interrupted. Called at open, before anything reads
     /// the claim. One file test decides it - see the note on compactPendingKey.
-    private func resumeVectorCompactionLocked() {
-        guard dbOpen() else { return }
+    /// False: the file is the compacted one and the claim could not be made to follow it. The marker
+    /// stays, so the next open tries again; reading on now would seat every row on the wrong vector.
+    private func resumeVectorCompactionLocked() -> Bool {
+        guard dbOpen() else { return true }
         let pending = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.compactPendingKey)'")
-        guard pending > 0 else { return }
+        guard pending > 0 else { return true }
         if FileManager.default.fileExists(atPath: vecCompactURL.path) {
             // The rename never happened: the vector file and the claim still describe each other.
             try? FileManager.default.removeItem(at: vecCompactURL)
             exec("DELETE FROM meta WHERE key = '\(Self.compactPendingKey)';")
+            exec("DELETE FROM meta WHERE key = '\(Self.compactColumnKey)';")
             FileHandle.standardError.write(Data("[omni] abandoned an interrupted slot reclaim; index unchanged\n".utf8))
-            return
+            return true
         }
         // The rename happened, so the file on disk IS the compacted one and the claim has to catch
         // up with it. Nothing can have mutated the table in between - the crash stopped everything.
-        beginTxnLocked()
         // The same renumbering the commit path applies, and the reason it can simply be repeated:
-        // a position's new number is how many live positions sit below it, read off `chunks.slot`,
-        // so running it on an already-dense column is the identity. There is no remap table to
-        // carry across the crash and no way to apply it twice by mistake.
-        _ = renumberSlotsByRankLocked()
-        exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(pending)');")
-        exec("DELETE FROM vec_holes;")
-        exec("DELETE FROM meta WHERE key = '\(Self.compactPendingKey)';")
-        exec("COMMIT;")
+        // a position's new number is how many live positions sit below it, read off the column the
+        // plan read, so running it on an already-dense column is the identity. There is no remap
+        // table to carry across the crash and no way to apply it twice by mistake. A marker from a
+        // build that did not say which column is read the way that build read it.
+        let column = metaGetLocked(Self.compactColumnKey)
+        guard beginTxnLocked(),
+              renumberSlotsByRankLocked(plannedOnContents: column.map { $0 == "chunk" }),
+              execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.coveredRowsKey)','\(pending)');"),
+              execChecked("DELETE FROM vec_holes;"),
+              execChecked("DELETE FROM meta WHERE key = '\(Self.compactPendingKey)';"),
+              execChecked("DELETE FROM meta WHERE key = '\(Self.compactColumnKey)';"),
+              execChecked("COMMIT;")
+        else {
+            rollbackTxnLocked()
+            return false
+        }
         removeRowSidecarFiles(keepVectors: true)
         FileHandle.standardError.write(Data("[omni] finished an interrupted slot reclaim at \(pending) rows\n".utf8))
+        return true
     }
 
     /// `reclaim` is false on the close path: taking the tombstoned slots back copies the live
@@ -14962,12 +15186,18 @@ public final class VectorStore: @unchecked Sendable {
         // about to invalidate one.
         // BEFORE the claim is read: an interrupted reclaim leaves the claim and the file describing
         // different things, and this is what makes them agree again.
-        resumeVectorCompactionLocked()
+        guard resumeVectorCompactionLocked() else {
+            // A lock is the likely cause and it passes (OmniError.storeUnavailable: wait and retry).
+            reclaimResumeBlocked = true
+            reportCoverageUnreadableLocked("an interrupted slot reclaim could not be finished.")
+            return
+        }
         loadCoverageLocked()
         // BEFORE ANY LOADER, so every one of them reads bookkeeping that agrees with itself. The
         // by-slot loader refuses this contradiction; the sidecar adopt never asks, and an index
         // that opens with it keeps handing an owned position to the free list.
         if splitBuilt, coveredRows > 0, !vecHoles.isEmpty { _ = releaseHolesOwnedByLiveContentsLocked() }
+        if splitBuilt { retireContentsSharingAPositionOnceLocked() }
         if tryAdoptRowSidecarLocked() {
             omniPerfLog("store adopted row sidecar")
             let t0 = CFAbsoluteTimeGetCurrent()
@@ -15363,6 +15593,7 @@ public final class VectorStore: @unchecked Sendable {
     /// split is built" and "the store is reading it", which are the two claims that came apart
     /// for weeks without a single test noticing.
     public var residentIDsAreContentsForTest: Bool { queue.sync { residentIDsAreContents } }
+    var v4BackfillPendingForTest: Bool { queue.sync { v4BackfillPending } }
     /// Write the row sidecar now, rather than waiting out the stamp's debounce.
     func stampRowSidecarForTest() { queue.sync { stampRowSidecarLocked(sync: true) } }
     /// Live files, and files per kind and per extension - what the filter menu is built from.
@@ -16220,6 +16451,7 @@ public final class VectorStore: @unchecked Sendable {
             UPDATE chunk SET refs = (SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = chunk.id)
              WHERE id IN (SELECT chunk_id FROM split_aff);
             """)
+        repointSurvivorsOfReleasedLocked()
         // NARROW THE AFFECTED LIST, THEN DELETE BY IT. The old spelling asked
         // `... IN (SELECT id FROM chunk WHERE refs = 0)`, which no index answers: two full scans
         // of `chunk` on EVERY file write, new files included. Measured on a clone of a
@@ -17121,9 +17353,11 @@ public final class VectorStore: @unchecked Sendable {
             }
             if !splitDirtyContents.isEmpty {
                 let list = splitDirtyContents.map(String.init).joined(separator: ",")
-                exec("UPDATE chunk SET refs = (SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = chunk.id) "
-                     + "WHERE id IN (\(list));")
-                splitDirtyContents.removeAll(keepingCapacity: true)
+                // Kept when it could not be written: the next write's recount covers them.
+                if execChecked("UPDATE chunk SET refs = (SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = chunk.id) "
+                               + "WHERE id IN (\(list));") {
+                    splitDirtyContents.removeAll(keepingCapacity: true)
+                }
             }
         }
         // A CONTENT THE CLAIM ALREADY COVERS NEEDS NO BLOB, and this is the only place that can

@@ -115,6 +115,17 @@ final class LinkController {
         }
     }
 
+    /// The index moved and this folder with it (IndexRelocation.companionFolders). The running node
+    /// would go on writing the peers to the old place, and the next launch would read the new one.
+    func reopenAfterIndexMove() {
+        guard let old = node else { return }   // never linked: nothing to reopen
+        old.stop()
+        node = nil
+        RemoteFiles.shared.attach(nil)
+        start(force: showWindow)
+        if showWindow { node?.setPairingWindow(true) }
+    }
+
     var thisID: String? { node?.identity.id }
 
     // MARK: - State

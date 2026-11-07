@@ -575,12 +575,14 @@ struct FolderBrowser: View {
         // cheap half.
         //
         // Both halves ride the store's read-only connection, so neither waits on the indexer.
+        // ASKED OF THE MODEL. `folder` is a let on this view value, so `url == folder` compared it
+        // with itself and could never see a faster click: a slow listing landed over the new folder.
         let children = await model.indexedChildrenDetailed(of: url, aggregates: false)
-        guard url == folder else { return }        // a faster click already moved us on
+        guard url == model.filterFolder else { return }        // a faster click already moved us on
         var tagsByPath: [String: [String]] = [:]
         if columns.isOn(.tags) {
             tagsByPath = await model.tags(inFolder: url)
-            guard url == folder else { return }
+            guard url == model.filterFolder else { return }
         }
         setEntries(children.map { c in
             // `isDirectory:` given: the plain initialiser stats the path to find out, once per
@@ -618,7 +620,7 @@ struct FolderBrowser: View {
             return
         }
         let counts = await model.folderCounts(under: url)
-        guard url == folder, !counts.isEmpty else { return }
+        guard url == model.filterFolder, !counts.isEmpty else { return }
         // On a copy, assigned once. Writing `entries[i]` on the @State array copied the whole
         // listing for every folder in it.
         var next = entries

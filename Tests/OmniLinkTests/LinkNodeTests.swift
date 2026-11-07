@@ -222,6 +222,37 @@ final class LinkNodeTests: XCTestCase, @unchecked Sendable {
         do { _ = try await a.node.call(b.id, "echo", timeout: 2); XCTFail() } catch {}
     }
 
+    /// The row must not keep saying Unlinked after a new code has linked the two again.
+    func testPairingAgainClearsUnlinked() async throws {
+        let a = try Node("A"), b = try Node("B")
+        _ = try await pair(a, b)
+        until("online") { a.node.state(of: b.id) == .online }
+        b.node.peers.remove(a.id)
+        b.node.reconcile()
+        a.node.stop()
+        a.node.reconcile()
+        until("A sees it is unlinked", timeout: 15) { a.node.state(of: b.id) == .unlinked }
+        _ = try await pair(a, b)
+        until("A is online again, with no Reconnect", timeout: 15) { a.node.state(of: b.id) == .online }
+        _ = try await a.node.call(b.id, "echo", timeout: 5)
+    }
+
+    /// A malformed begin must not hold the pairing slot: the next Mac that asks gets to pair.
+    func testAMalformedBeginDoesNotHoldThePairingSlot() async throws {
+        let a = try Node("A"), b = try Node("B"), c = try Node("C")
+        b.node.setPairingWindow(true)
+        until("B listens") { b.node.port != nil }
+        let conn = NWConnection(to: b.endpoint, using: LinkTLS.parameters(identity: c.node.identity, queue: DispatchQueue(label: "t")) { _ in true })
+        let ch = try await c.node.connect(conn, timeout: 10)
+        do {
+            _ = try await ch.call("pair.begin", LinkMessage(body: Data("not json".utf8)), timeout: 5)
+            XCTFail("a malformed begin must be refused")
+        } catch {}
+        let peer = try await pair(a, b)
+        XCTAssertEqual(peer.id, b.id, "the slot was left held")
+        ch.close()
+    }
+
     func testUnlinkTellsTheOtherMac() async throws {
         let a = try Node("A"), b = try Node("B")
         _ = try await pair(a, b)

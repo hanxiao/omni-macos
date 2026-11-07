@@ -232,6 +232,8 @@ extension AppModel {
             defer { if remoteOpening == remote { remoteOpening = nil } }
             do {
                 let url = try await RemoteFiles.shared.fetch(remote)
+                // Cancelled, or a newer one took over: the copy stays cached, and nothing opens.
+                guard remoteOpening == remote else { return }
                 then(url)
             } catch {
                 guard remoteOpening == remote else { return }   // cancelled by a newer one
@@ -239,6 +241,13 @@ extension AppModel {
                 remoteError = "Couldn\u{2019}t open \u{201C}\(name)\u{201D}. \(LinkController.describe(error))"
             }
         }
+    }
+
+    /// The status line's Cancel: the fetch stops, and what it was for does not happen.
+    func cancelRemoteOpen() {
+        guard let remote = remoteOpening else { return }
+        remoteOpening = nil
+        RemoteFiles.shared.cancel(remote)
     }
 
     func openRemote(_ remote: String) {

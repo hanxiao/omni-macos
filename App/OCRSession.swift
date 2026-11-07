@@ -756,6 +756,9 @@ final class OCRSession {
 
         guard let installed = Self.installedModel() else {
             if pages.isEmpty { pages = []; texts = [] }
+            // Kept for when the model lands. Nothing else remembers them: the screen had no way out
+            // once the download finished, and the files that brought it up were gone.
+            waitingForModel += sources.filter { !waitingForModel.contains($0) }
             phase = .needsModel
             return
         }
@@ -841,10 +844,19 @@ final class OCRSession {
         let arrived = Array(firstNewPage ..< pages.count)
         if OCRCache.isEnabled {
             awaitingCache.formUnion(arrived)
-            restoreFromCache(arrived, variant: installed.variant, token: runToken)
+            restoreFromCache(arrived, variant: installed.variant)
         } else {
             startRunIfNeeded(installed, token: runToken)
         }
+    }
+
+    /// The model is on disk now, and the screen that asked for it is up: open what brought it up.
+    func modelArrived() {
+        guard phase == .needsModel, Self.installedModel() != nil else { return }
+        let waiting = waitingForModel
+        waitingForModel = []
+        phase = pages.isEmpty ? .empty : .finished
+        if !waiting.isEmpty { open(urls: waiting) }
     }
 
     /// Start the run unless there is nothing to decode.
@@ -875,7 +887,8 @@ final class OCRSession {
 
     /// Look up the pages that just arrived, off the main actor, and hand what came back to
     /// `applyCacheHits`.
-    private func restoreFromCache(_ ids: [Int], variant: OCRModelCatalog.Variant, token: Int) {
+    private func restoreFromCache(_ ids: [Int], variant: OCRModelCatalog.Variant) {
+        let epoch = documentEpoch
         let prompt = Settings.prompt ?? OCRModel.defaultPrompt
         let slug = variant.rawValue
         let t0 = omniPerfEnabled ? Date() : nil
@@ -901,14 +914,19 @@ final class OCRSession {
                     omniPerfLog(String(format: "ocr-cache-lookup %.1fms pages=%d hits=%d",
                                        elapsed, wanted.count, hits.count))
                 }
-                self?.applyCacheHits(hits, of: ids, token: token)
+                self?.applyCacheHits(hits, of: ids, epoch: epoch)
             }
         }
     }
 
     /// Put the restored transcripts in, release the pages that missed, and start the run for them.
-    private func applyCacheHits(_ hits: [(id: Int, text: String)], of ids: [Int], token: Int) {
-        guard runToken == token else { return }
+    ///
+    /// NOT THE RUN TOKEN. That also moves on leaving OCR mode, and an answer dropped then left its
+    /// pages held back for good: the run loop skips them, and the screen said "Preparing" until the
+    /// document was closed. The pages are still there, so the answer still applies; only a new
+    /// document (`reset`, whose page ids mean other pages) makes it stale.
+    private func applyCacheHits(_ hits: [(id: Int, text: String)], of ids: [Int], epoch: Int) {
+        guard documentEpoch == epoch else { return }
         var restored = 0
         for hit in hits where pages.indices.contains(hit.id) && pages[hit.id].state == .pending {
             texts[hit.id] = hit.text
@@ -926,7 +944,9 @@ final class OCRSession {
             post(notice: restored == 1 ? "Restored 1 page" : "Restored \(restored) pages",
                  symbol: "clock.arrow.circlepath", seconds: 3)
         }
-        guard let installed = Self.installedModel() else { return }
+        // Away from OCR mode nothing runs: coming back starts what is left (resumeAfterStandDown).
+        guard !standingDown, let installed = Self.installedModel() else { return }
+        let token = runToken
         startRunIfNeeded(installed, token: token)
         // A run that was already winding down may have taken its LAST look at the queue while
         // these pages were still held back, and then finished - which would leave the ones that
@@ -975,6 +995,7 @@ final class OCRSession {
     private func reset() {
         cancel()
         runToken += 1
+        documentEpoch += 1
         pages = []
         texts = []
         jobs = []
@@ -1104,9 +1125,17 @@ final class OCRSession {
     /// Entering and leaving OCR mode. The model is loaded on first use and dropped on the way out,
     /// so 4.53 GB is only resident while the user is actually transcribing something.
     func activate() {
+        standingDown = false
         onModelResident?(true)
         resumeAfterStandDown()
     }
+
+    /// Out of OCR mode: nothing may start a run until `activate`.
+    @ObservationIgnored private var standingDown = false
+    /// Moves when the document set is thrown away, which makes a cache lookup's answer stale.
+    @ObservationIgnored private var documentEpoch = 0
+    /// Files dropped while the model was missing (`modelArrived`).
+    @ObservationIgnored private var waitingForModel: [URL] = []
 
     /// Pages a STAND-DOWN left unreached - leaving OCR mode, not a Stop. Empty after an explicit
     /// Stop, which is the distinction the resume below depends on.
@@ -1125,7 +1154,14 @@ final class OCRSession {
         let owed = isBusy
             ? Set(pages.filter { $0.state == .pending || $0.state == .running }.map(\.id))
             : []
+        let awaiting = awaitingCache
+        standingDown = true
         cancel()
+        // A page still waiting on its cache lookup is not a stopped one: `cancel` dims it, and the
+        // lookup's answer, which restores only what is pending, would pass it over.
+        for index in pages.indices where awaiting.contains(pages[index].id) && pages[index].state == .stopped {
+            pages[index].state = .pending
+        }
         // Pages IN FLIGHT are settled by the run when it winds down - but the token bumped below
         // makes it drop those writes, so they sat RUNNING forever and `resumeAfterStandDown`
         // (which re-queues `.stopped` only) never took them back. They are stopped here instead.
@@ -1156,20 +1192,25 @@ final class OCRSession {
     private func resumeAfterStandDown() {
         let owed = stoodDown
         stoodDown = []
-        guard !owed.isEmpty, !isBusy, let installed = Self.installedModel() else { return }
+        guard !isBusy, let installed = Self.installedModel() else { return }
         var requeued = 0
         for index in pages.indices where owed.contains(pages[index].id) && pages[index].state == .stopped {
             pages[index].state = .pending
             requeued += 1
         }
-        guard requeued > 0 else { return }
-        post(notice: requeued == 1 ? "Resumed 1 page" : "Resumed \(requeued) pages",
-             symbol: "play.circle", seconds: 3)
-        startRunIfNeeded(installed, token: runToken)
+        if requeued > 0 {
+            post(notice: requeued == 1 ? "Resumed 1 page" : "Resumed \(requeued) pages",
+                 symbol: "play.circle", seconds: 3)
+        }
+        // With what a cache lookup released while this was away. One still out starts it when it lands.
+        if pages.contains(where: { $0.state == .pending && !awaitingCache.contains($0.id) }) {
+            startRunIfNeeded(installed, token: runToken)
+        }
     }
 
     func clear() {
         stoodDown = []
+        waitingForModel = []
         // THE SAME TEARDOWN A NEW DROP DOES. This kept its own list and the list left `documents`
         // out: the closed tab stayed with page ids into the emptied `pages`, so leaving OCR mode
         // read past the end (`logDocumentState`, a crash under OMNI_PERF_LOG), and the find text

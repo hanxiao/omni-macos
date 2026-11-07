@@ -143,6 +143,10 @@ struct Sidebar: View {
     /// A row marked because the scope came back to its place (Back, a typed `in:`), not clicked:
     /// the place is already on screen, so the click's work (enter it, a navigation stop) is skipped.
     @State private var markedOnly: SidebarSelection?
+    /// The row was taken off because the scope moved away from it (reconcileSelection). Nobody picked
+    /// "nothing", so the selection handler has nothing to do: it cleared the map, which is how
+    /// Visualize on a selected folder wiped itself one update later.
+    @State private var unmarkedOnly = false
     @State private var folds = SidebarFolds.load()
 
 
@@ -284,10 +288,13 @@ struct Sidebar: View {
         // highlights (folders are acted on via context menu / Delete).
         .onChange(of: folds) { _, f in f.save() }
         .onChange(of: selection) { _, sel in
+            let unmarked = unmarkedOnly
+            unmarkedOnly = false
             if let marked = markedOnly {
                 markedOnly = nil
                 if marked == sel { return }
             }
+            if unmarked, sel == nil { return }
             if case .history(let id) = sel, let item = model.searchHistory.first(where: { $0.id == id }) {
                 // If it couldn't run (e.g. a file query whose file is gone), drop the selection so the
                 // row isn't left stuck-highlighted and a re-click still fires.
@@ -403,9 +410,9 @@ struct Sidebar: View {
         // scope comes back to it, as Back from a subfolder does in Finder.
         let scope = model.filterFolders.map(\.path)
         switch selection {
-        case .folder(let url) where scope != [url.path]: selection = nil
-        case .clipboard where scope != [AppModel.clipboardDirectory.path]: selection = nil
-        case .recents where !model.filterRecents: selection = nil
+        case .folder(let url) where scope != [url.path]: unmarkedOnly = true; selection = nil
+        case .clipboard where scope != [AppModel.clipboardDirectory.path]: unmarkedOnly = true; selection = nil
+        case .recents where !model.filterRecents: unmarkedOnly = true; selection = nil
         default: break
         }
         if selection == nil, model.fileQuery == nil, model.linkedScope == nil {
