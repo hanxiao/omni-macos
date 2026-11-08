@@ -916,7 +916,11 @@ public final class VectorStore: @unchecked Sendable {
     @inline(__always) private func setFileMetaLocked(_ fid: Int32, _ m: FileMeta, live: Bool) {
         let f = Int(fid)
         guard f >= 0, f < fileMeta.count else { return }
-        if live || fileChunkCount[f] == 0 { fileMeta[f] = m }
+        if live || fileChunkCount[f] == 0 {
+            // The date filter's GPU table keeps one entry per file and is rebuilt only when the file
+            // count moves: a file indexed again kept its old time there (modifiedGPULocked).
+            fileMeta[f] = m
+        }
     }
 
     /// Build a Row for `path`, interning it and its kind, and record the file's metadata. The one
@@ -1244,6 +1248,14 @@ public final class VectorStore: @unchecked Sendable {
     private var mutationGen: Int64 = 0
     /// When the last mutation committed: what "writes have gone quiet" is measured from.
     private var lastMutationAt = Date.distantPast
+    /// WHEN THIS STORE OPENED, where the two clocks that wait for an app nobody is using start (the
+    /// hole reclaim and the tombstone collection). From distantPast, an index nothing had written to
+    /// or searched since it opened read as idle for ever, and the first stamp after launch started a
+    /// reclaim beside the catch-up and the first searches: a bench delete took 17 s, or 70-346 s when
+    /// a stamp came first (index.md, "A bench run that draws the hole reclaim").
+    private let openedAt = Date()
+    private var writesQuietSince: Date { Swift.max(lastMutationAt, openedAt) }
+    private var searchesAbsentSince: Date { Swift.max(lastSearchAt, openedAt) }
     /// How long writes must have been quiet, and searches absent, before a hole reclaim starts
     /// (see the caught-up stamp). A search after its copy began abandons it at the commit.
     nonisolated(unsafe) public static var reclaimQuietSeconds: TimeInterval = 30
@@ -1423,7 +1435,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func invalidateBase() { baseDirty = true; mlxBase = nil; mlxFileID = nil; mlxFileIDRows = 0; mlxKindCode = nil; mlxKindCodeRows = 0; mlxModified = nil; mlxModifiedRows = 0; quantBase = nil; bitBase = nil; baseRows = 0
-                                     mlxOccSlot = nil; mlxOccSlotRows = 0; mlxDeadOcc = nil; mlxDeadOccRows = 0; baseOccCount = 0
+                                     mlxOccSlot = nil; mlxOccSlotRows = 0; slotLiftKey = ""; mlxDeadOcc = nil; mlxDeadOccRows = 0; baseOccCount = 0
                                      // Nothing is inside the base any more, so nothing is stale in it.
                                      patchedSlots.removeAll(keepingCapacity: true)
                                      // CONSERVATIVE: everything that renumbers positions throws the
@@ -3318,6 +3330,8 @@ public final class VectorStore: @unchecked Sendable {
         // batch holding the same passage stored it twice.
         var seen: [Data: Int32] = [:]
         let placing = beginPlacementLocked()   // placement and slot records commit together - see replace()
+        if !released.isEmpty { seatKeptContentsLocked(work, bfs: bfs, seen: &seen) }
+        laps.lap("seat")
         for (wi, it) in work.enumerated() {
             let written = writtenByWork[wi] ?? WrittenChunks()
             let assigned = appendChunksLocked(it.chunks, bfs: bfs[wi], ids: written.residentIDs,
@@ -3662,10 +3676,12 @@ public final class VectorStore: @unchecked Sendable {
     /// wait for any search typed meanwhile (index.md, "Heavy CRUD review"). Each slice is a
     /// complete delete - holes, SQL, tombstones - so a crash between two leaves an index that is
     /// consistent and merely not finished, which the next pass or prune finishes.
-    public func deletePaths(_ paths: Set<String>) {
-        guard !paths.isEmpty else { return }
+    /// False: a lock outlasted the wait and some of the rows are still there.
+    @discardableResult
+    public func deletePaths(_ paths: Set<String>) -> Bool {
+        guard !paths.isEmpty else { return true }
         // Sorted, so a slice is mostly neighbours: their rows share B-tree pages.
-        deleteFilesInSlices(.paths(paths.sorted()), keepReleased: true)
+        return deleteFilesInSlices(.paths(paths.sorted()), keepReleased: true)
     }
 
     /// Queue time one slice of a bulk write aims at. Long enough that a slice's fixed costs stay
@@ -3700,7 +3716,8 @@ public final class VectorStore: @unchecked Sendable {
     /// went (a watcher's deletes, a prune), not for a folder, a kind or an extension taken out. A
     /// call keeps at most one cache's worth, so a large delete pays for 16 MB of copies, not for
     /// every vector it drops (a 2.35M-file folder delete: 478 s -> 548 s when every slice copied).
-    private func deleteFilesInSlices(_ source: BulkSource, keepReleased: Bool) {
+    @discardableResult
+    private func deleteFilesInSlices(_ source: BulkSource, keepReleased: Bool) -> Bool {
         queue.sync { releaseBudget = keepReleased ? Self.releasedCap : 0 }
         defer { queue.sync { releaseBudget = nil } }
         var at = 0
@@ -3743,7 +3760,7 @@ public final class VectorStore: @unchecked Sendable {
             warmer.warm(files: pick.map { ($0.dir, $0.name) })
             let t = Date()
             var tHeld: Date?
-            retryWhileLocked("delete") {
+            guard retryWhileLocked("delete", {
                 writeGate.hold {
                     queue.sync {
                         tHeld = Date()
@@ -3751,7 +3768,7 @@ public final class VectorStore: @unchecked Sendable {
                         return deletePathsLocked(Set(pick.map(\.path)))
                     }
                 }
-            }
+            }) else { return false }
             let units = pick.reduce(0) { $0 + $1.rows + 1 }
             if Self.searchTiming, let tHeld {
                 print(String(format: "[delslice] files=%d units=%d warm=%.1fms wait=%.1fms hold=%.1fms",
@@ -3762,6 +3779,7 @@ public final class VectorStore: @unchecked Sendable {
             let perRow = Swift.max(-t.timeIntervalSinceNow, 0.000_1) / Double(units)
             budget = Swift.min(Swift.max(Int(Self.bulkSliceBudget / perRow), 64), Swift.min(budget * 2, 65_536))
         }
+        return true
     }
 
     /// Rows past which a file is peeled before it is deleted or replaced (shrinkFileInSlices).
@@ -3827,7 +3845,9 @@ public final class VectorStore: @unchecked Sendable {
         exec("COMMIT;")
         laps.lap("sql")
         removeRowsByPathsLocked([path], victims: victims)
-        if Int(rid) < fileMeta.count { fileMeta[Int(rid)].modified = 0 }
+        if Int(rid) < fileMeta.count {
+            fileMeta[Int(rid)].modified = 0
+        }
         checkpointIfDueLocked()
         laps.lap("rows")
         laps.print("shrink rows=\(victims.count) left=\(live.count - victims.count)")
@@ -4033,10 +4053,12 @@ public final class VectorStore: @unchecked Sendable {
     /// folder in one transaction held the queue 36 s. The single transaction below then runs once
     /// over what is left - files with no rows, anything indexed meanwhile, the directory rows -
     /// which after the slices is small.
-    public func deleteUnderFolder(_ folder: String) {
+    /// False: a lock outlasted the wait and some of the folder's rows are still there.
+    @discardableResult
+    public func deleteUnderFolder(_ folder: String) -> Bool {
         // Destructive-op guard: an empty (or root "/") folder would match every absolute path and
         // silently wipe the whole index. A legitimate folder is never empty.
-        guard !folder.isEmpty, folder != "/" else { return }
+        guard !folder.isEmpty, folder != "/" else { return true }
         let ids: [(id: Int32, hash: Int)] = queue.sync {
             guard dbOpen() else { return [] }
             let under = filePaths.filesUnder(folder, semantics: .bytes)
@@ -4049,11 +4071,11 @@ public final class VectorStore: @unchecked Sendable {
         // Re-checked per slice by the plain byte prefix, which can only be stricter than the
         // resolver's: a file it declines is left to the single transaction, never deleted wrongly.
         let prefix = Array((folder.hasSuffix("/") ? folder : folder + "/").utf8)
-        deleteFilesInSlices(.ids(ids) { p in p == folder || p.utf8.starts(with: prefix) }, keepReleased: false)
+        guard deleteFilesInSlices(.ids(ids) { p in p == folder || p.utf8.starts(with: prefix) }, keepReleased: false) else { return false }
         // BEHIND THE GATE like the slices: it runs right after them, which is when the Checkpointer
         // is most likely restarting the log, and outside the gate its BEGIN waited out that restart
         // on the store queue - 819 ms, a search behind it.
-        retryWhileLocked("folder delete") { writeGate.hold { queue.sync {
+        return retryWhileLocked("folder delete") { writeGate.hold { queue.sync {
             guard dbOpen() else { return true }
             return deleteUnderFolderLocked(folder)
         } } }
@@ -4210,12 +4232,28 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// What is queued for the identifier sidecar, written before the hard exit. It is written behind
+    /// the rows and the backfill does not come back for a file it has seen, so a record lost at quit
+    /// is an exact-match miss until that file changes. Bounded: a quit must not stall.
+    public func flushIdentifiersBeforeExit(timeout: TimeInterval) {
+        let ids = idIndex
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async { ids.flush(); done.signal() }
+        _ = done.wait(timeout: .now() + timeout)
+    }
+
     /// Drop all vectors (e.g. before a forced full reindex into a new embedding space).
-    public func wipeChunks() {
+    /// False: a lock outlasted the wait and nothing was wiped.
+    @discardableResult
+    public func wipeChunks() -> Bool {
         retryWhileLocked("wipe") { writeGate.hold { queue.sync {
             guard dbOpen() else { return true }
             guard beginTxnLocked() else { return false }
             for t in StoreSchema.allTables { exec("DELETE FROM \(t);") }   // every row is an orphan now
+            // A reuse's debt names a position, and that number is about to be some new content's: the
+            // next stamp would sync and delete the blob of whatever sits there, its only copy.
+            exec("DELETE FROM vec_reuse_debt;")
+            unsyncedReuse.removeAll()
             forgetReleasedLocked()
             bumpGenLocked()
             exec("COMMIT;")
@@ -5722,6 +5760,9 @@ public final class VectorStore: @unchecked Sendable {
 
     /// Serial number of the newest counts request. Superseded ones return nothing rather than walk
     /// a subtree whose answer is already stale.
+    /// TEST: an older request's interrupt, landing on the first row of the walk now running.
+    nonisolated(unsafe) static var aggregateInterruptForTest: (() -> Void)?
+    func interruptAggregatesForTest() { aggregateLane.interrupt() }
     private let aggTicketLock = NSLock()
     private var aggTicket: UInt64 = 0
     /// How many subtree walks actually reached the database. The property that matters under fast
@@ -5771,10 +5812,28 @@ public final class VectorStore: @unchecked Sendable {
             sqlite3_bind_text(st, 1, pfx, -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(st, 2, folder + "0", -1, SQLITE_TRANSIENT)
             var rows = 0
-            while sqlite3_step(st) == SQLITE_ROW {
-                // A partial answer is worse than none: it would write wrong counts into rows the
-                // browser then leaves alone. An interrupted or superseded walk yields nothing.
+            // A partial answer is worse than none: it would write wrong counts into rows the browser
+            // then leaves alone. An interrupted or superseded walk yields nothing. AND CUT SHORT IS
+            // NOT FINISHED: an older request's interrupt can land on this walk (it took its ticket,
+            // then this one started before the interrupt went out), the step returns
+            // SQLITE_INTERRUPT, and a loop that stopped at the first non-row handed back the counts so
+            // far as final. Still current, the walk starts over; only SQLITE_DONE is an answer.
+            var attempts = 0
+            walk: while true {
+                let rc = sqlite3_step(st)
+                if rc == SQLITE_DONE { break walk }
+                if rc != SQLITE_ROW {
+                    attempts += 1
+                    guard rc == SQLITE_INTERRUPT, attempts < 3, ticket == 0 || self.aggregateIsCurrent(ticket) else {
+                        self.aggregateLane.busline.noteWasted()
+                        return [:]
+                    }
+                    out.removeAll(keepingCapacity: true); rows = 0
+                    sqlite3_reset(st)
+                    continue walk
+                }
                 rows += 1
+                if rows == 1, let hook = Self.aggregateInterruptForTest { Self.aggregateInterruptForTest = nil; hook() }
                 if ticket != 0, rows % 4096 == 0, !self.aggregateIsCurrent(ticket) {
                     self.aggregateLane.busline.noteWasted()   // superseded mid-walk
                     return [:]
@@ -6055,7 +6114,8 @@ public final class VectorStore: @unchecked Sendable {
     /// waits behind a tile rather than behind the whole pull.
     public func vectorsUnderFolder(_ folder: String, cap: Int = .max, landmarkCap: Int = .max,
                                    streaming: Bool = false) -> FolderVectors {
-        queue.sync {
+        if streaming { return streamedVectorsUnderFolder(folder, cap: cap, landmarkCap: landmarkCap) }
+        return queue.sync {
             guard dim > 0, !folder.isEmpty, folder != "/" else { return FolderVectors(paths: [], kinds: [], vectors: [], dim: dim) }
             let empty = FolderVectors(paths: [], kinds: [], vectors: [], dim: dim)
             let prefix = folder + "/"
@@ -6217,6 +6277,132 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// Computes and returns; stores nothing, persists nothing. One GPU pass, about 25 s over 2.68M
     /// files, so call it from a tool, not from a launch path.
+    /// `vectorsUnderFolder(streaming: true)`, in two holds of the store queue with the Strings between
+    /// them. As one hold it built a path String per file under the folder on the queue every search
+    /// waits on: 353 ms for the root of the 9.7M-row bench index (96 ms for one top folder). The first
+    /// hold now collects the files in row order as ids and kind codes, with the path table it reads
+    /// (copy on write: nothing is copied unless a write lands meanwhile); the names are built off the
+    /// queue; the second hold pools the landmarks alone. A file written in between is pooled as it is
+    /// then, which is what a map drawn a moment later would show.
+    /// Rows the streamed folder walk reads in one hold: about 40 ms on the bench index.
+    nonisolated(unsafe) static var folderWalkSliceRows = 2_000_000
+    /// TEST: a write landing between two slices of the walk.
+    nonisolated(unsafe) static var folderWalkBetweenSlicesForTest: (() -> Void)?
+    private func streamedVectorsUnderFolder(_ folder: String, cap: Int, landmarkCap: Int) -> FolderVectors {
+        let empty = FolderVectors(paths: [], kinds: [], vectors: [], dim: dim)
+        let tHold = omniPerfEnabled ? Date() : nil
+        // THE WALK IN SLICES, each its own hold, about a slice's budget of rows. Row indices are only
+        // good while nothing moves them, so a write between two holds (the generation) starts the walk
+        // over; after three it runs in ONE hold, scope to names, so a steady stream of writes cannot
+        // keep it starting over.
+        typealias Walked = (gids: [Int32], kinds: [Int16], paths: PathTable, kindNames: [String])
+        var longestSlice = 0.0
+        func walk(sliced: Bool) -> Walked?? {
+            var ranges: [Range<Int>] = [], gen: Int64 = 0, nGlobal = 0
+            var inFolder: [Bool] = [], seen: [Bool] = []
+            var gids: [Int32] = [], kinds: [Int16] = []
+            var at = 0, offset = 0
+            func scopeLocked() -> Bool {
+                guard dim > 0, !folder.isEmpty, folder != "/" else { return false }
+                nGlobal = max(1, fileChunkCount.count)
+                inFolder = [Bool](repeating: false, count: nGlobal)
+                var scopedIds: [Int32] = []
+                let under = filePaths.filesUnder(folder, semantics: .string)
+                for gid in 0 ..< Swift.min(nGlobal, under.count) where fileChunkCount[gid] > 0 && under[gid] {
+                    inFolder[gid] = true; scopedIds.append(Int32(gid))
+                }
+                guard !scopedIds.isEmpty else { return false }
+                ranges = provenRowRangesLocked(scopedIds, dead: deadRows)
+                offset = ranges.first?.lowerBound ?? 0
+                seen = [Bool](repeating: false, count: nGlobal)
+                gen = mutationGen
+                return true
+            }
+            // Every distinct file under the folder, in order of first appearance in row order: the
+            // landmark stride below indexes that order, as the one-hold version did.
+            func stepLocked(_ budget: Int) -> Bool {
+                guard mutationGen == gen else { return false }
+                let dead = deadRows, hasDead = !dead.isEmpty
+                var done = 0
+                while at < ranges.count, done < budget {
+                    let r = ranges[at]
+                    let hi = Swift.min(r.upperBound, offset + (budget - done))
+                    for i in offset ..< hi {
+                        if hasDead, dead.contains(Int32(i)) { continue }
+                        let gid = Int(fileID[i])
+                        guard gid < nGlobal, inFolder[gid], !seen[gid] else { continue }
+                        seen[gid] = true; gids.append(Int32(gid)); kinds.append(Int16(rows[i].kc))
+                    }
+                    done += hi - offset
+                    if hi == r.upperBound { at += 1; offset = at < ranges.count ? ranges[at].lowerBound : 0 } else { offset = hi }
+                }
+                return true
+            }
+            if !sliced {
+                return queue.sync {
+                    guard scopeLocked() else { return .some(nil) }
+                    _ = stepLocked(Int.max)
+                    return .some((gids, kinds, filePaths, idKind))
+                }
+            }
+            guard queue.sync(execute: { scopeLocked() }) else { return .some(nil) }
+            while at < ranges.count {
+                let t0 = DispatchTime.now().uptimeNanoseconds
+                let fresh = queue.sync(execute: { stepLocked(Self.folderWalkSliceRows) })
+                longestSlice = Swift.max(longestSlice, Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6)
+                guard fresh else { return nil }
+                if at < ranges.count, let hook = Self.folderWalkBetweenSlicesForTest { Self.folderWalkBetweenSlicesForTest = nil; hook() }
+            }
+            return queue.sync { mutationGen == gen ? .some((gids, kinds, filePaths, idKind)) : nil }
+        }
+        var walked: Walked? = nil
+        var attempt = 0
+        while true {
+            attempt += 1
+            if let w = walk(sliced: attempt <= 3) { walked = w; break }
+        }
+        if let tHold { omniPerfLog(String(format: "folder-map walk %.0fms in slices of %d rows, longest hold %.0fms (attempts %d)", -tHold.timeIntervalSinceNow * 1000, Self.folderWalkSliceRows, longestSlice, attempt)) }
+        guard let walked, !walked.gids.isEmpty else { return empty }
+        let total = walked.gids.count
+        let allPaths = walked.gids.map { walked.paths[Int($0)] }
+        let allKinds = walked.kinds.map { Int($0) < walked.kindNames.count ? walked.kindNames[Int($0)] : "" }
+        let lCap = min(landmarkCap, cap)
+        var order: [String] = [], kinds: [String] = []
+        if total <= lCap {
+            order = allPaths; kinds = allKinds
+        } else {
+            order.reserveCapacity(min(total, cap)); kinds.reserveCapacity(min(total, cap))
+            var taken = [Bool](repeating: false, count: total)
+            let stride = Double(total) / Double(lCap)
+            var t = 0.0
+            while order.count < lCap {
+                let idx = min(total - 1, Int(t))
+                if !taken[idx] { taken[idx] = true; order.append(allPaths[idx]); kinds.append(allKinds[idx]) }
+                t += stride
+            }
+            if order.count < cap {
+                for i in 0 ..< total where !taken[i] {
+                    order.append(allPaths[i]); kinds.append(allKinds[i])
+                    if order.count >= cap { break }
+                }
+            }
+        }
+        let landmarkCount = min(total, lCap)
+        let tPool = omniPerfEnabled ? Date() : nil
+        let lm = queue.sync { pooledFilesLocked(Array(order[0 ..< landmarkCount])) }
+        if let tPool { omniPerfLog(String(format: "folder-map landmark hold %.0fms landmarks=%d", -tPool.timeIntervalSinceNow * 1000, landmarkCount)) }
+        let scratch = TileScratch()
+        let plan = order        // immutable copy for the escaping tile closure
+        return FolderVectors(paths: order, kinds: kinds, vectors: lm, dim: dim, total: total,
+                             landmarkCount: landmarkCount,
+                             tile: { [weak self] start, end in
+                                 guard let self, start < end, end <= plan.count else { return [] }
+                                 return self.queue.sync {
+                                     self.pooledFilesLocked(Array(plan[start ..< end]), scratch: scratch)
+                                 }
+                             })
+    }
+
     public struct KindScoreProfile: Sendable {
         public var files = 0
         public var p10: Float = 0
@@ -6920,18 +7106,21 @@ public final class VectorStore: @unchecked Sendable {
                 // ONE `which` against the cached combined mask, not one per filter clause with
                 // its gathers rebuilt on every keystroke.
                 var selectScore = baseScore
+                var byPosition = false   // a per-position fact was folded into the coarse score
                 if let selectMask, let slotMask = slotMaskFromOccMaskLocked(selectMask) {
                     selectScore = MLX.which(slotMask.reshaped(baseScore.shape) .> 0.5,
                                             selectScore, MLXArray(-Float.infinity))
+                    byPosition = true
                 }
                 // Candidates are chosen on the LIFTED coarse score, or a photo a text query asks for
                 // could be cut here, before the exact scores ever see it.
                 if let lift, let slotLift = slotLiftGPULocked(lift) {
                     selectScore = selectScore * slotLift.reshaped(baseScore.shape)
+                    byPosition = true
                 }
                 let result = fillSnippetsLocked(searchCandidatesLocked(
                     coarse: selectScore, qv: qv, n: n, candidateCount: C, query: query,
-                    topK: topK, filter: filter, lift: lift))
+                    topK: topK, filter: filter, lift: lift, byPosition: byPosition))
                 if let t0 {
                     print(String(format: "[search] n=%d gpu-candidate path total=%.1fms", n, -t0.timeIntervalSinceNow * 1000))
                 }
@@ -6942,7 +7131,7 @@ public final class VectorStore: @unchecked Sendable {
             let baseScore: MLXArray
             if quantBits == 1, let bb = bitBase {
                 let tDead = Self.searchTiming ? Date() : nil
-                baseScore = patchScoresLocked(maskDeadLocked(bitScanLocked(bb, query: query, rows: baseRows)), qv: qv)
+                baseScore = patchBitScoresLocked(maskDeadLocked(bitScanLocked(bb, query: query, rows: baseRows)), query: query)
                 if let tDead { print(String(format: "[search] bitscan+dead graph %.1fms", -tDead.timeIntervalSinceNow * 1000)) }
                 if let r = coarseFastPathLocked(baseScore) { return r }
             } else if let qb = quantBase {
@@ -7178,6 +7367,25 @@ public final class VectorStore: @unchecked Sendable {
         return out
     }
 
+    /// `patchScoresLocked` for the 1-bit tier, ON ITS SCALE. That one writes exact cosines, which is
+    /// what the affine and full tiers score in; this tier scores the rotated query against a row's
+    /// signs, about sqrt(dim) larger, so a patched position's cosine of 1.0 sat far below every code
+    /// around it and a vector the free list put in a hole could not reach the candidates until a fold
+    /// re-packed it. On the bench index, 8 of 40 files re-indexed into holes were missing from a plain
+    /// search, in every version through 0.19.11. Their sign codes are packed now, the way the fold
+    /// packs them, and scored by the same scan.
+    private func patchBitScoresLocked(_ scores: MLXArray, query: [Float]) -> MLXArray {
+        guard !patchedSlots.isEmpty, baseRows > 0 else { return scores }
+        var idx: [Int] = []
+        var seen = Set<Int32>()
+        for p in patchedSlots where Int(p) < baseRows && seen.insert(p).inserted { idx.append(Int(p)) }
+        guard !idx.isEmpty, let codes = packSignBitsLocked(positions: idx) else { return scores }
+        var out = scores
+        out[MLXArray(idx.map { Int32($0) })] = bitScanLocked(codes, query: query, rows: idx.count).asType(scores.dtype)
+        return out
+    }
+    var patchedCountForTest: Int { queue.sync { Set(patchedSlots.filter { Int($0) < baseRows }).count } }
+
     private func maskDeadLocked(_ scores: MLXArray) -> MLXArray {
         // `scores` is per CONTENT. deadRows are ROW indices, and using them to index a per-content
         // array is the identity only while a row owns its vector - under sharing it masks whichever
@@ -7321,7 +7529,8 @@ public final class VectorStore: @unchecked Sendable {
     /// caller already chose the candidates on the lifted coarse score.
     private func searchCandidatesLocked(coarse: MLXArray, qv: MLXArray, n: Int,
                                         candidateCount C: Int, query: [Float], topK: Int,
-                                        filter: SearchFilter = SearchFilter(), lift: [Float]? = nil) -> [SearchHit] {
+                                        filter: SearchFilter = SearchFilter(), lift: [Float]? = nil,
+                                        byPosition: Bool = true) -> [SearchHit] {
 
         // Top-C base candidates on the GPU; delta rows are exact and all enter the reduce.
         let tPh = Self.searchTiming ? Date() : nil
@@ -7361,6 +7570,15 @@ public final class VectorStore: @unchecked Sendable {
         // In slot order: every step below reads each candidate's entries in arrays as long as the
         // index (its vector, its rows, their files), and in partition order those reads were
         // scattered cache misses (946k rows: the exact rescore 0.9 -> 0.3 ms, the offers 1.7 -> 1.2).
+        // ROWS PAST THE BASE ON ONE OF ITS POSITIONS, a copy sharing a folded content or a vector the
+        // free list put in a hole, add no position, so nothing folds them in and the position's mask
+        // and lift above are still its old owner's: a search scoped to a copy's folder never saw it.
+        // Their positions are candidates by right; `offer` judges each row by its own facts. Only
+        // when a mask or a lift was applied by position (`byPosition`): the score itself is right
+        // at those positions (patchedSlots), and so is the dead mask (it counts live rows per
+        // position), so an unmasked, unlifted search reaches them by score alone and pays nothing.
+        let reused = byPosition ? reusedBasePositionsLocked() : []
+        if !reused.isEmpty { cand = Array(Set(cand).union(reused)) }
         cand.sort()
         mark("coarse+topC")
 
@@ -7525,6 +7743,19 @@ public final class VectorStore: @unchecked Sendable {
     /// base has <= C rows every row is a candidate and the result is exactly the full bf16 search.
     /// `lift`: candidates are chosen on the lifted coarse score; the scores returned stay raw (the
     /// reducer lifts them, once).
+    /// Positions below the base that a row past it reads (`searchCandidatesLocked`). Bounded by the
+    /// rows since the last fold, which the fold keeps small.
+    private func reusedBasePositionsLocked() -> [Int32] {
+        let end = Swift.min(rows.count, occSlot.count)
+        guard baseOccCount < end else { return [] }
+        var out = Set<Int32>()
+        for r in baseOccCount ..< end where !deadRows.contains(Int32(r)) {
+            let sl = occSlot[r]
+            if sl >= 0, Int(sl) < baseRows { out.insert(sl) }
+        }
+        return Array(out)
+    }
+
     private func rerankLocked(coarse: [Float], n: Int, query: [Float], filter: SearchFilter, topK: Int,
                               lift: [Float]? = nil) -> [Float] {
         let C = min(baseRows, Self.candidateCount(topK: topK))
@@ -7570,9 +7801,10 @@ public final class VectorStore: @unchecked Sendable {
             kindCode.withUnsafeBufferPointer { kc in
                 // Rows, not contents: every filter below is a per-ROW fact. baseRows counts
                 // CONTENTS, and the two stopped being the same number once contents are shared.
-                for i in 0 ..< Swift.min(baseOccCount, Swift.min(rows.count, occSlot.count)) {
+                // And the rows past the base that read one of its positions (reusedBasePositionsLocked).
+                for i in 0 ..< Swift.min(rows.count, occSlot.count) {
                     let sl = slotOf(i)
-                    guard sl >= 0, sl < sp.count else { continue }
+                    guard sl >= 0, sl < sp.count, i < baseOccCount || sl < baseRows else { continue }
                     let sc = lift.map { sp[sl] * $0[Int(kc[i])] } ?? sp[sl]
                     if !sc.isFinite { continue }
                     if hScore.count >= C && sc <= hScore[0] { continue }
@@ -7970,8 +8202,22 @@ public final class VectorStore: @unchecked Sendable {
     /// scores. A content has one kind; the scatter takes the max over its occurrences, and a slot
     /// no base occurrence names gets 1 (not the scatter's 0: 0 times a masked -inf is NaN).
     /// Cached like the select mask, by the base it was built over.
+    /// Reset with the slot mirror (`mlxOccSlot`): a tail reclaim moves a vector to another position and
+    /// changes neither count, so a photo moved into a hole a text left kept the text's lift.
     private var slotLiftKey = ""
     private var slotLiftGPU: MLXArray? = nil
+    /// TEST: whether the cached per-position lift is the one a fresh build gives now.
+    func slotLiftIsCurrentForTest(kind: String, lift value: Float) -> Bool? {
+        queue.sync {
+            var lift = [Float](repeating: 1, count: 256)
+            guard let id = kindID[kind] else { return nil }
+            lift[Int(id)] = value
+            guard let cached = slotLiftGPULocked(lift) else { return nil }
+            slotLiftKey = ""
+            guard let fresh = slotLiftGPULocked(lift) else { return nil }
+            return MLX.allClose(cached, fresh).item(Bool.self)
+        }
+    }
     private func slotLiftGPULocked(_ lift: [Float]) -> MLXArray? {
         let key = "\(baseRows)|\(baseOccCount)|\(lift.hashValue)"
         if key == slotLiftKey, let m = slotLiftGPU { return m }
@@ -8076,6 +8322,11 @@ public final class VectorStore: @unchecked Sendable {
     /// before any filter reads it) and appended the new rows past the base, where the host reads
     /// `fileMeta` directly. Keying on the mutation generation as well would rebuild a 2.7M-entry
     /// table on the first date query after every indexing write, for no answer that differs.
+    /// "Past the base" includes new rows on a base POSITION (a hole the free list reused, a shared
+    /// content): a filtered search takes those positions as candidates (reusedBasePositionsLocked),
+    /// so the host reads their dates too. Before it did, a re-indexed file in a reused hole was
+    /// filtered on this table's old date; patching changed dates into the table was tried and
+    /// changed no answer once the positions were taken (BaseReuseSearchTests, 2026-11-07).
     private static let modifiedEpochBase = 946_684_800.0   // 2000-01-01T00:00:00Z
     private var mlxModified: MLXArray? = nil
     private var mlxModifiedRows = 0
@@ -8629,9 +8880,35 @@ public final class VectorStore: @unchecked Sendable {
         quantPatchedOnDisk = false
     }
 
+    /// WHO PUTS THE REPLICA IN PLACE. A persist runs on `persistIO`, and a drop while it wrote used to
+    /// lose: the job moved its file in afterwards, codes for bytes the file no longer holds, with
+    /// nothing recording that (the patch record needs a replica to exist) and an adoption that samples
+    /// ~512 rows. Exact rerank corrects a score, but a stale coarse code can hide a row. A drop moves
+    /// the epoch, and a job started under an older one does not install.
+    final class QuantReplicaFile: @unchecked Sendable {
+        private let lock = NSLock()
+        private var epoch = 0
+        var current: Int { lock.withLock { epoch } }
+        func drop(_ url: URL) {
+            lock.withLock {
+                epoch += 1
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        func install(_ tmp: URL, at url: URL, startedUnder born: Int) throws {
+            try lock.withLock {
+                let fm = FileManager.default
+                guard epoch == born else { try? fm.removeItem(at: tmp); return }
+                try? fm.removeItem(at: url)
+                try fm.moveItem(at: tmp, to: url)
+            }
+        }
+    }
+    private let quantReplicaFile = QuantReplicaFile()
+
     /// The replica file is gone, so nothing on disk is stale.
     private func dropQuantReplicaLocked() {
-        try? FileManager.default.removeItem(at: quantReplicaURL)
+        quantReplicaFile.drop(quantReplicaURL)
         lastPersistedBaseRows = -1
         clearQuantPatchedLocked()
     }
@@ -8777,6 +9054,7 @@ public final class VectorStore: @unchecked Sendable {
         lastPersistedBaseRows = baseRows
         let url = quantReplicaURL
         let tmp = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp")
+        let file = quantReplicaFile, born = file.current
         let job: @Sendable () -> Void = {
             guard var head = try? JSONEncoder().encode(header) else { return }
             head.append(0x0A)
@@ -8787,8 +9065,8 @@ public final class VectorStore: @unchecked Sendable {
                 try fh.write(contentsOf: head)
                 try fh.write(contentsOf: wqData)
                 try fh.close()
-                try? fm.removeItem(at: url)
-                try fm.moveItem(at: tmp, to: url)
+                Self.quantPersistHoldForTest?()
+                try file.install(tmp, at: url, startedUnder: born)
             } catch {
                 try? fh.close(); try? fm.removeItem(at: tmp)
             }
@@ -8840,6 +9118,7 @@ public final class VectorStore: @unchecked Sendable {
         lastPersistedBaseRows = baseRows
         let url = quantReplicaURL
         let tmp = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp")
+        let file = quantReplicaFile, born = file.current
         let job: @Sendable () -> Void = {
             guard var head = try? JSONEncoder().encode(header) else { return }
             head.append(0x0A)
@@ -8852,8 +9131,8 @@ public final class VectorStore: @unchecked Sendable {
                 try fh.write(contentsOf: scData)
                 if let biData { try fh.write(contentsOf: biData) }
                 try fh.close()
-                try? fm.removeItem(at: url)
-                try fm.moveItem(at: tmp, to: url)
+                Self.quantPersistHoldForTest?()
+                try file.install(tmp, at: url, startedUnder: born)
             } catch {
                 try? fh.close()
                 try? fm.removeItem(at: tmp)
@@ -9168,8 +9447,9 @@ public final class VectorStore: @unchecked Sendable {
         ProcessInfo.processInfo.environment["OMNI_FREE_LIST"] != "0"
     private var freeSlots = SlotAllocator()
     private var freeSlotsValid = false
-    /// The mutation the quarantine was last released at. A position freed in one mutation becomes
-    /// allocatable in the next, never in the same one - see SlotAllocator on why.
+    /// The generation the quarantine was last released at. A position freed in a transaction becomes
+    /// allocatable once its generation has moved, which for a replace is that replace's own placement
+    /// step: see SlotAllocator, and seatKeptContentsLocked for what that obliges the caller to do.
     private var freeSlotsCommitGen: Int64 = -1
     /// Positions BELOW `baseRows` whose bytes changed since the base was built.
     private var patchedSlots: [Int32] = []
@@ -9206,6 +9486,11 @@ public final class VectorStore: @unchecked Sendable {
     private var v4BackfillPending = false
 
     private var reclaimResumeBlocked = false
+    private var reclaimResumeCanPass = true
+    private static func sqliteFailurePasses(_ code: Int32) -> Bool {
+        [SQLITE_BUSY, SQLITE_LOCKED, SQLITE_FULL, SQLITE_IOERR, SQLITE_READONLY, SQLITE_CANTOPEN,
+         SQLITE_NOMEM, SQLITE_INTERRUPT, SQLITE_PROTOCOL].contains(code & 0xFF)
+    }
 
     private func refreshV4BackfillPendingLocked() {
         v4BackfillPending = hasColumnLocked("chunks", "slot") && !slotsBackfilled
@@ -9394,20 +9679,28 @@ public final class VectorStore: @unchecked Sendable {
     /// row's content. Reachable with no test at all: the build finishes and the process is
     /// killed before the publish commits. Written in the same transaction as the translation.
     private static let pendingOnContentKey = "pending_vecs_on_content"
+    /// The split needs no build and no staged blob needs translating. One statement, so no kill parts
+    /// the flags: done with the other absent made the v4 drop's proof refuse for ever.
+    private static var splitDoneNothingToTranslateSQL: String {
+        "INSERT OR REPLACE INTO meta(key, value) VALUES('\(chunkSplitDoneKey)', '1'), ('\(pendingOnContentKey)', '1');"
+    }
     private var pendingOnContent = false
     /// Durable: the v4 tables are gone and this index is v5 only. Read rather than inferred from
     /// `hasTableLocked` so a half-dropped database - one table gone, one not - is still named by
     /// the flag rather than by whichever table happened to be asked about.
     private static let v4DroppedKey = "v4_tables_dropped"
     public private(set) var v4Dropped = false
-    /// One drop at a time: it walks 9.7M rows to prove itself and then frees 2.6 GB of pages.
-    private var v4DropInFlight = false
+    /// WHICH LONG PIECE OF MAINTENANCE HOLDS THE INDEX. One at a time, of all of them: the build is
+    /// minutes long, the drop walks 9.7M rows and frees 2.6 GB of pages, and the reclaim rewrites the
+    /// file and renumbers what the other two read. Three flags, each guarding only its own kind, let
+    /// a reclaim overlap a build (reclaimVectorHoles).
+    private enum MaintenanceOwner { case splitBuild, v4Drop, reclaim }
+    private var maintenanceOwner: MaintenanceOwner?
+    private var v4DropInFlight: Bool { maintenanceOwner == .v4Drop }
+    private var splitBuildInFlight: Bool { maintenanceOwner == .splitBuild }
     /// Whether THIS index has the split built and proven. Cached because every result row asks it,
     /// and a meta SELECT per displayed snippet is not free on the interactive path.
     private var splitBuilt = false
-    /// True while the off-queue split build is running. One at a time: the build is minutes long
-    /// and starting a second would have two connections writing the same four tables.
-    private var splitBuildInFlight = false
     /// Contents a write touched, whose `refs` must be recomputed once the batch commits.
     /// Recomputed rather than incremented: INSERT OR REPLACE on an occurrence can overwrite one,
     /// and an increment that double-counts frees a vector another file still points at - silently,
@@ -9599,6 +9892,30 @@ public final class VectorStore: @unchecked Sendable {
     /// TEST ONLY: stop after a named step, leaving the on-disk state a crash there would leave.
     /// "marker" = after the marker commit, before the rename. "rename" = after it, before the claim.
     nonisolated(unsafe) public static var compactStopAfter: String? = nil
+    /// TEST: the reclaim's copy is done and nothing durable has changed.
+    nonisolated(unsafe) static var reclaimBeforeCommitForTest: (() -> Void)?
+    /// TEST: the rename has happened and the claim has not followed.
+    nonisolated(unsafe) static var reclaimAfterRenameForTest: (() -> Void)?
+    /// TEST: the first wait before a failed in-session reload is tried again.
+    nonisolated(unsafe) static var reloadRetrySecondsForTest: TimeInterval?
+    /// TEST: a background persist of the quant replica has written its file and not moved it into place.
+    nonisolated(unsafe) static var quantPersistHoldForTest: (() -> Void)?
+    /// TEST: a vacuum reports what a search interrupting it reports.
+    nonisolated(unsafe) static var vacuumInterruptForTest = false
+    private(set) var stampsForTest = 0
+    func collectTombstonesForTest() { queue.sync { _ = compactRowsLocked { _ in false } } }
+    func persistQuantInBackgroundForTest() -> Bool {
+        queue.sync {
+            let before = lastPersistedBaseRows
+            persistQuantReplicaLocked(sync: false)
+            return lastPersistedBaseRows != before
+        }
+    }
+    func dropQuantReplicaForTest() { queue.sync { dropQuantReplicaLocked() } }
+    func waitForPersistIOForTest() { persistIO.sync {} }
+    func markBackfillPendingForTest() { queue.sync { v4BackfillPending = true } }
+    func armCoverageStampForTest(after delay: TimeInterval) { queue.sync { scheduleCoverageStampLocked(after: delay) } }
+    func setVacuumPendingForTest() { queue.sync { exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vacuumPendingKey)','1');") } }
     /// OMNI_VEC_COVERAGE=0 keeps every blob, which is the pre-migration behaviour exactly. The
     /// escape hatch for a user who hits trouble: coverage stops advancing, nothing already cleared
     /// is lost (the file still holds it), and the index keeps working.
@@ -9678,18 +9995,29 @@ public final class VectorStore: @unchecked Sendable {
         // to it. The guard was therefore false at exactly the moment a write needed to arm the
         // timer, and armed it only for work that was already visible. Cost of dropping it: one
         // timer fires, stampVectorCoverageLocked finds nothing to do and does not re-arm.
-        guard Self.vecCoverage, Self.rowSidecarEnabled, !coverageArmed else { return }
-        coverageArmed = true
+        //
+        // AN EARLIER DEADLINE WINS, and that is all that can replace one. A later one is ignored, which
+        // is what keeps a stream of writes from pushing the stamp out; ignoring an earlier one let a
+        // reclaim's wait of up to five minutes swallow every stamp asked for meanwhile.
+        guard Self.vecCoverage, Self.rowSidecarEnabled else { return }
+        let due = Date().addingTimeInterval(delay)
+        if let armed = coverageDue, armed <= due { return }
+        coverageDue = due
+        coverageArmToken &+= 1
+        let token = coverageArmToken
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [weak self] in
             guard let self else { return }
             self.writeGate.hold {
                 self.queue.sync {
-                    self.coverageArmed = false
+                    guard self.coverageArmToken == token else { return }
+                    self.coverageDue = nil
                     self.stampVectorCoverageLocked()
                 }
             }
         }
     }
+    private var coverageDue: Date?
+    private var coverageArmToken = 0
 
     /// Debounced from bumpGenLocked (i.e. from every mutation): stamp once writes go quiet.
     private func scheduleRowStampLocked(after delay: TimeInterval = 90) {
@@ -9906,8 +10234,14 @@ public final class VectorStore: @unchecked Sendable {
     /// back at the next open. False: nothing has happened, in SQLite or in memory, so the caller
     /// stops there and the write is asked for again. Already inside a transaction is not a failure:
     /// the caller's COMMIT closes it, as it always did.
+    ///
+    /// AND NOT OVER A STORE THAT COULD NOT LOAD. A reload that failed in session leaves no rows and
+    /// `dim` 0 over a vector file full of good vectors. A write there mapped a new file over it and
+    /// truncated it to one page, and a delete found no victims to record. To a writer this is a lock:
+    /// nothing happened, ask again (reloadInSessionLocked brings the rows back).
     private func beginTxnLocked() -> Bool {
-        sqlite3_get_autocommit(db) == 0 || execChecked("BEGIN IMMEDIATE;")
+        if sqlite3_get_autocommit(db) == 0 { return true }
+        return coverageUnreadable == nil && execChecked("BEGIN IMMEDIATE;")
     }
 
     /// The second transaction of a write: where its vectors are placed and their slots recorded. The
@@ -9936,16 +10270,23 @@ public final class VectorStore: @unchecked Sendable {
     /// store queue: a wait inside it would hold every search behind it. As long as the longest
     /// maintenance transaction (the split build), the same bound Indexer.writeWaitingOutLocks has.
     /// Still refused after that: the rows stay, in memory and in the table, and the next pass finds them.
-    private func retryWhileLocked(_ what: String, _ attempt: () -> Bool) {
-        let deadline = Date().addingTimeInterval(210)
+    /// False: it gave up with nothing done. The bound is long past anything of Omni's own, which waits
+    /// at the gate; only another process holds the lock this long. A caller that goes on to act as if
+    /// the rows were gone has to ask (a folder's owed removal settled with its rows present, a forced
+    /// pass over old vectors).
+    @discardableResult
+    private func retryWhileLocked(_ what: String, _ attempt: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(Self.retryBoundSecondsForTest ?? 210)
         while !attempt() {
             guard Date() < deadline else {
                 FileHandle.standardError.write(Data("[omni] \(what) gave up: the write lock stayed held\n".utf8))
-                return
+                return false
             }
             Thread.sleep(forTimeInterval: 0.4)
         }
+        return true
     }
+    nonisolated(unsafe) static var retryBoundSecondsForTest: TimeInterval?
 
     /// Roll back, and put the resident hole set back in step with the table.
     ///
@@ -11424,10 +11765,12 @@ public final class VectorStore: @unchecked Sendable {
         let files = scalarQuery("SELECT COUNT(DISTINCT file_id) FROM occurrence WHERE chunk_id IN (\(ids))")
         guard execChecked("BEGIN IMMEDIATE;"),
               execChecked("DELETE FROM vec_holes WHERE slot IN (\(slots));"),
-              // Four 0xFF bytes in front of the key's own bytes: unique because the original was,
-              // and no key the store writes starts that way. On the BYTES - some keys are text
-              // that starts with NUL, which `length()` calls empty and which are still shared.
-              execChecked("UPDATE chunk SET key = CAST(X'FFFFFFFF' || CAST(key AS BLOB) AS BLOB) WHERE id IN (\(ids));"),
+              // Four 0xFF bytes in front of the key's own bytes: no key the store writes starts that
+              // way. On the BYTES - some keys are text that starts with NUL, which `length()` calls
+              // empty and which are still shared. The id behind them, because a key can be retired
+              // twice, the first row still standing: UNIQUE failed, rolled back, and repeated at
+              // every open.
+              execChecked("UPDATE chunk SET key = CAST(X'FFFFFFFF' || CAST(key AS BLOB) || CAST(id AS TEXT) AS BLOB) WHERE id IN (\(ids));"),
               execChecked("UPDATE files SET modified = -1 WHERE id IN (SELECT DISTINCT file_id FROM occurrence WHERE chunk_id IN (\(ids)));"),
               // A NEW GENERATION, so the row sidecar - which carries every file's old `modified` -
               // is not adopted over these rows and the pass sees the files as changed.
@@ -11447,6 +11790,9 @@ public final class VectorStore: @unchecked Sendable {
     /// above, and their files marked changed, so the next pass embeds them afresh. Once per index,
     /// after the check has run clean or the repair has committed: the fix that stops new ones is in the
     /// same build, and a scan of the content table is not worth paying at every open.
+    ///
+    /// THE SECOND KEY IS A SECOND ROUTE TO THE SAME STATE. Any batch could make these, not only an
+    /// upgrade (seatKeptContentsLocked), so an index that passed the first check can hold new ones.
     private func retireContentsSharingAPositionOnceLocked() {
         guard dbOpen(), sqlite3_get_autocommit(db) != 0, metaGetLocked(Self.sharedPositionsCheckedKey) != "1" else { return }
         var ids: [Int64] = []
@@ -11460,7 +11806,7 @@ public final class VectorStore: @unchecked Sendable {
         sqlite3_finalize(st)
         let list = ids.map(String.init).joined(separator: ",")
         guard execChecked("BEGIN IMMEDIATE;"),
-              ids.isEmpty || execChecked("UPDATE chunk SET key = CAST(X'FFFFFFFF' || CAST(key AS BLOB) AS BLOB) WHERE id IN (\(list));"),
+              ids.isEmpty || execChecked("UPDATE chunk SET key = CAST(X'FFFFFFFF' || CAST(key AS BLOB) || CAST(id AS TEXT) AS BLOB) WHERE id IN (\(list));"),
               ids.isEmpty || execChecked("UPDATE files SET modified = -1 WHERE id IN (SELECT DISTINCT file_id FROM occurrence WHERE chunk_id IN (\(list)));"),
               // A new generation, so the row sidecar is not adopted over these files' old dates.
               ids.isEmpty || execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('mutation_gen','\(mutationGen + 1)');"),
@@ -11471,7 +11817,104 @@ public final class VectorStore: @unchecked Sendable {
         mutationGen += 1
         FileHandle.standardError.write(Data("[omni] repaired: \(ids.count) contents shared a position; their files will be re-embedded on the next pass\n".utf8))
     }
-    private static let sharedPositionsCheckedKey = "chunk_shared_positions_checked"
+    private static let sharedPositionsCheckedKey = "chunk_shared_positions_checked_2"
+
+    /// Pointers of files that have no row, and whatever that leaves unowned. Positions no content holds
+    /// past this are the holes `deriveUnownedPositionsAsHolesLocked` names. Returns how many went.
+    private func removeOccurrencesOfMissingFilesLocked() -> Int {
+        guard dbOpen(), sqlite3_get_autocommit(db) != 0, execChecked("BEGIN IMMEDIATE;") else { return 0 }
+        let body = [
+            "DROP TABLE IF EXISTS temp.gone_aff;",
+            "CREATE TEMP TABLE gone_aff(chunk_id INTEGER PRIMARY KEY);",
+            "INSERT OR IGNORE INTO temp.gone_aff SELECT chunk_id FROM occurrence WHERE file_id NOT IN (SELECT id FROM files);",
+            "DELETE FROM occurrence WHERE file_id NOT IN (SELECT id FROM files);",
+        ]
+        for sql in body where !execChecked(sql) { rollbackTxnLocked(); return 0 }
+        let removed = Int(sqlite3_changes(db))
+        let rest = removed == 0 ? [] : Self.dropUnownedContentsSQL("temp.gone_aff", coveredRowsKey: Self.coveredRowsKey)
+        for sql in rest + ["DROP TABLE temp.gone_aff;", "COMMIT;"] where !execChecked(sql) { rollbackTxnLocked(); return 0 }
+        if removed > 0 {
+            FileHandle.standardError.write(Data("[omni] repaired: removed \(removed) occurrences of files that no longer exist\n".utf8))
+        }
+        return removed
+    }
+
+    /// Recount the contents in `affected` (a table of chunk_id) after their pointers changed, and take
+    /// out the ones nothing points at: the position to the holes if the claim covers it, then the
+    /// snippet, the staged blob and the row.
+    private static func dropUnownedContentsSQL(_ affected: String, coveredRowsKey: String) -> [String] {
+        ["UPDATE chunk SET refs = (SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = chunk.id) WHERE id IN (SELECT chunk_id FROM \(affected));",
+         """
+         INSERT OR IGNORE INTO vec_holes(slot) SELECT slot FROM chunk
+          WHERE refs = 0 AND id IN (SELECT chunk_id FROM \(affected)) AND slot >= 0
+            AND slot < COALESCE((SELECT CAST(value AS INTEGER) FROM meta WHERE key = '\(coveredRowsKey)'), 0);
+         """,
+         "DELETE FROM chunk_snippet WHERE chunk_id IN (SELECT id FROM chunk WHERE refs = 0 AND id IN (SELECT chunk_id FROM \(affected)));",
+         "DELETE FROM pending_vecs WHERE chunk_id IN (SELECT id FROM chunk WHERE refs = 0 AND id IN (SELECT chunk_id FROM \(affected)));",
+         "DELETE FROM chunk WHERE refs = 0 AND id IN (SELECT chunk_id FROM \(affected));"]
+    }
+
+    /// TWO `files` ROWS OF ONE CANONICAL NAME, which 0.7.0 - 0.7.3 wrote (storedSpellingLocked). Memory
+    /// holds them as one file, its victims include both, and SQL deletes the stored spelling: every
+    /// rewrite released a position a live content kept, the next open retired it and re-embedded, and
+    /// the next rewrite did it again. `deleteProvenOrphanTwins` reads `chunks`, so it cannot help once
+    /// those are gone. Which row is right cannot be proven, and it does not have to be: the older goes
+    /// and the newer is marked changed, so the next pass reads the file. Once per index, since nothing
+    /// has written a twin since 0.7.4 and this reads every `files` row. Before the loaders and before
+    /// the claim is read, so all of them see the merged table.
+    private func mergeTwinFileRowsOnceLocked() {
+        guard dbOpen(), sqlite3_get_autocommit(db) != 0, metaGetLocked(Self.twinFilesCheckedKey) != "1" else { return }
+        var groups: [String: [(id: Int64, at: Double)]] = [:]
+        var st: OpaquePointer?
+        if sqlite3_prepare_v2(db, "SELECT f.id, d.path || '/' || f.name, f.indexed_at FROM files f JOIN dirs d ON d.id = f.dir_id;",
+                              -1, &st, nil) == SQLITE_OK {
+            while sqlite3_step(st) == SQLITE_ROW {
+                guard let c = sqlite3_column_text(st, 1) else { continue }
+                // Only a non-ASCII path can have a second spelling.
+                var p = c, ascii = true
+                while p.pointee != 0 { if p.pointee >= 0x80 { ascii = false; break }; p += 1 }
+                if ascii { continue }
+                groups[String(cString: c), default: []].append((sqlite3_column_int64(st, 0), sqlite3_column_double(st, 2)))
+            }
+        }
+        sqlite3_finalize(st)
+        var doomed: [Int64] = [], kept: [Int64] = []
+        for group in groups.values where group.count > 1 {
+            let newest = group.sorted { ($0.at, $0.id) > ($1.at, $1.id) }
+            kept.append(newest[0].id)
+            doomed += newest.dropFirst().map(\.id)
+        }
+        let list = doomed.map(String.init).joined(separator: ",")
+        let keep = kept.map(String.init).joined(separator: ",")
+        var statements = ["BEGIN IMMEDIATE;"]
+        if !doomed.isEmpty {
+            if hasTableLocked("chunks") {
+                statements += ["DELETE FROM chunk_text WHERE chunk_id IN (SELECT id FROM chunks WHERE file_id IN (\(list)));",
+                               "DELETE FROM chunks WHERE file_id IN (\(list));"]
+            }
+            statements += [
+                "DROP TABLE IF EXISTS temp.twin_aff;",
+                "CREATE TEMP TABLE twin_aff(chunk_id INTEGER PRIMARY KEY);",
+                "INSERT OR IGNORE INTO temp.twin_aff SELECT chunk_id FROM occurrence WHERE file_id IN (\(list));",
+                "DELETE FROM occurrence WHERE file_id IN (\(list));",
+            ]
+            statements += Self.dropUnownedContentsSQL("temp.twin_aff", coveredRowsKey: Self.coveredRowsKey)
+            statements += [
+                "DROP TABLE temp.twin_aff;",
+                "DELETE FROM dedup WHERE file_id IN (\(list));",
+                "DELETE FROM files WHERE id IN (\(list));",
+                "UPDATE files SET modified = -1 WHERE id IN (\(keep));",
+                // A new generation, so the row sidecar is not adopted over the rows just removed.
+                "INSERT OR REPLACE INTO meta(key, value) VALUES('mutation_gen','\(mutationGen + 1)');",
+            ]
+        }
+        statements += ["INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.twinFilesCheckedKey)','1');", "COMMIT;"]
+        for sql in statements where !execChecked(sql) { rollbackTxnLocked(); return }
+        guard !doomed.isEmpty else { return }
+        mutationGen += 1
+        FileHandle.standardError.write(Data("[omni] repaired: merged \(doomed.count) file rows indexed twice under two spellings of one name\n".utf8))
+    }
+    private static let twinFilesCheckedKey = "files_twins_checked"
 
     /// The coverage claim could not be read. Says so loudly and changes NOTHING on disk.
     ///
@@ -11681,8 +12124,8 @@ public final class VectorStore: @unchecked Sendable {
               !hasIndexLocked("idx_path"),              // redundant index gone
               coveredRows >= (slotCount)   // duplicate vectors removed
         else { return false }
-        exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.migratedKey)','1');")
-        exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.vacuumPendingKey)','1');")
+        // One statement: migrated with no vacuum owed, and the space is never given back.
+        exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.migratedKey)','1'), ('\(Self.vacuumPendingKey)','1');")
         return true
     }
 
@@ -11796,7 +12239,8 @@ public final class VectorStore: @unchecked Sendable {
         let owed = queue.sync { dbOpen() && scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.vacuumPendingKey)'") == 1 }
         guard owed else { return 0 }
         let freed = compact(minFreeRatio: 0)
-        queue.sync { exec("DELETE FROM meta WHERE key = '\(Self.vacuumPendingKey)';") }
+        // Interrupted or failed, it is still owed: the next launch reads this key.
+        queue.sync { if !vacuumOwed { exec("DELETE FROM meta WHERE key = '\(Self.vacuumPendingKey)';") } }
         return freed
     }
 
@@ -11940,16 +12384,19 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// It gets one, because the stamp dispatches this asynchronously from a timer and callers can
     /// ask for it directly at the same moment.
-    private var reclaimInFlight = false
-
+    ///
+    /// AND IT SHARES ONE OWNER WITH THE SPLIT'S BUILD AND THE v4 DROP. The reclaim renumbers the
+    /// column the build reads, and each guarded only its own kind, so one stamp could start both.
+    /// A build that read the positions before the renumber wrote them into `chunk.slot` over a file
+    /// that no longer had them, and passed every invariant.
     @discardableResult
     public func reclaimVectorHoles() -> Bool {
         guard queue.sync(execute: { () -> Bool in
-            if reclaimInFlight { return false }
-            reclaimInFlight = true
+            guard maintenanceOwner == nil else { return false }
+            maintenanceOwner = .reclaim
             return true
         }) else { return false }
-        defer { queue.sync { reclaimInFlight = false } }
+        defer { queue.sync { maintenanceOwner = nil } }
         // A split index fills its holes from the tail in slices; the whole-file copy below is what
         // an index not yet on the split still takes.
         if !Self.copyReclaimForTest, queue.sync(execute: { splitBuilt && v4Dropped && shouldReclaimHolesLocked() }) {
@@ -12095,7 +12542,7 @@ public final class VectorStore: @unchecked Sendable {
             if Int(pr.dst) < baseRows { patchedSlots.append(pr.dst) }
         }
         // Everything else that read the old row -> slot mapping.
-        mlxOccSlot = nil; mlxOccSlotRows = 0
+        mlxOccSlot = nil; mlxOccSlotRows = 0; slotLiftKey = ""
         identityCacheGen = -1
         baseOccCount = occCountCoveringSlotsLocked(baseRows)
         invalidateFreeListLocked()
@@ -12126,7 +12573,7 @@ public final class VectorStore: @unchecked Sendable {
         rebuildRowWindowsLocked()
         // Per-ROW arrays on the GPU; the scan base is per position and stays.
         mlxFileID = nil; mlxFileIDRows = 0; mlxKindCode = nil; mlxKindCodeRows = 0; mlxModified = nil; mlxModifiedRows = 0
-        mlxOccSlot = nil; mlxOccSlotRows = 0; mlxDeadOcc = nil; mlxDeadOccRows = 0
+        mlxOccSlot = nil; mlxOccSlotRows = 0; slotLiftKey = ""; mlxDeadOcc = nil; mlxDeadOccRows = 0
         identityCacheGen = -1
         baseOccCount = occCountCoveringSlotsLocked(baseRows)
         rowWindowAuditLocked("collectTombstones")
@@ -12166,7 +12613,7 @@ public final class VectorStore: @unchecked Sendable {
         patchedSlots.removeAll { Int($0) >= keep }
         flat16.truncate(toElements: keep * dim, shrinkFile: !Self.tailReclaimSkipTruncate)
         baseOccCount = occCountCoveringSlotsLocked(baseRows)
-        mlxOccSlot = nil; mlxOccSlotRows = 0
+        mlxOccSlot = nil; mlxOccSlotRows = 0; slotLiftKey = ""
         invalidateFreeListLocked()
         laps.lap("cut")
         laps.print("reclaim cut to \(keep) of \(n)")
@@ -12192,6 +12639,14 @@ public final class VectorStore: @unchecked Sendable {
         let tPlan = Date()
         let plan: Plan? = queue.sync {
             guard shouldReclaimHolesLocked() else { return nil }
+            // THE SESSION THAT PUBLISHED THE SPLIT RANKS THE WRONG COLUMN. Resident ids are still v4
+            // rows, so the plan reads `chunks.slot`, and a content written since the publish has no
+            // row there: it kept its number over a file compacted under it. The next open is a
+            // normal session, and holes cost disk until then.
+            guard !(splitBuilt && !residentIDsAreContents && hasTableLocked("chunks")) else { return nil }
+            // An abandon that met a lock left its marker. This copy would delete what that marker's
+            // reading depends on.
+            guard metaGetLocked(Self.compactPendingKey) == nil else { return nil }
             // Under sharing, every stored slot is about to be rewritten by rank, so the column has
             // to exist and be complete first. It always is by here - coverage cannot advance
             // without it - but the pass that rewrites it should not be the one that assumes it.
@@ -12296,6 +12751,7 @@ public final class VectorStore: @unchecked Sendable {
         }
 
         // PHASE 3 - the switch. Short, and one turn of the queue.
+        Self.reclaimBeforeCommitForTest?()
         return writeGate.hold { queue.sync { commitReclaimLocked(plan.newCount, deadCount: plan.deadCount, gen: plan.gen, since: t0) } }
     }
 
@@ -12334,10 +12790,8 @@ public final class VectorStore: @unchecked Sendable {
         flat16.releaseAll()
         guard rename(vecCompactURL.path, vecSidecarURL.path) == 0 else {
             FileHandle.standardError.write(Data("[omni] slot reclaim: rename failed, index unchanged\n".utf8))
-            exec("DELETE FROM meta WHERE key = '\(Self.compactPendingKey)';")
-            exec("DELETE FROM meta WHERE key = '\(Self.compactColumnKey)';")
-            try? FileManager.default.removeItem(at: vecCompactURL)
-            loadIntoMemory()   // the mapping is gone; the claim still holds, so rebuild from it
+            abandonCompactionLocked()
+            reloadInSessionLocked()   // the mapping is gone; the claim still holds, so rebuild from it
             return false
         }
         // A rename is atomic but not durable by itself: without this the directory entry can still
@@ -12346,6 +12800,7 @@ public final class VectorStore: @unchecked Sendable {
         if dirFD >= 0 { fsync(dirFD); Darwin.close(dirFD) }
         laps.lap("marker+rename")
         if Self.compactStopAfter == "rename" { return false }   // TEST: crash before the claim
+        Self.reclaimAfterRenameForTest?()
 
         guard execChecked("BEGIN IMMEDIATE;"),
               renumberSlotsByRankLocked(),
@@ -12358,7 +12813,7 @@ public final class VectorStore: @unchecked Sendable {
             // The file is already the compacted one, so the claim MUST follow it. Leaving the marker
             // in place is what makes the next open finish the job instead of guessing.
             rollbackTxnLocked()
-            loadIntoMemory()
+            reloadInSessionLocked()
             return false
         }
         laps.lap("renumber")
@@ -12368,7 +12823,7 @@ public final class VectorStore: @unchecked Sendable {
         // Rebuild the resident state from what is now on disk. The compacted file is exactly the
         // live rows in order, which is what loading from the claim expects - so this is the same
         // path a launch takes rather than a special case.
-        loadIntoMemory()
+        reloadInSessionLocked()
         laps.lap("load")
         let reclaimed = Int64(deadCount) * Int64(dim * MemoryLayout<UInt16>.size)
         FileHandle.standardError.write(Data(String(format:
@@ -12376,6 +12831,39 @@ public final class VectorStore: @unchecked Sendable {
             deadCount, Double(reclaimed) / 1_048_576, -t0.timeIntervalSinceNow,
             newCount + deadCount, rows.count).utf8))
         return true
+    }
+
+    /// The rows again, in the session, after a reclaim dropped the mapping. If that fails - the claim
+    /// lost the lock and so did the resume, or the load refused - the store is empty, says so to
+    /// writers (beginTxnLocked), and tries again: a lock passes, and nothing else will reload it short
+    /// of a relaunch. Doubling, because a refusal that does not pass costs a load each time.
+    private func reloadInSessionLocked() {
+        coverageUnreadable = nil
+        reclaimResumeBlocked = false
+        vectorFileUnmappable = false
+        loadIntoMemory()
+        guard coverageUnreadable != nil else { reloadRetryDelay = nil; return }
+        let wait = reloadRetryDelay ?? Self.reloadRetrySecondsForTest ?? 30
+        reloadRetryDelay = Swift.min(wait * 2, 900)
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + wait) { [weak self] in
+            guard let self else { return }
+            self.writeGate.hold {
+                self.queue.sync {
+                    guard self.dbOpen(), self.coverageUnreadable != nil else { return }
+                    self.reloadInSessionLocked()
+                }
+            }
+        }
+    }
+    private var reloadRetryDelay: TimeInterval?
+
+    /// The rename will not happen. THE MARKER GOES FIRST, AND THE COPY ONLY IF IT WENT: "marker
+    /// present, copy gone" is what a finished rename looks like, and read over the file the rename
+    /// never touched it renumbers every content onto the wrong vector. One statement for both keys, and
+    /// a lock here only postpones it: file and claim still agree, and the next open sees the copy.
+    private func abandonCompactionLocked() {
+        guard execChecked("DELETE FROM meta WHERE key IN ('\(Self.compactPendingKey)', '\(Self.compactColumnKey)');") else { return }
+        try? FileManager.default.removeItem(at: vecCompactURL)
     }
 
     /// COMPACT THE STORED SLOT NUMBERING, to match a vector file that has just had its unowned
@@ -12454,12 +12942,15 @@ public final class VectorStore: @unchecked Sendable {
     private func resumeVectorCompactionLocked() -> Bool {
         guard dbOpen() else { return true }
         let pending = scalarQuery("SELECT CAST(value AS INTEGER) FROM meta WHERE key='\(Self.compactPendingKey)'")
-        guard pending > 0 else { return true }
+        guard pending > 0 else {
+            // A copy killed before its marker was written: gigabytes nothing will ever read, and on a
+            // v5-only index no later reclaim takes this path to delete it.
+            try? FileManager.default.removeItem(at: vecCompactURL)
+            return true
+        }
         if FileManager.default.fileExists(atPath: vecCompactURL.path) {
             // The rename never happened: the vector file and the claim still describe each other.
-            try? FileManager.default.removeItem(at: vecCompactURL)
-            exec("DELETE FROM meta WHERE key = '\(Self.compactPendingKey)';")
-            exec("DELETE FROM meta WHERE key = '\(Self.compactColumnKey)';")
+            abandonCompactionLocked()
             FileHandle.standardError.write(Data("[omni] abandoned an interrupted slot reclaim; index unchanged\n".utf8))
             return true
         }
@@ -12479,6 +12970,9 @@ public final class VectorStore: @unchecked Sendable {
               execChecked("DELETE FROM meta WHERE key = '\(Self.compactColumnKey)';"),
               execChecked("COMMIT;")
         else {
+            // A lock, a full disk, a volume gone: wait. Anything else no wait will cure, and saying
+            // "busy" kept the app retrying every 30 s for ever, short of the rebuild that does cure it.
+            reclaimResumeCanPass = Self.sqliteFailurePasses(sqlite3_errcode(db))
             rollbackTxnLocked()
             return false
         }
@@ -12496,6 +12990,7 @@ public final class VectorStore: @unchecked Sendable {
     /// the row sidecar that close writes immediately afterwards.
     private func stampVectorCoverageLocked(budget: Int = VectorStore.coverageSlice, reclaim: Bool = true,
                                            allowSplitBuild: Bool = true) {
+        stampsForTest += 1
         guard Self.vecCoverage, Self.rowSidecarEnabled, dbOpen(), dim > 0, !rows.isEmpty else { return }
         if reclaim { collectIfIdleLocked() }
         // COVERAGE CAUGHT UP is the steady state, and it is where the other half of the work lives:
@@ -12508,6 +13003,13 @@ public final class VectorStore: @unchecked Sendable {
         // that accumulate holes.
         let coverUnits = slotCount
         guard coveredRows < coverUnits else {
+            // THE BACKFILL, FROM HERE TOO. The claim cannot move until it is done, so an index caught
+            // up with slots unfinished got one slice per open and none at all between them, until a
+            // write came along to take the other branch.
+            if v4BackfillPending, !yieldToSearchLocked("backfill") {
+                backfillSlotsLocked()
+                if v4BackfillPending { scheduleCoverageStampLocked() }
+            }
             // A reused position still owes its blob back even when the claim cannot move: the file
             // has to be synced first, which is the one thing this branch still does.
             if flat16.isPersistent, !unsyncedReuse.isEmpty {
@@ -12549,11 +13051,11 @@ public final class VectorStore: @unchecked Sendable {
             // a caught-up stamp, so without this a user who searched within the window after a big
             // delete kept its holes until the next launch.
             if reclaim {
-                let waitWrites = Self.reclaimQuietSeconds + lastMutationAt.timeIntervalSinceNow
+                let waitWrites = Self.reclaimQuietSeconds + writesQuietSince.timeIntervalSinceNow
                 // Relocation holds the queue a slice at a time, so it needs a minute of quiet, not
                 // the five the whole-file copy's single commit does.
                 let idle = (splitBuilt && v4Dropped) ? Swift.min(60, Self.reclaimIdleSeconds) : Self.reclaimIdleSeconds
-                let waitSearch = idle + lastSearchAt.timeIntervalSinceNow
+                let waitSearch = idle + searchesAbsentSince.timeIntervalSinceNow
                 if waitWrites <= 0, waitSearch <= 0 {
                     if shouldReclaimHolesLocked() {
                         DispatchQueue.global(qos: .utility).async { [weak self] in self?.reclaimVectorHoles() }
@@ -12650,8 +13152,8 @@ public final class VectorStore: @unchecked Sendable {
     /// Under coverage the reclaim takes the positions back instead.
     private func collectIfIdleLocked() {
         guard coveredRows == 0, Self.tombstones, deadRows.count > deadBudget else { return }
-        let waitWrites = Self.reclaimQuietSeconds + lastMutationAt.timeIntervalSinceNow
-        let waitSearch = Swift.min(60, Self.reclaimIdleSeconds) + lastSearchAt.timeIntervalSinceNow
+        let waitWrites = Self.reclaimQuietSeconds + writesQuietSince.timeIntervalSinceNow
+        let waitSearch = Swift.min(60, Self.reclaimIdleSeconds) + searchesAbsentSince.timeIntervalSinceNow
         guard waitWrites <= 0, waitSearch <= 0 else {
             scheduleCoverageStampLocked(after: Swift.max(waitWrites, waitSearch) + 1)
             return
@@ -13087,9 +13589,14 @@ public final class VectorStore: @unchecked Sendable {
     /// Signs for the 1-bit tier's rotation. This tier always rotates, so it always has them.
     private var bitSigns: MLXArray? = nil
 
+    var bitSignsWidthForTest: Int? { queue.sync { bitSignsLocked()?.size } }   // what the next 1-bit scan multiplies by
+
     private func bitSignsLocked() -> MLXArray? {
         guard dim > 0, Self.hadamardCompatible(dim) else { return nil }
-        if let s = bitSigns { return s }
+        // OF THIS WIDTH. Nothing cleared them: a model switch in session wipes the store and indexes
+        // again at the other width, and the first 1-bit search multiplied [rows, 1024] by the 768
+        // signs, which MLX answers with fatalError.
+        if let s = bitSigns, s.size == dim { return s }
         // Host xorshift, not MLX.random: a different sign vector silently mis-scores an existing
         // replica, so it must not be able to change under an MLX version bump.
         var rng: UInt64 = 0x243F_6A88_85A3_08D3 &+ UInt64(dim)
@@ -14510,6 +15017,7 @@ public final class VectorStore: @unchecked Sendable {
         var filters = nb(pathAllowGPU)
         filters += nb(pathAllowPureGPU)
         filters += nb(selectMaskGPU)
+        filters += nb(slotLiftGPU)   // the per-position kind lift; left out, Settings counted it under the model
         filters += nb(bitSigns)
         m.gpuFilters = filters
         return m
@@ -14591,7 +15099,7 @@ public final class VectorStore: @unchecked Sendable {
         if Self.vacuumSmallCache { exec("PRAGMA cache_size=-2000;") }
         let tVac = Date()
         if interruptible { vacuumHandle.withLock { $0 = db } }
-        let rc = sqlite3_exec(db, "VACUUM;", nil, nil, nil)
+        let rc = Self.vacuumInterruptForTest ? SQLITE_INTERRUPT : sqlite3_exec(db, "VACUUM;", nil, nil, nil)
         if interruptible { vacuumHandle.withLock { $0 = nil } }
         if rc == SQLITE_INTERRUPT {
             // Rolled back whole by SQLite; the file is as it was. Owed, not dropped.
@@ -14606,6 +15114,7 @@ public final class VectorStore: @unchecked Sendable {
         // exec() ignores return codes; this one matters. A silently failing VACUUM means space
         // is never reclaimed again, and the caller would report 0 bytes freed forever.
         if rc != SQLITE_OK { print("[store] VACUUM failed (rc=\(rc)); no space reclaimed") }
+        vacuumOwed = rc != SQLITE_OK
         exec("PRAGMA cache_size=-\(restoreCache);")
         exec("PRAGMA wal_checkpoint(TRUNCATE);")
         return max(0, before - onDiskBytes())
@@ -15188,10 +15697,11 @@ public final class VectorStore: @unchecked Sendable {
         // different things, and this is what makes them agree again.
         guard resumeVectorCompactionLocked() else {
             // A lock is the likely cause and it passes (OmniError.storeUnavailable: wait and retry).
-            reclaimResumeBlocked = true
+            reclaimResumeBlocked = reclaimResumeCanPass
             reportCoverageUnreadableLocked("an interrupted slot reclaim could not be finished.")
             return
         }
+        if splitBuilt { mergeTwinFileRowsOnceLocked() }
         loadCoverageLocked()
         // BEFORE ANY LOADER, so every one of them reads bookkeeping that agrees with itself. The
         // by-slot loader refuses this contradiction; the sidecar adopt never asks, and an index
@@ -15275,6 +15785,14 @@ public final class VectorStore: @unchecked Sendable {
                 // is a repair, not a guess - and the user never sees a screen for 59 rows in 3.8M.
                 if let db, Self.deleteProvenOrphanTwins(db: db, vecURL: vecSidecarURL, dim: storedDimLocked()) > 0,
                    loadFromCoverageLocked() { return }
+                // A POINTER OF A FILE THAT IS GONE, which a delete between the split's build and its
+                // publish left (no build does now: buildChunkSplitLocked). `files` says it is gone, so
+                // this is a repair and not a guess, and refusing would rebuild an index with one
+                // stale file in it.
+                if splitBuilt, removeOccurrencesOfMissingFilesLocked() > 0 {
+                    loadCoverageLocked()
+                    if loadFromCoverageLocked() { return }
+                }
                 // AN INDEX LEFT MID-FOLD BY A BUILD THAT DID NOT RECORD ITS HOLES PER SLICE.
                 // Those builds moved a duplicate's pointer onto its representative and recorded the
                 // position it vacated only when the whole pass finished, so quitting part-way left
@@ -16274,6 +16792,32 @@ public final class VectorStore: @unchecked Sendable {
     /// construction, which is what makes a full rewrite affordable here and is exactly the
     /// distinction v4's note missed: it rejected a slot column over the cost of doing this on every
     /// DELETE, not on a rare renumbering.
+    private func persistSlotsThroughOccurrencesLocked() {
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(db, "UPDATE chunk SET slot = ?1 WHERE id = (SELECT chunk_id FROM occurrence WHERE file_id = ?2 AND ordinal = ?3);",
+                                 -1, &st, nil) == SQLITE_OK else { return }
+        let inTxn = sqlite3_get_autocommit(db) == 0
+        if !inTxn { exec("BEGIN IMMEDIATE;") }
+        var fileIDs: [Int32: Int64] = [:]
+        for i in rows.indices where !deadRows.contains(Int32(i)) {
+            let pid = fileID[i]
+            let fid: Int64
+            if let known = fileIDs[pid] { fid = known }
+            else {
+                guard let found = fileIDLocked(filePaths[Int(pid)], insert: false) else { continue }
+                fileIDs[pid] = found
+                fid = found
+            }
+            sqlite3_reset(st)
+            sqlite3_bind_int(st, 1, i < occSlot.count ? occSlot[i] : rows[i].slot)
+            sqlite3_bind_int64(st, 2, fid)
+            sqlite3_bind_int(st, 3, Int32(rows[i].chunkIndex))
+            sqlite3_step(st)
+        }
+        if !inTxn { exec("COMMIT;") }
+    }
+
     func persistAllSlotsLocked() {
         guard dbOpen(), !rows.isEmpty else { return }
         // WHICH TABLE HOLDS THE PROMISE. Under the split the position is a property of the
@@ -16285,6 +16829,10 @@ public final class VectorStore: @unchecked Sendable {
         // whichever ran first the table for the rest of the session - and both statements are
         // valid SQL against both tables, so the loser would write positions into the wrong one in
         // silence. Renumbering is rare (reclaim and compaction only), so one prepare is free.
+        // THE SESSION THAT PUBLISHED: resident ids are v4 rows but positions live on `chunk`, and a
+        // row written since has no `chunks` row at all. Written to `chunks` (or to nothing, once it is
+        // dropped), the table kept the old numbers over bytes that had moved.
+        if splitBuilt, !residentIDsAreContents { persistSlotsThroughOccurrencesLocked(); return }
         let onSplit = residentIDsAreContents
         var st: OpaquePointer?
         defer { sqlite3_finalize(st) }
@@ -16581,18 +17129,19 @@ public final class VectorStore: @unchecked Sendable {
     /// are dropped on the queue once the tables are, rather than discovering it later.
     @discardableResult
     func dropV4TablesLocked() -> Bool {
-        guard splitBuilt, !Self.legacyWriteForTest, dbOpen(), !v4DropInFlight else { return false }
+        guard splitBuilt, !Self.legacyWriteForTest, dbOpen(), maintenanceOwner == nil else { return false }
         guard hasTableLocked("chunks") || hasTableLocked("chunk_text") else { return false }
         // NOT WHILE v3 IS STILL BEING STAGED. `chunks` is the v3 -> v4 conversion's landing
         // table, and it converts and then builds the split in the same launch.
         guard layoutLocked() == .v4, !v4BackfillPending else { return false }
-        v4DropInFlight = true
+        maintenanceOwner = .v4Drop
         let url = dbURL
+        let gate = writeGate
         DispatchQueue.global(qos: .utility).async { [weak self] in
             var side: OpaquePointer?
             defer {
                 if side != nil { sqlite3_close(side) }
-                self?.queue.sync { self?.v4DropInFlight = false }
+                self?.queue.sync { self?.maintenanceOwner = nil }
             }
             guard sqlite3_open_v2(url.path, &side, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else { return }
             sqlite3_exec(side, "PRAGMA journal_mode=WAL;", nil, nil, nil)
@@ -16611,13 +17160,20 @@ public final class VectorStore: @unchecked Sendable {
                                     WHERE o.file_id = c.file_id AND o.ordinal = c.chunk_index);
                 """)
             let unseated = num("SELECT COUNT(*) FROM chunk WHERE slot < 0")
-            let onContent = num("SELECT CAST(value AS INTEGER) FROM meta WHERE key='pending_vecs_on_content'")
-            guard unrepresented == 0, unseated == 0, onContent == 1 else {
+            // The flag says the staged blobs moved to content ids. With none staged, nothing can be
+            // in the wrong id space: an empty index killed between its two flags has this shape, and
+            // refusing it held the migration for ever.
+            let onContent = num("SELECT CAST(value AS INTEGER) FROM meta WHERE key='pending_vecs_on_content'") == 1
+                || num("SELECT COUNT(*) FROM pending_vecs") == 0
+            guard unrepresented == 0, unseated == 0, onContent else {
                 FileHandle.standardError.write(Data(
                     ("[omni] v4 tables kept: \(unrepresented) rows with no occurrence, "
                      + "\(unseated) contents with no position, pendingOnContent=\(onContent)\n").utf8))
                 return
             }
+            // UNDER THE WRITE GATE, as the build is: a write that met this transaction waited 5 s an
+            // attempt holding the store queue, and every search behind it.
+            gate.hold {
             var ok = true
             for sql in ["BEGIN IMMEDIATE;",
                         "DROP TABLE IF EXISTS chunk_text;",
@@ -16640,6 +17196,7 @@ public final class VectorStore: @unchecked Sendable {
                 }
             }
             guard ok else { sqlite3_exec(side, "ROLLBACK;", nil, nil, nil); return }
+            MigrationV5Runner.holdForTest?("dropped")
             let secs = -t0.timeIntervalSinceNow
             self?.queue.sync {
                 guard let self, self.dbOpen() else { return }
@@ -16667,26 +17224,30 @@ public final class VectorStore: @unchecked Sendable {
                     }
                 }
             }
+            }
         }
         return true
     }
 
     /// MAKE THE SPLIT AUTHORITATIVE, IN ONE TRANSACTION.
     ///
-    /// Three things have to become true together or not at all: the rows written during the
-    /// build get their occurrences, the staged vectors move into the content id space, and the
-    /// flags that say both of those happened go down. Committed separately, each pair has a
-    /// crash window with its own silent failure - the worst being a translated `pending_vecs`
-    /// under a flag that still says v4, where every blob address finds an unrelated row rather
-    /// than missing. One transaction is the only shape with no such window, and it is short:
-    /// the build's minutes of work are already committed on the other connection.
+    /// Two things have to become true together or not at all: the staged vectors move into the
+    /// content id space, and the flags that say so go down. Committed separately, there is a crash
+    /// window where a translated `pending_vecs` sits under a flag that still says v4, and every blob
+    /// address finds an unrelated row rather than missing.
+    ///
+    /// NO CATCH-UP. This used to add occurrences for rows written after the build's commit. A delete
+    /// or a rewrite landed in the same window, and nothing could see those: a delete left an
+    /// occurrence with no file, which made the next open refuse the index, and a rewrite left the
+    /// file on its old content for good. Writers wait at the gate from before the build's first read
+    /// until this returns (buildChunkSplitLocked), so no row can arrive to catch up with.
     ///
     /// A failure leaves a v4 index with some orphaned split rows, which is exactly the state the
     /// next build starts from - so the retry is the ordinary path rather than a repair.
     private func publishSplitLocked() -> Bool {
         guard dbOpen() else { return false }
         guard execChecked("BEGIN IMMEDIATE;") else { return false }
-        guard catchUpSplitLocked(),
+        guard rekeyPendingVectorsOntoContentsLocked(),
               execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.pendingOnContentKey)', '1');"),
               execChecked("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');"),
               execChecked("COMMIT;")
@@ -16707,68 +17268,6 @@ public final class VectorStore: @unchecked Sendable {
         // it does not fail, it just never happens, and nothing says so.
         scheduleCoverageStampLocked()
         return true
-    }
-
-    /// ROWS THAT ARRIVED WHILE THE BUILD WAS RUNNING.
-    ///
-    /// The build works from a snapshot on its own connection and takes minutes. Anything indexed
-    /// in that window went to v4 only - `splitBuilt` was still false, so `writeChunksLocked`
-    /// skipped the native split write - so `occurrence` is missing exactly those rows. Left
-    /// alone, those files would be invisible to every reader the moment the split becomes
-    /// authoritative: present in `chunks`, absent from `occurrence`, and no error anywhere.
-    ///
-    /// Runs on the store queue in the same turn that sets the done flag, so there is no instant
-    /// at which the split is both authoritative and incomplete.
-    @discardableResult
-    private func catchUpSplitLocked() -> Bool {
-        guard dbOpen() else { return false }
-        let media = StoreSchema.mediaKindCodes.map(String.init).joined(separator: ",")
-        _ = media
-        // A content per missing row, keyed the same way the build keys them, then the pointer,
-        // then the snippet. INSERT OR IGNORE throughout: a row whose content already exists
-        // simply joins it, which is the whole point of the table.
-        exec("""
-            CREATE TEMP TABLE IF NOT EXISTS split_catchup AS
-            SELECT c.id AS chunk_row, c.slot AS slot, c.kind AS kind, c.file_id AS file_id,
-                   c.chunk_index AS ordinal
-              FROM chunks c
-             WHERE c.slot >= 0
-               AND NOT EXISTS (SELECT 1 FROM occurrence o
-                                WHERE o.file_id = c.file_id AND o.ordinal = c.chunk_index);
-            """)
-        let missing = scalarQuery("SELECT COUNT(*) FROM split_catchup")
-        if missing > 0 {
-            exec("""
-                INSERT OR IGNORE INTO chunk(key, kind, refs, slot)
-                SELECT COALESCE(NULLIF(t.chunk_key, x''), CAST(x'00' || u.chunk_row AS BLOB)),
-                       u.kind, 0, u.slot
-                  FROM split_catchup u
-                  LEFT JOIN chunk_text t ON t.chunk_id = u.chunk_row;
-                """)
-            exec("""
-                INSERT OR REPLACE INTO occurrence(file_id, ordinal, chunk_id, locator)
-                SELECT u.file_id, u.ordinal, k.id, COALESCE(t.locator, '')
-                  FROM split_catchup u
-                  JOIN chunk k ON k.slot = u.slot
-                  LEFT JOIN chunk_text t ON t.chunk_id = u.chunk_row
-                 ORDER BY u.chunk_row;
-                """)
-            exec("""
-                INSERT OR IGNORE INTO chunk_snippet(chunk_id, kind, snippet)
-                SELECT k.id, u.kind, COALESCE(t.snippet, '')
-                  FROM split_catchup u
-                  JOIN chunk k ON k.slot = u.slot
-                  LEFT JOIN chunk_text t ON t.chunk_id = u.chunk_row;
-                """)
-            exec("""
-                UPDATE chunk SET refs = (SELECT COUNT(*) FROM occurrence o WHERE o.chunk_id = chunk.id)
-                 WHERE id IN (SELECT k.id FROM chunk k JOIN split_catchup u ON k.slot = u.slot);
-                """)
-            FileHandle.standardError.write(Data(
-                "[omni] split catch-up: \(missing) rows written during the build\n".utf8))
-        }
-        exec("DROP TABLE IF EXISTS split_catchup;")
-        return rekeyPendingVectorsOntoContentsLocked()
     }
 
     /// THE STAGED BLOBS MOVE ID SPACES WITH EVERYTHING ELSE.
@@ -16859,12 +17358,11 @@ public final class VectorStore: @unchecked Sendable {
         // exactly the state this is about.
         if !tableExists("chunks") || scalarQuery("SELECT COUNT(*) FROM chunks") == 0,
            scalarQuery("SELECT COUNT(*) FROM files") == 0 {
-            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');")
             // AND NOTHING TO TRANSLATE, EVER. A born-v5 index stages its first blob under a
             // content id, so the one-way translation has no work here and must never run: left
             // unset, the first build of a LATER session would find the flag down and translate
-            // blobs that are already in the content space.
-            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.pendingOnContentKey)', '1');")
+            // blobs that are already in the content space. One statement, so a kill cannot part them.
+            exec(Self.splitDoneNothingToTranslateSQL)
             splitBuilt = false
             refreshSplitBuiltLocked()
             return splitBuilt
@@ -16880,8 +17378,7 @@ public final class VectorStore: @unchecked Sendable {
         // already v5, and `MAX(slot) FROM chunks` answering -1 for a missing table would send it
         // down the "not ready yet" path for ever.
         guard hasTableLocked("chunks") else {
-            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.chunkSplitDoneKey)', '1');")
-            exec("INSERT OR REPLACE INTO meta(key, value) VALUES('\(Self.pendingOnContentKey)', '1');")
+            exec(Self.splitDoneNothingToTranslateSQL)
             splitBuilt = false
             refreshSplitBuiltLocked()
             return splitBuilt
@@ -16891,7 +17388,6 @@ public final class VectorStore: @unchecked Sendable {
         // The file may hold positions past the highest a row claims - coverage extends it ahead of
         // the rows - so the free list is derived against whichever is larger, or it would call a
         // position that exists "not covered by anything" and fail its own invariant.
-        let highWater = highWaterOverride ?? Int64(Swift.max(Int(maxSlot) + 1, slotCount))
         // OFF THE STORE QUEUE, ON ITS OWN CONNECTION.
         //
         // Built inline this held the queue for its whole duration and every search queued behind
@@ -16900,38 +17396,45 @@ public final class VectorStore: @unchecked Sendable {
         // runs anyway, which is right for a fold that yields between slices and wrong for a
         // single 199-second transaction.
         //
-        // A second connection to the same file writes under WAL, where readers do not block on a
-        // writer, so search is untouched for the entire build. What does wait is the index's own
-        // WRITES, which are background work that already retries - and the catch-up pass below is
-        // what makes it safe for them to have landed while the build was running.
-        guard !splitBuildInFlight else { return false }
-        splitBuildInFlight = true
+        // UNDER THE WRITE GATE, FROM BEFORE ITS FIRST READ UNTIL THE PUBLISH. Writes take the gate
+        // before the store queue, so one that arrives now waits holding nothing a search needs. That
+        // is one rule in place of four states it used to have:
+        // - a write waiting on the SQLite lock held the store queue 5 s an attempt, for as long as
+        //   the build ran, so "search is untouched" was not true;
+        // - a write landing between the build's commit and the publish was a v4 write the split
+        //   never saw, and a delete there made the next open refuse the index;
+        // - a row committed between the build's first read and its lock had no content, and failed
+        //   the first invariant after the whole transaction, again at the next stamp;
+        // - a build taking the lock between a write's two transactions left that row without a
+        //   position (T1 and T2 are one hold of the gate).
+        guard maintenanceOwner == nil else { return false }
+        maintenanceOwner = .splitBuild
         let url = dbURL
-        let hw = highWater
+        let gate = writeGate
         DispatchQueue.global(qos: .utility).async { [weak self] in
             var side: OpaquePointer?
             defer {
                 if side != nil { sqlite3_close(side) }
-                self?.queue.sync { self?.splitBuildInFlight = false }
+                self?.queue.sync { self?.maintenanceOwner = nil }
             }
             guard sqlite3_open_v2(url.path, &side, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else { return }
             sqlite3_exec(side, "PRAGMA journal_mode=WAL;", nil, nil, nil)
             sqlite3_exec(side, "PRAGMA busy_timeout=120000;", nil, nil, nil)
+            gate.hold {
             do {
-                // `adoptExisting`: this whole path only runs when the done flag is unset (the guard at
-                // the top of buildChunkSplitLocked), so a populated `occurrence` here is a build
-                // that committed and never got to publish. Finished rather than rebuilt, and only
-                // if it re-proves every invariant.
-                guard let r = try MigrationV5Runner.backfillInPlace(db: side!, highWater: hw,
-                                                                    adoptExisting: true) else { return }
+                // The file may hold positions past the highest a row claims - coverage extends it
+                // ahead of the rows - so the free list is derived against whichever is larger, or it
+                // would call a position that exists "not covered by anything" and fail its own
+                // invariant. Read here, with writers held out: a write since the stamp moved it.
+                guard let hw: Int64 = self?.queue.sync(execute: { () -> Int64? in
+                    guard let self, self.dbOpen() else { return nil }
+                    let top = self.scalarQuery("SELECT COALESCE(MAX(slot), -1) FROM chunks")
+                    return highWaterOverride ?? Int64(Swift.max(Int(top) + 1, self.slotCount))
+                }) else { return }
+                guard let r = try MigrationV5Runner.backfillInPlace(db: side!, highWater: hw) else { return }
                 self?.queue.sync {
                     guard let self, self.dbOpen() else { return }
-                    // CATCH UP. Rows written while the build was running went to v4 only -
-                    // `splitBuilt` was still false, so the native split write was skipped - and
-                    // the build's snapshot cannot contain them. They are given occurrences here,
-                    // inside the same store queue turn that publishes the flag, so no window
-                    // exists in which the split is authoritative and incomplete.
-                    // AND THE FLAG IS NOT SET IF THE CATCH-UP COULD NOT FINISH. The staged
+                    // THE FLAG IS NOT SET IF THE TRANSLATION COULD NOT FINISH. The staged
                     // vectors move id space in the same turn, and publishing over a translation
                     // that rolled back would leave every blob keyed on a v4 row while every
                     // reader addressed it by content - two spaces that overlap numerically, so
@@ -16966,6 +17469,7 @@ public final class VectorStore: @unchecked Sendable {
                     self.refreshSplitBuiltLocked()
                 }
                 FileHandle.standardError.write(Data("[omni] chunk split refused: \(error)\n".utf8))
+            }
             }
         }
         return false   // not built YET; the next stamp sees the flag once it is
@@ -17469,6 +17973,37 @@ public final class VectorStore: @unchecked Sendable {
                                 kind: c.kind, slot: slot)
         }
         return assigned
+    }
+
+    /// EVERY CONTENT A WRITE KEEPS TAKES ITS POSITION BACK BEFORE ANY NEW CONTENT IS PLACED.
+    ///
+    /// A batch releases what its victims held, judged from the resident rows, and only then asks the
+    /// table what it wrote. So with a passage moving from file A to file B in one batch, B first, A's
+    /// position is released while B's copy of the passage still names it: the content survives its
+    /// recount. Seating chunk by chunk, a new chunk placed ahead of that copy was handed the position,
+    /// its bytes overwrote the passage's, and the copy then sat down on them. Two contents on one
+    /// vector, one scoring as the other: a moved passage scored 0.168 against its own vector, after a
+    /// reopen too, and nothing in the store could notice. Checked against a model under random edits
+    /// and moves (SharedPositionWriteTests).
+    ///
+    /// Only a write that released something can hit it, so the ordinary new file pays nothing. A plain
+    /// edit of one file cannot: its own delete takes an unshared content to no references, so the
+    /// content comes back as new. The lookups are not extra: `seen` answers them in appendChunksLocked.
+    private func seatKeptContentsLocked(_ work: [(path: String, chunks: [IndexedChunk])], bfs: [[[UInt16]]],
+                                        seen: inout [Data: Int32]) {
+        // Rebuilt first if it is stale: a rebuild reads ownership from the rows, where these contents'
+        // positions look free because their rows are not back yet, and would undo the claims below.
+        // Nothing is handed out while the numbering cannot be reused anyway (placeVectorLocked).
+        guard Self.freeListEnabled, dim > 0, !v4BackfillPending, !placementUnrecorded, !Self.legacyWriteForTest else { return }
+        ensureFreeSlotsLocked()
+        for (wi, it) in work.enumerated() {
+            for (i, c) in it.chunks.enumerated() {
+                let key = StoreSchema.hexToBytes(effectiveKeyLocked(c, bf16: bfs[wi][i]))
+                guard !key.isEmpty, seen[key] == nil, let s = liveSlotForContentLocked(key) else { continue }
+                reclaimSharedSlotLocked(s)
+                seen[key] = s
+            }
+        }
     }
 
     /// A ROW SEATED ON AN EXISTING CONTENT'S POSITION HAS TAKEN THAT POSITION BACK.

@@ -167,7 +167,43 @@ public final class ANETextBackend: @unchecked Sendable {
     /// let go won it straight back, so a query on Small waited out batch after batch (search while
     /// indexing p99 27.7 -> 40.4 ms).
     private let waiting = OSAllocatedUnfairLock(initialState: 0)
-    private func letQueriesIn() { while waiting.withLock({ $0 }) > 0 { usleep(100) } }
+    /// AND NOT FOREVER. Waiting for the count to reach zero, a batch beside two clients searching back to
+    /// back never went (Nano, 64 long chunks, 6.1 s alone: not done in 60 s beside 2, 4 or 16 threads
+    /// of queries), and a Pause waited with it until the searches stopped. Giving the batch a fifth of
+    /// the Neural Engine finished it but cost every query: p99 18 -> 113 ms at two clients, 137 -> 232
+    /// at sixteen. So it waits as before, with two ways out: a call once it has waited `queryShare` of
+    /// its own last call's length (about 0.5% of the Neural Engine, too few calls to move a query's
+    /// p99), and indexing stopping (`stopWaitingOnQueries`), after which it goes one call at a time,
+    /// letting the queries waiting in between: run flat out, NSLock's unfairness held a query behind
+    /// call after call (Small p99 444-825 ms); one at a time, a query waits one call (Small 425-455 ms,
+    /// Nano 220 ms), what a lone client waits beside indexing in 0.19.11 (Small 360, Nano 186 ms).
+    /// Against 0.19.11, interleaved, query p99 with 1, 2, 4 and 16 clients and a 10 s burst the same
+    /// (Small 357-360, 38.1, 75, 335-355 ms; Nano 185-189, 17.7, 35, 137 ms), the burst's batch done
+    /// when it was (Small 21.0 s, Nano 15.7 s), and a Pause beside four clients done 26.7-26.9 s after
+    /// it on Small and 13.4-13.6 s on Nano, where it had waited until the searches stopped (71, 66 s).
+    private func letQueriesIn(stop gen: Int) {
+        let began = Date()
+        while !Self.batchMayGo(waiting: waiting.withLock { $0 }, waited: -began.timeIntervalSinceNow,
+                               lastCallTook: lastBatchCall.withLock { $0 }, stopped: stops.withLock { $0 } != gen) {
+            usleep(100)
+        }
+    }
+    static let queryShare = 200.0
+    /// Whether an indexing batch call goes now (`letQueriesIn`). The wait is counted from when it began,
+    /// not from the last call: counted from the last call, the first wait of a burst found the clock
+    /// long run out and went at once, and on Small that one call moved a 10 s burst's p99 38 -> 46 ms.
+    /// A minute before any call has been timed: at five seconds a fresh process's first nonstop minute
+    /// took a call and answered 1% fewer queries.
+    static func batchMayGo(waiting: Int, waited: TimeInterval, lastCallTook: TimeInterval, stopped: Bool) -> Bool {
+        if waiting == 0 { return true }
+        if stopped { return waited >= Swift.max(0.025, lastCallTook) }
+        return waited >= (lastCallTook > 0 ? queryShare * lastCallTook : 60)
+    }
+    /// How long the last indexing batch call took, across batches.
+    private let lastBatchCall = OSAllocatedUnfairLock(initialState: 0.0)
+    /// Bumped when indexing stops (a Pause, a cancel, a reload): a batch begun before stops waiting.
+    private let stops = OSAllocatedUnfairLock(initialState: 0)
+    public func stopWaitingOnQueries() { stops.withLock { $0 += 1 } }
 
     /// Many token sequences, each its pooled vector (nil where `encode` would give nil). The ones of
     /// a baked length go to the Neural Engine together, as one batch per `batchTokens` of that
@@ -178,7 +214,8 @@ public final class ANETextBackend: @unchecked Sendable {
     public func encode(batch ids: [[Int]], urgent: Bool = false) -> [[Float]?] {
         if urgent { waiting.withLock { $0 += 1 } }
         defer { if urgent { waiting.withLock { $0 -= 1 } } }
-        func yieldToQueries() { if !urgent { letQueriesIn() } }
+        let gen = stops.withLock { $0 }
+        func yieldToQueries() { if !urgent { letQueriesIn(stop: gen) } }
         var out = [[Float]?](repeating: nil, count: ids.count)
         var rest = Array(ids.indices)
         if let L = lengths.first, let model = functions.model("L\(L)"), Self.takesWholeMask(model) {
@@ -198,6 +235,8 @@ public final class ANETextBackend: @unchecked Sendable {
             for start in stride(from: 0, to: calls.count, by: per) {
                 let group = calls[start ..< min(start + per, calls.count)]
                 yieldToQueries()
+                let tCall = Date()
+                defer { if !urgent { lastBatchCall.withLock { $0 = -tCall.timeIntervalSinceNow } } }
                 let vectors = lock.withLock { () -> [[[Float]?]] in
                     let feeds = group.compactMap { packedInputs($0.map { ids[$0] }, L) }
                     guard feeds.count == group.count,
@@ -225,6 +264,8 @@ public final class ANETextBackend: @unchecked Sendable {
             for start in stride(from: 0, to: members.count, by: per) {
                 let group = members[start ..< min(start + per, members.count)]
                 yieldToQueries()
+                let tCall = Date()
+                defer { if !urgent { lastBatchCall.withLock { $0 = -tCall.timeIntervalSinceNow } } }
                 let vectors = lock.withLock { () -> [[Float]?] in
                     let feeds = group.compactMap { i in inputs(ids[i].count, L, whole: whole) { x, L in fillTokens(x, ids[i], L) } }
                     guard feeds.count == group.count,

@@ -8,6 +8,8 @@ final class TestService: LinkService, @unchecked Sendable {
     let lock = NSLock()
     var calls: [(String, String)] = []    // (method, peer id)
     var cancelled = 0
+    let generation = Locked(0)
+    var serviceGeneration: Int { generation.get() }
     func serve(_ method: String, _ msg: LinkMessage, peer: LinkPeer) async throws -> LinkMessage {
         lock.withLock { calls.append((method, peer.id)) }
         switch method {
@@ -25,11 +27,11 @@ final class Node: @unchecked Sendable {
     let service = TestService()
     let dir: URL
     let requests = Locked<[IncomingPairing]>([])
-    init(_ name: String) throws {
+    init(_ name: String, bonjour: Bool = true) throws {
         dir = FileManager.default.temporaryDirectory.appendingPathComponent("link-\(name)-\(UUID().uuidString)")
         let id = try LinkIdentity.loadOrCreate(at: dir.appendingPathComponent("identity"))
         node = LinkNode(identity: id, peers: LinkPeerStore(url: dir.appendingPathComponent("peers.json")),
-                        config: .init(name: name, model: "Mac15,14", version: "test", port: 0), service: service)
+                        config: .init(name: name, model: "Mac15,14", version: "test", port: 0, bonjour: bonjour), service: service)
         let r = requests
         node.onPairingRequest = { req in r.set(r.get() + [req]) }
     }
@@ -120,7 +122,7 @@ final class LinkNodeTests: XCTestCase, @unchecked Sendable {
         b.node.setPairingWindow(true)
         until("B listens") { b.node.port != nil }
         b.node.setPairingWindow(false)
-        b.node.peers.put(LinkPeer(id: "x", publicKey: Data([1]), name: "x", model: "", allowSearch: false,
+        try b.node.peers.put(LinkPeer(id: "x", publicKey: Data([1]), name: "x", model: "", allowSearch: false,
                                   allowFetch: false, theyAllowSearch: false, theyAllowFetch: false))
         b.node.reconcile()
         until("B still listens") { b.node.port != nil }
@@ -357,13 +359,27 @@ final class LinkNodeTests: XCTestCase, @unchecked Sendable {
         let saved = (LinkNode.pingInterval, LinkNode.pingTimeout)
         LinkNode.pingInterval = 0.3; LinkNode.pingTimeout = 0.5
         defer { (LinkNode.pingInterval, LinkNode.pingTimeout) = saved }
-        let a = try Node("A"), b = try Node("B")
+        // THE LINK HAS TO BE THE ONE THROUGH THE PROXY before the proxy goes quiet. A's hello reaches B
+        // through it with A's own port, and B, offline since A's restart, dials A straight back
+        // (the hello handler, in this release and the one before). When that direct link was the one
+        // that stayed up, swallowing the proxy's bytes changed nothing, no ping failed, and A rightly
+        // kept B online: 2 to 5 runs in 25 under load. So the bytes are watched first, and the restart
+        // repeated until the proxy carries the pings. Bonjour off: it is a third way between them.
+        let a = try Node("A", bonjour: false), b = try Node("B", bonjour: false)
         _ = try await pair(a, b)
         b.node.setPairingWindow(false)
         let proxy = try FlipProxy(to: b.node.port!)
         a.node.peers.update(b.id) { $0.host = "127.0.0.1"; $0.port = proxy.port }
-        a.node.stop(); a.node.reconcile()
-        until("online through the proxy", timeout: 15) { a.node.state(of: b.id) == .online }
+        var viaProxy = false
+        for _ in 0 ..< 6 where !viaProxy {
+            a.node.stop(); a.node.reconcile()
+            until("online through the proxy", timeout: 15) { a.node.state(of: b.id) == .online }
+            usleep(1_000_000)   // B's dial back, when it comes, has come and settled
+            let before = proxy.bytes.get()
+            usleep(700_000)     // two pings
+            viaProxy = a.node.state(of: b.id) == .online && proxy.bytes.get() > before
+        }
+        XCTAssertTrue(viaProxy, "the link never settled on the proxy")
         proxy.blackhole.set(true)
         let t0 = Date()
         until("A notices B froze", timeout: 5) { a.node.state(of: b.id) != .online }
@@ -425,7 +441,7 @@ final class LinkNodeTests: XCTestCase, @unchecked Sendable {
         b.node.stop()
         // The impostor knows A's public key (it is public) and welcomes it, so if A did not check
         // the key at the other end, A would come online to C and send it A's searches.
-        c.node.peers.put(LinkPeer(id: a.id, publicKey: a.node.identity.publicKey, name: "A", model: "",
+        try c.node.peers.put(LinkPeer(id: a.id, publicKey: a.node.identity.publicKey, name: "A", model: "",
                                   allowSearch: true, allowFetch: true, theyAllowSearch: true, theyAllowFetch: true))
         c.node.setPairingWindow(true)
         until("C listens") { c.node.port != nil }

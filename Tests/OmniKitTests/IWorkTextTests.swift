@@ -158,9 +158,9 @@ final class IWorkTextTests: XCTestCase {
         var junk = [UInt8](repeating: 0, count: 4096)
         for i in junk.indices { junk[i] = UInt8(truncatingIfNeeded: i &* 2_654_435_761 >> 7) }
         _ = IWorkText.extract(try tempFile("z.key", Data(junk)))
-        guard case .empty = try FileExtractor.extract(try tempFile("w.pages", Data("nope".utf8))) else {
-            return XCTFail("an unreadable Pages file should index as empty")
-        }
+        // Nothing indexed and no crash. A throw, not `.empty`: it may be a save still under way, and
+        // `.empty` on the watcher path deletes a known file's rows (ContentSource maps this to `.unreadable`).
+        XCTAssertThrowsError(try FileExtractor.extract(try tempFile("w.pages", Data("nope".utf8))), "an unreadable Pages file read as a file")
     }
 
     func testLongTextIsCappedOnAScalarBoundary() throws {

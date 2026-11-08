@@ -332,7 +332,7 @@ struct Sidebar: View {
             if case .history(let id) = selection,
                let item = model.searchHistory.first(where: { $0.id == id }),
                item.displayText != raw {
-                selection = nil
+                deselectQuietly()
             }
             reconcileSelection()
         })
@@ -340,19 +340,12 @@ struct Sidebar: View {
         // Leaving a linked Mac's scope (its chip, another row, a folder here) drops its highlight.
         .onChange(of: model.linkedScope) { _, scope in
             switch selection {
-            case .linkedMac(let id) where scope?.peer != id || scope?.folder != nil: selection = nil
-            case .linkedFolder(let id, let key) where scope?.peer != id || scope?.folder != key: selection = nil
+            case .linkedMac(let id) where scope?.peer != id || scope?.folder != nil: deselectQuietly()
+            case .linkedFolder(let id, let key) where scope?.peer != id || scope?.folder != key: deselectQuietly()
             default: break
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: .omniPerfSidebarSelect)) { note in
-            if let i = note.object as? Int, i == -1 { selection = .recents }
-            else if let i = note.object as? Int, i == -2 { selection = .clipboard }
-            else if let i = note.object as? Int, i <= -100, model.searchHistory.indices.contains(-100 - i) {
-                selection = .history(model.searchHistory[-100 - i].id)
-            }
-            else if let i = note.object as? Int, model.roots.indices.contains(i) { selection = .folder(model.roots[i]) }
-        }
+        .onReceive(NotificationCenter.default.publisher(for: .omniPerfSidebarSelect)) { perfSelect($0.object) }
         .onReceive(NotificationCenter.default.publisher(for: .omniPerfLinkFold)) { note in
             if let id = note.object as? String { $folds.section("mac:" + id).wrappedValue.toggle() }
         }
@@ -397,6 +390,20 @@ struct Sidebar: View {
         }
     }
 
+    /// PerfScript's sidebar steps: a row clicked, or the selection logged.
+    private func perfSelect(_ object: Any?) {
+        if let text = object as? String {
+            if text.hasPrefix("photos:") { selection = .photos(String(text.dropFirst(7))) }
+            omniPerfLog("sidebar selection=\(selection.map { "\($0)" } ?? "nil") scope=\(model.filterFolders.map(\.path)) recents=\(model.filterRecents)")
+            return
+        }
+        guard let i = object as? Int else { return }
+        if i == -1 { selection = .recents }
+        else if i == -2 { selection = .clipboard }
+        else if i <= -100, model.searchHistory.indices.contains(-100 - i) { selection = .history(model.searchHistory[-100 - i].id) }
+        else if model.roots.indices.contains(i) { selection = .folder(model.roots[i]) }
+    }
+
     /// A folder has background work when it is mid full-index or mid live reconcile of
     /// file-system changes.
 
@@ -410,14 +417,17 @@ struct Sidebar: View {
         // scope comes back to it, as Back from a subfolder does in Finder.
         let scope = model.filterFolders.map(\.path)
         switch selection {
-        case .folder(let url) where scope != [url.path]: unmarkedOnly = true; selection = nil
-        case .clipboard where scope != [AppModel.clipboardDirectory.path]: unmarkedOnly = true; selection = nil
-        case .recents where !model.filterRecents: unmarkedOnly = true; selection = nil
+        case .folder(let url) where scope != [url.path]: deselectQuietly()
+        case .clipboard where scope != [AppModel.clipboardDirectory.path]: deselectQuietly()
+        case .recents where !model.filterRecents: deselectQuietly()
+        case .photos(let key) where model.browsedPhotoSource?.key != key: deselectQuietly()
         default: break
         }
-        if selection == nil, model.fileQuery == nil, model.linkedScope == nil {
+        if selection == nil, model.fileQuery == nil {
             var place: SidebarSelection?
-            if model.filterRecents { place = scope.isEmpty ? .recents : nil }
+            if let source = model.browsedPhotoSource { place = .photos(source.key) }
+            else if let linked = model.linkedScope { place = linked.folder.map { .linkedFolder(linked.peer, $0) } ?? .linkedMac(linked.peer) }
+            else if model.filterRecents { place = scope.isEmpty ? .recents : nil }
             else if scope == [AppModel.clipboardDirectory.path] { place = .clipboard }
             else if scope.count == 1, let root = model.roots.first(where: { $0.path == scope[0] }) { place = .folder(root) }
             if let place { markedOnly = place; selection = place }
@@ -435,7 +445,14 @@ struct Sidebar: View {
         var active: Set<String> = []
         if let fq = model.fileQuery { active.insert("file:\(fq.url.path)") }
         else if !q.isEmpty { active.insert("query:\(q)"); active.insert("serving:\(q)") }
-        if !active.contains(id) { selection = nil }
+        if !active.contains(id) { deselectQuietly() }
+    }
+
+    /// The row stops being lit because the scope moved on. Not a click: the handler below `selection`
+    /// must not act on it, or it clears the map that Visualize has just put up.
+    private func deselectQuietly() {
+        unmarkedOnly = true
+        selection = nil
     }
 
     /// Ask for library access (once), then offer the picker - or, if macOS already said no, the
@@ -1154,6 +1171,10 @@ private struct RawQueryWatcher: View {
     var body: some View {
         Color.clear.frame(width: 0, height: 0)
             .onChange(of: model.rawQuery) { _, raw in action(raw) }
+            // Leaving a Photos source can leave the box as it was.
+            .onChange(of: model.browsedPhotoSource?.key) { _, _ in action(model.rawQuery) }
+            // The sidebar is rebuilt on the way back from OCR mode, and its row with it.
+            .onAppear { action(model.rawQuery) }
     }
 }
 

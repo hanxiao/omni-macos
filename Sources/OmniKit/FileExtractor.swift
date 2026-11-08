@@ -76,6 +76,9 @@ public enum ExtractedContent {
     /// they were drawn to read them (a Numbers sheet's words come from its preview: DocumentPictures).
     case document([DocumentPage], pictures: RenderedPages?)
     case empty
+    /// It could not be read just now: gone a moment ago, a read error, a save still under way. Not
+    /// the same as `.empty`, which is a file with nothing in it: only that one leaves the index.
+    case unreadable
 }
 
 /// Pulls embeddable content from a file. Plain text and code are read directly;
@@ -159,15 +162,16 @@ public enum FileExtractor {
         let ext = url.pathExtension.lowercased()
         if textExtensions.contains(ext) { return try extractText(url) }
         if pdfExtensions.contains(ext) { return try extractPDF(url, maxImageDimension: maxImageDimension) }
-        if officeExtensions.contains(ext) { return extractOffice(url) }
-        if documentExtensions.contains(ext) { return extractDocument(url, maxImageDimension: maxImageDimension) }
+        if officeExtensions.contains(ext) { return try extractOffice(url) }
+        if documentExtensions.contains(ext) { return try extractDocument(url, maxImageDimension: maxImageDimension) }
         if imageExtensions.contains(ext) {
-            if let img = loadImage(url, maxDimension: maxImageDimension) { return .images([img]) }
-            return .empty
+            guard let img = loadImage(url, maxDimension: maxImageDimension) else { throw OmniError.extraction("cannot read image \(url.lastPathComponent)") }
+            return .images([img])
         }
         if videoExtensions.contains(ext) {
             let frames = videoFrames(url, maxFrames: maxVideoFrames, maxDimension: maxImageDimension)
-            return frames.isEmpty ? .empty : .images(frames)
+            guard !frames.isEmpty else { throw OmniError.extraction("no frames read from \(url.lastPathComponent)") }
+            return .images(frames)
         }
         return .empty   // audio handled separately by the audio tower
     }
@@ -195,7 +199,9 @@ public enum FileExtractor {
     private static func extractText(_ url: URL) throws -> ExtractedContent {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
-        let data = handle.readData(ofLength: maxTextBytes)
+        // The throwing read: `readData(ofLength:)` raises an Objective-C exception on an I/O error,
+        // and one a drive pulled mid-read takes the app with it.
+        let data = try handle.read(upToCount: maxTextBytes) ?? Data()
         if looksBinary(data) { return .empty }
         // A file larger than maxTextBytes is cut at the cap, which can split a multi-byte UTF-8
         // codepoint at the boundary. String(data:.utf8) then returns nil and we would fall through to
@@ -270,31 +276,31 @@ public enum FileExtractor {
 
     // MARK: - Office
 
-    private static func extractOffice(_ url: URL) -> ExtractedContent {
+    private static func extractOffice(_ url: URL) throws -> ExtractedContent {
         if iWorkExtensions.contains(url.pathExtension.lowercased()) {
-            guard let s = IWorkText.extract(url), !s.isEmpty else { return .empty }
-            return .text(s)
-        }
-        #if canImport(AppKit)
-        if let attr = try? NSAttributedString(url: url, options: [:], documentAttributes: nil) {
-            let s = attr.string.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let s = IWorkText.extract(url) else { throw OmniError.extraction("cannot read \(url.lastPathComponent)") }
             return s.isEmpty ? .empty : .text(s)
         }
-        #endif
+        #if canImport(AppKit)
+        let attr = try NSAttributedString(url: url, options: [:], documentAttributes: nil)
+        let s = attr.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return s.isEmpty ? .empty : .text(s)
+        #else
         return .empty
+        #endif
     }
 
     /// A deck's slides or a workbook's sheets. A Numbers document's words are read from the pages
     /// Quick Look draws (its tables live in IWA tiles IWorkText does not read), so those pictures
     /// come back with them; a deck's and a workbook's are drawn by whoever wants them.
-    private static func extractDocument(_ url: URL, maxImageDimension: Int) -> ExtractedContent {
+    private static func extractDocument(_ url: URL, maxImageDimension: Int) throws -> ExtractedContent {
         if url.pathExtension.lowercased() == "numbers" {
-            guard let drawn = DocumentPictures.render(url, maxDimension: maxImageDimension) else { return .empty }
+            guard let drawn = DocumentPictures.render(url, maxDimension: maxImageDimension) else { throw OmniError.extraction("cannot draw \(url.lastPathComponent)") }
             let pages = drawn.pages.filter { !$0.text.isEmpty }.map { DocumentPage(label: $0.label, text: $0.text) }
             return .document(pages, pictures: drawn)
         }
-        guard let pages = OfficeDocument.extract(url), !pages.isEmpty else { return .empty }
-        return .document(pages, pictures: nil)
+        guard let pages = OfficeDocument.extract(url) else { throw OmniError.extraction("cannot read \(url.lastPathComponent)") }
+        return pages.isEmpty ? .empty : .document(pages, pictures: nil)
     }
 
     // MARK: - Image

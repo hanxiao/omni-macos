@@ -286,7 +286,11 @@ enum Transcribe {
             for a in assets {
                 if let u = await PhotoActions.materialized(a) { urls.append(u) }
             }
-            guard !urls.isEmpty else { return }
+            guard !urls.isEmpty else {
+                let name = wanted.count == 1 ? (wanted[0] as NSString).lastPathComponent : "Those files"
+                ocr.reject("\(name) could not be fetched.")
+                return
+            }
             ocr.open(urls: urls)
             if let t0 {
                 omniPerfLog(String(format: "send-to-ocr %.1fms files=%d assets=%d",

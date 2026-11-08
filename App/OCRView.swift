@@ -25,7 +25,7 @@ struct OCRView: View {
 
     /// The add-on is not here yet. Said in the empty state rather than only when a drop fails: a
     /// pane that invites a document it cannot read is a trap.
-    private var needsModel: Bool { !model.ocrInstalled.contains(.balanced) }
+    private var needsModel: Bool { model.ocrInstalled.isEmpty }
 
     var body: some View {
         @Bindable var session = session
@@ -133,7 +133,9 @@ struct OCRView: View {
             // run of a session it was simply wrong: nothing is queued behind anything, the app is
             // reading four and a half gigabytes of weights off disk.
             CenteredHint(symbol: session.phase == .loading ? "gearshape.arrow.trianglehead.2.clockwise.rotate.90" : "text.viewfinder",
-                         title: waitingTitle, detail: "", spinner: session.isBusy,
+                         title: waitingTitle,
+                         detail: !session.isBusy && session.isVisibleDocumentStopped ? "Click a page to transcribe it." : "",
+                         spinner: session.isBusy,
                          progress: session.phase == .loading ? session.loadProgress : nil)
         } else {
             switch session.mode {
@@ -194,21 +196,15 @@ struct OCRView: View {
             // the whole wait and it needs a number that moves.
             return "Reading \(session.prefilled) of \(session.prefillTarget) pages"
         }
-        if visibleDocumentIsRunning { return "Reading the page" }
-        return session.isBusy ? "Queued" : "Preparing"
-    }
-
-    private var visibleDocumentIsRunning: Bool {
-        guard let doc = session.visibleDocument else { return false }
-        return doc.pageIDs.contains {
-            session.pageState($0) == .running
-        }
+        if session.isDecodingVisibleDocument { return "Reading the page" }
+        if session.isBusy { return "Queued" }
+        return session.isVisibleDocumentStopped ? "Not transcribed" : "Preparing"
     }
 
     /// Space toggles; an arrow inside an open preview replaces it with the next page.
     private func previewCurrentPage(force: Bool = false) {
         if session.previewing != nil && !force { session.previewing = nil; return }
-        guard let id = session.visibleIndex else { return }
+        guard let id = session.railSelection else { return }
         session.previewing = session.previewURL(for: id)
     }
 
@@ -268,8 +264,9 @@ private struct OCRToolbar: ViewModifier {
                 .help("View")
             }
             if #available(macOS 26.0, *) { ToolbarSpacer(.fixed) }
-            // Closing lives in the File menu only (Shift-Cmd-W). It is rare, it is undone by
-            // reopening, and a toolbar earns its density from what people reach for often.
+            // Closing lives in the File menu only (Shift-Cmd-W). It is rare, reopening brings the
+            // model's text back (an edit gets the save prompt first), and a toolbar earns its density
+            // from what people reach for often.
             ToolbarItem(id: "ocr.open", placement: .primaryAction) {
                 Button { session.chooseAndOpen() } label: {
                     Label("Open Document", systemImage: "folder")
@@ -476,17 +473,22 @@ private struct PageThumb: View, Equatable {
         .animation(.easeOut(duration: 0.25), value: page.state)
     }
 
-    private var untranscribed: Bool { page.state == .pending || page.state == .stopped }
+    /// Dim, so clickable: a page a Stop cut has only part of its text.
+    private var untranscribed: Bool {
+        page.state == .pending || page.state == .stopped || (page.state == .done && page.truncatedByStop)
+    }
 
     private var stateDescription: String {
         switch page.state {
         // A restored page has no counters - nothing decoded it this time - so it says what it
         // is rather than "0 tokens".
+        case .done where page.truncatedByStop: return "stopped part way"
         case .done: return page.restored ? "cached" : "\(page.tokens) tokens"
         case .running: return "transcribing"
         case .failed: return "could not be transcribed"
         case .pending: return "not transcribed yet"
         case .stopped: return "not transcribed"
+        case .closed: return "closed"
         }
     }
 }
@@ -696,7 +698,13 @@ private struct RawDocument: View {
     /// read-only form: the editor is an `NSTextView` with no sections to report a scroll position
     /// from or scroll to, so a split with the editor in it could not keep its halves together.
     /// Editing the transcript is what the single Raw Text view is for.
-    private var editable: Bool { side == nil && !session.isBusy && session.hasCompletedPages }
+    ///
+    /// And only once this tab has nothing decoding. A Stop reads as not busy at once, with the pages
+    /// in flight settling a decode step later: the editor mounted without them, and its first
+    /// keystroke recorded them as already in the edit, so they left the panes, Copy and Save.
+    private var editable: Bool {
+        side == nil && !session.isBusy && session.hasCompletedPages && !session.isDecodingVisibleDocument
+    }
 
     var body: some View {
         Group {
@@ -907,7 +915,7 @@ private struct SourceEditor: NSViewRepresentable {
                 text.scrollRangeToVisible(range)
                 return
             }
-            guard let page, page != scrolledTo, let offset = source.offsets[page] else { return }
+            guard let page, page != scrolledTo, let offset = source.offsets[session.sourceKey(forPage: page)] else { return }
             scrolledTo = page
             let length = (text.string as NSString).length
             guard offset < length else { return }

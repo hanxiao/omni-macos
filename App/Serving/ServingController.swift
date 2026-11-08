@@ -17,7 +17,7 @@ final class ServingController {
     var enabled: Bool = false { didSet { persist(); reconcile() } }
     /// Held off for a benchmark run. Never persisted and never written to `enabled`, so a run that
     /// dies part-way leaves Serving exactly as the owner set it, and the next launch serves again.
-    var pausedForBenchmark = false { didSet { reconcile() } }
+    var pausedForBenchmark = false { didSet { held.set(pausedForBenchmark); reconcile() } }
     /// What the toolbar and the tab show: off while a benchmark holds it.
     var isOn: Bool { enabled && !pausedForBenchmark }
     var scope: ServingScope = .local { didSet { persist(); restartIfServing() } }
@@ -58,9 +58,17 @@ final class ServingController {
     /// The `omni` command line's socket: the same router, ALWAYS up while a backend is, whatever
     /// the Serving toggle says - the toggle is about opening a port, and the socket opens none.
     private var socketServer: HTTPServer?
+    /// Asking again for a socket another Omni holds, or that failed to come up. Yielding was for good:
+    /// when the other copy quit, `omni` found a running app with no socket until a relaunch.
+    private var socketRetry: Task<Void, Never>?
+    private var serverRetry: Task<Void, Never>?
+    /// Set for a benchmark run. The hold reached only the TCP server, and the socket went on answering,
+    /// though a client mid-run shares the engine with every case. Answered, not closed: `omni` then
+    /// says why instead of waiting a minute for a socket it reads as still loading.
+    private nonisolated let held = ServingHold()
 
     /// The log lives only in the file; the Serving tab tails it.
-    private let logFile = ServingLogFile()
+    private nonisolated let logFile = ServingLogFile()
     private let defaults = UserDefaults.standard
     /// True while load() is assigning persisted values, so each property's didSet does not
     /// persist() back a half-loaded snapshot (which would clobber fields not yet read).
@@ -99,18 +107,60 @@ final class ServingController {
             }
         }
         backend = b
-        if isRunning {
-            restart()
+        // In place, when a server is up: what changed is what answers, not the port (HTTPServer.setHandler).
+        if isRunning, let server {
+            server.setHandler(httpHandler(backend: b, auth: serverAuth()))
         } else {
             reconcile()
         }
-        startSocket()
+        if let socketServer {
+            socketServer.setHandler(socketHandler(backend: b))
+        } else {
+            startSocket()
+        }
+    }
+
+    /// A request while a benchmark holds serving: what to tell it.
+    private nonisolated static var heldResponse: HTTPResponse {
+        var r = HTTPResponse.json(["error": ["message": "Omni is running its benchmark; try again when it finishes",
+                                             "type": "service_unavailable"]], status: 503)
+        r.headers["Retry-After"] = "60"
+        return r
+    }
+
+    private func socketHandler(backend: any ServingBackend) -> HTTPServer.Handler {
+        let router = Router(backend: backend, auth: { _ in true }, appVersion: AppModel.appVersion, sources: sources,
+                            mcpSurface: .cli)
+        let held = self.held
+        return { req in held.isOn ? Self.heldResponse : await router.handle(req) }
+    }
+
+    private func httpHandler(backend: any ServingBackend, auth: @escaping @Sendable (HTTPRequest) -> Bool) -> HTTPServer.Handler {
+        var built = Router(backend: backend, auth: auth, appVersion: AppModel.appVersion, sources: sources)
+        // Local scope: answer only requests addressed to this Mac (DNS rebinding; Router.handle).
+        // LAN scope already requires the token, which a rebinding page does not have.
+        built.loopbackOnly = scope != .public
+        let router = built
+        return { req in await router.handle(req) }
+    }
+
+    /// Localhost never requires a token; a public (LAN) bind ALWAYS requires one.
+    private func serverAuth() -> @Sendable (HTTPRequest) -> Bool {
+        let token = bearerToken
+        let requireToken = scope == .public
+        return { req in
+            guard requireToken else { return true }
+            if req.bearer == token { return true }
+            if req.googApiKey == token { return true }
+            if req.query["key"] == token { return true }
+            return false
+        }
     }
 
     /// The served search for App Intents (Shortcuts, Siri, Spotlight): the same search, grouping
     /// and passages an agent gets over MCP, on the served work queue. Empty until the engine is up.
     func searchForIntents(_ query: String, limit: Int, width: Int = Indexer.defaultSnippetLength) async -> [(hit: SearchHit, passage: String?)] {
-        guard let backend else { return [] }
+        guard let backend, !held.isOn else { return [] }
         return await ServedWork.run {
             let (hits, vector) = backend.searchReturningVector(query, topK: min(limit * 3, 150), filter: SearchFilter(), surface: .intent)
             let reps = backend.groupedResults(hits, enabled: true, limit: limit).map(\.representative)
@@ -131,8 +181,12 @@ final class ServingController {
     }
 
     /// Stop the socket at quit, so the file goes with the app rather than waiting for the next
-    /// launch to find it dead.
-    func shutdown() { stopSocket() }
+    /// launch to find it dead. The searches still waiting for their batch go to the history now:
+    /// the two seconds of them before a quit never reached it.
+    func shutdown() {
+        for (q, surface) in servedSearches.take() { onServedSearch?(q, surface) }
+        stopSocket()
+    }
 
     // MARK: The command line socket
 
@@ -160,29 +214,49 @@ final class ServingController {
         if FileManager.default.fileExists(atPath: path) {
             if Self.socketAnswers(path) {
                 note(.error, "Command line socket in use by another Omni: \(path)")
+                retrySocket(path)
                 return
             }
             unlink(path)
         }
-        let router = Router(backend: backend, auth: { _ in true }, appVersion: AppModel.appVersion, sources: sources,
-                            mcpSurface: .cli)
-        let sink: @Sendable (LogEntry) -> Void = { [weak self] entry in
-            Task { @MainActor in self?.ingest(entry) }
-        }
-        let srv = HTTPServer(handler: { req in await router.handle(req) }, onLog: sink)
+        let log = logFile
+        let srv = HTTPServer(handler: socketHandler(backend: backend), onLog: { log.append($0) })
         srv.admitsLargeBody = { _ in true }
-        srv.onFailure = { [weak self] msg in
-            Task { @MainActor in self?.note(.error, "Command line socket failed: \(msg)") }
+        srv.onFailure = { [weak self, weak srv] msg in
+            Task { @MainActor in
+                self?.note(.error, "Command line socket failed: \(msg)")
+                guard let self, let srv, self.socketServer === srv else { return }
+                srv.stop()
+                self.socketServer = nil
+                self.retrySocket(path)
+            }
         }
         do {
             try srv.start(unixPath: path)
             socketServer = srv
         } catch {
             note(.error, "Command line socket failed: \(error)")
+            retrySocket(path)
         }
     }
 
+    private func retrySocket(_ path: String) {
+        socketRetry?.cancel()
+        socketRetry = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(Self.socketRetrySeconds))
+                guard !Task.isCancelled else { return }
+                let taken = await Task.detached { Self.socketAnswers(path) }.value
+                guard !Task.isCancelled else { return }
+                if !taken { self?.startSocket(); return }
+            }
+        }
+    }
+
+    private static let socketRetrySeconds: Double = 5
+
     private func stopSocket() {
+        socketRetry?.cancel(); socketRetry = nil
         socketServer?.stop()
         socketServer = nil
     }
@@ -242,26 +316,10 @@ final class ServingController {
         if isPublic && bearerToken.isEmpty {
             bearerToken = Self.generateToken()   // didSet persists; restart guard below is no-op while starting
         }
-        let token = bearerToken
         let requireToken = isPublic
-        let auth: @Sendable (HTTPRequest) -> Bool = { req in
-            guard requireToken else { return true }
-            if req.bearer == token { return true }
-            if req.googApiKey == token { return true }
-            if req.query["key"] == token { return true }
-            return false
-        }
-
-        var built = Router(backend: backend, auth: auth, appVersion: AppModel.appVersion, sources: sources)
-        // Local scope: answer only requests addressed to this Mac (DNS rebinding; Router.handle).
-        // LAN scope already requires the token, which a rebinding page does not have.
-        built.loopbackOnly = !isPublic
-        let router = built
-        let sink: @Sendable (LogEntry) -> Void = { [weak self] entry in
-            Task { @MainActor in self?.ingest(entry) }
-        }
-
-        let srv = HTTPServer(handler: { req in await router.handle(req) }, onLog: sink)
+        let auth = serverAuth()
+        let log = logFile
+        let srv = HTTPServer(handler: httpHandler(backend: backend, auth: auth), onLog: { log.append($0) })
         srv.admitsLargeBody = auth
         srv.onFailure = { [weak self, weak srv] msg in
             Task { @MainActor in
@@ -274,10 +332,11 @@ final class ServingController {
                 self.note(.error, msg == "port in use" ? "Port \(self.port) is in use" : "Server failed: \(msg)")
                 self.isRunning = false
                 self.boundAddress = ""
+                self.retryServerWhenPortIsFree()
                 // Deliberately do NOT flip `enabled` (it persists to defaults): a transient bind
                 // failure at launch was silently disabling the feature forever, breaking the
                 // agents whose SKILL.md points at this server. The toggle stays on, the status
-                // dot shows the failure, and the next launch (or port edit) retries.
+                // dot shows the failure, and it starts by itself once the port is free.
             }
         }
 
@@ -289,8 +348,12 @@ final class ServingController {
         // beside "Server failed: port in use" in the log.
         srv.onReady = { [weak self, weak srv] in
             Task { @MainActor in
-                guard let self, let srv, self.server === srv, self.state == .starting else { return }
+                guard let self, let srv, self.server === srv else { return }
+                // After a failure too: a listener that waited and then bound is serving, and said so.
+                let waiting: Bool = switch self.state { case .starting, .portInUse, .failed: true; default: false }
+                guard waiting else { return }
                 self.state = .running
+                self.isRunning = true
                 self.boundAddress = address
                 self.note(.info, "Listening on \(host):\(port)\(tokenNote)")
             }
@@ -307,20 +370,67 @@ final class ServingController {
             boundAddress = ""
             server = nil
             // `enabled` stays as the user set it - see onFailure above.
+            retryServerWhenPortIsFree()
+        }
+    }
+
+    /// A listener that found its port taken never binds once the port comes free (measured: 50 s after
+    /// the other process let go, still nothing on the port and "Port in use" on show), and nothing else
+    /// tried again until a toggle, a port edit or an engine reload. So this asks: quietly, by binding a
+    /// socket of its own, since a restart per try would write two log lines every few seconds for as
+    /// long as another app keeps the port.
+    private func retryServerWhenPortIsFree() {
+        serverRetry?.cancel()
+        let port = self.port, isPublic = scope == .public
+        serverRetry = Task { [weak self] in
+            // The first look soon: a restart under a connected client finds its own old connection
+            // still holding the port, gone within a second (measured: down for 5 s with one wait, for
+            // good before this existed).
+            var wait: Double = 1
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(wait))
+                wait = Self.serverRetrySeconds
+                guard !Task.isCancelled else { return }
+                let free = await Task.detached { Self.canBind(port: port, loopbackOnly: !isPublic) }.value
+                guard !Task.isCancelled, let self else { return }
+                let waiting: Bool = switch self.state { case .portInUse, .failed: true; default: false }
+                guard waiting, self.isOn else { return }
+                if free {
+                    self.note(.info, "Port \(port) is free")
+                    self.startServer()
+                    return
+                }
+            }
+        }
+    }
+
+    private static let serverRetrySeconds: Double = 5
+
+    /// Whether a listener could take this port right now. The same reuse option the server's listener
+    /// sets, so a connection still closing does not read as taken.
+    nonisolated private static func canBind(port: Int, loopbackOnly: Bool) -> Bool {
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        var on: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, socklen_t(MemoryLayout<Int32>.size))
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = in_port_t(port).bigEndian
+        addr.sin_addr.s_addr = loopbackOnly ? in_addr_t(INADDR_LOOPBACK).bigEndian : in_addr_t(INADDR_ANY).bigEndian
+        return withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) == 0 }
         }
     }
 
     private func stopServer() {
+        serverRetry?.cancel(); serverRetry = nil
         if server != nil { note(.info, "Stopped") }
         server?.stop()
         server = nil
         isRunning = false
         boundAddress = ""
         if state != .stopped { state = .stopped }
-    }
-
-    private func ingest(_ e: LogEntry) {
-        append(ServingLogFile.line(for: e))
     }
 
     private func note(_ level: ServingLogFile.Level, _ message: String) {
@@ -400,6 +510,14 @@ final class ServingController {
         }
         return address
     }
+}
+
+/// Whether a benchmark holds serving, readable from any request.
+final class ServingHold: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var isOn: Bool { lock.withLock { value } }
+    func set(_ on: Bool) { lock.withLock { value = on } }
 }
 
 /// Served queries waiting for their batch into the history. `add` returns true for the first query

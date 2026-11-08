@@ -61,13 +61,21 @@ struct LinkSheet: View {
         .overlay {
             if link.available.isEmpty {
                 VStack(spacing: 8) {
-                    ProgressView().controlSize(.small)
-                    Text("Open Link a Mac on the other Mac").foregroundStyle(.secondary)
+                    if let issue = link.discoveryIssue {
+                        Text(issue).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    } else {
+                        ProgressView().controlSize(.small)
+                        Text("Open Link a Mac on the other Mac").foregroundStyle(.secondary)
+                    }
                 }
                 .font(.callout)
+                .padding(.horizontal, 12)
             }
         }
         .onChange(of: picked) { _, p in if p != nil { address = "" } }
+        .onChange(of: link.available) { _, now in
+            if let id = picked, !now.contains(where: { $0.id == id }) { picked = nil }
+        }
         TextField("Name or address", text: $address)
             .textFieldStyle(.roundedBorder)
             .onChange(of: address) { _, a in if !a.isEmpty { picked = nil } }
@@ -79,9 +87,15 @@ struct LinkSheet: View {
             Spacer()
             Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
             Button("Link", action: start).keyboardShortcut(.defaultAction)
-                .disabled(picked == nil && address.trimmingCharacters(in: .whitespaces).isEmpty)
+                .disabled(!canStart)
         }
         .padding(.top, 4)
+    }
+
+    /// A picked Mac that has since gone from the list is not something to link with.
+    private var canStart: Bool {
+        if let id = picked { return link.available.contains { $0.id == id } }
+        return !address.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
     private func start() {
@@ -232,7 +246,10 @@ struct RemoteBrowser: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if !link.isOnline(scope.peer) {
+            if link.state(scope.peer) == .unlinked {
+                CenteredStatus(symbol: CenteredStatus.moleSad, title: "Unlinked on \(macName)", subtitle: "",
+                               showSpinner: false, action: ("Try Again", { link.retry(scope.peer) }))
+            } else if !link.isOnline(scope.peer) {
                 CenteredStatus(symbol: CenteredStatus.moleSleep, title: "\(macName) is offline", subtitle: "",
                                showSpinner: false, action: ("Try Again", { link.retry(scope.peer) }))
             } else if link.peer(scope.peer)?.theyAllowSearch == false {
@@ -262,16 +279,22 @@ struct RemoteBrowser: View {
     private func load() async {
         loading = true
         failure = nil
-        defer { loading = false }
+        defer { if !Task.isCancelled { loading = false } }
         guard link.isOnline(scope.peer) else { children = []; return }
         if let folder = scope.folder {
             do {
-                children = try await link.list(scope.peer, folder: folder)
+                let listed = try await link.list(scope.peer, folder: folder)
+                guard !Task.isCancelled else { return }
+                children = listed
             } catch {
+                // The user moved on: this load's end is not news. It landed after the new load had
+                // cleared `failure`, and left the title "cancelled" over the folder they went to.
+                guard !Task.isCancelled else { return }
                 failure = LinkController.describe(error)
             }
         } else {
             await link.reloadSources(scope.peer)
+            guard !Task.isCancelled else { return }
             children = (link.sources[scope.peer] ?? []).map {
                 LinkWire.Child(path: $0.key, folder: true, kind: $0.kind, modified: 0, size: 0, files: $0.files)
             }
@@ -441,6 +464,8 @@ struct RemoteFetchStatus: View {
             .background(.regularMaterial, in: Capsule())
             .padding(.bottom, 14)
             .task(id: path) {
+                // From nothing: the bar kept the last fetch's fraction until this one's first slice.
+                fraction = 0
                 while !Task.isCancelled {
                     fraction = RemoteFiles.shared.fraction(path) ?? fraction
                     try? await Task.sleep(for: .milliseconds(150))

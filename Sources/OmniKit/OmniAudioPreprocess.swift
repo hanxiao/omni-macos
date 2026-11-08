@@ -167,10 +167,14 @@ public enum OmniAudioPreprocess {
     public final class AudioSegmentReader: @unchecked Sendable {
         private var file: AVAudioFile?
         private var slice: AVAudioPCMBuffer?
+        private let url: URL
         private let channelCount: Int
         private let nativeRate: Double
         private let nativeSegmentFrames: Int   // native frames per segment
         private var done = false
+        /// A read failed: what came before it is all this reader will give, and it is not the file's
+        /// end. `done` was all it set, so a pulled drive read as a short recording.
+        public private(set) var readFailed = false
         /// Segments in the file (the last may be short). Kept past `close()`: a parked long file's
         /// plan reads it every turn.
         public let segmentCount: Int
@@ -197,10 +201,17 @@ public enum OmniAudioPreprocess {
             guard let b = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: readFrames) else { return nil }
             file = f
             slice = b
+            self.url = url
             channelCount = Int(fmt.channelCount)
             nativeRate = fmt.sampleRate
             nativeSegmentFrames = Int(OmniAudioPreprocess.segmentSeconds * fmt.sampleRate)
             segmentCount = Int((Double(f.length) / Double(nativeSegmentFrames)).rounded(.up))
+        }
+
+        private func fileIsThere() -> Bool {
+            guard let h = try? FileHandle(forReadingFrom: url) else { return false }
+            defer { try? h.close() }
+            return (try? h.read(upToCount: 1)) != nil
         }
 
         /// Let go of the file and its buffer. A long file waiting for its next turn holds no open
@@ -218,7 +229,15 @@ public enum OmniAudioPreprocess {
             while mono.count < nativeSegmentFrames {
                 let want = AVAudioFrameCount(Swift.min(Int(slice.frameCapacity), nativeSegmentFrames - mono.count))
                 slice.frameLength = 0
-                do { try file.read(into: slice, frameCount: want) } catch { done = true; break }
+                do { try file.read(into: slice, frameCount: want) } catch {
+                    done = true
+                    // AVAudioFile throws at the end of a file too (framePosition == length, no error
+                    // worth reading), so a throw is a failure only short of the end, and only with the
+                    // file out of reach: `length` is an estimate for some formats, and taking a file
+                    // that merely ends early for a failure would leave it unindexable.
+                    if file.framePosition < file.length, !fileIsThere() { readFailed = true }
+                    break
+                }
                 let n = Int(slice.frameLength)
                 if n == 0 { done = true; break }   // end of file
                 guard let chans = slice.floatChannelData else { done = true; break }

@@ -144,4 +144,244 @@ final class MediaTurnTests: XCTestCase {
         XCTAssertEqual(embedder.audioCalls - afterFirst, 24, "the resumed pass embedded the first turn again")
         XCTAssertEqual(indexer.streams.count, 0)
     }
+
+    // MARK: - A failed turn is not an empty one
+
+    /// Good for a number of calls, then refusing or non-finite.
+    final class Faulty: Embedder, @unchecked Sendable {
+        enum Fault { case none, refuse, nan }
+        let dim = 8
+        private let lock = NSLock()
+        private var calls = 0
+        var fault = Fault.none
+        var goodCalls = 0
+        var recovers = false
+        var onCall: ((Int) -> Void)?
+        private func media(_ good: [Float]) -> [Float]? {
+            let (n, f): (Int, Fault) = lock.withLock { calls += 1; return (calls, calls > goodCalls ? fault : .none) }
+            onCall?(n)
+            switch f {
+            case .none: return good
+            case .refuse: return nil
+            case .nan: return [Float](repeating: .nan, count: dim)
+            }
+        }
+        func recoverMediaPath() -> Bool { if recovers { lock.withLock { fault = .none } }; return recovers }
+        func embedText(_ text: String, as type: OmniInputType) -> [Float] { [1, 0, 0, 0, 0, 0, 0, 0] }
+        func embedTextBatch(_ texts: [String], as type: OmniInputType) -> [[Float]] { texts.map { _ in [1, 0, 0, 0, 0, 0, 0, 0] } }
+        func embedImage(_ image: CGImage) -> [Float]? { nil }
+        func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? {
+            guard let v = media([0, 1, 0, 0, 0, 0, 0, 0]) else { return nil }
+            return raws.map { _ in v }
+        }
+        func embedVideoFrames(_ frames: [CGImage]) -> [Float]? { frames.isEmpty ? nil : media([0, 0, 1, 0, 0, 0, 0, 0]) }
+        func embedAudio(_ url: URL) -> [Float]? { nil }
+        func embedAudioMel(_ mel: [Float], frames: Int) -> [Float]? { media([0, 0, 0, 1, 0, 0, 0, 0]) }
+        func embedAudioMelBatch(_ mels: [[Float]], frames: [Int]) -> [[Float]]? {
+            guard let v = media([0, 0, 0, 1, 0, 0, 0, 0]) else { return nil }
+            return mels.map { _ in v }
+        }
+    }
+
+    private func blankPDF(pages: Int, at url: URL) {
+        var box = CGRect(x: 0, y: 0, width: 200, height: 200)
+        let ctx = CGContext(url as CFURL, mediaBox: &box, nil)!
+        for _ in 0 ..< pages { ctx.beginPDFPage(nil); ctx.setFillColor(gray: 0.5, alpha: 1); ctx.fill(box); ctx.endPDFPage() }
+        ctx.closePDF()
+    }
+
+    private func pass(_ indexer: Indexer, _ root: URL, _ kinds: Set<FileKind>) -> IndexProgress {
+        let done = expectation(description: "pass")
+        nonisolated(unsafe) var last = IndexProgress()
+        indexer.index(roots: [root], settings: IndexSettings(enabledKinds: kinds)) { p in if p.done { last = p; done.fulfill() } }
+        wait(for: [done], timeout: 600)
+        return last
+    }
+
+    /// The tower says nil mid-file: the turn stays where it was, and the file comes out whole.
+    func testARefusedTurnIsResumedNotFinished() throws {
+        let (root, db) = try folder("refused-audio")
+        let long = root.appendingPathComponent("lecture.m4a")
+        try recording(minutes: 25, at: long)
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let faulty = Faulty()
+        faulty.fault = .refuse
+        faulty.goodCalls = 1   // the first turn's one minute
+        var indexer = Indexer(store: store, embedder: faulty)
+        let p = pass(indexer, root, [.audio])
+        XCTAssertEqual(p.failed, 1, "a refused turn was counted as done")
+        XCTAssertEqual(indexer.streams.count, 1, "the cursor was finished over the missing windows")
+        XCTAssertNil(store.contentKeys(paths: [long.path])[long.path], "a copy would be served the part")
+
+        faulty.fault = .none
+        indexer = Indexer(store: store, embedder: faulty)
+        _ = pass(indexer, root, [.audio])
+        let rows = try XCTUnwrap(store.storedChunks(path: long.path)).sorted { $0.chunkIndex < $1.chunkIndex }
+        XCTAssertEqual(rows.map(\.chunkIndex), Array(0 ..< 25), "windows missing")
+        XCTAssertEqual(indexer.streams.count, 0)
+        XCTAssertNotNil(store.contentKeys(paths: [long.path])[long.path])
+    }
+
+    /// The cold-load weight fault in a later turn: no non-finite row is stored (search skips them, so
+    /// nobody would ever see the hole), and the weights are loaded again before the turn is retried.
+    func testANonFiniteTurnIsNotStored() throws {
+        let (root, db) = try folder("nan-audio")
+        let long = root.appendingPathComponent("lecture.m4a")
+        try recording(minutes: 25, at: long)
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let faulty = Faulty()
+        faulty.fault = .nan
+        faulty.goodCalls = 1
+        var indexer = Indexer(store: store, embedder: faulty)
+        _ = pass(indexer, root, [.audio])
+        var rows = try XCTUnwrap(store.storedChunks(path: long.path))
+        XCTAssertTrue(rows.allSatisfy { Indexer.isFinite($0.embedding) }, "non-finite rows stored")
+        XCTAssertEqual(indexer.streams.count, 1, "the cursor was finished over the faulted windows")
+
+        // A process whose weights reload clean finishes it in the same pass.
+        faulty.recovers = true
+        indexer = Indexer(store: store, embedder: faulty)
+        _ = pass(indexer, root, [.audio])
+        rows = try XCTUnwrap(store.storedChunks(path: long.path)).sorted { $0.chunkIndex < $1.chunkIndex }
+        XCTAssertEqual(rows.map(\.chunkIndex), Array(0 ..< 25))
+        XCTAssertTrue(rows.allSatisfy { Indexer.isFinite($0.embedding) })
+        XCTAssertEqual(indexer.streams.count, 0)
+    }
+
+    func testARefusedScanTurnIsResumedNotFinished() throws {
+        let (root, db) = try folder("refused-scan")
+        let scan = root.appendingPathComponent("scan.pdf")
+        blankPDF(pages: 45, at: scan)
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let faulty = Faulty()
+        faulty.fault = .refuse
+        faulty.goodCalls = 1
+        var indexer = Indexer(store: store, embedder: faulty)
+        let p = pass(indexer, root, [.text])
+        XCTAssertEqual(p.failed, 1)
+        XCTAssertEqual(indexer.streams.count, 1, "the cursor was finished over the refused pages")
+        let part = store.chunkCount(path: scan.path)
+        XCTAssertGreaterThan(part, 0)
+        XCTAssertLessThan(part, 45)
+        faulty.fault = .none
+        indexer = Indexer(store: store, embedder: faulty)
+        _ = pass(indexer, root, [.text])
+        let rows = try XCTUnwrap(store.storedChunks(path: scan.path)).sorted { $0.chunkIndex < $1.chunkIndex }
+        XCTAssertEqual(rows.map(\.chunkIndex), Array(0 ..< 45), "pages missing")
+        XCTAssertEqual(indexer.streams.count, 0)
+    }
+
+    func testARefusedVideoTurnIsResumedNotFinished() throws {
+        let (root, db) = try folder("refused-video")
+        let film = root.appendingPathComponent("talk.mp4")
+        try video(minutes: 44, at: film)
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let faulty = Faulty()
+        faulty.fault = .refuse
+        faulty.goodCalls = 1
+        var indexer = Indexer(store: store, embedder: faulty)
+        var settings = IndexSettings(enabledKinds: [.video])
+        settings.soundtrack = false
+        func run() {
+            let done = expectation(description: "pass")
+            indexer.index(roots: [root], settings: settings) { p in if p.done { done.fulfill() } }
+            wait(for: [done], timeout: 600)
+        }
+        run()
+        XCTAssertEqual(indexer.streams.count, 1, "the cursor was finished over the refused segments")
+        faulty.fault = .none
+        indexer = Indexer(store: store, embedder: faulty)
+        run()
+        let rows = try XCTUnwrap(store.storedChunks(path: film.path)).sorted { $0.chunkIndex < $1.chunkIndex }
+        XCTAssertEqual(rows.map(\.locator), (0 ..< 11).map { "\($0 * 4):00" }, "segments missing")
+    }
+
+    /// A drive pulled during a turn: the reader's read fails, which is not the recording's end.
+    func testAPulledDriveDuringATurnIsNotTheEndOfARecording() throws {
+        let (base, db) = try folder("pulled-audio")
+        let disk = try IndexerStateTests.DiskImage(in: base, name: "audio")
+        addTeardownBlock { disk.pull() }
+        // The root inside the volume, so it goes with it as /Volumes/<name> does.
+        let root = disk.mount.appendingPathComponent("Music", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let long = root.appendingPathComponent("lecture.m4a")
+        try recording(minutes: 25, at: long)
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let faulty = Faulty()
+        nonisolated(unsafe) var pulled = false
+        faulty.onCall = { n in if n == 3, !pulled { pulled = true; disk.pull() } }   // inside the second turn
+        var indexer = Indexer(store: store, embedder: faulty)
+        _ = pass(indexer, root, [.audio])
+        XCTAssertTrue(pulled)
+        XCTAssertEqual(indexer.streams.count, 1)
+
+        disk.attach()
+        faulty.onCall = nil
+        indexer = Indexer(store: store, embedder: faulty)
+        _ = pass(indexer, root, [.audio])
+        let rows = try XCTUnwrap(store.storedChunks(path: long.path)).sorted { $0.chunkIndex < $1.chunkIndex }
+        XCTAssertEqual(rows.map(\.chunkIndex), Array(0 ..< 25), "windows lost to the read error")
+        XCTAssertEqual(indexer.streams.count, 0)
+    }
+
+    // MARK: - N12. A read on the embed stage that never returns
+
+    /// The pipeline bounds a decode's read; this stage's reads had no limit, and one that never came
+    /// back held the pass and every Pause.
+    func testAReadThatNeverReturnsOnTheEmbedStageDoesNotHoldThePass() throws {
+        let (root, db) = try folder("embed-hang")
+        let film = root.appendingPathComponent("talk.mp4")
+        try video(minutes: 9, at: film)   // three segments, one turn
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let indexer = Indexer(store: store, embedder: Faulty())
+        indexer.stallLimit = 2
+        let calls = Indexer.Counter()
+        Indexer.testReadDelay = { p in
+            guard p == film.path else { return nil }
+            calls.add(1)
+            return calls.value >= 3 ? 25 : nil   // the decode and the first segment read, the next does not return
+        }
+        addTeardownBlock { Indexer.testReadDelay = nil }
+        var settings = IndexSettings(enabledKinds: [.video])
+        settings.soundtrack = false
+        let t0 = Date()
+        let done = expectation(description: "pass")
+        indexer.index(roots: [root], settings: settings) { p in if p.done { done.fulfill() } }
+        wait(for: [done], timeout: 60)
+        XCTAssertLessThan(-t0.timeIntervalSinceNow, 15, "the pass waited for the read")
+        XCTAssertGreaterThanOrEqual(calls.value, 3, "the hang was not reached")
+        XCTAssertEqual(indexer.quarantine.count, 1, "the file was not remembered: the next pass walks into it again")
+        XCTAssertEqual(store.chunkCount(path: film.path), 0, "a part stored as the whole")
+    }
+
+    func testACancelStopsWaitingForAReadOnTheEmbedStage() throws {
+        let (root, db) = try folder("embed-hang-cancel")
+        let film = root.appendingPathComponent("talk.mp4")
+        try video(minutes: 9, at: film)
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let indexer = Indexer(store: store, embedder: Faulty())
+        let calls = Indexer.Counter()
+        Indexer.testReadDelay = { p in
+            guard p == film.path else { return nil }
+            calls.add(1)
+            return calls.value >= 3 ? 25 : nil
+        }
+        addTeardownBlock { Indexer.testReadDelay = nil }
+        var settings = IndexSettings(enabledKinds: [.video])
+        settings.soundtrack = false
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2) { indexer.cancel(.pause) }
+        let t0 = Date()
+        let done = expectation(description: "pass")
+        indexer.index(roots: [root], settings: settings) { p in if p.done { done.fulfill() } }
+        wait(for: [done], timeout: 60)
+        XCTAssertLessThan(-t0.timeIntervalSinceNow, 15, "a Pause waited for the read")
+        XCTAssertEqual(indexer.quarantine.count, 0, "paused, not broken")
+    }
 }

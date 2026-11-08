@@ -92,10 +92,16 @@ public final class LinkChannel: @unchecked Sendable {
     /// connection goes, `.remote` with the other end's message if its handler threw, and
     /// `.cancelled` if the calling task is cancelled (the other end is told).
     public func call(_ method: String, _ msg: LinkMessage = LinkMessage(), timeout: Double) async throws -> LinkMessage {
+        // Cancelled already, it is not sent. `onCancel` below runs at once for such a task, finds
+        // nothing pending, and the request then went out with no cancel to follow it: a superseded
+        // search still ran on the other Mac, and a cancelled pairing still opened its sheet.
+        if Task.isCancelled { throw LinkError.cancelled }
         let id: UInt64 = queue.sync { defer { nextID += 1 }; return nextID }
+        let early = CancelledEarly()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (cont: CheckedContinuation<LinkMessage, Error>) in
                 queue.async { [self] in
+                    guard !early.value else { cont.resume(throwing: LinkError.cancelled); return }   // the cancel got here first
                     guard !closed else { cont.resume(throwing: LinkError.closed); return }
                     pending[id] = cont
                     send(Header(id: id, t: "q", m: method), msg)
@@ -108,6 +114,7 @@ public final class LinkChannel: @unchecked Sendable {
             }
         } onCancel: {
             queue.async { [self] in
+                early.value = true
                 guard let c = pending.removeValue(forKey: id) else { return }
                 send(Header(id: id, t: "c"), LinkMessage())
                 c.resume(throwing: LinkError.cancelled)
@@ -204,6 +211,9 @@ public final class LinkChannel: @unchecked Sendable {
         let hs = closeHandlers; closeHandlers = []
         for f in hs { f(err) }
     }
+
+    /// One call's cancel, when it reaches the queue before the call does. Only touched on `queue`.
+    private final class CancelledEarly: @unchecked Sendable { var value = false }
 
     private func be32(_ n: Int) -> Data { withUnsafeBytes(of: UInt32(n).bigEndian) { Data($0) } }
     private func u32(_ d: Data, _ i: Data.Index) -> UInt32 {

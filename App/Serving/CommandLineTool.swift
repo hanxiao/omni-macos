@@ -22,11 +22,15 @@ enum CommandLineTool {
                           command: bundledPath)
     }
 
-    enum State: Equatable { case notInstalled, installed, stale(String) }
+    enum State: Equatable {
+        case notInstalled, installed, stale(String)
+        /// Something that is not a link is at that path.
+        case occupied
+    }
 
     nonisolated static var state: State {
         guard let dest = try? FileManager.default.destinationOfSymbolicLink(atPath: linkPath) else {
-            return FileManager.default.fileExists(atPath: linkPath) ? .stale(linkPath) : .notInstalled
+            return FileManager.default.fileExists(atPath: linkPath) ? .occupied : .notInstalled
         }
         return dest == bundledPath ? .installed : .stale(dest)
     }

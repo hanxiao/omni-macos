@@ -7,6 +7,13 @@ import Network
 /// switched off takes effect on the next request.
 public protocol LinkService: Sendable {
     func serve(_ method: String, _ msg: LinkMessage, peer: LinkPeer) async throws -> LinkMessage
+    /// Moves whenever what `serve` answers from changes (an engine arrived, a model switched): a
+    /// linked Mac sees it in the ping's reply and asks again what it learned from this one.
+    var serviceGeneration: Int { get }
+}
+
+public extension LinkService {
+    var serviceGeneration: Int { 0 }
 }
 
 /// One Mac on the link: listens, advertises itself over Bonjour, keeps a connection to every Mac
@@ -28,6 +35,16 @@ public final class LinkNode: @unchecked Sendable {
     nonisolated(unsafe) static var pingTimeout: Double = 5
     /// How long a connection gets to come up (TCP and TLS).
     nonisolated(unsafe) static var connectTimeout: Double = 10
+    /// A client that sent `pair.begin` has this long to reveal, and an honest one takes milliseconds.
+    /// It holds the one pairing slot meanwhile.
+    nonisolated(unsafe) static var pairingBeginTimeout: Double = 30
+    /// A key this Mac does not know, not pairing, keeps its connection this long. Anyone on the LAN
+    /// can make one, so they are also capped: the oldest gives way to a new one past `maxStrangers`.
+    nonisolated(unsafe) static var strangerTimeout: Double = 30
+    nonisolated(unsafe) static var maxStrangers = 16
+    /// How often a row that says Unlinked asks again. Trust can come back with no pairing on this
+    /// side (the other Mac's file restored), and that Mac may not be able to dial this one.
+    nonisolated(unsafe) static var unlinkedRetry: Double = 300
 
     public enum PeerState: Equatable, Sendable {
         case offline
@@ -67,16 +84,29 @@ public final class LinkNode: @unchecked Sendable {
     public var onChange: (@Sendable () -> Void)?
     public var onPairingRequest: (@Sendable (IncomingPairing) -> Void)?
     public var onLog: (@Sendable (String) -> Void)?
+    /// A link typed for on this Mac could not be saved.
+    public var onStorageFailure: (@Sendable (String) -> Void)?
 
     private var listener: NWListener?
     private var browser: NWBrowser?
     private var listening: UInt16?
     private var windowOpen = false
     private var running = false
+    /// Stopped for good: this node's folder is no longer the link's (the index moved), and nothing
+    /// may start it again or write through it.
+    private var retired = false
     private var discovered: [String: Discovered] = [:]       // by peer id; every Omni seen, open window or not
     private var conns: [String: PeerConn] = [:]              // outgoing, by peer id
     private var incoming: [ObjectIdentifier: LinkChannel] = [:]
-    private var pairingInProgress = false
+    /// Connections from a key this Mac does not know, and since when.
+    private var strangers: [ObjectIdentifier: Date] = [:]
+    /// The channel holding the one pairing slot. Whose it is, not just that it is taken: a close used
+    /// to free the slot whoever held it by then.
+    private var pairingOwner: ObjectIdentifier?
+    /// Pairings this Mac started and has not finished. Two Macs that ask each other at once would
+    /// each hide the code the other needs behind its request, so while one is going a request hears
+    /// this Mac is busy.
+    private var outgoingPairings = 0
 
     private final class PeerConn {
         var state: PeerState = .offline
@@ -86,6 +116,8 @@ public final class LinkNode: @unchecked Sendable {
         var retry: DispatchWorkItem?
         var ping: DispatchSourceTimer?
         var generation = 0
+        /// What the other Mac's `serviceGeneration` last was, from a ping's reply.
+        var serviceGeneration: Int?
     }
 
     public init(identity: LinkIdentity, peers: LinkPeerStore, config: Config, service: LinkService) {
@@ -104,6 +136,10 @@ public final class LinkNode: @unchecked Sendable {
     public var port: UInt16? { queue.sync { listening } }
 
     public func state(of id: String) -> PeerState { queue.sync { conns[id]?.state ?? .offline } }
+    /// What a linked Mac last reported as its service generation. nil: not yet, or a Mac before this
+    /// release, which reports none.
+    public func serviceGeneration(of id: String) -> Int? { queue.sync { conns[id]?.serviceGeneration } }
+    public var serviceGenerations: [String: Int] { queue.sync { conns.compactMapValues(\.serviceGeneration) } }
     public var states: [String: PeerState] { queue.sync { conns.mapValues(\.state) } }
 
     /// Macs with their Link window open that are not linked yet, nearest name first.
@@ -144,6 +180,16 @@ public final class LinkNode: @unchecked Sendable {
         queue.sync { stopLocked() }
     }
 
+    /// Stop for good. A pair or an unlink still in flight on this node ended in `reconcile`, which
+    /// started it again whenever peers existed, with the change going to the old folder's file and a
+    /// second listener pushing the new node off the fixed port.
+    public func retire() {
+        queue.sync {
+            retired = true
+            stopLocked()
+        }
+    }
+
     /// Call `method` on a linked Mac. Fails at once when it is not connected: a search never waits
     /// for a Mac to come back.
     public func call(_ id: String, _ method: String, _ msg: LinkMessage = LinkMessage(), timeout: Double) async throws -> LinkMessage {
@@ -166,6 +212,7 @@ public final class LinkNode: @unchecked Sendable {
         let ch: LinkChannel? = queue.sync { conns[id]?.channel }
         if let ch { _ = try? await ch.call("unlink", timeout: 3) }
         queue.sync {
+            guard !retired else { return }
             dropConn(id)
             peers.remove(id)
             reconcileLocked()
@@ -178,11 +225,19 @@ public final class LinkNode: @unchecked Sendable {
     /// `alsoShare`: let that Mac search (and open files on) this one as well.
     public func pair(_ endpoint: NWEndpoint, alsoShare: Bool,
                      showCode: @escaping @Sendable (_ code: String, _ name: String) -> Void) async throws -> LinkPeer {
+        // Checked at each step: a cancel while connecting used to be lost, and the begin and the
+        // reveal still went out, opening the other Mac's sheet asking for a code nobody could see.
+        func stillWanted() throws { if Task.isCancelled { throw LinkError.cancelled } }
+        try stillWanted()
+        guard !queue.sync(execute: { retired }) else { throw LinkError.closed }
+        queue.sync { outgoingPairings += 1 }
+        defer { queue.async { self.outgoingPairings -= 1 } }
         let seen = Locked<Data?>(nil)
         let params = LinkTLS.parameters(identity: identity, queue: queue) { key in seen.set(key); return true }
         let conn = NWConnection(to: endpoint, using: params)
         let ch = try await connect(conn, timeout: 10)
         defer { ch.close() }
+        try stillWanted()
         guard let serverKey = LinkTLS.peerKey(conn) ?? seen.get() else { throw LinkError.protocolViolation("no server key") }
         guard serverKey != identity.publicKey else { throw LinkError.refused("That's this Mac.") }
         guard let exporter = LinkTLS.exporter(conn) else { throw LinkError.protocolViolation("no exporter") }
@@ -203,7 +258,8 @@ public final class LinkNode: @unchecked Sendable {
                             model: begin.model, host: host, port: port,
                             allowSearch: alsoShare, allowFetch: alsoShare,
                             theyAllowSearch: true, theyAllowFetch: true)
-        peers.put(peer)
+        guard !queue.sync(execute: { retired }) else { throw LinkError.closed }
+        try peers.put(peer)
         queue.async { [self] in
             relinkedLocked(peer.id)
             reconcileLocked()
@@ -236,6 +292,7 @@ public final class LinkNode: @unchecked Sendable {
     // MARK: - Up and down
 
     private func reconcileLocked() {
+        guard !retired else { return }
         let want = windowOpen || !peers.all.isEmpty
         if want && !running { startLocked() }
         if !want && running { stopLocked() }
@@ -323,14 +380,37 @@ public final class LinkNode: @unchecked Sendable {
             let appeared = Set(next.keys).subtracting(self.discovered.keys)
             self.discovered = next
             // A linked Mac that just appeared is dialled now, not at the end of its backoff.
-            for id in appeared where self.conns[id]?.state == .offline { self.dial(id) }
+            for id in appeared where self.conns[id]?.state == .offline || self.conns[id]?.state == .unlinked { self.revive(id) }
             self.notify()
         }
         b.stateUpdateHandler = { [weak self] s in
-            if case .failed(let e) = s { self?.log("browser failed: \(e)") }
+            guard let self else { return }
+            if case .failed(let e) = s { self.log("browser failed: \(e)") }
+            let problem = Self.discoveryProblem(s)
+            if problem != self.discoveryBlocked { self.discoveryBlocked = problem; self.notify() }
         }
         b.start(queue: queue)
     }
+
+    /// WHY NO MAC NEARBY CAN SHOW UP, when it is not "none is open". With Local Network access denied
+    /// the browser waits with a policy error for good, and the sheet spun on "Open Link a Mac on the
+    /// other Mac" with nothing anyone could open to end it. Only `.failed` was looked at.
+    static func discoveryProblem(_ state: NWBrowser.State) -> String? {
+        switch state {
+        case .ready, .setup, .cancelled: return nil
+        case .waiting(let e), .failed(let e):
+            if case .dns(let code) = e, code == DNSServiceErrorType(kDNSServiceErr_PolicyDenied) {
+                return "Local Network access is off for Omni. Turn it on in System Settings > Privacy & Security > Local Network."
+            }
+            return "Macs nearby can't be listed right now (\(e.localizedDescription))."
+        @unknown default: return nil
+        }
+    }
+    /// What the sheet says for a denied Local Network (a test seam shows it without the prompt).
+    public static var localNetworkDenied: String { discoveryProblem(.waiting(.dns(DNSServiceErrorType(kDNSServiceErr_PolicyDenied)))) ?? "" }
+    private var discoveryBlocked: String?
+    /// Why nearby Macs cannot be listed, or nil (`discoveryProblem`).
+    public var discoveryIssue: String? { queue.sync { discoveryBlocked } }
 
     // MARK: - Outgoing: one connection per linked Mac
 
@@ -369,6 +449,10 @@ public final class LinkNode: @unchecked Sendable {
                         c.state = .unlinked
                         self.log("\(id): unlinked on the other Mac")
                         self.notify()
+                        let item = DispatchWorkItem { [weak self] in self?.revive(id) }
+                        c.retry?.cancel()
+                        c.retry = item
+                        self.queue.asyncAfter(deadline: .now() + Self.unlinkedRetry, execute: item)
                         return
                     }
                     self.failed(id, why: "\(error)")
@@ -381,9 +465,26 @@ public final class LinkNode: @unchecked Sendable {
     /// dial only starts from `.offline`: the sheet said linked and the row said Unlinked until someone
     /// pressed Reconnect.
     private func relinkedLocked(_ id: String) {
-        guard let c = conns[id], c.state == .unlinked else { return }
+        guard let c = conns[id] else { return }
+        // A dial from before the pairing: its "not linked" is about the old link, and landing after
+        // this it parked the row at Unlinked again.
+        if c.state == .connecting {
+            c.generation += 1
+            c.attempt?.cancel(); c.attempt = nil
+            c.state = .offline
+        }
+        guard c.state == .unlinked else { return }
+        c.retry?.cancel(); c.retry = nil
         c.state = .offline
         c.backoff = 2
+    }
+
+    /// Dial a Mac that may trust this one again. `.unlinked` had no way back but Reconnect, because a
+    /// dial only starts from `.offline`.
+    private func revive(_ id: String) {
+        guard let c = conns[id], c.state == .unlinked || c.state == .offline else { return }
+        if c.state == .unlinked { relinkedLocked(id) }
+        dial(id)
     }
 
     private func connected(_ id: String, gen: Int, channel ch: LinkChannel, hello: HelloReply, conn: NWConnection) {
@@ -417,9 +518,14 @@ public final class LinkNode: @unchecked Sendable {
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now() + Self.pingInterval, repeating: Self.pingInterval)
         let timeout = Self.pingTimeout
-        t.setEventHandler { [weak ch] in
+        t.setEventHandler { [weak self, weak ch] in
             guard let ch else { return }
-            Task { do { _ = try await ch.call("ping", timeout: timeout) } catch { ch.close() } }
+            Task {
+                do {
+                    let reply = try await ch.call("ping", timeout: timeout)
+                    self?.pinged(id, gen: gen, reply)
+                } catch { ch.close() }
+            }
         }
         t.resume()
         c.ping = t
@@ -427,10 +533,26 @@ public final class LinkNode: @unchecked Sendable {
         notify()
     }
 
+    /// A ping's reply is also what that Mac grants now and its service generation, so a grants push
+    /// that was lost, or a model it switched since, is put right within a ping. The reply from a Mac
+    /// before this release has no body, and its pings ignore this one's.
+    private func pinged(_ id: String, gen: Int, _ reply: LinkMessage) {
+        guard !reply.body.isEmpty, let r = try? reply.decode(PingReply.self) else { return }
+        queue.async { [self] in
+            guard let c = conns[id], c.generation == gen else { return }
+            let before = peers.peer(id)
+            let after = peers.update(id) { p in p.theyAllowSearch = r.allowSearch; p.theyAllowFetch = r.allowFetch }
+            let moved = c.serviceGeneration != r.generation
+            c.serviceGeneration = r.generation
+            if moved || before != after { notify() }
+        }
+    }
+
     private func failed(_ id: String, why: String) {
         guard let c = conns[id] else { return }
         c.state = .offline
         c.channel = nil
+        c.serviceGeneration = nil
         notify()
         guard running else { return }
         let delay = c.backoff
@@ -458,7 +580,23 @@ public final class LinkNode: @unchecked Sendable {
     /// the server has judged its certificate; a refused client then sees its first request fail.
     func connect(_ conn: NWConnection, timeout: Double) async throws -> LinkChannel {
         let q = queue
-        let ch: LinkChannel = try await withCheckedThrowingContinuation { cont in
+        if Task.isCancelled { throw LinkError.cancelled }
+        let ch: LinkChannel
+        do {
+            ch = try await withTaskCancellationHandler {
+                try await bringUp(conn, timeout: timeout, q)
+            } onCancel: {
+                conn.cancel()
+            }
+        } catch {
+            throw Task.isCancelled ? LinkError.cancelled : error
+        }
+        ch.start()
+        return ch
+    }
+
+    private func bringUp(_ conn: NWConnection, timeout: Double, _ q: DispatchQueue) async throws -> LinkChannel {
+        try await withCheckedThrowingContinuation { cont in
             let done = Locked(false)
             @Sendable func finish(_ r: Result<LinkChannel, Error>) {
                 guard !done.get() else { return }
@@ -487,8 +625,6 @@ public final class LinkNode: @unchecked Sendable {
             }
             conn.start(queue: q)
         }
-        ch.start()
-        return ch
     }
 
     // MARK: - Incoming
@@ -510,10 +646,15 @@ public final class LinkNode: @unchecked Sendable {
                     ch.setHandler { m, msg in m.hasPrefix("pair.") ? try await pairing(m, msg) : try await linked(m, msg) }
                 } else {
                     ch.setHandler(self.pairingHandler(ch))
+                    self.admitStranger(oid, ch)
                 }
                 ch.onClose { [weak self] _ in
                     guard let self else { return }
-                    self.queue.async { self.incoming[oid] = nil }
+                    self.queue.async {
+                        self.incoming[oid] = nil
+                        self.strangers[oid] = nil
+                        if self.pairingOwner == oid { self.pairingOwner = nil }
+                    }
                 }
                 ch.start()
             case .failed, .cancelled:
@@ -528,6 +669,28 @@ public final class LinkNode: @unchecked Sendable {
             if conn.state != .ready { conn.cancel() }
         }
         conn.start(queue: queue)
+    }
+
+    /// A key this Mac does not know gets a connection for free, so it does not get to keep it: a
+    /// time limit while it is not the one pairing, and a cap with the oldest giving way, so that
+    /// nobody can fill the Mac with sockets or keep an honest pairing out.
+    private func admitStranger(_ oid: ObjectIdentifier, _ ch: LinkChannel) {
+        if strangers.count >= Self.maxStrangers,
+           let oldest = strangers.filter({ $0.key != pairingOwner }).min(by: { $0.value < $1.value })?.key {
+            incoming[oldest]?.close()
+            strangers[oldest] = nil
+        }
+        strangers[oid] = Date()
+        scheduleStrangerCheck(oid, ch)
+    }
+
+    private func scheduleStrangerCheck(_ oid: ObjectIdentifier, _ ch: LinkChannel) {
+        queue.asyncAfter(deadline: .now() + Self.strangerTimeout) { [weak self, weak ch] in
+            guard let self, let ch, self.strangers[oid] != nil else { return }
+            if self.pairingOwner == oid { self.scheduleStrangerCheck(oid, ch); return }   // pairing: bounded by its own timers
+            self.log("closing an idle connection from an unknown key")
+            ch.close()
+        }
     }
 
     static let notLinked = "not linked"
@@ -545,13 +708,15 @@ public final class LinkNode: @unchecked Sendable {
                     if let port = h.port, case .hostPort(let host, _)? = remote { p.host = "\(host)"; p.port = port }
                 }
                 // A Mac that paired by coming to this one is only now reachable from here: dial it back.
-                self.queue.async { if self.conns[id]?.state == .offline { self.dial(id) } }
+                // Also from Unlinked: a Mac that says hello trusts this one (its file came back).
+                self.queue.async { self.revive(id) }
                 self.queue.async { self.notify() }
                 let c = self.queue.sync { self.config }
                 return try .json(HelloReply(name: c.name, model: c.model, version: c.version, proto: 1,
                                             allowSearch: peer.allowSearch, allowFetch: peer.allowFetch))
             case "ping":
-                return LinkMessage()
+                return try .json(PingReply(allowSearch: peer.allowSearch, allowFetch: peer.allowFetch,
+                                           generation: self.service.serviceGeneration))
             case "grants":
                 // The other Mac changed what it lets this one do.
                 let g = try msg.decode(Grants.self)
@@ -560,6 +725,7 @@ public final class LinkNode: @unchecked Sendable {
                 return LinkMessage()
             case "unlink":
                 self.queue.async {
+                    guard !self.retired else { return }
                     self.log("\(id): unlinked by the other Mac")
                     self.dropConn(id)
                     self.peers.remove(id)
@@ -589,13 +755,27 @@ public final class LinkNode: @unchecked Sendable {
 
     // MARK: - Pairing, server side
 
+    /// One connection's walk through pairing. Each frame runs in its own task, so all of it is read
+    /// and written on `queue`: a client that sent frames without waiting could overlap them.
     private final class ServerPairing: @unchecked Sendable {
-        var begin: PairBegin?
-        var nonce = Data()
+        enum Stage {
+            case idle
+            case begun(PairBegin, nonce: Data, attempt: Int)
+            case waitingForCode
+        }
+        var stage = Stage.idle
+        var attempts = 0
+    }
+
+    /// Give back the slot, if `owner` holds it. `stage` ends with it. On `queue`.
+    private func endPairing(_ st: ServerPairing, owner: ObjectIdentifier) {
+        st.stage = .idle
+        if pairingOwner == owner { pairingOwner = nil }
     }
 
     private func pairingHandler(_ ch: LinkChannel) -> LinkChannel.Handler {
         let st = ServerPairing()
+        let owner = ObjectIdentifier(ch)
         return { [weak self, weak ch] method, msg in
             guard let self, let ch else { throw LinkError.closed }
             switch method {
@@ -603,44 +783,66 @@ public final class LinkNode: @unchecked Sendable {
                 // BEFORE THE SLOT. A begin that does not decode held it with no release installed:
                 // every later request heard "busy" until the app was relaunched.
                 let b = try msg.decode(PairBegin.self)
-                let ok: String? = self.queue.sync {
-                    if !self.windowOpen { return "Open Link a Mac on \(self.config.name) first." }
-                    if self.pairingInProgress { return "\(self.config.name) is busy linking another Mac." }
-                    self.pairingInProgress = true
-                    return nil
+                let nonce = LinkPairing.nonce()
+                let c: Config = try self.queue.sync {
+                    if !self.windowOpen { throw LinkError.refused("Open Link a Mac on \(self.config.name) first.") }
+                    if self.pairingOwner != nil || self.outgoingPairings > 0 {
+                        throw LinkError.refused("\(self.config.name) is busy linking another Mac.")
+                    }
+                    self.pairingOwner = owner
+                    st.attempts += 1
+                    let attempt = st.attempts
+                    st.stage = .begun(b, nonce: nonce, attempt: attempt)
+                    // A client that begins and goes silent must not hold the slot for as long as it
+                    // stays connected. Its close frees the slot too (see accept).
+                    self.queue.asyncAfter(deadline: .now() + Self.pairingBeginTimeout) { [weak self, weak ch] in
+                        guard let self, case .begun(_, _, let a) = st.stage, a == attempt else { return }
+                        self.log("pairing: no reveal in time")
+                        self.endPairing(st, owner: owner)
+                        ch?.close()
+                    }
+                    return self.config
                 }
-                if let ok { throw LinkError.refused(ok) }
-                st.begin = b
-                st.nonce = LinkPairing.nonce()
-                let c = self.queue.sync { self.config }
-                // A client that begins and walks away must not hold the pairing slot.
-                ch.onClose { [weak self] _ in
-                    guard let self else { return }
-                    self.queue.async { self.pairingInProgress = false }
-                }
-                return try .json(PairBeginReply(name: c.name, model: c.model, nonce: st.nonce))
+                return try .json(PairBeginReply(name: c.name, model: c.model, nonce: nonce))
             case "pair.reveal":
-                guard let b = st.begin else { throw LinkError.protocolViolation("reveal before begin") }
-                st.begin = nil   // one reveal per begin
-                let r = try msg.decode(PairReveal.self)
-                guard LinkPairing.commitment(r.nonce) == b.commit else {
-                    self.queue.async { self.pairingInProgress = false }
-                    throw LinkError.refused("Pairing failed.")
+                // One reveal per begin, whatever it holds: anything wrong with it gives the slot back.
+                let begun: (PairBegin, Data)? = self.queue.sync {
+                    guard case .begun(let b, let nonce, _) = st.stage else { return nil }
+                    st.stage = .waitingForCode
+                    return (b, nonce)
                 }
-                guard let exporter = LinkTLS.exporter(ch.connection) else { throw LinkError.protocolViolation("no exporter") }
+                guard let (b, nonce) = begun else { throw LinkError.protocolViolation("reveal before begin") }
+                func refuse(_ e: LinkError) -> LinkError { self.queue.async { self.endPairing(st, owner: owner) }; return e }
+                guard let r = try? msg.decode(PairReveal.self) else {
+                    throw refuse(.protocolViolation("\(PairReveal.self) did not decode"))
+                }
+                guard LinkPairing.commitment(r.nonce) == b.commit else { throw refuse(.refused("Pairing failed.")) }
+                // The window again: nobody pops a sheet on a Mac that is not pairing, and a client
+                // that began while it was open could otherwise do so at any later time.
+                let (open, myName) = self.queue.sync { (self.windowOpen, self.config.name) }
+                guard open else { throw refuse(.refused("Open Link a Mac on \(myName) first.")) }
+                guard let exporter = LinkTLS.exporter(ch.connection) else { throw refuse(.protocolViolation("no exporter")) }
                 let code = LinkPairing.code(exporter: exporter, clientKey: ch.peerKey, serverKey: self.identity.publicKey,
-                                            clientNonce: r.nonce, serverNonce: st.nonce)
+                                            clientNonce: r.nonce, serverNonce: nonce)
                 let req = IncomingPairing(name: b.name, model: b.model, code: code)
                 ch.onClose { _ in req.finish(.cancelled) }
                 self.queue.async { self.onPairingRequest?(req) }
                 let outcome = await req.wait()
-                self.queue.async { self.pairingInProgress = false }
+                self.queue.async { self.endPairing(st, owner: owner) }
                 switch outcome {
                 case .linked:
                     let peer = LinkPeer(id: LinkIdentity.id(of: ch.peerKey), publicKey: ch.peerKey, name: b.name, model: b.model,
                                         allowSearch: true, allowFetch: true,
                                         theyAllowSearch: b.share, theyAllowFetch: b.share)
-                    self.peers.put(peer)
+                    guard !self.queue.sync(execute: { self.retired }) else { return try .json(PairResult(ok: false, reason: "Pairing failed.")) }
+                    do {
+                        try self.peers.put(peer)
+                    } catch {
+                        // The asking Mac must not trust a link this one will have forgotten.
+                        self.log("pairing: \(error)")
+                        self.queue.async { self.onStorageFailure?("\(error)") }
+                        return try .json(PairResult(ok: false, reason: "\(myName) could not save the link."))
+                    }
                     self.queue.async { self.relinkedLocked(peer.id); self.reconcileLocked(); self.notify() }
                     return try .json(PairResult(ok: true, reason: nil))
                 case .wrong:
@@ -676,8 +878,22 @@ public final class IncomingPairing: @unchecked Sendable, Identifiable {
     private var left = IncomingPairing.tries
     private var outcome: Outcome?
     private var waiter: CheckedContinuation<Outcome, Never>?
-    /// Called once when the request ends for any reason (so the sheet closes).
-    public var onEnd: (@Sendable (Outcome) -> Void)?
+    private var onEndHandler: (@Sendable (Outcome) -> Void)?
+    /// Called once when the request ends for any reason (so the sheet closes), at once if it already
+    /// has: one that ended before the main actor presented it left a sheet nothing could dismiss,
+    /// with Decline a no-op and Link answering "Wrong code." for good.
+    public var onEnd: (@Sendable (Outcome) -> Void)? {
+        get { lock.withLock { onEndHandler } }
+        set {
+            let ended: Outcome? = lock.withLock {
+                if let outcome { return outcome }
+                onEndHandler = newValue
+                return nil
+            }
+            if let ended { newValue?(ended) }
+        }
+    }
+    public var isOver: Bool { lock.withLock { outcome != nil } }
 
     init(name: String, model: String, code: String) {
         self.name = name; self.model = model; self.code = code
@@ -706,7 +922,7 @@ public final class IncomingPairing: @unchecked Sendable, Identifiable {
             guard outcome == nil else { return (nil, nil) }
             outcome = o
             defer { waiter = nil }
-            return (waiter, onEnd)
+            return (waiter, onEndHandler)
         }
         w?.resume(returning: o)
         end?(o)
@@ -740,6 +956,7 @@ struct HelloReply: Codable {
     var allowSearch: Bool; var allowFetch: Bool
 }
 struct Grants: Codable { var allowSearch: Bool; var allowFetch: Bool }
+struct PingReply: Codable { var allowSearch: Bool; var allowFetch: Bool; var generation: Int }
 
 final class Locked<T>: @unchecked Sendable {
     private var v: T

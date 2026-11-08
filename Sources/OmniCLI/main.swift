@@ -72,11 +72,20 @@ var defaultSocketPath: String {
 
 struct NotRunning: Error {}
 
+/// How long `omni` waits for a byte from the app, the same 600 s it gives the app over HTTP. A wedged
+/// app accepts at the kernel and never answers, and this waited for ever. `OMNI_CLI_TIMEOUT`: seconds.
+let readTimeout = ProcessInfo.processInfo.environment["OMNI_CLI_TIMEOUT"].flatMap { Int($0) } ?? 600
+
 /// One HTTP/1.1 exchange over a Unix socket: request out, `Connection: close`, read to EOF.
 func unixExchange(_ path: String, body: Data) throws -> (status: Int, body: Data) {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else { throw Failure(message: "omni: socket: \(String(cString: strerror(errno)))", code: Exit.unavailable) }
     defer { close(fd) }
+    // A write after the app has gone is an error to report, not a signal that kills the command.
+    var on: Int32 = 1
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+    var limit = timeval(tv_sec: readTimeout, tv_usec: 0)
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &limit, socklen_t(MemoryLayout<timeval>.size))
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
     let bytes = Array(path.utf8)
@@ -102,6 +111,9 @@ func unixExchange(_ path: String, body: Data) throws -> (status: Int, body: Data
     var buf = [UInt8](repeating: 0, count: 65536)
     while true {
         let n = read(fd, &buf, buf.count)
+        if n < 0, errno == EAGAIN || errno == EWOULDBLOCK {
+            throw Failure(message: "omni: Omni did not answer within \(readTimeout) s.", code: Exit.unavailable)
+        }
         if n <= 0 { break }
         response.append(contentsOf: buf[0 ..< n])
         // A keep-alive server would not close: stop once Content-Length is satisfied.
@@ -205,16 +217,32 @@ var requestID = 0
             guard mayLaunch else {
                 throw Failure(message: "omni: Omni is not running. Open Omni, or drop --no-launch to let omni start it.", code: Exit.unavailable)
             }
-            let running = appIsRunning
+            var running = appIsRunning
             if !running {
                 FileHandle.standardError.write(Data("Starting Omni...\n".utf8))
                 launchApp()
             }
-            let deadline = Date().addingTimeInterval(running ? 60 : 180)
+            var deadline = Date().addingTimeInterval(running ? 60 : 180)
             var answer: (Int, Data)?
+            // Only a connection refused is tried again: nothing of the request has gone anywhere. A
+            // failure after that may be after the app acted on it, and `tools/call` can be a change
+            // (`remove_source` run twice says the second time that there is no such source).
             while answer == nil, Date() < deadline {
                 Thread.sleep(forTimeInterval: 0.5)
-                answer = try? unixExchange(path, body: body)
+                do {
+                    answer = try unixExchange(path, body: body)
+                } catch is NotRunning {
+                    // The app that was running has quit: it is not still loading, and nothing will
+                    // come of waiting out the minute.
+                    if running, !appIsRunning {
+                        running = false
+                        FileHandle.standardError.write(Data("Starting Omni...\n".utf8))
+                        launchApp()
+                        deadline = Date().addingTimeInterval(180)
+                    }
+                } catch {
+                    if method == "tools/call" { throw error }
+                }
             }
             guard let answer else {
                 throw Failure(message: running

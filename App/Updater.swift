@@ -13,6 +13,7 @@ enum Updater {
     static let feedURL = "https://hanxiao.io/omni/latest.json"
     private static let lastCheckKey = "omni.update.lastCheckEpoch"
     private static var inProgress = false
+    private static var offerOnScreen = false
     private static let progressUI = UpdateProgress()
 
     struct Manifest: Decodable { let version: String; let url: String; let md5: String? }
@@ -39,7 +40,6 @@ enum Updater {
         let now = Date().timeIntervalSince1970
         let last = UserDefaults.standard.double(forKey: lastCheckKey)
         guard now - last > 86_400 else { return }
-        OmniPrefs.set(now, forKey: lastCheckKey)
         check(userInitiated: false)
     }
 
@@ -55,6 +55,8 @@ enum Updater {
                 req.timeoutInterval = 15
                 let (data, _) = try await URLSession.shared.data(for: req)
                 let m = try JSONDecoder().decode(Manifest.self, from: data)
+                // Stamped on an answer, not on asking: a launch with no network cost the next 24 h.
+                if !userInitiated { OmniPrefs.set(Date().timeIntervalSince1970, forKey: lastCheckKey) }
                 if isNewer(m.version, than: currentVersion) {
                     // A version the user explicitly skipped stays quiet on launch checks; the
                     // menu command always shows it again (the user asked).
@@ -69,8 +71,17 @@ enum Updater {
         }
     }
 
+    /// PerfScript's `updateprompt:`: the offer of a release that is not real, downloading from `url`.
+    static func promptForPerfScript(url: String) {
+        Task { await promptAndInstall(Manifest(version: "99.0.0", url: url, md5: nil)) }
+    }
+
     private static func promptAndInstall(_ m: Manifest) async {
-        guard !inProgress else { return }
+        // One offer at a time. The launch check and the menu check could both get here: their sheets
+        // queued on the window, Install on both started two downloads, and Cancel stopped only one,
+        // so the app later quit to install the other.
+        guard !inProgress, !offerOnScreen else { return }
+        offerOnScreen = true
         // Pull the changelog for every release between what the user has and what's offered, so the
         // prompt shows what they actually gain (they may be several versions behind). Best-effort:
         // an empty string just falls back to the plain prompt.
@@ -83,6 +94,7 @@ enum Updater {
         a.addButton(withTitle: "Later").keyEquivalent = "\u{1b}"  // Esc dismisses (HIG: cancel-equivalent)
         a.addButton(withTitle: "Skip This Version")
         present(a) { response in
+            offerOnScreen = false
             switch response {
             case .alertFirstButtonReturn:
                 startUpdate(m)

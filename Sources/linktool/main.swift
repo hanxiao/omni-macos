@@ -12,6 +12,8 @@ import OmniLink
 //       <appLinkDir> (quit that app first), and point the tool at <host>:<port>.
 //   linktool call <toolDir> <method> '<json body>' [blobOut]
 //       Call <method> on the app and print the reply (body JSON; blob size and SHA-256).
+//   linktool pairwalk <toolDir> <host:port> <ms>
+//       Ask to pair with the app, and walk away <ms> after the code is shown.
 
 struct NoService: LinkService {
     func serve(_ method: String, _ msg: LinkMessage, peer: LinkPeer) async throws -> LinkMessage {
@@ -33,10 +35,10 @@ case "seed":
     let me = try LinkIdentity.loadOrCreate(at: toolDir.appendingPathComponent("identity"))
     // The app's public key, from its identity file (this is a test: the tool may read it).
     let app = try LinkIdentity.loadOrCreate(at: appDir.appendingPathComponent("identity"))
-    LinkPeerStore(url: appDir.appendingPathComponent("peers.json")).put(LinkPeer(
+    try LinkPeerStore(url: appDir.appendingPathComponent("peers.json")).put(LinkPeer(
         id: me.id, publicKey: me.publicKey, name: "linktool", model: "tool",
         allowSearch: true, allowFetch: grantFetch, theyAllowSearch: false, theyAllowFetch: false))
-    LinkPeerStore(url: toolDir.appendingPathComponent("peers.json")).put(LinkPeer(
+    try LinkPeerStore(url: toolDir.appendingPathComponent("peers.json")).put(LinkPeer(
         id: app.id, publicKey: app.publicKey, name: "app", model: "", host: args[4], port: port,
         allowSearch: false, allowFetch: false, theyAllowSearch: true, theyAllowFetch: grantFetch))
     print("tool \(me.id) linked with app \(app.id)")
@@ -72,6 +74,31 @@ case "call":
     sem.wait()
     print(out.get())
     node.stop()
+
+case "pairwalk":
+    guard args.count >= 5, let ep = LinkNode.endpoint(forAddress: args[3]), let ms = Int(args[4]) else {
+        fail("linktool pairwalk <toolDir> <host:port> <ms>")
+    }
+    let me = try LinkIdentity.loadOrCreate(at: toolDir.appendingPathComponent("identity"))
+    let node = LinkNode(identity: me, peers: LinkPeerStore(url: toolDir.appendingPathComponent("walk-peers.json")),
+                        config: .init(name: "walker", model: "tool", version: "0", port: 0, bonjour: false), service: NoService())
+    let sem = DispatchSemaphore(value: 0)
+    let out = Locked<String>("")
+    Task.detached {
+        let pairing = Task {
+            try await node.pair(ep, alsoShare: false) { code, name in
+                out.set("code shown for \(name)")
+                Task.detached {
+                    try? await Task.sleep(for: .milliseconds(ms))
+                    exit(0)   // gone, as a crash or a closed lid is: no cancel frame, the socket just closes
+                }
+            }
+        }
+        do { _ = try await pairing.value; out.set("linked") } catch { out.set("\(out.get()); \(error)") }
+        sem.signal()
+    }
+    sem.wait()
+    print(out.get())
 
 default:
     fail("unknown command \(args[1])")

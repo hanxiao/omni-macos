@@ -13,6 +13,18 @@ import OmniKit
 /// flushed. Covers every quit path (Cmd-Q, AppleEvent, and the updater's NSApp.terminate) uniformly.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // A transcript edited and not saved, the one thing here a quit would lose: every other way of
+        // closing a document asks (OCRSession.reviewUnsavedEdits), and the hard exit below would not.
+        if let ocr = OCRSession.current, ocr.hasUnsavedEdits {
+            ocr.reviewUnsavedEdits { proceed in
+                if proceed { Self.finishQuit() } else { sender.reply(toApplicationShouldTerminate: false) }
+            }
+            return .terminateLater
+        }
+        Self.finishQuit()
+    }
+
+    @MainActor private static func finishQuit() -> Never {
         AppModel.shared?.quiesceForQuit()       // stop indexing so no new MLX work starts mid-exit
         AppModel.shared?.flushHistoryForQuit()  // the search history's file, written before the exit
         UserDefaults.standard.synchronize()     // persist settings/roots before the hard exit
@@ -48,6 +60,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let closingSheets: @convention(block) (AnyObject, AnyObject?) -> Void = { app, sender in
             nonisolated(unsafe) let app = app, sender = sender
             MainActor.assumeIsolated {
+                // The save prompt of a quit or a close is up, or its save panel: that answer decides. A
+                // second quit ending them as Cancel and running on took the app out with the edit unsaved.
+                if OCRSession.current?.reviewingEdits == true { return }
                 func sheetsOpen() -> Bool { NSApp.windows.contains { $0.attachedSheet != nil } }
                 guard sheetsOpen() else { return original(app, sel, sender) }
                 NotificationCenter.default.post(name: dismissSheetsForQuit, object: nil)
@@ -56,6 +71,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     if sheetsOpen(), Date() < deadline {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { MainActor.assumeIsolated { attempt() } }
                     } else {
+                        // What is still up has no SwiftUI owner to ask: the update prompt, the OCR
+                        // save panel. Ended as Cancel, and terminate: follows in this same turn, so
+                        // nothing can present it again. Left attached, terminate: did nothing at
+                        // all: run with an NSAlert sheet and with an NSSavePanel, the app was
+                        // still there 12 s after the quit.
+                        for w in NSApp.windows { if let s = w.attachedSheet { w.endSheet(s, returnCode: .cancel) } }
                         original(app, sel, sender)
                     }
                 }
@@ -134,6 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Runs in `applicationWillFinishLaunching`, before the store is opened, so the redundant
     /// process exits without ever touching the index.
     func applicationWillFinishLaunching(_ notification: Notification) {
+        omniPerfLog("launch will-finish-launching model-built=\(AppModel.shared != nil)")
         Self.letQuitEndSheets()
         // The ARGUMENT domain, for the same reason as AppModel.isolatedByLaunchArgument: reading
         // the key itself meant a user who moved their index in Settings lost the single-instance
@@ -151,6 +173,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        MainActor.assumeIsolated { AppModel.shared?.sweepTemporaryFilesOnce() }
         // Services > Search in Omni, for text selected in any app (Info.plist NSServices).
         NSApp.servicesProvider = self
         NSAppleEventManager.shared().setEventHandler(self, andSelector: #selector(handleQuitEvent(_:withReplyEvent:)),
@@ -465,9 +488,11 @@ private struct OmniCommands: Commands {
             Button("Open") { model.openSelected() }
                 .keyboardShortcut(model.ocrMode ? nil : KeyboardShortcut("o", modifiers: .command))
                 .disabled(!sel.hasSelection || model.ocrMode)
+            // Not in OCR mode: the selection is a search result that is not on screen. Quick Look had
+            // no presenter there and opened by itself on the way back; Trash binned the unseen file.
             Button("Quick Look") { model.toggleQuickLook() }
                 .keyboardShortcut("y", modifiers: .command)
-                .disabled(!sel.hasSelection || multi)
+                .disabled(!sel.hasSelection || multi || model.ocrMode)
             Button("Show in Finder") { model.revealSelected() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
                 .disabled(!sel.hasSelection)
@@ -491,7 +516,7 @@ private struct OmniCommands: Commands {
             // editor's delete-to-line-start, so typing in the search box can never trash files.
             Button(multi ? "Move \(sel.pathsCount) Items to Trash" : "Move to Trash") { moveToTrashCommand() }
                 .keyboardShortcut(.delete, modifiers: .command)
-                .disabled(!sel.hasSelection)
+                .disabled(!sel.hasSelection || model.ocrMode)
             Divider()
             // Search-level actions in one group: start a search from a file, save the
             // current one. (A lone item between two separators reads as over-separation.)

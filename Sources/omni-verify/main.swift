@@ -4769,6 +4769,50 @@ if args.count >= 4 && args[1] == "searchreal" {
     exit(0)
 }
 
+// FILES RE-INDEXED ON A REAL INDEX, searched in their own folder: omni-verify basereusecheck <index.sqlite> [files]
+// Each file gets a new vector; the free list puts it in a hole below the quantized base, where the
+// base's per-position facts (folder, date) are still the old owner's. A search scoped to the file's
+// folder, and one for files changed since a minute ago, has to find it first (BaseReuseSearchTests,
+// end to end on a clone of a real index).
+if args.count >= 3 && args[1] == "basereusecheck" {
+    let store = try VectorStore(dbURL: URL(fileURLWithPath: args[2]))
+    defer { store.close() }
+    let want = (args.count >= 4 ? Int(args[3]) : nil) ?? 40
+    let dim = store.vectorDim
+    func unit(_ seed: Int) -> [Float] {
+        var s = UInt64(truncatingIfNeeded: seed &* 2_654_435_761 &+ 77), n: Float = 0
+        var v = [Float](repeating: 0, count: dim)
+        for i in 0 ..< dim { s ^= s << 13; s ^= s >> 7; s ^= s << 17; v[i] = Float(s >> 40) / Float(1 << 24) - 0.5; n += v[i] * v[i] }
+        let inv = 1 / n.squareRoot(); return v.map { $0 * inv }
+    }
+    var inDocs = SearchFilter()
+    inDocs.folderPrefix = (ProcessInfo.processInfo.environment["HOME"] ?? "") + "/Documents"
+    inDocs.kinds = ["text"]
+    var seen = Set<String>(), paths: [String] = []
+    for h in store.listMatching(filter: inDocs, topK: 4000) where seen.insert(h.path).inserted {
+        paths.append(h.path); if paths.count >= want { break }
+    }
+    _ = store.search(unit(1), topK: 10)   // the base is built over the index as it stands
+    let t0 = Date()
+    guard store.deletePaths(Set(paths)) else { print("basereusecheck: delete refused"); exit(1) }
+    let now = Date().timeIntervalSince1970
+    try store.replaceMany(paths.enumerated().map { i, p in
+        (p, [IndexedChunk(path: p, modified: now, size: 1, kind: "text", chunkIndex: 0, snippet: "reuse \(i)", embedding: unit(1000 + i))])
+    })
+    var plain = 0, folder = 0, since = 0
+    var recent = SearchFilter(); recent.since = now - 60
+    for (i, p) in paths.enumerated() {
+        let v = unit(1000 + i)
+        var f = SearchFilter(); f.folderPrefix = (p as NSString).deletingLastPathComponent
+        if store.search(v, topK: 10).first?.path == p { plain += 1 }
+        if store.search(v, filter: f, topK: 10).first?.path == p { folder += 1 }
+        if store.search(v, filter: recent, topK: 10).first?.path == p { since += 1 }
+    }
+    print(String(format: "BASEREUSECHECK files=%d found plain=%d in-folder=%d since=%d (%.1fs)",
+                 paths.count, plain, folder, since, -t0.timeIntervalSinceNow))
+    exit(0)
+}
+
 // THE MIGRATION READ GATE: omni-verify migprobe <modelDir> <index.sqlite> [activeSeconds]
 //
 // "Does the app still work during the migration" was only ever answered by a UI suite asserting

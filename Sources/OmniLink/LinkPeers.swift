@@ -31,29 +31,65 @@ public struct LinkPeer: Codable, Sendable, Identifiable, Equatable {
 }
 
 /// The linked Macs, in one 0600 JSON file. Thread-safe; every write persists.
+///
+/// WHAT CANNOT BE READ IS NOT "NO MACS". An undecodable or unreadable file used to give an empty list
+/// that the next pairing saved over every link, and pairing is what anyone does when the sidebar has
+/// just gone empty. A file that reads and does not decode is kept aside; one that will not read is
+/// left alone, nothing is written while it stays so, and each write tries it again first.
+///
+/// AND A SAVE THAT FAILS IS NOT A SAVE. A new link that the disk refuses fails where it was asked
+/// for (`put` throws, memory unchanged), since the other Mac would go on trusting a Mac that forgets
+/// it at the next launch. A revoke or an unlink holds in memory whatever the disk says, because that
+/// is the safe side for this session; `saveFailure` says it is not on disk, and every later write,
+/// and `retrySave`, tries again.
 public final class LinkPeerStore: @unchecked Sendable {
     private let url: URL
     private let lock = NSLock()
     private var peers: [LinkPeer]
+    /// Why the file could not be read, while it cannot: nothing is written over it.
+    private var unreadable: String?
+    private var unsaved: String?
 
     public init(url: URL) {
         self.url = url
-        if let d = try? Data(contentsOf: url), let p = try? JSONDecoder().decode([LinkPeer].self, from: d) {
-            peers = p
-        } else {
-            peers = []
+        peers = []
+        load()
+    }
+
+    /// Reads the file into `peers`, or says why not. Called with the lock held, or from init.
+    private func load() {
+        switch LinkFile.read(url) {
+        case .absent:
+            unreadable = nil
+        case .read(let d):
+            if let p = try? JSONDecoder().decode([LinkPeer].self, from: d) {
+                peers = p
+                unreadable = nil
+            } else {
+                do { try LinkFile.keepAside(url); unreadable = nil }
+                catch { unreadable = "\(error)" }
+            }
+        case .unreadable(let why):
+            unreadable = why
         }
     }
 
     public var all: [LinkPeer] { lock.withLock { peers } }
     public func peer(_ id: String) -> LinkPeer? { lock.withLock { peers.first { $0.id == id } } }
     public func peer(key: Data) -> LinkPeer? { lock.withLock { peers.first { $0.publicKey == key } } }
+    /// Why the file could not be read, while it cannot.
+    public var readFailure: String? { lock.withLock { unreadable } }
+    /// Why memory holds something the file does not, while it does.
+    public var saveFailure: String? { lock.withLock { unsaved } }
 
-    /// Insert or replace by id.
-    public func put(_ p: LinkPeer) {
-        lock.withLock {
+    /// Insert or replace by id. Throws if the file cannot take it, and then nothing has changed.
+    public func put(_ p: LinkPeer) throws {
+        try lock.withLock {
+            if unreadable != nil { load() }
+            if let unreadable { throw LinkError.storage("The list of linked Macs cannot be read: \(unreadable)") }
+            let before = peers
             if let i = peers.firstIndex(where: { $0.id == p.id }) { peers[i] = p } else { peers.append(p) }
-            save()
+            do { try save(); unsaved = nil } catch { peers = before; throw error }
         }
     }
 
@@ -63,26 +99,35 @@ public final class LinkPeerStore: @unchecked Sendable {
             guard let i = peers.firstIndex(where: { $0.id == id }) else { return nil }
             let before = peers[i]
             f(&peers[i])
-            if peers[i] != before { save() }
+            // Also with nothing new while a save is owed: it is the next chance to pay it.
+            if peers[i] != before || unsaved != nil { saveNoting() }
             return peers[i]
         }
     }
 
     public func remove(_ id: String) {
         lock.withLock {
+            guard unreadable == nil else { return }
             peers.removeAll { $0.id == id }
-            save()
+            saveNoting()
         }
     }
 
-    private func save() {
-        guard let d = try? JSONEncoder().encode(peers) else { return }
-        let fm = FileManager.default
-        try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let tmp = url.appendingPathExtension("tmp")
-        fm.createFile(atPath: tmp.path, contents: d, attributes: [.posixPermissions: 0o600])
-        _ = try? fm.replaceItemAt(url, withItemAt: tmp)
-        if !fm.fileExists(atPath: url.path) { try? fm.moveItem(at: tmp, to: url) }
+    /// Try again what the file did not take. True when memory and the file now agree.
+    @discardableResult
+    public func retrySave() -> Bool {
+        lock.withLock {
+            if unsaved != nil { saveNoting() }
+            return unsaved == nil
+        }
+    }
+
+    private func saveNoting() {
+        do { try save(); unsaved = nil } catch { unsaved = "\(error)" }
+    }
+
+    private func save() throws {
+        try LinkFile.write(try JSONEncoder().encode(peers), to: url)
     }
 }
 

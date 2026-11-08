@@ -235,4 +235,80 @@ final class EnrichmentTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(store.storedChunks(path: shot.path)).map { "\($0.kind)|\($0.locator)|\($0.snippet)" }, shotChunks)
         XCTAssertEqual(try XCTUnwrap(store.storedChunks(path: film.path)).map { "\($0.kind)|\($0.locator)" }, filmChunks)
     }
+
+    // MARK: - Failures are retried
+
+    /// `Fake` whose audio can be refused.
+    final class AudioRefused: Embedder, @unchecked Sendable {
+        let inner = Fake()
+        var refuse = true
+        var dim: Int { inner.dim }
+        func embedText(_ text: String, as type: OmniInputType) -> [Float] { inner.embedText(text, as: type) }
+        func embedTextBatch(_ texts: [String], as type: OmniInputType) -> [[Float]] { inner.embedTextBatch(texts, as: type) }
+        func embedImage(_ image: CGImage) -> [Float]? { inner.embedImage(image) }
+        func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? { inner.embedImages(raws) }
+        func embedVideoFrames(_ frames: [CGImage]) -> [Float]? { inner.embedVideoFrames(frames) }
+        func embedAudio(_ url: URL) -> [Float]? { refuse ? nil : inner.embedAudio(url) }
+        func embedAudioMel(_ mel: [Float], frames: Int) -> [Float]? { refuse ? nil : inner.embedAudioMel(mel, frames: frames) }
+        func embedAudioMelBatch(_ mels: [[Float]], frames: [Int]) -> [[Float]]? { refuse ? nil : inner.embedAudioMelBatch(mels, frames: frames) }
+    }
+
+    private func runPass(_ store: VectorStore, _ embedder: any Embedder, _ settings: IndexSettings) {
+        let done = expectation(description: "pass")
+        Indexer(store: store, embedder: embedder).index(roots: [root], settings: settings) { p in if p.done { done.fulfill() } }
+        wait(for: [done], timeout: 120)
+    }
+
+    /// The enrichment that failed on a file finished anyway, and the file went without for good.
+    func testAFileTheEnrichmentFailedOnIsTriedAgain() throws {
+        let clip = try video(seconds: 90, name: "clip.mp4")
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        var without = IndexSettings(enabledKinds: [.video])
+        without.soundtrack = false
+        let embedder = AudioRefused()
+        runPass(store, embedder, without)
+        XCTAssertFalse(try XCTUnwrap(store.storedChunks(path: clip.path)).contains { $0.kind == "audio" })
+        // The soundtrack comes on: the phase runs, and the tower refuses it.
+        let with = IndexSettings(enabledKinds: [.video])
+        runPass(store, embedder, with)
+        XCTAssertFalse(store.enrichLedger.backfilled, "a file not done was called done")
+        embedder.refuse = false
+        runPass(store, embedder, with)
+        XCTAssertTrue(try XCTUnwrap(store.storedChunks(path: clip.path)).contains { $0.kind == "audio" }, "it was never tried again")
+        XCTAssertTrue(store.enrichLedger.backfilled)
+    }
+
+    /// One that always fails stops being tried, or the phase runs at the end of every pass for good.
+    func testAFileThatAlwaysFailsStopsBeingTried() throws {
+        _ = try video(seconds: 90, name: "clip.mp4")
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        var without = IndexSettings(enabledKinds: [.video])
+        without.soundtrack = false
+        let embedder = AudioRefused()
+        runPass(store, embedder, without)
+        let with = IndexSettings(enabledKinds: [.video])
+        for expected in [false, false, true] {
+            runPass(store, embedder, with)
+            XCTAssertEqual(store.enrichLedger.backfilled, expected)
+        }
+    }
+
+    /// A soundtrack that failed at index time: "the enrichment pass retries it" only if one runs.
+    func testASoundtrackThatFailedAtIndexTimeIsTriedAgain() throws {
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        try "a note".write(to: root.appendingPathComponent("note.txt"), atomically: true, encoding: .utf8)
+        let settings = IndexSettings(enabledKinds: [.text, .video])
+        let embedder = AudioRefused()
+        runPass(store, embedder, settings)
+        XCTAssertTrue(store.enrichLedger.backfilled, "the index was not settled before the new file")
+        let clip = try video(seconds: 90, name: "clip.mp4")
+        runPass(store, embedder, settings)
+        XCTAssertFalse(try XCTUnwrap(store.storedChunks(path: clip.path)).isEmpty)
+        embedder.refuse = false
+        runPass(store, embedder, settings)
+        XCTAssertTrue(try XCTUnwrap(store.storedChunks(path: clip.path)).contains { $0.kind == "audio" }, "the soundtrack was never tried again")
+    }
 }

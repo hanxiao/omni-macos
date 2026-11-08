@@ -34,6 +34,7 @@ enum PerfScript {
                     let t0 = Date()
                     HangWatch.step = raw
                     if raw.hasPrefix("type:") { await type(String(raw.dropFirst(5)), model) }
+                    else if raw.hasPrefix("listen:") { await listen(String(raw.dropFirst(7)), model) }
                     else if raw.hasPrefix("intent:") {   // the App Intents search, as Shortcuts runs it
                         let files = (try? await OmniIntentSearch.run(String(raw.dropFirst(7)), limit: 5)) ?? []
                         omniPerfLog("script intent n=\(files.count) " + files.map { "\($0.name) [\($0.location)] \($0.passage.prefix(60))" }.joined(separator: " | "))
@@ -44,7 +45,8 @@ enum PerfScript {
                             try? await Task.sleep(for: .milliseconds(200))
                         }
                     }
-                    else { perform(raw, model) }
+                    else if raw.hasPrefix("ocrwait:") { await ocrWait(String(raw.dropFirst(8))) }
+                    else if !ocrStep(raw, model) { perform(raw, model) }
                     let pause = raw.hasPrefix("wait:") ? Double(raw.dropFirst(5)) ?? 0 : settle
                     try? await Task.sleep(for: .seconds(pause))
                     let cpu = (HangWatch.threadCPU() - cpu0) * 1000
@@ -55,6 +57,25 @@ enum PerfScript {
                 times = 1
             }
             omniPerfLog("script done")
+        }
+    }
+
+    /// Steps as a harness decides them, in a run it cannot script ahead: `<dir>/<n>` holds step lines,
+    /// run in order, then `<dir>/<n>.done` appears. Never returns.
+    private static func listen(_ dir: String, _ model: AppModel) async {
+        var n = 0
+        while true {
+            let path = "\(dir)/\(n)"
+            guard let text = try? String(contentsOfFile: path, encoding: .utf8) else {
+                try? await Task.sleep(for: .milliseconds(50))
+                continue
+            }
+            for step in text.split(separator: "\n").map(String.init) {
+                omniPerfLog("listen \(n) \(step)")
+                if step.hasPrefix("wait:") { try? await Task.sleep(for: .seconds(Double(step.dropFirst(5)) ?? 0)) } else { perform(step, model) }
+            }
+            try? "".write(toFile: path + ".done", atomically: true, encoding: .utf8)
+            n += 1
         }
     }
 
@@ -148,6 +169,19 @@ enum PerfScript {
             let nm = arg.split(separator: ":").compactMap { Int($0) }
             model.seedHistory(nm.first ?? 10_000, bookmarkEvery: nm.count > 1 ? nm[1] : 50)
         case "note": break   // a marker in the log for a harness to wait on
+        case "resign": NSApp.windows.first { $0.isVisible && $0.toolbar != nil }?.makeFirstResponder(nil)   // no text focused, as a click on a thumbnail leaves it
+        case "sheetroute":   // the single sheet route: progress | none
+            model.activeSheet = arg == "progress" ? .progress : nil
+        case "ocrdownloading": model.isOCRDownloading = arg == "on"
+        case "bcolumn": if let c = BrowserColumn(rawValue: arg) { BrowserColumnSettings.shared.toggle(c) }   // a browser column's header menu item
+        case "browserreload": model.requestBrowserReload()
+        case "linkscope": model.linkedScope = AppModel.LinkedScope(peer: arg, folder: nil)   // a linked Mac's row, with no peer needed
+        case "ocrdownloadfail": model.ocrDownloadFailed = true; model.ocrDownloadLabel = arg
+        case "ignorefolder": model.ignoreFolder(URL(fileURLWithPath: arg, isDirectory: true))   // Remove from Omni on a subfolder
+        case "sidebardump": NotificationCenter.default.post(name: .omniPerfSidebarSelect, object: "dump")   // log the sidebar's selection
+        case "sidebarphotos": NotificationCenter.default.post(name: .omniPerfSidebarSelect, object: "photos:" + arg)   // a click on a Photos row with this key
+        case "photodenied": model.showPhotoDenied = true   // what a denied Photos request raises
+        case "updateprompt": Updater.promptForPerfScript(url: arg)   // the update offer, as a check that found one makes it
         case "sidebarscroll":   // scroll the main window's sidebar: top, bottom, or a fraction 0...1
             if let w = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil && $0.title == "Omni" }),
                let outline = firstView(of: NSOutlineView.self, in: w.contentView), let sv = outline.enclosingScrollView {
@@ -257,6 +291,48 @@ enum PerfScript {
             if let i = Int(arg), model.link.peers.indices.contains(i) {
                 NotificationCenter.default.post(name: .omniPerfLinkFold, object: model.link.peers[i].id)
             }
+        case "linkgrant":   // linked Mac n's "Allow Searching This Mac": n:on | n:off
+            let parts = arg.split(separator: ":").map(String.init)
+            if let i = Int(parts[0]), model.link.peers.indices.contains(i) {
+                model.link.setAllowSearch(model.link.peers[i].id, parts.count > 1 && parts[1] == "on")
+                model.link.setAllowFetch(model.link.peers[i].id, parts.count > 1 && parts[1] == "on")
+            }
+        case "linkreopen":  // what the end of an index move does to the link
+            model.link.reopenAfterIndexMove()
+        case "linkopen":    // what a click on a linked Mac's result does, with the open reported: first | n
+            let index = arg == "first" ? model.results.firstIndex { RemotePath.isRemote($0.path) } : Int(arg)
+            if let i = index, model.results.indices.contains(i) {
+                model.withRemoteCopy(model.results[i].path) { url in omniPerfLog("linkopen delivered \(url.lastPathComponent)") }
+            }
+        case "linkcancel":  // the status line's Cancel
+            model.cancelRemoteOpen()
+        case "linkstate":   // what the Link window and the status line are working from
+            var parts = ["window=\(model.link.windowOpen)", "incoming=\(model.link.incoming?.name ?? "-")",
+                         "outgoing=\(model.link.outgoing.map { "\($0.name):\($0.code == nil ? "nocode" : "code"):\($0.error ?? "-"):\($0.linked)" } ?? "-")",
+                         "startFailure=\(model.link.startFailure ?? "-")", "port=\(model.link.port.map(String.init) ?? "-")",
+                         "remoteError=\(model.remoteError ?? "-")", "remoteOpening=\(model.remoteOpening ?? "-")",
+                         "scope=\(model.linkedScope?.peer ?? "-")", "scopeFailure=\(model.link.scopeFailure ?? "-")"]
+            for p in model.link.peers {
+                parts.append("\(p.name):\(model.link.state(p.id)) theyAllow=\(p.theyAllowSearch) allow=\(p.allowSearch) mixable=\(model.link.mixable[p.id].map(String.init) ?? "nil") fuses=\(model.link.fusesText[p.id].map(String.init) ?? "nil") sources=\(model.link.sources[p.id]?.count ?? -1)")
+            }
+            omniPerfLog("linkstate " + parts.joined(separator: " | "))
+        case "modelswitch":  // <small|nano>:<dir>: a model switch, the isolated run's model argument moved with it (process-local)
+            let parts = arg.split(separator: ":", maxSplits: 1).map(String.init)
+            if parts.count == 2, let v = ModelVariant(rawValue: parts[0]) {
+                var args = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+                args["omni.modelDir"] = parts[1]
+                UserDefaults.standard.setVolatileDomain(args, forName: UserDefaults.argumentDomain)
+                model.modelVariant = v
+                model.setModelDir(URL(fileURLWithPath: parts[1]))
+            }
+        case "modelreload":  // the engine and store attached again, as a switch to the same model does
+            model.retryBootstrap()
+        case "quit":
+            NSApp.terminate(nil)
+        case "closemain":   // the red button on the main window
+            NSApp.windows.first { $0.title == "Omni" }?.performClose(nil)
+        case "linkpaircancel":  // the sheet's Cancel while connecting or showing a code
+            model.link.cancelPairing()
         case "linkunlink":  // unlink linked Mac n, without the confirmation
             if let i = Int(arg), model.link.peers.indices.contains(i) { model.link.unlink(model.link.peers[i].id) }
         case "dumpui":   // what the window shows, as JSON at <path>: results with their copies, browser rows
@@ -281,6 +357,7 @@ enum PerfScript {
                 "results": groups,
                 "selection": model.selection ?? "",
                 "locators": model.rawResults.prefix(10).map { "\(($0.path as NSString).lastPathComponent)|\($0.locator)" },
+                "snippets": model.rawResults.prefix(10).map { "\(($0.path as NSString).lastPathComponent)|\($0.snippet)" },
                 "browseFolder": model.browserListingForPerf.folder,
                 "browse": model.browserListingForPerf.paths,
                 "clipboardOff": model.showsClipboardOff,
@@ -297,8 +374,16 @@ enum PerfScript {
                 "mapFolder": model.selectedFolderForViz?.path ?? "",
                 "filterFolders": model.filterFolders.map(\.path),
                 "servingState": "\(model.serving.state)",
+                "ignoreText": model.ignoreText,
+                "previewURL": model.previewURL?.path ?? "",
+                "filterRecents": model.filterRecents,
+                "photoDenied": model.showPhotoDenied,
+                "sidebarShown": model.sidebarShown,
+                "activeSheet": model.activeSheet.map { "\($0)" } ?? "",
             ]
-            if let data = try? JSONSerialization.data(withJSONObject: payload) {
+            var all = payload
+            for (k, v) in model.perfDump() { all[k] = v }
+            if let data = try? JSONSerialization.data(withJSONObject: all) {
                 try? data.write(to: URL(fileURLWithPath: arg), options: .atomic)
             }
         case "bench":       // Settings > Performance > Run benchmark (returns at once; the run goes on)
@@ -314,6 +399,38 @@ enum PerfScript {
         case "stall":       // the index watchdog's positive control: queue:<path> | flag
             let parts = arg.split(separator: ":", maxSplits: 1).map(String.init)
             model.makeStallForWatchdog(parts.first ?? "", path: parts.count > 1 ? parts[1] : "")
+        case "photosource": // photosource:<id>:<title>, the sidebar's click on a Photos source (no library access needed)
+            let parts = arg.split(separator: ":", maxSplits: 1).map(String.init)
+            model.enterPhotoSource(PhotoLibrary.Source(id: parts.first ?? "", title: parts.count > 1 ? parts[1] : "Source"))
+        case "back": model.goBack()
+        case "forward": model.goForward()
+        case "removefolder": model.removeRoot(URL(fileURLWithPath: arg, isDirectory: true))   // the sidebar's Remove
+        case "similarat":   // similarat:<file>:<source path>, a Find Similar whose file stands in for an indexed one
+            let parts = arg.split(separator: ":", maxSplits: 1).map(String.init)
+            if parts.count == 2 { model.setFileQuery(URL(fileURLWithPath: parts[0]), similar: false, sourcePath: parts[1]) }
+        case "filequery": model.setFileQuery(URL(fileURLWithPath: arg))   // Search by File
+        case "sheettest":   // an AppKit sheet on the main window, as the update prompt (alert) or the OCR save panel (save) puts up
+            if let w = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil }) {
+                if arg == "save" {
+                    NSSavePanel().beginSheetModal(for: w) { _ in omniPerfLog("sheettest save ended") }
+                } else {
+                    let a = NSAlert(); a.messageText = "Test prompt"; a.addButton(withTitle: "OK"); a.addButton(withTitle: "Later")
+                    a.beginSheetModal(for: w) { r in omniPerfLog("sheettest alert ended \(r.rawValue)") }
+                }
+                omniPerfLog("sheettest \(arg) attached=\(w.attachedSheet != nil)")
+            }
+        case "swiftsheet":  // the SwiftUI link sheet, then an AppKit one over nothing: the two routes together
+            model.activeSheet = .link
+        case "terminate": omniPerfLog("terminate asked"); NSApp.terminate(nil)   // what Cmd-Q and the Dock's Quit call
+        case "rebootstrap": model.retryBootstrap()   // a model switch or a reopen, on the model already in hand
+        case "movedb": Task { let r = await model.moveDatabaseDir(to: URL(fileURLWithPath: arg, isDirectory: true)); omniPerfLog("movedb result=\(r ?? "ok")") }
+        case "testseam": model.perfSeam(arg)   // see AppModel.perfSeam
+        case "shot":   // the main window, as cacheDisplay draws it (no Screen Recording needed), to <path>
+            if let w = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil }), let frame = w.contentView?.superview,
+               let rep = frame.bitmapImageRepForCachingDisplay(in: frame.bounds) {
+                frame.cacheDisplay(in: frame.bounds, to: rep)
+                try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: arg))
+            }
         case "cliinstall":  // Settings > Serving > Install... (point -omni.cliLinkDir at a scratch folder)
             let err = CommandLineTool.install()
             omniPerfLog("cli install \(err.map { $0.isEmpty ? "cancelled" : "failed: \($0)" } ?? "ok") state=\(CommandLineTool.state)")
@@ -426,7 +543,112 @@ extension Notification.Name {
 }
 
 
+/// The OCR workspace, driven and read from a script: the session's own calls, as its buttons make
+/// them, so a run in the app can reproduce a state machine's hole (review 2026-11-06). Steps:
+/// `ocropen:<path>[:<path>]`, `ocrleave`, `ocrstop`, `ocrpause`, `ocrresume`, `ocrselect:<page id>`,
+/// `ocrstep:<delta>`, `ocrtab:<index>`, `ocrtype:<text>` (a keystroke into the editor), `ocrfind:<text>`,
+/// `ocrdump:<path>`, `ocrwait:done>=N|running>=N|phase=<name>|settled|thumbs>=N`.
 extension PerfScript {
+    private static func ocrStep(_ step: String, _ model: AppModel) -> Bool {
+        guard step.hasPrefix("ocr"), let session = OCRSession.current else { return false }
+        let name = step.split(separator: ":", maxSplits: 1).first.map(String.init) ?? ""
+        let arg = step.split(separator: ":", maxSplits: 1).dropFirst().first.map(String.init) ?? ""
+        switch name {
+        case "ocropen": session.open(urls: arg.split(separator: ":").map { URL(fileURLWithPath: String($0)) })
+        case "ocrleave": model.ocrMode = false
+        case "ocrstop": session.cancel()
+        case "ocrpause": session.pause()
+        case "ocrresume": session.resume()
+        case "ocrselect": session.select(Int(arg) ?? 0)
+        case "ocrstep": session.step(by: Int(arg) ?? 1)
+        case "ocrtab":
+            if let i = Int(arg), session.documents.indices.contains(i) { session.selectDocument(id: session.documents[i].id) }
+        case "ocrfind": session.find = arg
+        case "ocrclosetab":   // a tab's close box
+            if let i = Int(arg), session.documents.indices.contains(i) { session.closeDocument(id: session.documents[i].id) }
+        case "ocrclear": session.clear()   // File > Close Document
+        case "ocrsave": session.exportMarkdown()   // File > Save Markdown
+        case "ocrroute":   // a drop of a web address onto the pane: DropRouter, on a private pasteboard
+            let pb = NSPasteboard(name: NSPasteboard.Name("omni.perf.route"))
+            pb.clearContents()
+            if let url = URL(string: arg) { pb.writeObjects([url as NSURL]) }
+            DropRouter.handle(pb, model: model, ocr: session)
+        case "ocrsend": Transcribe.send([arg], model: model, ocr: session)   // Transcribe on a result
+        case "ocrtype":
+            guard let editor = ocrEditor() else { omniPerfLog("ocrtype: no editor on screen"); return true }
+            editor.window?.makeFirstResponder(editor)
+            if arg == "<backspace>" { editor.deleteBackward(nil) }
+            else { editor.insertText(arg, replacementRange: editor.selectedRange()) }
+        case "ocrdump":
+            let payload = ocrSnapshot(session)
+            if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) {
+                try? data.write(to: URL(fileURLWithPath: arg), options: .atomic)
+            }
+        default: return false
+        }
+        return true
+    }
+
+    private static func ocrSnapshot(_ session: OCRSession) -> [String: Any] {
+        let done = session.pages.filter { $0.state == .done }.map(\.id)
+        return [
+            "phase": "\(session.phase)", "busy": session.isBusy,
+            "tabs": session.documents.map { ["id": $0.id, "name": $0.name, "pages": $0.pageIDs.count] as [String: Any] },
+            "visibleDocument": session.visibleDocument?.name ?? "",
+            "documentName": session.documentName, "runningDocumentName": session.runningDocumentName,
+            "states": session.pages.map { "\($0.id):\($0.state)\($0.truncatedByStop ? "/cut" : "")\($0.restored ? "/restored" : "")" },
+            "textCounts": session.pages.indices.map { session.texts.indices.contains($0) ? session.texts[$0].count : -1 },
+            "donePages": done,
+            "sections": session.sectionIDs,
+            "markdownChars": session.documentMarkdown.count,
+            "editorChars": ocrEditor()?.string.count ?? -1,
+            "editorTop": ocrEditor()?.enclosingScrollView?.contentView.bounds.origin.y ?? -1,
+            "edit": session.documentEdit?.count ?? -1,
+            "unsavedEdits": session.hasUnsavedEdits,
+            "readout": session.readoutVisible, "elapsed": session.elapsed,
+            "paused": session.isPaused, "holding": session.isHolding,
+            "groupRunning": session.isGroupRunning, "prefilled": session.prefilled, "prefillTarget": session.prefillTarget,
+            "queue": "\(session.queueCompleted) of \(session.queueTotal)",
+            "hasCompleted": session.hasCompletedPages, "completedPages": session.completedPages,
+            "notice": session.notice ?? "",
+            "selection": session.selection ?? -1, "visibleIndex": session.visibleIndex ?? -1, "railSelection": session.railSelection ?? -1,
+            "matches": session.matchCount,
+            "previewing": session.previewing?.path ?? "",
+            "thumbs": session.pages.filter { $0.thumbnail != nil }.count,
+            "time": Date().timeIntervalSince1970,
+        ]
+    }
+
+    /// Holds the script until the workspace is in the named state, five minutes at most.
+    private static func ocrWait(_ condition: String) async {
+        let t0 = Date()
+        func met(_ s: OCRSession) -> Bool {
+            func count(_ prefix: String) -> Int? { condition.hasPrefix(prefix) ? Int(condition.dropFirst(prefix.count)) : nil }
+            if let n = count("done>=") { return s.pages.filter { $0.state == .done }.count >= n }
+            if let n = count("running>=") { return s.pages.filter { $0.state == .running }.count >= n }
+            if let n = count("thumbs>=") { return s.pages.filter { $0.thumbnail != nil }.count >= n }
+            if condition.hasPrefix("phase=") { return "\(s.phase)".hasPrefix(condition.dropFirst(6)) }
+            if condition == "settled" { return !s.isBusy && !s.pages.contains { $0.state == .running } }
+            return true
+        }
+        while Date().timeIntervalSince(t0) < 300 {
+            if let s = OCRSession.current, met(s) { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        omniPerfLog(String(format: "ocrwait %@ %.1fs", condition, -t0.timeIntervalSinceNow))
+    }
+
+    /// The transcript's editor, if the workspace is showing it.
+    private static func ocrEditor() -> NSTextView? {
+        func find(_ view: NSView?) -> NSTextView? {
+            guard let view else { return nil }
+            if let text = view as? OCRSourceTextView, text.isEditable { return text }
+            for sub in view.subviews { if let hit = find(sub) { return hit } }
+            return nil
+        }
+        return find(NSApp.windows.first { $0.isVisible && $0.toolbar != nil }?.contentView)
+    }
+
     /// The first scroll view under `view`, depth first (settingsscroll).
     static func firstScrollView(in view: NSView?) -> NSScrollView? {
         guard let view else { return nil }

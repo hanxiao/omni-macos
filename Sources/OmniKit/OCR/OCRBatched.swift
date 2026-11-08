@@ -184,6 +184,7 @@ extension OCRModel {
     /// Rows the batch starts on before it widens. Four is enough that the first word lands in
     /// about a second and small enough that the ramp is over within a few steps.
     private static let rampRows = 4
+    private static let lastRowWait: TimeInterval = 0.5
 
     private func decodeContinuous(_ pages: [PreparedPage], width: Int, maxNewTokens requested: Int,
                                   loopGuard: Bool, loopReps: Int, loopGrace: Int,
@@ -278,6 +279,9 @@ extension OCRModel {
                 // A page its caller no longer wants (a closed tab) is never rendered or prefilled.
                 if shouldDrop?(nextPage) == true {
                     stopped[nextPage] = .cancelled
+                    // Its prefetch goes with it: left in place it stayed "for its page", no page ever
+                    // came for it, its pixels stayed held and no later page was prefetched.
+                    if let job = prefetch, job.page == nextPage { job.group.wait(); prefetch = nil }
                     nextPage += 1
                     continue
                 }
@@ -381,11 +385,13 @@ extension OCRModel {
             // what moves the wait off the front of the run.
             // The new row is the one just appended, NOT a running count: a compaction earlier in
             // the run renumbers the rows, and `filled` then indexed past the end. The buffer
-            // cannot grow past what was allocated either, so admission is capped by it.
-            if rowPage.count < w, rowPage.count < batchCaches[0].batch,
+            // cannot grow past what was allocated either, so a row dropped while admission was held
+            // (a search on the GPU) took the batch's width with it for good: it is put back here.
+            if rowPage.count < w,
                decodedSince >= OCRRuntimeFlags.rampDecodeShare * admitCost,
                shouldAdmit?() ?? true, let t = try nextReadable(),
                batchCaches[0].canAdmit(promptTokens: t) {
+                if rowPage.count >= batchCaches[0].batch { for cache in batchCaches { cache.widen(to: rowPage.count + 1) } }
                 let tAdmit = Date()
                 rowPage.append(-1)
                 rowPos.append(0)
@@ -499,7 +505,22 @@ extension OCRModel {
                 if !took { vacated.append(row) }
             }
             if !vacated.isEmpty {
-                let keep = rows.filter { !vacated.contains($0) }
+                var keep = rows.filter { !vacated.contains($0) }
+                // THE LAST ROW WAITS FOR ADMISSION, briefly, with pages left. Admission is held while
+                // a search is on the GPU, a matter of milliseconds, and a row that ended in those
+                // milliseconds left nothing to go on: the loop ended, every page not yet started came
+                // back cancelled with no text, and a served request reported them failed. A pause
+                // holds admission too, and that one is meant to drain to nothing: it costs this wait.
+                if keep.isEmpty, nextPage < n, shouldAdmit?() == false, shouldContinue?() ?? true {
+                    let deadline = Date().addingTimeInterval(Self.lastRowWait)
+                    while Date() < deadline, shouldAdmit?() == false, shouldContinue?() ?? true { usleep(2000) }
+                    if shouldAdmit?() ?? true, let t = try nextReadable(), batchCaches[0].canAdmit(promptTokens: t) {
+                        let row = vacated.removeFirst()
+                        try admit(row: row, page: nextPage)
+                        nextPage += 1
+                        keep = [row]
+                    }
+                }
                 if keep.isEmpty {
                     for cache in batchCaches { cache.keepRows(MLXArray([Int32]()), count: 0) }
                     rowPage = []

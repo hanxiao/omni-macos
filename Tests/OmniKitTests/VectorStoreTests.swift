@@ -181,6 +181,11 @@ final class VectorStoreTests: XCTestCase {
             }
             try store.replace(path: path, chunks: chunks)
         }
+        // The walk in slices of a few rows, so a plan spans many holds (folderWalkSliceRows).
+        let savedSlice = VectorStore.folderWalkSliceRows
+        defer { VectorStore.folderWalkSliceRows = savedSlice }
+        for slice in [savedSlice, 7]
+        { VectorStore.folderWalkSliceRows = slice
         for (cap, lcap) in [(Int.max, Int.max), (30, 8), (40, 40), (5, 5)] {
             let eager = store.vectorsUnderFolder("/d", cap: cap, landmarkCap: lcap)
             let streamed = store.vectorsUnderFolder("/d", cap: cap, landmarkCap: lcap, streaming: true)
@@ -199,6 +204,20 @@ final class VectorStoreTests: XCTestCase {
                 s = e
             }
             XCTAssertEqual(got, eager.vectors, "cap=\(cap): streamed floats differ from eager")
+        }
+        }
+        // A delete between two slices of the walk: the walk starts over and matches a pull taken after it.
+        do {
+            VectorStore.folderWalkSliceRows = 7
+            var hooked = false
+            VectorStore.folderWalkBetweenSlicesForTest = { hooked = true; store.deletePath("/d/f3.txt") }
+            defer { VectorStore.folderWalkBetweenSlicesForTest = nil; VectorStore.folderWalkSliceRows = savedSlice }
+            let cut = store.vectorsUnderFolder("/d", cap: .max, landmarkCap: 8, streaming: true)
+            XCTAssertTrue(hooked, "the probe: the walk never paused between slices")
+            let after = store.vectorsUnderFolder("/d", cap: .max, landmarkCap: 8)
+            XCTAssertFalse(cut.paths.contains("/d/f3.txt"), "a file deleted mid-walk was drawn")
+            XCTAssertEqual(cut.paths, after.paths)
+            XCTAssertEqual(cut.vectors, Array(after.vectors.prefix(cut.landmarkCount * dim)))
         }
         // A file deleted after the plan was made must not shift the rows after it.
         let streamed = store.vectorsUnderFolder("/d", cap: .max, landmarkCap: 4, streaming: true)

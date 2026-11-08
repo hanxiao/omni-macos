@@ -58,7 +58,10 @@ public final class StreamCursors: @unchecked Sendable {
     /// Every cursor, with its path.
     public var all: [(path: String, cursor: Cursor)] { lock.withLock { cursors.map { ($0.key, $0.value) } } }
 
-    public func set(_ path: String, _ c: Cursor) { lock.withLock { cursors[path] = c; save() } }
+    /// `save` false: in memory only, for the next write to carry (Indexer.settle).
+    public func set(_ path: String, _ c: Cursor, save saving: Bool = true) {
+        lock.withLock { cursors[path] = c; if saving { save() } }
+    }
 
     public func finish(_ path: String) {
         lock.withLock { guard cursors.removeValue(forKey: path) != nil else { return }; save() }

@@ -85,11 +85,22 @@ final class ExtractionQuarantineTests: XCTestCase {
         q.journal([("/a/big.pdf", 10, 100), ("/a/other.pdf", 11, 200)])
         q.finished(path: "/a/other.pdf")
         // The app dies here. Next launch:
+        ExtractionQuarantine.session = UUID().uuidString
         let next = ExtractionQuarantine(directory: dir)
         XCTAssertTrue(next.contains(path: "/a/big.pdf", modified: 10, size: 100))
         XCTAssertFalse(next.contains(path: "/a/other.pdf", modified: 11, size: 200), "a finished read was quarantined")
         XCTAssertFalse(next.contains(path: "/a/big.pdf", modified: 12, size: 100), "a changed file stayed quarantined")
         XCTAssertEqual(next.reason(for: "/a/big.pdf"), "Omni stopped while reading this file")
+    }
+
+    /// A new Indexer in the same process (a model switch while a long read runs) is not a crash.
+    func testANewInstanceInTheSameProcessDoesNotQuarantineALiveRead() throws {
+        let dir = try tempDir("q")
+        let q = ExtractionQuarantine(directory: dir)
+        q.journal([("/a/big.pdf", 10, 100)])
+        let same = ExtractionQuarantine(directory: dir)
+        XCTAssertFalse(same.contains(path: "/a/big.pdf", modified: 10, size: 100), "a read still running was quarantined as a crash")
+        XCTAssertEqual(same.count, 0)
     }
 
     func testACleanQuitClearsTheJournal() throws {

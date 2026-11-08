@@ -112,18 +112,23 @@ enum ChatOCRAdapter {
             case .success(let p): pages = p
             case .failure(let f): return ocrError(f)
             }
+            if let f = OCRServing.wholeRequestFailed(pages) { return ocrError(f) }
             let (prompt, completion) = tokenTotals(pages)
-            return HTTPResponse.json([
+            var reply: [String: Any] = [
                 "id": id, "object": "chat.completion", "created": created, "model": model,
                 "choices": [[
                     "index": 0,
                     "message": ["role": "assistant",
-                                "content": pages.map(\.markdown).joined(separator: OCRServing.pageSeparator)],
+                                "content": pages.map { $0.failed ? OCRServing.failedPageText : $0.markdown }
+                                    .joined(separator: OCRServing.pageSeparator)],
                     "finish_reason": finishReason(pages)
                 ]],
                 "usage": ["prompt_tokens": prompt, "completion_tokens": completion,
                           "total_tokens": prompt + completion]
-            ])
+            ]
+            let failed = pages.enumerated().filter(\.element.failed).map(\.offset)
+            if !failed.isEmpty { reply["failed_pages"] = failed }
+            return HTTPResponse.json(reply)
         }
 
         return HTTPResponse.eventStream { send in
@@ -143,7 +148,7 @@ enum ChatOCRAdapter {
             if !(await event(chunk(["role": "assistant", "content": ""]))) { gone.set() }
             let runner = Task {
                 let r = await job.run(onText: { ordered.update($0, $1) },
-                                      onDone: { ordered.finish($0, $1.markdown) },
+                                      onDone: { ordered.finish($0, $1.failed ? OCRServing.failedPageText : $1.markdown) },
                                       shouldContinue: { !gone.isSet })
                 sink.finish()
                 return r
@@ -157,6 +162,12 @@ enum ChatOCRAdapter {
             guard !gone.isSet else { return }
             switch result {
             case .success(let pages):
+                // Past the 200 that went out with the head, a failure can only be said in the stream.
+                if let f = OCRServing.wholeRequestFailed(pages) {
+                    _ = await event(["error": ["message": f.message, "type": "server_error"]])
+                    _ = await send(Data("data: [DONE]\n\n".utf8))
+                    return
+                }
                 _ = await event(chunk([:], finish: finishReason(pages)))
                 if includeUsage {
                     let (prompt, completion) = tokenTotals(pages)
@@ -229,19 +240,24 @@ enum DocumentOCRAdapter {
         case .success(let p): pages = p
         case .failure(let f): return ocrError(f)
         }
+        if let f = OCRServing.wholeRequestFailed(pages) { return ocrError(f) }
         let rows: [[String: Any]] = pages.map { p in
-            [
+            var row: [String: Any] = [
                 "index": p.index,
                 "markdown": p.markdown,
                 "images": [] as [Any],
                 // A cached page was not rendered for this request, so there is nothing to measure.
                 "dimensions": p.width > 0 ? ["dpi": p.dpi, "height": p.height, "width": p.width] : NSNull()
             ]
+            // Not in Mistral's shape, and a caller that does not read it still sees an empty page:
+            // this is how it tells that from a blank one.
+            if p.failed { row["failed"] = true }
+            return row
         }
         return HTTPResponse.json([
             "pages": rows,
             "model": job.modelID,
-            "usage_info": ["pages_processed": pages.count, "doc_size_bytes": document.bytes]
+            "usage_info": ["pages_processed": pages.filter { !$0.failed }.count, "doc_size_bytes": document.bytes]
         ])
     }
 }

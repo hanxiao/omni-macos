@@ -28,6 +28,10 @@ struct FolderEmbeddingVisualization: View {
     @State private var selectedIndex: Int?                // clicked point; its kNN stay lit, rest dimmed
     @State private var litNeighbors: [Int] = []           // the selected point's kNN row (for the overlay)
     @State private var positions: [SIMD2<Float>] = []     // model-space, row-aligned with colors/folderProjection
+    /// The projection generation `positions` was built from. A refit of the same count left the old
+    /// positions beside the new points until the rebuild landed, and a hover in that moment named the
+    /// file that now sits at the old dot's row (`nearestIndex`).
+    @State private var positionsGeneration = -1
     @State private var baseColors: [SIMD4<Float>] = []    // full per-point RGBA (pre-dimming)
     @State private var colors: [SIMD4<Float>] = []        // displayed RGBA (dimmed when a point is selected)
     @State private var bbox = SIMD4<Float>(0, 0, 1, 1)    // cached (cx, cy, extX, extY) for O(1) hit-test + ring
@@ -214,6 +218,7 @@ struct FolderEmbeddingVisualization: View {
             // under the cursor (hover tracks it); over empty space there's nothing to act on.
             .contextMenu { if let h = hovered { dotMenu(h) } }
             // Mouse-wheel / two-finger-scroll zoom (anchored at the cursor), gated to the map's frame.
+            .background(MapWindowProbe { scroller.window = $0 })
             .onAppear {
                 scroller.vizFrame = geo.frame(in: .global)
                 scroller.onScroll = { loc, f, sz in zoomAt(loc, factor: f, size: sz) }
@@ -387,6 +392,7 @@ struct FolderEmbeddingVisualization: View {
     /// inline - no per-point NSColor/Color allocation, so it stays cheap for 50k+ files.
     private func rebuildPoints() {
         let pts = model.folderProjection
+        let generation = model.projectionGeneration
         // Resolve the kind->HSB palette on the main actor: performAsCurrentDrawingAppearance is what
         // makes it adapt to light/dark, and it is only ~8 FileKinds, so it stays on @MainActor.
         var baseHSB: [String: (h: CGFloat, s: CGFloat, b: CGFloat)] = [:]
@@ -413,7 +419,7 @@ struct FolderEmbeddingVisualization: View {
         rebuildTask?.cancel()
         let noOverlap = model.mapNoOverlap
         rebuildTask = Task { @MainActor in
-            let built = await Task.detached(priority: .userInitiated) { () -> (pos: [SIMD2<Float>], col: [SIMD4<Float>], bbox: SIMD4<Float>, kinds: [FileKind], gridCols: Int)? in
+            let build = Task.detached(priority: .userInitiated) { () -> (pos: [SIMD2<Float>], col: [SIMD4<Float>], bbox: SIMD4<Float>, kinds: [FileKind], gridCols: Int)? in
                 var gridColsOut = 0
                 if Task.isCancelled { return nil }
                 var pos = [SIMD2<Float>](); pos.reserveCapacity(pts.count)
@@ -492,9 +498,13 @@ struct FolderEmbeddingVisualization: View {
                 let ext = pointwiseMax(mx - mn, SIMD2<Float>(1e-5, 1e-5))
                 let present = FileKind.allCases.filter { kindsSeen.contains($0.rawValue) }
                 return (pos, col, SIMD4<Float>((mn.x + mx.x) / 2, (mn.y + mx.y) / 2, ext.x, ext.y), present, gridColsOut)
-            }.value
+            }
+            // A detached task does not inherit this one's cancel, so the check at its top was never
+            // true and rapid switches stacked builds. Passed across by hand.
+            let built = await withTaskCancellationHandler { await build.value } onCancel: { build.cancel() }
             guard !Task.isCancelled, let built else { return }
             positions = built.pos
+            positionsGeneration = generation
             baseColors = built.col
             bbox = built.bbox
             presentKinds = built.kinds
@@ -605,7 +615,7 @@ struct FolderEmbeddingVisualization: View {
         let pts = positions
         // Row-aligned with folderProjection by construction; if a rebuild is mid-flight and they
         // disagree, resolve nothing this sample rather than index the shorter array.
-        guard !pts.isEmpty, pts.count == model.folderProjection.count else { return nil }
+        guard !pts.isEmpty, pts.count == model.folderProjection.count, positionsGeneration == model.projectionGeneration else { return nil }
         let cx = bbox.x, cy = bbox.y, extX = bbox.z, extY = bbox.w
         let rect = CGRect(origin: .zero, size: size).insetBy(dx: Self.inset, dy: Self.inset)
         let scale = min(rect.width / CGFloat(extX), rect.height / CGFloat(extY)) * effectiveZoom
@@ -640,12 +650,13 @@ private func pointwiseMax(_ a: SIMD2<Float>, _ b: SIMD2<Float>) -> SIMD2<Float> 
 final class ScrollZoomCatcher {
     var onScroll: ((_ location: CGPoint, _ factor: CGFloat, _ size: CGSize) -> Void)?
     var vizFrame: CGRect = .zero          // the map's frame in SwiftUI global coords
+    weak var window: NSWindow?            // the window it is in: coordinates alone also match Settings or Quick Look above it
     private var monitor: Any?
 
     func install() {
         guard monitor == nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
-            guard let self, let content = event.window?.contentView else { return event }
+            guard let self, event.window === self.window, let content = event.window?.contentView else { return event }
             let p = event.locationInWindow
             let sp = CGPoint(x: p.x, y: content.bounds.height - p.y)   // AppKit (bottom-left) -> SwiftUI (top-left)
             guard self.vizFrame.contains(sp) else { return event }     // not over the map: scroll normally
@@ -661,6 +672,17 @@ final class ScrollZoomCatcher {
     }
     func remove() { if let m = monitor { NSEvent.removeMonitor(m) }; monitor = nil; onScroll = nil }
     deinit { remove() }
+}
+
+/// Tells the scroll monitor which window the map is in.
+private struct MapWindowProbe: NSViewRepresentable {
+    let found: (NSWindow?) -> Void
+    final class Probe: NSView {
+        var found: ((NSWindow?) -> Void)?
+        override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); found?(window) }
+    }
+    func makeNSView(context: Context) -> Probe { let p = Probe(); p.found = found; return p }
+    func updateNSView(_ view: Probe, context: Context) {}
 }
 
 private extension Comparable {

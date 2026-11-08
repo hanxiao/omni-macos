@@ -26,6 +26,10 @@ final class LinkController {
     private(set) var peers: [LinkPeer] = []
     private(set) var states: [String: LinkNode.PeerState] = [:]
     private(set) var available: [LinkNode.Discovered] = []
+    /// Why `available` cannot fill, or nil (LinkNode.discoveryProblem).
+    private(set) var discoveryIssue: String?
+    /// TEST: what the browser says with Local Network access denied (PerfScript).
+    var discoveryIssueForTest: String? { didSet { discoveryIssue = discoveryIssueForTest ?? node?.discoveryIssue } }
     private(set) var port: UInt16?
     private(set) var windowOpen = false
     /// Whether this Mac is in the same vector space as each linked Mac (nil until known). Same
@@ -36,6 +40,11 @@ final class LinkController {
     private(set) var fusesText: [String: Bool] = [:]
     /// Each linked Mac's sources, as it last reported them.
     private(set) var sources: [String: [LinkWire.Source]] = [:]
+    /// Why Linked Macs cannot start, while they cannot (no index folder, a key file that will not
+    /// read). The Link window says so; Link used to do nothing with no word why.
+    private(set) var startFailure: String?
+    /// Why the last scoped search reached nothing: "no results" and "could not ask" are not the same.
+    var scopeFailure: String?
     var incoming: IncomingPairing?
     var incomingMessage: String?
     /// This Mac just accepted a link from the Mac named here (its sheet shows the success view).
@@ -48,13 +57,27 @@ final class LinkController {
     let model: String
 
     @ObservationIgnored let responder = LinkResponder()
+    /// The linked Macs for whoever asks off the main actor: served searches, and the reply cache.
+    nonisolated let served = LinkServed()
     @ObservationIgnored private var node: LinkNode?
     @ObservationIgnored private var pairTask: Task<Void, Never>?
-    @ObservationIgnored private var cache: [String: (at: Date, hits: [SearchHit])] = [:]
+    /// Which pairing the sheet is about. A task from an earlier attempt wrote into the current one:
+    /// a typed address failing late put its error on the Mac picked after Cancel.
+    @ObservationIgnored private var pairAttempt = 0
     @ObservationIgnored private var refreshQueued = false
+    /// A linked Mac's facts being learned; each ends known, or gives up only when the Mac goes
+    /// offline or stops sharing, and is started again by what ended that.
+    @ObservationIgnored private var learning: [String: Task<Void, Never>] = [:]
+    /// The other Mac's service generation when its facts were learned.
+    @ObservationIgnored private var learnedGeneration: [String: Int] = [:]
+    /// Which fetch the status line is about (AppModel.withRemoteCopy). A path alone cannot tell a
+    /// fetch from the one started after its Cancel.
+    @ObservationIgnored var remoteOpenToken = 0
     /// Called when a linked Mac has come online and its vector space is known: AppModel re-runs
     /// the visible search, so a Mac that comes back joins the results without a keystroke.
     @ObservationIgnored var onPeerReady: ((String) -> Void)?
+    /// A linked Mac left the list (unlinked on either side).
+    @ObservationIgnored var onPeerGone: ((String) -> Void)?
     /// The local index's space probe, read by AppModel when the index opens.
     @ObservationIgnored var localSpace: (dim: Int, probe: [Float]?) = (0, nil)
 
@@ -83,6 +106,18 @@ final class LinkController {
         return (try? AppModel.indexURL())?.deletingLastPathComponent().appendingPathComponent("link", isDirectory: true)
     }
 
+    /// Where the link folder stayed when the index moved before moves carried it along: the folder
+    /// the app's index starts in. A test passes `-omni.link.legacyDir`; any other isolated run has no
+    /// such place, and must never read the real one.
+    private static var legacyDirectory: URL? {
+        let args = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+        if let p = args["omni.link.legacyDir"] as? String, !p.isEmpty { return URL(fileURLWithPath: p, isDirectory: true) }
+        guard !AppModel.isolatedByLaunchArgument,
+              let base = try? FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask,
+                                                      appropriateFor: nil, create: false) else { return nil }
+        return base.appendingPathComponent("Omni/link", isDirectory: true)
+    }
+
     static var configuredPort: UInt16 {
         let p = UserDefaults.standard.integer(forKey: "omni.link.port")
         return p > 0 && p < 65536 ? UInt16(p) : LinkNode.defaultPort
@@ -91,10 +126,20 @@ final class LinkController {
     /// Bring the node up if this Mac has linked Macs (or `force`, for the Link window). A Mac that
     /// never linked anything never creates an identity, never listens, never browses.
     private func start(force: Bool) {
-        guard node == nil, let dir = Self.linkDirectory() else { return }
+        guard node == nil else { return }
+        guard let dir = Self.linkDirectory() else {
+            startFailure = "The index folder is not available."
+            return
+        }
+        // An index moved before moves carried this folder left the key and the peers behind, and the
+        // next launch found neither: cut off from every linked Mac, with nothing to say why.
+        if let old = Self.legacyDirectory, LinkFile.adopt(from: old, to: dir) {
+            omniPerfLog("link: adopted the link folder left at \(old.path)")
+        }
         let peersURL = dir.appendingPathComponent("peers.json")
         let store = LinkPeerStore(url: peersURL)
-        guard force || !store.all.isEmpty else { return }
+        if let why = store.readFailure { omniPerfLog("link: peers: \(why)") }
+        guard force || !store.all.isEmpty else { startFailure = nil; return }
         do {
             let identity = try LinkIdentity.loadOrCreate(at: dir.appendingPathComponent("identity"))
             let version = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "dev"
@@ -106,29 +151,42 @@ final class LinkController {
             n.onChange = { [weak self] in Task { @MainActor in self?.scheduleRefresh() } }
             n.onLog = { line in if omniPerfEnabled { omniPerfLog("link \(line)") } }
             n.onPairingRequest = { [weak self] req in Task { @MainActor in self?.present(req) } }
-            node = n
-            RemoteFiles.shared.attach(n)
+            n.onStorageFailure = { [weak self] why in Task { @MainActor in self?.saveFailed(why) } }
+            setNode(n)
+            startFailure = nil
             n.reconcile()
+            // The sheet is open already: a node that arrives under it (the folder came back, the
+            // index moved) has to know, or requests hear "Open Link a Mac first" with it on screen.
+            if windowOpen { n.setPairingWindow(true) }
             refresh()
         } catch {
+            startFailure = LinkController.describe(error)
             omniPerfLog("link: identity failed: \(error)")
         }
     }
 
+    /// The index is here now. `start` runs at init, when the folder may not have been: a volume not
+    /// mounted yet at launch left the node down for the session.
+    func startIfItCanNow() { start(force: windowOpen) }
+
     /// The index moved and this folder with it (IndexRelocation.companionFolders). The running node
     /// would go on writing the peers to the old place, and the next launch would read the new one.
     func reopenAfterIndexMove() {
-        guard let old = node else { return }   // never linked: nothing to reopen
-        old.stop()
-        node = nil
-        RemoteFiles.shared.attach(nil)
-        start(force: showWindow)
-        if showWindow { node?.setPairingWindow(true) }
+        pairTask?.cancel(); pairTask = nil
+        pairAttempt += 1
+        node?.retire()
+        setNode(nil)
+        // `windowOpen`, not `showWindow`: that is a pulse ContentView has already turned back to false.
+        start(force: windowOpen)
+    }
+
+    private func setNode(_ n: LinkNode?) {
+        node = n
+        served.attach(n)
+        RemoteFiles.shared.attach(n)
     }
 
     var thisID: String? { node?.identity.id }
-
-    // MARK: - State
 
     private func scheduleRefresh() {
         guard !refreshQueued else { return }
@@ -145,16 +203,34 @@ final class LinkController {
         guard let node else { return }
         let p = node.peers.all.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         let s = node.states
+        let generations = node.serviceGenerations
+        // What is known of a linked Mac changes on more than the online edge: a grant switched on, or
+        // its service moving under a link that stays up (an engine arriving, a model switch).
+        let before = peers
         let wentOnline = p.map(\.id).filter { s[$0] == .online && states[$0] != .online }
+        let granted = p.filter { q in q.theyAllowSearch && s[q.id] == .online && before.first { $0.id == q.id }?.theyAllowSearch == false }.map(\.id)
+        let moved = p.map(\.id).filter { id in
+            guard s[id] == .online, let g = generations[id], let known = learnedGeneration[id] else { return false }
+            return g != known
+        }
         if peers != p { peers = p }
         if states != s { states = s }
         let a = node.available
         if available != a { available = a }
+        let issue = discoveryIssueForTest ?? node.discoveryIssue
+        if discoveryIssue != issue { discoveryIssue = issue }
         let port = node.port
         if self.port != port { self.port = port }
-        for id in wentOnline { learn(id) }
-        let gone = Set(mixable.keys).subtracting(p.map(\.id))
-        for id in gone { mixable[id] = nil; fusesText[id] = nil; sources[id] = nil; RemoteFiles.shared.forget(peer: id) }
+        for id in Set(wentOnline + granted) { learn(id) }
+        for id in moved where learning[id] == nil { learn(id) }
+        let left = Set(before.map(\.id)).subtracting(p.map(\.id))
+        let gone = Set(mixable.keys).union(left).subtracting(p.map(\.id))
+        for id in gone {
+            mixable[id] = nil; fusesText[id] = nil; sources[id] = nil
+            learning.removeValue(forKey: id)?.cancel(); learnedGeneration[id] = nil
+            RemoteFiles.shared.forget(peer: id)
+        }
+        for id in left { onPeerGone?(id) }
     }
 
     func state(_ id: String) -> LinkNode.PeerState { states[id] ?? .offline }
@@ -172,14 +248,33 @@ final class LinkController {
         peers.filter { $0.theyAllowSearch && isOnline($0.id) && (only == nil || $0.id == only) }
     }
 
-    /// On connect: the other Mac's vector space (mix or group?) and its sources (the sidebar).
+    /// The other Mac's vector space (mix or group?) and its sources (the sidebar), until they are
+    /// known. A failure was dropped, so "still starting" or one slow answer lasted as long as the
+    /// link did: no mixing, no folder rows, and that Mac embedding every query itself.
     private func learn(_ id: String) {
         guard let node else { return }
-        Task { [weak self] in
-            if let r = try? await node.call(id, "space", timeout: 10), let sp = try? r.decode(LinkWire.Space.self) {
-                await MainActor.run { self?.noteSpace(id, sp) }
+        learning[id]?.cancel()
+        learning[id] = Task { [weak self] in
+            defer { if !Task.isCancelled { self?.learning[id] = nil } }   // cancelled: a newer run holds the entry
+            var wait: Double = 2
+            while !Task.isCancelled {
+                guard let self, self.isOnline(id), self.peer(id)?.theyAllowSearch != false else { return }
+                do {
+                    let r = try await node.call(id, "space", timeout: 10)
+                    let sp = try r.decode(LinkWire.Space.self)
+                    guard !Task.isCancelled else { return }
+                    self.noteSpace(id, sp)
+                    try await self.loadSources(id)
+                    return
+                } catch {
+                    guard !Task.isCancelled else { return }
+                    omniPerfLog("link \(id): facts not learned (\(LinkController.describe(error))); again in \(Int(wait)) s")
+                    // Not `try? await Task.sleep` as a wait that guards anything: a cancel ends it at
+                    // once, and the loop's head then leaves.
+                    try? await Task.sleep(for: .seconds(wait))
+                    wait = min(wait * 2, 60)
+                }
             }
-            await self?.reloadSources(id)
         }
     }
 
@@ -191,8 +286,11 @@ final class LinkController {
             for i in 0 ..< a.count { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i] }
             same = dot / max((na * nb).squareRoot(), 1e-12) >= 0.999
         }
+        // A reply cached under the old space ranks on the wrong scale.
+        if mixable[id] != same || learnedGeneration[id] != sp.generation { served.forgetReplies(peer: id) }
         if mixable[id] != same { mixable[id] = same }
         if fusesText[id] != (sp.fusesText == true) { fusesText[id] = sp.fusesText == true }
+        learnedGeneration[id] = sp.generation
         omniPerfLog("link \(id): space dim=\(sp.dim) model=\(sp.model) mixable=\(same)")
         onPeerReady?(id)
     }
@@ -200,9 +298,11 @@ final class LinkController {
     /// Re-check every linked Mac's space (this Mac's index or model changed).
     func localSpaceChanged() { for p in peers where isOnline(p.id) { learn(p.id) } }
 
-    func reloadSources(_ id: String) async {
-        guard let node, let r = try? await node.call(id, "sources", timeout: 10),
-              let s = try? r.decode(LinkWire.Sources.self) else { return }
+    func reloadSources(_ id: String) async { try? await loadSources(id) }
+
+    private func loadSources(_ id: String) async throws {
+        guard let node else { return }
+        let s = try await node.call(id, "sources", timeout: 10).decode(LinkWire.Sources.self)
         if sources[id] != s.sources { sources[id] = s.sources }
     }
 
@@ -210,6 +310,9 @@ final class LinkController {
 
     func openWindow() {
         start(force: true)
+        // The sheet hangs off the main window, and a closed window runs nothing that would show it:
+        // File > Link a Mac did nothing, with no sheet and the window flag still false 2 s later.
+        if NSApp.windows.first(where: { $0.toolbar != nil })?.isVisible != true { AppDelegate.showMainWindow() }
         showWindow = true
     }
 
@@ -220,6 +323,7 @@ final class LinkController {
         node?.setPairingWindow(open)
         if !open {
             pairTask?.cancel(); pairTask = nil
+            pairAttempt += 1
             outgoing = nil
             incoming?.cancel(); incoming = nil
             incomingMessage = nil; incomingLinked = nil
@@ -227,24 +331,36 @@ final class LinkController {
     }
 
     func pair(_ endpoint: NWEndpoint, name: String) {
-        guard let node else { return }
+        guard let node else {
+            outgoing = Outgoing(name: name, error: startFailure ?? "Linked Macs could not start.")
+            return
+        }
         pairTask?.cancel()
+        pairAttempt += 1
+        let attempt = pairAttempt
         outgoing = Outgoing(name: name)
         let share = alsoShare
         pairTask = Task { [weak self] in
             do {
                 let peer = try await node.pair(endpoint, alsoShare: share) { code, name in
-                    Task { @MainActor in self?.outgoing?.code = code; self?.outgoing?.name = name }
+                    Task { @MainActor in
+                        guard let self, self.pairAttempt == attempt else { return }
+                        self.outgoing?.code = code; self.outgoing?.name = name
+                    }
                 }
                 await MainActor.run {
-                    self?.outgoing = Outgoing(name: peer.name, code: nil, error: nil, linked: true)
                     self?.refresh()
+                    guard self?.pairAttempt == attempt else { return }
+                    self?.outgoing = Outgoing(name: peer.name, code: nil, error: nil, linked: true)
                 }
             } catch is CancellationError {
             } catch LinkError.cancelled {
             } catch {
                 let text = Self.describe(error)
-                await MainActor.run { self?.outgoing?.error = text; self?.outgoing?.code = nil }
+                await MainActor.run {
+                    guard let self, self.pairAttempt == attempt else { return }
+                    self.outgoing?.error = text; self.outgoing?.code = nil
+                }
             }
         }
     }
@@ -259,10 +375,14 @@ final class LinkController {
 
     func cancelPairing() {
         pairTask?.cancel(); pairTask = nil
+        pairAttempt += 1
         outgoing = nil
     }
 
     private func present(_ req: IncomingPairing) {
+        // It can end between the reveal and here: the other Mac cancelled, or lost the network. A
+        // sheet for it would have nothing that could ever close it.
+        guard !req.isOver else { return }
         incoming?.cancel()
         incoming = req
         incomingMessage = nil; incomingLinked = nil
@@ -297,7 +417,7 @@ final class LinkController {
         switch error {
         case let e as LinkError:
             switch e {
-            case .refused(let s), .remote(let s): return s
+            case .refused(let s), .remote(let s), .storage(let s), .identity(let s): return s
             case .timeout: return "No answer."
             case .closed: return "Connection closed."
             default: return e.description
@@ -324,6 +444,7 @@ final class LinkController {
         }
         node.pushGrants(id)
         refresh()
+        reportUnsaved(node)
     }
 
     func setAllowFetch(_ id: String, _ on: Bool) {
@@ -331,6 +452,7 @@ final class LinkController {
         node.peers.update(id) { p in p.allowFetch = on && p.allowSearch }
         node.pushGrants(id)
         refresh()
+        reportUnsaved(node)
     }
 
     func unlink(_ id: String) {
@@ -338,26 +460,38 @@ final class LinkController {
         Task {
             await node.unlink(id)
             RemoteFiles.shared.forget(peer: id)
-            await MainActor.run { self.refresh() }
+            await MainActor.run {
+                self.refresh()
+                self.reportUnsaved(node)
+            }
         }
+    }
+
+    /// A change the disk did not take holds until Omni quits, and then comes back: the user who just
+    /// revoked a grant is told, and the store goes on trying (every later write, and here).
+    private func reportUnsaved(_ node: LinkNode) {
+        guard let why = node.peers.saveFailure else { return }
+        saveFailed(why)
+        Task { [weak self] in
+            for _ in 0 ..< 40 {
+                try? await Task.sleep(for: .seconds(30))
+                guard self?.node === node else { return }
+                if node.peers.retrySave() { return }
+            }
+        }
+    }
+
+    private func saveFailed(_ why: String) {
+        omniPerfLog("link: \(why)")
+        AppModel.shared?.remoteError = "Linked Macs could not be saved. This change lasts until Omni quits. \(why)"
     }
 
     func retry(_ id: String) { node?.retry(id) }
 
     // MARK: - Asking linked Macs
 
-    /// Search one linked Mac. A repeat of the same request within a few seconds is answered from
-    /// the last reply: a live refresh of this Mac's results (its index changed, not the other's)
-    /// must not send the other Mac the same search again.
-    func search(_ req: LinkWire.SearchRequest, peer: String, timeout: Double) async throws -> [SearchHit] {
-        guard let node else { throw LinkError.refused("off") }
-        let key = peer + "\u{1}" + ((try? JSONEncoder().encode(req)).map { String(decoding: $0, as: UTF8.self) } ?? "")
-        if let c = cache[key], Date().timeIntervalSince(c.at) < 20 { return c.hits }
-        let reply = try await node.call(peer, "search", .json(req), timeout: timeout).decode(LinkWire.SearchReply.self)
-        let hits = reply.hits.map { $0.hit(peer: peer) }
-        if cache.count > 64 { cache = cache.filter { Date().timeIntervalSince($0.value.at) < 20 } }
-        cache[key] = (Date(), hits)
-        return hits
+    nonisolated func search(_ req: LinkWire.SearchRequest, peer: String, timeout: Double) async throws -> [SearchHit] {
+        try await served.search(req, peer: peer, timeout: timeout)
     }
 
     func similar(_ remote: String) async throws -> (hits: [SearchHit], vector: [Float]?) {
@@ -395,5 +529,49 @@ final class LinkController {
             }
         }
         return "\(name(of: peer)) \u{203A} \(dir)"
+    }
+}
+
+/// The linked Macs as code off the main actor sees them, read straight from the node: its peers are
+/// behind a lock, and its connection states on a queue that never waits on anything remote.
+///
+/// NOTHING PER SERVED REQUEST WAITS ON THE MAIN ACTOR. A default MCP or `omni` search asks every
+/// linked Mac, so it hopped through AppModel on every request, with no linked Mac at all and even
+/// after the sources snapshot had been taken off the main thread: 5.2 s for a served search under a
+/// main thread held for 6 s, 19 ms once it was free.
+final class LinkServed: @unchecked Sendable {
+    private let lock = NSLock()
+    private var node: LinkNode?
+    private var cache: [String: (at: Date, hits: [SearchHit])] = [:]
+
+    func attach(_ n: LinkNode?) { lock.withLock { node = n; cache = [:] } }
+
+    /// That Mac's model or index moved: what it answered before ranks on another scale.
+    func forgetReplies(peer: String) {
+        lock.withLock { cache = cache.filter { !$0.key.hasPrefix(peer + "\u{1}") } }
+    }
+
+    fileprivate var current: LinkNode? { lock.withLock { node } }
+    var peers: [LinkPeer] { current?.peers.all ?? [] }
+    func isOnline(_ id: String) -> Bool { current?.state(of: id) == .online }
+
+    /// Search one linked Mac. A repeat of the same request within a few seconds is answered from
+    /// the last reply: a live refresh of this Mac's results (its index changed, not the other's)
+    /// must not send the other Mac the same search again.
+    func search(_ req: LinkWire.SearchRequest, peer: String, timeout: Double) async throws -> [SearchHit] {
+        guard let node = current else { throw LinkError.refused("off") }
+        let key = peer + "\u{1}" + ((try? JSONEncoder().encode(req)).map { String(decoding: $0, as: UTF8.self) } ?? "")
+        let hit: [SearchHit]? = lock.withLock {
+            guard let c = cache[key], Date().timeIntervalSince(c.at) < 20 else { return nil }
+            return c.hits
+        }
+        if let hit { return hit }
+        let reply = try await node.call(peer, "search", .json(req), timeout: timeout).decode(LinkWire.SearchReply.self)
+        let hits = reply.hits.map { $0.hit(peer: peer) }
+        lock.withLock {
+            if cache.count > 64 { cache = cache.filter { Date().timeIntervalSince($0.value.at) < 20 } }
+            cache[key] = (Date(), hits)
+        }
+        return hits
     }
 }

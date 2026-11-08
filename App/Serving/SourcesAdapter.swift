@@ -112,20 +112,21 @@ struct SourcesControl: Sendable {
     var linkedFetch: (@Sendable (_ mac: String, _ path: String) async -> (path: String?, error: String?))? = nil
 }
 
-/// Stale-while-revalidate over `SourcesControl.snapshot`: the first caller waits for a snapshot;
-/// after that every caller gets the last one at once, and one that finds it over a second old
-/// starts a single refresh in the background.
-final class RecentSnapshot: @unchecked Sendable {
+/// Stale-while-revalidate over app state on the main actor (`SourcesControl.snapshot`, the linked
+/// responder's facts): the first caller waits for a snapshot, unless one was seeded; after that every
+/// caller gets the last one at once, and one that finds it over a second old starts a single refresh
+/// in the background.
+final class RecentValue<Value: Sendable>: @unchecked Sendable {
     private let lock = NSLock()
-    private var value: SourcesSnapshot?
+    private var value: Value?
     private var at = Date.distantPast
     private var refreshing = false
-    private let fetch: @Sendable () async -> SourcesSnapshot
+    private let fetch: @Sendable () async -> Value
 
-    init(_ fetch: @escaping @Sendable () async -> SourcesSnapshot) { self.fetch = fetch }
+    init(_ fetch: @escaping @Sendable () async -> Value) { self.fetch = fetch }
 
-    func get() async -> SourcesSnapshot {
-        let (cached, refresh) = lock.withLock { () -> (SourcesSnapshot?, Bool) in
+    func get() async -> Value {
+        let (cached, refresh) = lock.withLock { () -> (Value?, Bool) in
             let stale = -at.timeIntervalSinceNow > 1
             let start = value != nil && stale && !refreshing
             if start { refreshing = true }
@@ -140,7 +141,10 @@ final class RecentSnapshot: @unchecked Sendable {
         return s
     }
 
-    private func store(_ s: SourcesSnapshot) {
+    /// A value already in hand, so that no caller has to wait for the first one.
+    func seed(_ v: Value) { store(v) }
+
+    private func store(_ s: Value) {
         lock.withLock { value = s; at = Date(); refreshing = false }
     }
 }

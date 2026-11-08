@@ -150,6 +150,15 @@ struct FolderBrowser: View {
         // Finder's content-view keys, in both layouts: see ContentKeyMonitor.
         .background(ContentKeyMonitor(nav: { keyNav }, isPreviewOpen: { model.previewURL != nil }))
         .task(id: folder) { await reload() }
+        // Tags and the indexed figures are fetched only while a column shows them, so switching one
+        // on has to load it: only Tags did, and folders read 0 until the next reload.
+        .onChange(of: columns.visible) { old, now in
+            let fetched: [BrowserColumn] = [.tags, .filesIndexed, .dateIndexed, .dateAdded]
+            if fetched.contains(where: { now.contains($0) && !old.contains($0) }) { Task { await reload(quiet: true) } }
+        }
+        // The model drops its selection when the folder changes. A row left lit here looked selected
+        // with Space and Share dead until the next click.
+        .background(SelectionPruneWatcher { selected = nil })
         // Something removed files behind our back (a trash, an ignore rule): re-list rather than
         // leave a row pointing at a file that is gone.
         .onChange(of: model.browserReloadTick) { _, _ in Task { await reload(quiet: true) } }
@@ -313,8 +322,6 @@ struct FolderBrowser: View {
                 get: { columns.isOn(col) },
                 set: { _ in
                     columns.toggle(col)
-                    // Tags are only fetched when the column is on, so switching it on has to reload.
-                    if col == .tags { Task { await reload() } }
                 }))
         }
     }
@@ -579,6 +586,10 @@ struct FolderBrowser: View {
         // with itself and could never see a faster click: a slow listing landed over the new folder.
         let children = await model.indexedChildrenDetailed(of: url, aggregates: false)
         guard url == model.filterFolder else { return }        // a faster click already moved us on
+        // A quiet reload lists the same folders again: they keep the figures they have until the
+        // counts below arrive. Written as 0 here, every folder read 0 for as long as the counts took
+        // (2.4 s on a large root), and sorted by Files Indexed the rows jumped and jumped back.
+        let known = quiet ? Dictionary(entries.filter(\.isDirectory).map { ($0.url.path, $0) }, uniquingKeysWith: { a, _ in a }) : [:]
         var tagsByPath: [String: [String]] = [:]
         if columns.isOn(.tags) {
             tagsByPath = await model.tags(inFolder: url)
@@ -591,10 +602,10 @@ struct FolderBrowser: View {
                   isDirectory: c.isDirectory,
                   modified: Date(timeIntervalSince1970: c.modified),
                   kind: c.kind,
-                  indexedAt: c.indexedAt > 0 ? Date(timeIntervalSince1970: c.indexedAt) : nil,
-                  firstIndexedAt: c.firstIndexedAt > 0
-                      ? Date(timeIntervalSince1970: c.firstIndexedAt) : nil,
-                  fileCount: c.fileCount,
+                  indexedAt: known[c.path]?.indexedAt ?? (c.indexedAt > 0 ? Date(timeIntervalSince1970: c.indexedAt) : nil),
+                  firstIndexedAt: known[c.path]?.firstIndexedAt
+                      ?? (c.firstIndexedAt > 0 ? Date(timeIntervalSince1970: c.firstIndexedAt) : nil),
+                  fileCount: known[c.path]?.fileCount ?? c.fileCount,
                   tags: tagsByPath[c.path] ?? [],
                   size: c.isDirectory ? nil : c.size)
         })
@@ -673,4 +684,14 @@ struct FolderBrowser: View {
 
     private static let growthHold: TimeInterval = 45
 
+}
+
+/// In a view of its own, so the browser's body does not depend on the model's selection.
+private struct SelectionPruneWatcher: View {
+    @Environment(AppModel.self) private var model
+    let pruned: () -> Void
+    var body: some View {
+        Color.clear.frame(width: 0, height: 0)
+            .onChange(of: model.selection) { _, now in if now == nil { pruned() } }
+    }
 }

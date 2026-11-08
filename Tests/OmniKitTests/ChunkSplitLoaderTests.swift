@@ -404,8 +404,8 @@ final class ChunkSplitLoaderTests: XCTestCase {
     /// It used to stall the migration for good, silently: `backfillInPlace` read a populated
     /// `occurrence` as "already migrated, nothing to do" and returned nil, so the publish never
     /// ran again and the index kept a complete, correct, entirely unused split for the rest of
-    /// its life. The tables are re-proven against the same invariants a fresh build must pass
-    /// and then finished, rather than rebuilt from scratch or believed on sight.
+    /// its life. The tables are built again, because the session since may have rewritten a file
+    /// (testAnUnpublishedBuildDoesNotAdoptARewriteItNeverSaw).
     func testAnUnpublishedBuildIsFinishedOnTheNextOpen() throws {
         let url = tempDB()
         let savedCoverage = VectorStore.vecCoverage

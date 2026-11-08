@@ -233,9 +233,13 @@ public func omniSetMemoryHeadroom(_ headroomBytes: Int, residentBytes: Int) {
 /// model allocate beside the run: 348 tok/s at 4 GB, 371 at 16, against 385 for 0.13.8 (whole-run
 /// peak footprint 28 GB at 16, 46 GB for 0.13.8). A sixteenth of RAM, between 1 and 16 GB, so a
 /// Mac under 128 GB keeps the smaller bound. OMNI_OCR_CACHE_GB overrides it, to measure.
+///
+/// THE BATCH BUDGET STAYS THE USER'S. `capBytes` sizes indexing's batches and decode budget, not
+/// OCR's, and this holds for as long as the weights are resident (the workspace open, a served
+/// request's 120 s linger) while indexing stands down only for a run: in between it ran on budgets
+/// taken from physical memory, under the setting that says otherwise.
 public func omniSetOCRMemory() {
     let physical = Int(ProcessInfo.processInfo.physicalMemory)
-    OmniMemoryBudget.capBytes = physical
     MLX.Memory.memoryLimit = physical
     let override = ProcessInfo.processInfo.environment["OMNI_OCR_CACHE_GB"].flatMap { Int($0) }.map { $0 << 30 }
     MLX.Memory.cacheLimit = override ?? min(max(physical / 16, 1 << 30), 16 << 30)
@@ -724,6 +728,12 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         return env.flatMap { Double($0) } ?? 60
     }()
 
+    /// A batch on the Neural Engine waiting on queries finishes now: a Pause waits for it.
+    public func indexingStopping() {
+        guard #available(macOS 15.0, *) else { return }
+        (aneLock.withLock({ _aneText }) as? ANETextBackend)?.stopWaitingOnQueries()
+    }
+
     public func indexingIdle() {
         guard let delay = Self.idleTrimDelay else { return }
         let gen: UInt64 = trimLock.withLock { trimGen += 1; return trimGen }
@@ -888,6 +898,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         // 1. The programs, their weights the app's own. Nothing changes for callers yet: the GPU
         //    serves everything until step 4.
         let prefix = name.replacingOccurrences(of: "_text", with: "")
+        ANEBlocks.sweepLeftovers(cache: cache)
         guard let compiled = ANEProgram.compiled(name, weights: weightStore, cache: cache),
               let text = try? ANETextBackend(compiled: compiled, config: config, weights: weightStore,
                                              lengths: ANETextBackend.defaultLengths,
@@ -920,6 +931,9 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             return s <= Self.compiledLoadSeconds
         }
         let build = (try? String(contentsOf: stamp, encoding: .utf8)) != key || !compiledHere()
+        // The stamp says "every function compiled". A rebuild that is killed or cancelled has compiled
+        // the canary, which then passes beside the old stamp, and the rest compile inside a pass.
+        if build { try? FileManager.default.removeItem(at: stamp) }
         // Compiled and let go: a loaded function holds working buffers (ANEBlocks.Functions). By
         // phase: TEXT is the lengths text reaches (the tokenizer stops at 512); MEDIA the backbone's
         // longer lengths (an image is at most 1,344 tokens), the image sizes up to a photo's 5,120
@@ -968,12 +982,15 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
             case .text:
                 // The query length loaded now, so a search never waits for a load.
                 _ = text.load("L\(ANETextBackend.defaultLengths[0])")
+                // Under the lock, with the check: written after it, a switch back to the GPU landing
+                // between the two left the unit on the GPU and the store scanning on the CPU.
                 guard aneLock.withLock({ () -> Bool in
                     guard _computeUnit == .neuralEngine else { return false }
                     _aneText = text; _anePhase = .text
+                    OmniCompute.offGPU = true   // the store and the map leave the GPU too
                     return true
                 }) else { return false }
-                OmniCompute.offGPU = true   // the store and the map leave the GPU too
+                Self.testAfterTextPhase?()
                 omniPerfLog(String(format: "ane: text on the Neural Engine (%.1f s)", -t0.timeIntervalSinceNow))
             case .media:
                 guard installTowers(visionProgram: visionProgram, audioProgram: audioProgram, t0: t0) else { return false }
@@ -1035,27 +1052,50 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
         // clip and recording goes through the programs (a sequence past their longest length through
         // the GPU backbone with the programs' tokens).
         let releaseVision = vision != nil, releaseAudio = audio != nil
-        if releaseVision || releaseAudio {
-            run(highPriority: false) {
-                var w = weightStore.weights
-                if releaseVision {
-                    for k in Array(w.keys) where k.hasPrefix("vision_tower.") || k.hasPrefix("merger.") { w.removeValue(forKey: k) }
-                    imageEncoder = nil
-                }
-                if releaseAudio {
-                    for k in Array(w.keys) where k.hasPrefix("audio_tower.") || k.hasPrefix("audio_projector.") { w.removeValue(forKey: k) }
-                    audioEncoder = nil
-                }
-                weightStore = WeightStore(rawWeights: w)
-                // The text backbone holds the store it was built from, every tensor in it: built
-                // again from the one without the towers, or they stay resident (as in setTowers).
-                textEncoder = OmniTextEncoder(weights: weightStore, config: config, tokenizer: tokenizer)
-                MLX.Memory.clearCache()
-            }
-            aneLock.withLock { _gpuTowersReleased = true }
-            omniPerfLog("ane: GPU towers released (vision \(releaseVision), audio \(releaseAudio))")
-        }
+        if releaseVision || releaseAudio { releaseGPUTowers(vision: releaseVision, audio: releaseAudio) }
         return true
+    }
+
+    /// The GPU copies go, for the Neural Engine's programs in their place. DECIDED ON THE GATE, UNDER
+    /// THE LOCK, with the flag going up in the same breath: this waits for the gate, and a switch back
+    /// to the GPU landing meanwhile read the flag down, let the programs go, and then this let the GPU
+    /// towers go too. No towers at all, no reload coming, and every image, clip and recording refused
+    /// until a relaunch. Now the switch either stops this, or finds the flag up and keeps the programs
+    /// until the app has loaded the engine again.
+    func releaseGPUTowers(vision releaseVision: Bool, audio releaseAudio: Bool) {
+        let released: Bool = run(highPriority: false) {
+            guard aneLock.withLock({ () -> Bool in
+                guard _computeUnit == .neuralEngine else { return false }
+                _gpuTowersReleased = true
+                return true
+            }) else { return false }
+            var w = weightStore.weights
+            if releaseVision {
+                for k in Array(w.keys) where k.hasPrefix("vision_tower.") || k.hasPrefix("merger.") { w.removeValue(forKey: k) }
+                imageEncoder = nil
+            }
+            if releaseAudio {
+                for k in Array(w.keys) where k.hasPrefix("audio_tower.") || k.hasPrefix("audio_projector.") { w.removeValue(forKey: k) }
+                audioEncoder = nil
+            }
+            weightStore = WeightStore(rawWeights: w)
+            // The text backbone holds the store it was built from, every tensor in it: built
+            // again from the one without the towers, or they stay resident (as in setTowers).
+            textEncoder = OmniTextEncoder(weights: weightStore, config: config, tokenizer: tokenizer)
+            MLX.Memory.clearCache()
+            return true
+        }
+        if released { omniPerfLog("ane: GPU towers released (vision \(releaseVision), audio \(releaseAudio))") }
+    }
+
+    /// Tests: a switch landing right after the text phase took over.
+    nonisolated(unsafe) static var testAfterTextPhase: (() -> Void)?
+
+    /// Tests: as if a build were under way, without a compile.
+    func setComputeUnitForTest(_ unit: ComputeUnit) { aneLock.withLock { _computeUnit = unit } }
+    /// Tests: hold the gate, as an embed in flight does.
+    func holdGateForTest(_ holding: DispatchSemaphore, until letGo: DispatchSemaphore) {
+        run(highPriority: false) { holding.signal(); letGo.wait() }
     }
 
     /// Longer than a function takes to load from its compiled form, shorter than any compile.
@@ -1904,7 +1944,7 @@ public final class OmniEngine: Embedder, @unchecked Sendable {
                     p.rows.isEmpty ? p.text : p.rows.map { $0.cells.map(\.value).joined(separator: " | ") }.joined(separator: "\n")
                 }.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
                 return t.isEmpty ? nil : embedText(t, as: asDocument ? .passage : .query)
-            case .empty:
+            case .empty, .unreadable:
                 return nil
             }
         case .none:

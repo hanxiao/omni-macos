@@ -15,6 +15,15 @@ final class MultiFolderScopeTests: XCTestCase {
         return f
     }
 
+    /// "Search in This Source": a Photos source's key scopes a query as a folder does, its own assets
+    /// and no one else's.
+    func testAPhotosSourceKeyScopesItsAssetsOnly() {
+        let f = filter([PhotoLibrary.Source(id: "ABC/1", title: "Trip").key])
+        XCTAssertTrue(f.acceptsPath(PhotoLibrary.scheme + "ABC%2F1/UUID%2FL0%2F001/IMG_1.HEIC"))
+        XCTAssertFalse(f.acceptsPath(PhotoLibrary.scheme + "other/UUID%2FL0%2F001/IMG_1.HEIC"))
+        XCTAssertFalse(f.acceptsPath("/Users/x/Docs/notes.txt"), "a file on disk answered a search in a Photos source")
+    }
+
     func testTwoSiblingsBothMatch() {
         let f = filter(["/Users/x/Docs/Alpha", "/Users/x/Docs/Beta"])
         XCTAssertTrue(f.acceptsPath("/Users/x/Docs/Alpha/notes.txt"))

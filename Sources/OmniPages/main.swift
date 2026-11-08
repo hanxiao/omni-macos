@@ -97,6 +97,8 @@ final class Drawer: NSObject, WKNavigationDelegate {
     let web: WKWebView
     let window: NSWindow
     var loaded: CheckedContinuation<Bool, Never>?
+    /// What has been drawn so far, for an end before the last page.
+    var pages: [Page] = []
 
     init(rules: WKContentRuleList?) {
         let config = WKWebViewConfiguration()
@@ -121,6 +123,13 @@ final class Drawer: NSObject, WKNavigationDelegate {
     func webView(_ w: WKWebView, didFinish n: WKNavigation!) { resume(true) }
     func webView(_ w: WKWebView, didFail n: WKNavigation!, withError e: Error) { resume(false) }
     func webView(_ w: WKWebView, didFailProvisionalNavigation n: WKNavigation!, withError e: Error) { resume(false) }
+    /// WebKit's process died (a document it cannot draw). Nothing else reports that, so a bad document
+    /// cost the parent's whole timeout (120 s) before its kill: this ends with what was drawn so far,
+    /// and exit 2 when that is nothing.
+    func webViewWebContentProcessDidTerminate(_ w: WKWebView) {
+        resume(false)
+        finish(pages, code: pages.isEmpty ? 2 : 0)
+    }
     /// Nothing but the preview's own files.
     func webView(_ w: WKWebView, decidePolicyFor action: WKNavigationAction) async -> WKNavigationActionPolicy {
         action.request.url?.isFileURL == true ? .allow : .cancel
@@ -155,7 +164,6 @@ final class Drawer: NSObject, WKNavigationDelegate {
 
     func run(preview: URL) async -> [Page] {
         guard await load(preview.appendingPathComponent("Preview.html"), root: preview) else { return [] }
-        var pages: [Page] = []
         // A deck: one div.slide per slide, all on the one page.
         let found = await json("""
             JSON.stringify((() => {

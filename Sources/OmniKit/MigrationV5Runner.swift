@@ -20,6 +20,9 @@ import SQLite3
 /// running this first is how the size and the time are known before that change is written.
 public enum MigrationV5Runner {
 
+    /// TEST: called at the build's named points, so a test can hold it there and write meanwhile.
+    nonisolated(unsafe) static var holdForTest: ((String) -> Void)?
+
     public struct DryRun: Sendable {
         public var rows: Int64 = 0
         public var contents: Int64 = 0
@@ -188,14 +191,15 @@ extension MigrationV5Runner {
     ///
     /// Returns nil when there is nothing to do, and throws with the tables dropped when a check
     /// fails. A failed backfill must leave a v4 database, not a half-v5 one.
-    /// `adoptExisting` is what the store passes when its own done flag is UNSET: only then is a
-    /// populated `occurrence` an interrupted publish rather than an index that is simply already
-    /// migrated, and only then may these tables be re-proven and finished.
+    ///
+    /// A BUILD THAT COMMITTED AND WAS NEVER PUBLISHED is built again. The store calls this only with
+    /// its done flag unset, so a populated `occurrence` is a kill between the two transactions - and
+    /// the session since may have rewritten a file. Re-proving those tables cannot tell: a rewrite of
+    /// the same length keeps every count they are checked by, and it was adopted, leaving the file on
+    /// its old key and snippet for good. A rebuild costs what the build costs, once, off the store queue.
     static func backfillInPlace(db: OpaquePointer,
                                 highWater: Int64,
-                                adoptExisting: Bool = false,
                                 log: (String) -> Void = { _ in }) throws -> DryRun? {
-        let start0 = Date()
         func run(_ sql: String) throws {
             if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
                 throw Failure.sql(sql, String(cString: sqlite3_errmsg(db)))
@@ -209,34 +213,6 @@ extension MigrationV5Runner {
             return sqlite3_column_int64(st, 0)
         }
 
-        // A BUILD THAT COMMITTED AND WAS NEVER PUBLISHED. The whole build is one transaction and
-        // the publish is another, so a kill between them leaves `occurrence` full with the done
-        // flag unset - and "occurrence is not empty, so there is nothing to do" then meant the
-        // publish never ran again either. Not corruption: a migration that silently never
-        // finishes, which this file has already recorded once as "a refusal repeated forever is
-        // still a broken index".
-        //
-        // RE-PROVEN, NOT TRUSTED. The tables are adopted only if the same invariants a fresh
-        // build has to pass still hold, which is the difference between finishing an interrupted
-        // build and believing whatever happens to be in the tables. They cost a few aggregate
-        // queries against the 151 s a rebuild costs, and the caller is off the store queue for
-        // both.
-        if num("SELECT COUNT(*) FROM occurrence") > 0 {
-            guard adoptExisting else { return nil }
-            var out = DryRun()
-            out.rows = num("SELECT COUNT(*) FROM chunks")
-            out.highWater = highWater
-            for inv in MigrationV5.invariants(highWater: highWater) {
-                let got = num(inv.sql), expect = num(inv.mustEqual)
-                if got != expect { out.failures.append("\(inv.name): \(got) vs \(expect)") }
-            }
-            guard out.failures.isEmpty else { throw Failure.invariant(out.failures) }
-            out.contents = num("SELECT COUNT(*) FROM chunk")
-            out.occurrences = num("SELECT COUNT(*) FROM occurrence")
-            out.seconds = -start0.timeIntervalSinceNow
-            log("  adopted an unpublished build: \(out.contents) contents, \(out.occurrences) occurrences")
-            return out
-        }
         let rows = num("SELECT COUNT(*) FROM chunks")
         let seated = num("SELECT COUNT(*) FROM chunks WHERE slot >= 0")
         guard rows > 0, seated == rows else { return nil }
@@ -256,9 +232,15 @@ extension MigrationV5Runner {
         // this that is a full scan of this table per content - it does not finish.
         try run("CREATE INDEX temp.slot_of_by_slot ON slot_of(slot);")
         defer { _ = sqlite3_exec(db, "DROP TABLE IF EXISTS temp.slot_of;", nil, nil, nil) }
+        holdForTest?("before-lock")
 
         try run("BEGIN IMMEDIATE;")
         do {
+            if num("SELECT COUNT(*) FROM occurrence") > 0 {
+                try run("DELETE FROM chunk_snippet;")
+                try run("DELETE FROM occurrence;")
+                try run("DELETE FROM chunk;")
+            }
             for (label, sql) in [("chunk", buildChunkSQL()),
                                  ("occurrence", buildOccurrenceSQL()),
                                  ("chunk_snippet", buildSnippetSQL())] {
@@ -272,7 +254,9 @@ extension MigrationV5Runner {
                 if got != expect { out.failures.append("\(inv.name): \(got) vs \(expect)") }
             }
             guard out.failures.isEmpty else { throw Failure.invariant(out.failures) }
+            holdForTest?("inside")
             try run("COMMIT;")
+            holdForTest?("committed")
         } catch {
             _ = sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
             throw error

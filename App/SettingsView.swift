@@ -203,7 +203,15 @@ private struct IndexStatusRow: View {
                 }
             }
         case .paused:
-            if let hold = model.powerWaiting {
+            if model.ocrRunActive, !model.userPaused {
+                // Stood down for a transcription: it picks up when that ends, and Resume could do
+                // nothing until then.
+                HStack(spacing: 8) {
+                    Image(systemName: "pause.circle").foregroundStyle(.secondary)
+                    Text("Paused while transcribing")
+                    Spacer()
+                }
+            } else if let hold = model.powerWaiting, !model.userPaused {
                 // Held by power or the set hours, not by the user: it resumes on its own, so no Resume.
                 HStack(spacing: 8) {
                     Image(systemName: "pause.circle").foregroundStyle(.secondary)
@@ -368,6 +376,9 @@ private struct ActivityTab: View {
                             Text("\(rp.done.formatted()) of \(rp.total.formatted())"
                                  + (rp.secondsLeft.map { " \u{00B7} " + TimeLeft.text($0) } ?? ""))
                                 .foregroundStyle(.secondary)
+                        } else if model.isPaused, model.activeRoots.contains(url.path) || model.isFolderQueued(url) {
+                            // Nothing is counting or coming up, so nothing spins.
+                            Text("Paused").foregroundStyle(.secondary)
                         } else if (model.activeRoots.contains(url.path) || model.isFolderQueued(url)
                                     || (model.isIndexing && (rp?.total ?? 0) == 0))
                                     && !((rp?.total ?? 0) > 0 && (rp?.done ?? 0) >= (rp?.total ?? 0)) {
@@ -396,7 +407,11 @@ private struct ActivityTab: View {
                                model.isIndexing || model.activeRoots.contains(source.key) {
                                 Text("\(rp.done.formatted()) of \(rp.total.formatted())")
                                     .foregroundStyle(.secondary)
-                            } else if model.activeRoots.contains(source.key) || model.isPhotoSourceQueued(source) {
+                            } else if model.isPaused, model.activeRoots.contains(source.key) || model.isPhotoSourceQueued(source) {
+                                Text("Paused").foregroundStyle(.secondary)
+                            } else if (model.activeRoots.contains(source.key) || model.isPhotoSourceQueued(source))
+                                        && !((rp?.total ?? 0) > 0 && (rp?.done ?? 0) >= (rp?.total ?? 0)) {
+                                // Not a source that has finished while the rest of its batch goes on.
                                 ProgressView().controlSize(.small)
                                     .help(model.isPhotoSourceQueued(source) ? "Waiting to be indexed" : "Counting items\u{2026}")
                             } else if let c = model.folderFileCounts[source.key] {
@@ -452,6 +467,9 @@ private struct ContentTypesTab: View {
     @Environment(AppModel.self) private var model: AppModel
     @State private var draft = ""
     @State private var loaded = false
+    /// The applied rules `draft` was last in step with. This pane stays alive once visited, across
+    /// the window closing, and a menu's Remove from Omni or Ignore Folder rewrites the rules behind it.
+    @State private var basedOn = ""
     @State private var showSamples = false
     @State private var previewTask: Task<Void, Never>?
 
@@ -528,8 +546,25 @@ private struct ContentTypesTab: View {
             }
         }
         .formStyle(.grouped)
-        .onAppear { if !loaded { draft = model.ignoreText; loaded = true } }
+        .onAppear {
+            if !loaded { draft = model.ignoreText; basedOn = draft; loaded = true } else { followAppliedRules() }
+        }
         .onChange(of: draft) { _, newValue in schedulePreview(newValue) }
+        .onChange(of: model.ignoreText) { _, _ in followAppliedRules() }
+    }
+
+    /// Bring the draft up to rules that changed behind it, keeping what was typed. Left alone, Apply
+    /// wrote the old draft over the new rule and the folder a menu had just excluded was indexed again.
+    private func followAppliedRules() {
+        let now = model.ignoreText
+        guard now != basedOn else { return }
+        defer { basedOn = now }
+        guard draft != basedOn else { draft = now; return }
+        func lines(_ text: String) -> [String] { text.components(separatedBy: .newlines) }
+        let before = Set(lines(basedOn)), after = Set(lines(now))
+        var merged = lines(draft).filter { !before.contains($0) || after.contains($0) }
+        merged += lines(now).filter { !before.contains($0) && !merged.contains($0) }
+        draft = merged.joined(separator: "\n")
     }
 
     /// The published preview ONLY when it describes the text currently in the editor. The two are
@@ -576,11 +611,14 @@ private struct ContentTypesTab: View {
                     Button("Revert") {
                         model.revertIgnore()
                         draft = model.ignoreText
+                        basedOn = draft
                     }
                     .help("Undo the last applied change")
                 }
                 Button("Apply") {
                     previewTask?.cancel()
+                    followAppliedRules()
+                    basedOn = draft
                     model.applyIgnoreText(draft)
                 }
                 .keyboardShortcut("s", modifiers: .command)
@@ -1570,9 +1608,15 @@ private struct OCRCacheSection: View {
         }
         // Off the main thread: a large cache is gigabytes of files.
         moving = true
+        let old = folder
         Task {
             let result = await Task.detached(priority: .userInitiated) { () -> Error? in
-                do { _ = try OCRCache.move(to: url); return nil } catch { return error }
+                do { _ = try OCRCache.move(from: old, to: url); return nil }
+                catch {
+                    // All or none: what had moved was in a folder nothing reads.
+                    _ = try? OCRCache.move(from: url, to: old)
+                    return error
+                }
             }.value
             moving = false
             if let error = result {
@@ -1583,6 +1627,8 @@ private struct OCRCacheSection: View {
             } else {
                 OCRCache.directory = url
                 folder = url
+                // A page a run finished during the walk went to the old folder: nothing would read it.
+                await Task.detached(priority: .utility) { _ = try? OCRCache.move(from: old, to: url) }.value
             }
         }
     }

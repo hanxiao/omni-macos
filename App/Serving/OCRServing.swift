@@ -187,6 +187,16 @@ enum OCRServing {
         var cached: Bool { stop == "cached" }
     }
 
+    /// What a text answer puts where a page's transcript should be, in the MCP tool's words: an empty
+    /// string reads as a blank page.
+    static let failedPageText = "(this page could not be transcribed)"
+
+    /// A request none of whose pages could be read is an error, not a 200 with every page empty.
+    static func wholeRequestFailed(_ pages: [Page]) -> Failure? {
+        guard !pages.isEmpty, pages.allSatisfy(\.failed) else { return nil }
+        return .failed(pages.count == 1 ? "the page could not be transcribed" : "none of the \(pages.count) pages could be transcribed")
+    }
+
     // MARK: - Jobs
 
     /// A request's pages, with the cache already consulted and the decode slot already taken if any
@@ -223,8 +233,14 @@ enum OCRServing {
         /// decode at the next step - a streaming client that hung up.
         func run(onText: (@Sendable (Int, String) -> Void)? = nil,
                  onDone: (@Sendable (Int, Page) -> Void)? = nil,
-                 shouldContinue: @escaping @Sendable () -> Bool = { true }) async -> Result<[Page], Failure> {
+                 shouldContinue caller: @escaping @Sendable () -> Bool = { true }) async -> Result<[Page], Failure> {
             started = true
+            // A caller that left: seen by its own stream's failed send, or here for any other. Only the
+            // stream passed `shouldContinue`, so an agent whose tool call timed out had the whole
+            // request decoded for nobody.
+            let client = ServedClient.current
+            let shouldContinue: @Sendable () -> Bool = { caller() && client?.hasLeft != true }
+            if holdsSlot { client?.watch() }
             for (i, p) in pages.enumerated() where p.cached { onDone?(i, p) }
             guard holdsSlot else { return .success(pages) }
             defer { Task { await OCRModelHost.shared.endDecode() } }
@@ -283,7 +299,9 @@ enum OCRServing {
 
             let finish: @Sendable (Int, OCRModel.Result?) -> Page = { slot, result in
                 var page = self.pages[ready[slot]]
-                guard let result, !result.text.isEmpty else { page.failed = true; return page }
+                // A page that decoded to nothing is a blank page. One whose decode was cut with
+                // nothing to show, or that did not run, has failed, and the caller is told.
+                guard let result, !(result.text.isEmpty && result.stoppedBy == .cancelled) else { page.failed = true; return page }
                 page.markdown = result.text
                 page.tokens = result.tokens.count
                 page.promptTokens = result.promptTokens

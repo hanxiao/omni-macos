@@ -183,9 +183,12 @@ public enum OCRCache {
     /// that were already done. Only files this cache wrote are moved - the name test again - so a
     /// folder the user also keeps notes in does not have its notes dragged along.
     @discardableResult
-    public static func move(to dst: URL) throws -> Int {
+    public static func move(to dst: URL) throws -> Int { try move(from: directory, to: dst) }
+
+    /// The same, from a folder this cache has left or is about to leave.
+    @discardableResult
+    public static func move(from src: URL, to dst: URL) throws -> Int {
         let fm = FileManager.default
-        let src = directory
         guard src.standardizedFileURL != dst.standardizedFileURL else { return 0 }
         try fm.createDirectory(at: dst, withIntermediateDirectories: true)
         guard let names = try? fm.contentsOfDirectory(atPath: src.path) else { return 0 }

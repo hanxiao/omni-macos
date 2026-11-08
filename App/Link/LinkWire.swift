@@ -122,6 +122,9 @@ enum LinkWire {
         /// This Mac's search takes a request's vector AND its text (the lexical and name fusion still
         /// read the text). Absent from older Macs, which would drop the text beside a vector.
         var fusesText: Bool?
+        /// The answering Mac's service generation at this reply (LinkService). A later ping that
+        /// reports another one means this reply is out of date. Absent from older Macs.
+        var generation: Int?
     }
 
     struct PathRequest: Codable, Sendable {

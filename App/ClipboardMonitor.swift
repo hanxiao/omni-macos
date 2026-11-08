@@ -71,9 +71,11 @@ final class ClipboardMonitor {
         let change = pb.changeCount
         guard change != lastChange else { return }
         lastChange = change
+        // Whatever it was, the clip just stored is no longer what the pasteboard holds: left set, it
+        // hid that clip from an exact search for as long as reading stayed denied.
+        current = nil
         // Denied in System Settings > Privacy > Paste from Other Apps: reading would get nothing.
         if Self.accessDenied { return }
-        current = nil
         guard let clip = Self.clip(from: pb) else { return }
         let history = history
         let text: String? = { if case .text(let s) = clip { return s }; return nil }()

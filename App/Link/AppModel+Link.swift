@@ -65,9 +65,10 @@ extension AppModel {
         remoteInFlight.insert(peer)
         let t = Task { [weak self] in
             let hits: [SearchHit]?
-            do { hits = try await work() } catch { hits = nil }
+            var why: String?
+            do { hits = try await work() } catch { hits = nil; why = LinkController.describe(error) }
             guard !Task.isCancelled else { return }
-            await MainActor.run { self?.remoteArrived(peer, hits, token: token) }
+            await MainActor.run { self?.remoteArrived(peer, hits, failure: why, token: token) }
         }
         remoteTasks.append(t)
     }
@@ -80,9 +81,10 @@ extension AppModel {
         remoteHits = [:]
         remoteInFlight = []
         localLanded = false
+        if link.scopeFailure != nil { link.scopeFailure = nil }
     }
 
-    private func remoteArrived(_ peer: String, _ hits: [SearchHit]?, token: Int) {
+    private func remoteArrived(_ peer: String, _ hits: [SearchHit]?, failure: String? = nil, token: Int) {
         guard token == currentSearchToken else { return }
         if omniPerfEnabled {
             omniPerfLog(String(format: "remote %@ hits=%d since-search=%.1fms local-landed=%@", peer, hits?.count ?? -1,
@@ -91,13 +93,17 @@ extension AppModel {
         remoteInFlight.remove(peer)
         if let hits { remoteHits[peer] = hits }
         if linkedScope != nil {
-            // Scoped to a linked Mac: there is no local half, so its reply IS the result set.
+            // Scoped to a linked Mac: there is no local half, so its reply IS the result set. One
+            // that could not be had is not an empty one: a timeout read as nothing found on that Mac.
+            if let failure, link.scopeFailure != failure { link.scopeFailure = failure }
             guard remoteInFlight.isEmpty else { return }
             finishScopedSearch(token: token)
             return
         }
         guard localLanded, hits != nil else { return }
-        let combined = combinedHits()
+        // With the passages already filled: a reply later than the fill (600 ms after results land,
+        // and not run again) put the stored snippets back on every local row.
+        let combined = withPassages(combinedHits(), resolved: resolvedQuery)
         if rawResults != combined { rawResults = combined }
     }
 
@@ -155,88 +161,26 @@ extension AppModel {
         if hasQuery { search() }
     }
 
-    // MARK: - Served search (the MCP tool's `macs`, and `omni search --macs`)
-
-    /// The same search on the named linked Macs ("all" for every one), each answering from its own
-    /// index. Paths come back as paths on that Mac. A folder scope is a folder on THIS Mac, which
-    /// means nothing on another, so a scoped search does not go out.
-    func linkedSearchForServing(_ q: String, filter: SearchFilter, topK: Int, macs: [String], explicit: Bool) async -> [LinkedSearchAnswer] {
-        let everyone = macs.contains { $0.caseInsensitiveCompare("all") == .orderedSame }
-        let peers = link.peers.filter { p in
-            everyone || macs.contains { $0.caseInsensitiveCompare(p.name) == .orderedSame || $0 == p.id }
-        }
-        var out: [LinkedSearchAnswer] = []
-        for name in macs where !everyone && !link.peers.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame || $0.id == name }) {
-            let known = link.peers.map(\.name).joined(separator: ", ")
-            out.append(LinkedSearchAnswer(mac: name, hits: [], note: known.isEmpty
-                ? "no Mac is linked with this one (File > Link a Mac)"
-                : "no linked Mac is called \(name); linked: \(known)"))
-        }
-        guard filter.folderPrefixes.isEmpty else {
-            return explicit ? out + peers.map { LinkedSearchAnswer(mac: $0.name, hits: [], note: "a folder scope applies to this Mac only") } : out
-        }
-        await withTaskGroup(of: LinkedSearchAnswer.self) { group in
-            for p in peers {
-                let online = link.isOnline(p.id), shared = p.theyAllowSearch, link = self.link
-                let req = LinkWire.SearchRequest(query: q, vector: nil, filter: LinkWire.Filter(filter, folders: nil),
-                                                 topK: topK, exclude: nil)
-                group.addTask {
-                    guard online else { return LinkedSearchAnswer(mac: p.name, hits: [], note: "offline") }
-                    guard shared else { return LinkedSearchAnswer(mac: p.name, hits: [], note: "does not share its files with this Mac") }
-                    do {
-                        let hits = try await link.search(req, peer: p.id, timeout: Self.servedRemoteTimeout)
-                            .filter { !filter.rejectsByExtension($0.path) }
-                        return LinkedSearchAnswer(mac: p.name, hits: hits.map { h in
-                            SearchHit.make(path: RemotePath.parse(h.path)?.path ?? h.path, score: h.score, snippet: h.snippet,
-                                           kind: h.kind, chunkIndex: h.chunkIndex, modified: h.modified, width: h.width,
-                                           height: h.height, duration: h.duration, size: h.size, locator: h.locator,
-                                           chunkCount: h.chunkCount)
-                        }, note: nil, canOpen: p.theyAllowFetch)
-                    } catch {
-                        return LinkedSearchAnswer(mac: p.name, hits: [], note: LinkController.describe(error))
-                    }
-                }
-            }
-            for await a in group { out.append(a) }
-        }
-        return out.sorted { $0.mac.localizedCaseInsensitiveCompare($1.mac) == .orderedAscending }
-    }
-
-    /// An agent waits for the answer, so a served search gives linked Macs less time than the
-    /// window, which never waits at all. Replies measured ~80 ms on a LAN-less loopback pair.
-    static let servedRemoteTimeout: Double = 3
-
-    /// `get_linked_file`: copy a linked Mac's file (a path from its search results) here, read-only,
-    /// and return where. The same fetch Open and Quick Look use, under the same grant.
-    func linkedFetchForServing(_ mac: String, path: String) async -> (path: String?, error: String?) {
-        guard let p = link.peers.first(where: { $0.name.caseInsensitiveCompare(mac) == .orderedSame || $0.id == mac }) else {
-            let known = link.peers.map(\.name).joined(separator: ", ")
-            return (nil, known.isEmpty ? "no Mac is linked with this one" : "no linked Mac is called \(mac); linked: \(known)")
-        }
-        guard link.isOnline(p.id) else { return (nil, "\(p.name) is offline") }
-        guard p.theyAllowFetch else { return (nil, "\(p.name) does not allow opening its files") }
-        do {
-            return (try await RemoteFiles.shared.fetch(RemotePath.make(peer: p.id, path: path)).path, nil)
-        } catch {
-            return (nil, LinkController.describe(error))
-        }
-    }
-
     // MARK: - Acting on a linked Mac's file
 
     /// Fetch, then hand the local copy to `then`. While it fetches the window says so.
     func withRemoteCopy(_ remote: String, _ then: @escaping @MainActor (URL) -> Void) {
         guard remoteOpening != remote else { return }
         remoteOpening = remote
+        // A token, not the path: after Cancel and a new click the old task's guard passed on the path,
+        // it reported "cancelled" as an error, and its `defer` cleared the new fetch's claim, so the
+        // new fetch opened nothing.
+        link.remoteOpenToken += 1
+        let token = link.remoteOpenToken
         Task { @MainActor in
-            defer { if remoteOpening == remote { remoteOpening = nil } }
+            defer { if link.remoteOpenToken == token { remoteOpening = nil } }
             do {
                 let url = try await RemoteFiles.shared.fetch(remote)
                 // Cancelled, or a newer one took over: the copy stays cached, and nothing opens.
-                guard remoteOpening == remote else { return }
+                guard link.remoteOpenToken == token else { return }
                 then(url)
             } catch {
-                guard remoteOpening == remote else { return }   // cancelled by a newer one
+                guard link.remoteOpenToken == token else { return }   // cancelled by a newer one
                 let name = (remote as NSString).lastPathComponent
                 remoteError = "Couldn\u{2019}t open \u{201C}\(name)\u{201D}. \(LinkController.describe(error))"
             }
@@ -247,6 +191,7 @@ extension AppModel {
     func cancelRemoteOpen() {
         guard let remote = remoteOpening else { return }
         remoteOpening = nil
+        link.remoteOpenToken += 1
         RemoteFiles.shared.cancel(remote)
     }
 
@@ -275,6 +220,77 @@ extension AppModel {
     func passagesRemote(_ remote: String) async -> [ChunkHit] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         return await link.passages(remote, query: q.isEmpty ? nil : q, vector: lastQueryVectorForLink)
+    }
+}
+
+// MARK: - Served search (the MCP tool's `macs`, and `omni search --macs`)
+
+extension LinkServed {
+    /// The same search on the named linked Macs ("all" for every one), each answering from its own
+    /// index. Paths come back as paths on that Mac. A folder scope is a folder on THIS Mac, which
+    /// means nothing on another, so a scoped search does not go out.
+    func servedSearch(_ q: String, filter: SearchFilter, topK: Int, macs: [String], explicit: Bool) async -> [LinkedSearchAnswer] {
+        let everyone = macs.contains { $0.caseInsensitiveCompare("all") == .orderedSame }
+        let linked = self.peers
+        let peers = linked.filter { p in
+            everyone || macs.contains { $0.caseInsensitiveCompare(p.name) == .orderedSame || $0 == p.id }
+        }
+        var out: [LinkedSearchAnswer] = []
+        for name in macs where !everyone && !linked.contains(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame || $0.id == name }) {
+            let known = linked.map(\.name).joined(separator: ", ")
+            out.append(LinkedSearchAnswer(mac: name, hits: [], note: known.isEmpty
+                ? "no Mac is linked with this one (File > Link a Mac)"
+                : "no linked Mac is called \(name); linked: \(known)"))
+        }
+        guard filter.folderPrefixes.isEmpty else {
+            return explicit ? out + peers.map { LinkedSearchAnswer(mac: $0.name, hits: [], note: "a folder scope applies to this Mac only") } : out
+        }
+        await withTaskGroup(of: LinkedSearchAnswer.self) { group in
+            for p in peers {
+                let online = isOnline(p.id), shared = p.theyAllowSearch
+                let req = LinkWire.SearchRequest(query: q, vector: nil, filter: LinkWire.Filter(filter, folders: nil),
+                                                 topK: topK, exclude: nil)
+                group.addTask {
+                    guard online else { return LinkedSearchAnswer(mac: p.name, hits: [], note: "offline") }
+                    guard shared else { return LinkedSearchAnswer(mac: p.name, hits: [], note: "does not share its files with this Mac") }
+                    do {
+                        let hits = try await self.search(req, peer: p.id, timeout: Self.servedRemoteTimeout)
+                            .filter { !filter.rejectsByExtension($0.path) }
+                        return LinkedSearchAnswer(mac: p.name, hits: hits.map { h in
+                            SearchHit.make(path: RemotePath.parse(h.path)?.path ?? h.path, score: h.score, snippet: h.snippet,
+                                           kind: h.kind, chunkIndex: h.chunkIndex, modified: h.modified, width: h.width,
+                                           height: h.height, duration: h.duration, size: h.size, locator: h.locator,
+                                           chunkCount: h.chunkCount)
+                        }, note: nil, canOpen: p.theyAllowFetch)
+                    } catch {
+                        return LinkedSearchAnswer(mac: p.name, hits: [], note: LinkController.describe(error))
+                    }
+                }
+            }
+            for await a in group { out.append(a) }
+        }
+        return out.sorted { $0.mac.localizedCaseInsensitiveCompare($1.mac) == .orderedAscending }
+    }
+
+    /// An agent waits for the answer, so a served search gives linked Macs less time than the
+    /// window, which never waits at all. Replies measured ~80 ms on a LAN-less loopback pair.
+    static let servedRemoteTimeout: Double = 3
+
+    /// `get_linked_file`: copy a linked Mac's file (a path from its search results) here, read-only,
+    /// and return where. The same fetch Open and Quick Look use, under the same grant.
+    func servedFetch(_ mac: String, path: String) async -> (path: String?, error: String?) {
+        let linked = self.peers
+        guard let p = linked.first(where: { $0.name.caseInsensitiveCompare(mac) == .orderedSame || $0.id == mac }) else {
+            let known = linked.map(\.name).joined(separator: ", ")
+            return (nil, known.isEmpty ? "no Mac is linked with this one" : "no linked Mac is called \(mac); linked: \(known)")
+        }
+        guard isOnline(p.id) else { return (nil, "\(p.name) is offline") }
+        guard p.theyAllowFetch else { return (nil, "\(p.name) does not allow opening its files") }
+        do {
+            return (try await RemoteFiles.shared.fetch(RemotePath.make(peer: p.id, path: path)).path, nil)
+        } catch {
+            return (nil, LinkController.describe(error))
+        }
     }
 }
 

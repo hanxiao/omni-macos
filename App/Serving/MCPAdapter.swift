@@ -335,6 +335,9 @@ enum MCPAdapter {
 
     private static func callSearch(id: Any, args: [String: Any], backend: any ServingBackend,
                                    sources: SourcesControl?, surface: ServedSurface, cli: Bool) async -> HTTPResponse {
+        if AppModel.servedIndexObsolete.isOn {
+            return result(id: id, ["content": [["type": "text", "text": AppModel.servedRebuildingMessage]], "isError": true])
+        }
         guard let query = args["query"] as? String, !query.isEmpty else {
             // Tool-level (not protocol-level) failure: isError true with a readable message.
             return result(id: id, [
@@ -572,6 +575,9 @@ enum MCPAdapter {
 
     private static func callSearchInline(id: Any, args: [String: Any], backend: any ServingBackend,
                                          surface: ServedSurface, cli: Bool) -> HTTPResponse {
+        if AppModel.servedIndexObsolete.isOn {
+            return result(id: id, ["content": [["type": "text", "text": AppModel.servedRebuildingMessage]], "isError": true])
+        }
         guard let query = args["query"] as? String, !query.isEmpty else {
             return result(id: id, [
                 "content": [["type": "text", "text": "search_inline failed: 'query' is required"]],

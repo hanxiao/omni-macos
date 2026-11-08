@@ -301,8 +301,13 @@ public final class OmniTagger: @unchecked Sendable {
                 mug[i] = (mug[i] * n + sg[i]) / (n + 1)
             }
             priorCount += 1
+            // Kept on the way too, not only at the freeze: a library under 64 images was seeded again
+            // at every launch (a tower pass over the 6 seed images), and its prior started over.
+            // Every 6, so the seed's own last image writes it; ~200 KB, beside a tower pass each.
             if priorCount >= Self.priorFreezeCount {
                 priorFrozen = true
+                persistPrior()
+            } else if priorCount % 6 == 0 {
                 persistPrior()
             }
         }

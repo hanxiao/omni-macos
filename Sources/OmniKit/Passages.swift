@@ -345,8 +345,13 @@ public final class PassageRecovery: @unchecked Sendable {
                 let k = anchors[i]!.key
                 out[i] = pieces[k]
                 // A key is the text's digest: what cannot be recovered now never will be, and asking
-                // again re-reads the file for nothing (a 3.6 MB log, every query that hit it).
-                if out[i] == nil, unrecoverable.count < 65_536 { unrecoverable.insert(k) }
+                // again re-reads the file for nothing (a 3.6 MB log, every query that hit it). Only
+                // once the file has answered, though: a volume not mounted or a file not downloaded
+                // says nothing about its text, and hid that passage until the next launch.
+                if out[i] == nil, unrecoverable.count < 65_536,
+                   FileManager.default.isReadableFile(atPath: items[i].path), !FileExtractor.isDataless(items[i].path) {
+                    unrecoverable.insert(k)
+                }
             }
             // Keep what the cuts made, a file's worth at most: what the next hit nearby will ask for.
             guard pieces.values.reduce(0, { $0 + $1.utf8.count }) <= FileExtractor.maxTextBytes else {

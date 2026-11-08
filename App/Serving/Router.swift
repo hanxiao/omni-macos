@@ -61,6 +61,11 @@ struct Router: Sendable {
         case ("POST", "/v2/embed"):
             return await ServedWork.run { CohereAdapter.handle(req, backend, v2: true) }
         case ("POST", "/v1/search"):
+            if AppModel.servedIndexObsolete.isOn {
+                var r = HTTPResponse.json(["error": ["message": AppModel.servedRebuildingMessage, "type": "service_unavailable"]], status: 503)
+                r.headers["Retry-After"] = "60"
+                return r
+            }
             return await ServedWork.run { SearchAdapter.handle(req, backend) }
         case ("POST", "/v1/files/status"):
             return await ServedWork.run { FileStatusAdapter.handle(req, backend) }

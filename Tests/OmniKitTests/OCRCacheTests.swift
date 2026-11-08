@@ -145,6 +145,36 @@ final class OCRCacheTests: XCTestCase {
         XCTAssertNil(OCRCache.read(source: source, page: 0, prompt: "P", variant: "balanced"))
     }
 
+    /// A page a run finishes during the walk lands in the old folder, behind the walk. The assertion
+    /// in the middle is the stranding itself; the sweep the Settings pane makes after the pointer has
+    /// moved is what brings it across.
+    func testATranscriptWrittenDuringAMoveIsCollected() throws {
+        let source = try write("doc.png", "pixels")
+        OCRCache.write("first", source: source, page: 0, prompt: "p", variant: "v")
+        let old = dir!
+        let dst = dir.deletingLastPathComponent().appendingPathComponent("moved", isDirectory: true)
+        XCTAssertEqual(try OCRCache.move(to: dst), 1)
+        OCRCache.write("late", source: source, page: 1, prompt: "p", variant: "v")
+        OCRCache.directory = dst
+        XCTAssertNil(OCRCache.read(source: source, page: 1, prompt: "p", variant: "v"), "stranded in the old folder")
+        XCTAssertEqual(try OCRCache.move(from: old, to: dst), 1)
+        XCTAssertEqual(OCRCache.read(source: source, page: 1, prompt: "p", variant: "v"), "late")
+        XCTAssertEqual(OCRCache.read(source: source, page: 0, prompt: "p", variant: "v"), "first")
+    }
+
+    /// What Settings does when a move throws part-way: everything goes back, and the pointer, which
+    /// never moved, still reads it.
+    func testAFailedMoveCanBeTakenBack() throws {
+        let source = try write("doc.png", "pixels")
+        OCRCache.write("first", source: source, page: 0, prompt: "p", variant: "v")
+        let old = dir!
+        let dst = dir.deletingLastPathComponent().appendingPathComponent("moved", isDirectory: true)
+        XCTAssertEqual(try OCRCache.move(from: old, to: dst), 1)
+        XCTAssertNil(OCRCache.read(source: source, page: 0, prompt: "p", variant: "v"), "moved out from under the pointer")
+        XCTAssertEqual(try OCRCache.move(from: dst, to: old), 1)
+        XCTAssertEqual(OCRCache.read(source: source, page: 0, prompt: "p", variant: "v"), "first")
+    }
+
     func testMoveSurvivesAMissingFolder() throws {
         OCRCache.directory = dir.appendingPathComponent("never-created", isDirectory: true)
         XCTAssertEqual(try OCRCache.move(to: dir.appendingPathComponent("elsewhere", isDirectory: true)), 0)

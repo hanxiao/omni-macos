@@ -28,7 +28,16 @@ public final class ExtractionQuarantine: @unchecked Sendable {
         public var size: Int
         public var reason: String
         public var at: Double
+        /// A journal entry's session: who was reading (`session`).
+        public var session: String? = nil
     }
+
+    /// THE JOURNAL MEANS "THE APP DIED DURING THIS READ", and a new instance read it that way with
+    /// the read still running beside it. A switch of model or of compute unit builds a new Indexer
+    /// in the same process, whose init quarantined the file of a long read the cancel had stopped
+    /// waiting for (a healthy 5,000-page PDF, skipped until it next changed). An entry from this
+    /// process says nothing of the kind. `var` so a test can be the next launch.
+    nonisolated(unsafe) static var session = UUID().uuidString
 
     /// A read still unfinished after this long is written to the journal.
     public static let journalAfter: TimeInterval = 10
@@ -45,7 +54,7 @@ public final class ExtractionQuarantine: @unchecked Sendable {
         entries = (try? JSONDecoder().decode([String: Entry].self, from: Data(contentsOf: url))) ?? [:]
         // Left in the journal: the app stopped while these were being read.
         if let left = try? JSONDecoder().decode([String: Entry].self, from: Data(contentsOf: journalURL)), !left.isEmpty {
-            for (path, e) in left {
+            for (path, e) in left where e.session != Self.session {
                 entries[path] = Entry(modified: e.modified, size: e.size,
                                       reason: "Omni stopped while reading this file", at: Date().timeIntervalSince1970)
             }
@@ -90,7 +99,7 @@ public final class ExtractionQuarantine: @unchecked Sendable {
         lock.withLock {
             var changed = false
             for r in reads where journaled[r.path] == nil {
-                journaled[r.path] = Entry(modified: r.modified, size: r.size, reason: "", at: Date().timeIntervalSince1970)
+                journaled[r.path] = Entry(modified: r.modified, size: r.size, reason: "", at: Date().timeIntervalSince1970, session: Self.session)
                 changed = true
             }
             if changed { saveJournal() }

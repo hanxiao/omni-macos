@@ -1013,12 +1013,10 @@ releasing.
      run could have caught it - the suite goes quiet precisely so the migration can proceed, so
      the build and the searches never overlap by construction.
 
-     The build runs on its own connection now. Under WAL a reader does not block on a writer, so
-     search is untouched; what waits is the index's own writes, which retry. The catch-up pass is
-     what makes that safe: the build works from a snapshot for minutes, and rows indexed in that
-     window went to v4 only, so they are given occurrences in the same store-queue turn that
-     publishes the done flag - there is no instant where the split is authoritative and
-     incomplete.
+     The build runs on its own connection, so search is untouched, and it holds the write gate from
+     before its first read until the publish, so a write waits at the gate holding nothing a search
+     needs. (A catch-up pass used to add the rows written after the build's commit. It could not see a
+     delete or a rewrite in that window: index.md, "The state machines, run".)
   4b. PROVEN UNDER REAL-USER CHAOS, which is what steps 1-4 were for.
 
      `Scripts/migration-chaos.sh` against a clone of the real 9,773,836-chunk v4 index with
@@ -1106,7 +1104,7 @@ releasing.
      adopted afterwards would reinstate the old positions AND THEN RE-STAMP ITSELF: the freed
      space would never arrive, on any launch, with nothing failing anywhere.
 
-     THE PUBLISH IS ONE TRANSACTION. The catch-up, the blob translation and both flags commit
+     THE PUBLISH IS ONE TRANSACTION. The blob translation and both flags commit
      together or not at all. Separately committed, the worst of the three windows is a
      translated `pending_vecs` under a flag that still says v4, where every blob address finds an
      unrelated row rather than missing. And the translation is guarded by a DURABLE FLAG rather

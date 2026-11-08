@@ -205,6 +205,8 @@ struct ServingTab: View {
                     Text(cliError).foregroundStyle(.red)
                 } else if case .stale(let other) = cliState {
                     Text("\(CommandLineTool.linkPath) points to \(other). Install again to use this copy of Omni.")
+                } else if cliState == .occupied {
+                    Text("\(CommandLineTool.linkPath) is another file. Install replaces it.")
                 } else {
                     Text("Agents run `omni search \"...\"` against this app, with or without the server on.")
                 }

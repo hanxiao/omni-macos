@@ -163,6 +163,40 @@ final class HoleReclaimTests: XCTestCase {
     /// THE RECLAIM BY RELOCATION, STOPPED PART-WAY. Every slice is a complete state, so a quit after
     /// any of them leaves an index whose holes have moved and nothing else: the same files, each
     /// finding its own vector, a clean audit, the same hole count - and a later reclaim finishes it.
+    /// A photo moved into a hole a text left: the per-position lift is the photo's after the move.
+    func testTheLiftFollowsAVectorTheReclaimMoves() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("reclaimlift-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let dbURL = dir.appendingPathComponent("test.sqlite")
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            var batch: [(path: String, chunks: [IndexedChunk])] = []
+            for f in 0 ..< 800 { let p = "/h/t\(f).txt"; batch.append((p, [chunk(p, f * 11 + 1)])) }
+            for f in 0 ..< 400 {
+                let p = "/h/i\(f).png"
+                batch.append((p, [IndexedChunk(path: p, modified: 1, size: 10, kind: "image", chunkIndex: 0, snippet: "", embedding: vec(90_000 + f))]))
+            }
+            try store.replaceMany(batch)
+            store.close()
+        }
+        for _ in 0 ..< 4 { let s = try VectorStore(dbURL: dbURL); s.close() }
+        do {
+            let store = try VectorStore(dbURL: dbURL)
+            store.deletePaths(Set((0 ..< 600).map { "/h/t\($0).txt" }))
+            store.close()
+        }
+        VectorStore.bulkSliceRowsOverride = 50
+        VectorStore.tailReclaimStopAfterSlices = 3
+        defer { VectorStore.bulkSliceRowsOverride = nil; VectorStore.tailReclaimStopAfterSlices = nil }
+        let s = try VectorStore(dbURL: dbURL)
+        defer { s.close() }
+        _ = s.search(vec(90_001), filter: SearchFilter(), topK: 3)   // the base
+        XCTAssertEqual(s.slotLiftIsCurrentForTest(kind: "image", lift: 2), true, "the probe")
+        XCTAssertFalse(s.reclaimVectorHolesForTest(), "the probe: a reclaim told to stop finished")
+        XCTAssertEqual(s.slotLiftIsCurrentForTest(kind: "image", lift: 2), true, "the lift cache kept the old owners' kinds")
+    }
+
     func testRelocationStoppedPartWayKeepsEveryVector() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("reclaim-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

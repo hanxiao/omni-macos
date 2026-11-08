@@ -61,8 +61,8 @@ protocol ContentSource: Sendable {
     /// Nil means "produce nothing for this item, right now" and covers every such case at once:
     /// gone from the library, and content that could only be reached by an implicit network
     /// download (a cloud-evicted file, an iCloud-only asset) under `skipDataless`. Nil is NOT a
-    /// deletion - the crawl still marks the item seen, so the stale sweep never drops its rows, and
-    /// it indexes normally once materialized.
+    /// deletion - the crawl still marks the item seen, so the stale sweep never drops its rows, the
+    /// watcher path keeps them (`DecodedItem.couldNotRead`), and it indexes normally once materialized.
     ///
     /// One call, because for some sources readability and metrics are the same expensive question:
     /// PhotoKit answers both from a single `PhotoLibrary.info`, and asking twice per asset is
@@ -133,7 +133,7 @@ struct FileContentSource: ContentSource {
 
     func content(_ file: CrawledFile, kind: FileKind, settings: IndexSettings) -> ExtractedContent {
         (try? FileExtractor.extract(file.url, maxImageDimension: settings.maxImageDimension,
-                                    maxVideoFrames: settings.maxVideoFrames)) ?? .empty
+                                    maxVideoFrames: settings.maxVideoFrames)) ?? .unreadable
     }
 
     func video(_ file: CrawledFile, probe: SourceProbe, settings: IndexSettings) -> SourceDecode? {

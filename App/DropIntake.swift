@@ -33,6 +33,7 @@ enum DropIntake {
     static func read(_ pb: NSPasteboard,
                      accepts: @escaping (URL) -> Bool,
                      wantsText: Bool,
+                     failed: @escaping @MainActor () -> Void = {},
                      handle: @escaping @MainActor (DroppedItem) -> Void) -> Bool {
         // 1) Local file (Finder, Mail attachment).
         if let url = (pb.readObjects(forClasses: [NSURL.self],
@@ -62,7 +63,7 @@ enum DropIntake {
             // reader runs once the source app has written the file; it does no work of its own.
             promise.receivePromisedFiles(atDestination: dest, options: [:],
                                          operationQueue: .main) { url, error in
-                guard error == nil, accepts(url) else { return }
+                guard error == nil, accepts(url) else { Task { @MainActor in failed() }; return }
                 Task { @MainActor in handle(.file(url)) }
             }
             return true
@@ -71,7 +72,7 @@ enum DropIntake {
         //    a linked <img> can put the link href on public.url instead of the image src.
         if let remote = (pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL])?
             .first(where: { !$0.isFileURL && ($0.scheme == "http" || $0.scheme == "https") }) {
-            download(remote, textFallback: wantsText ? remote.absoluteString : nil, handle: handle)
+            download(remote, textFallback: wantsText ? remote.absoluteString : nil, failed: failed, handle: handle)
             return true
         }
         // 5) Any other bitmap the pasteboard can vend.
@@ -147,10 +148,12 @@ enum DropIntake {
     /// Download a remote URL and hand back the bytes if they decode as an image; otherwise, if a
     /// text fallback was given (a bare hyperlink), hand back that instead.
     private static func download(_ url: URL, textFallback: String?,
+                                 failed: @escaping @MainActor () -> Void = {},
                                  handle: @escaping @MainActor (DroppedItem) -> Void) {
         URLSession.shared.dataTask(with: url) { data, response, _ in
             guard let data, NSImage(data: data) != nil else {
                 if let textFallback { Task { @MainActor in handle(.text(textFallback)) } }
+                else { Task { @MainActor in failed() } }
                 return
             }
             let ext = response?.mimeType
@@ -191,7 +194,9 @@ enum DropRouter {
             let usable = urls.filter(OCRSession.isSupported)
             if !usable.isEmpty { ocr.open(urls: usable); return true }
         }
-        if let pb, DropIntake.read(pb, accepts: accepts, wantsText: !toOCR, handle: handle) { return true }
+        // A drop that fails later, a promise or a download, says so too: this pane has no other word.
+        let failed: @MainActor () -> Void = { [ocr] in if toOCR { ocr.reject("That file could not be fetched.") } }
+        if let pb, DropIntake.read(pb, accepts: accepts, wantsText: !toOCR, failed: failed, handle: handle) { return true }
         if DropIntake.read(providers: providers, accepts: accepts, wantsText: !toOCR, handle: handle) { return true }
         // Only the transcription pane says so. A search surface that ignores an unusable drag is
         // behaving normally; a transcription pane that swallows one looks broken.

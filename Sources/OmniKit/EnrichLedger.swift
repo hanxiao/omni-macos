@@ -127,6 +127,21 @@ public final class EnrichLedger: @unchecked Sendable {
         }
     }
 
+    /// A pass's enrichment left a file not done. True when that is enough tries (`retries` passes in a
+    /// row), and the phase should stop running at each pass's end for it. Started over by a change of
+    /// recipe, like everything here, and by a pass with no failures (`clearPassesWithFailures`).
+    public func notePassWithFailures(retries: Int = 3) -> Bool {
+        lock.withLock {
+            guard openLocked() else { return true }
+            let n = (metaLocked("failed_passes").flatMap { Int($0) } ?? 0) + 1
+            exec("INSERT OR REPLACE INTO meta(k, v) VALUES('failed_passes', '\(n)');")
+            return n >= retries
+        }
+    }
+    public func clearPassesWithFailures() {
+        lock.withLock { if openLocked() { exec("DELETE FROM meta WHERE k = 'failed_passes';") } }
+    }
+
     /// Every file the index held has been enriched; new ones are as they are indexed.
     public var backfilled: Bool {
         get { lock.withLock { openLocked() && metaLocked("backfilled") == "1" } }

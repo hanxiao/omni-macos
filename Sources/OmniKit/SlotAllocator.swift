@@ -16,11 +16,13 @@ import Foundation
 /// accumulated against 4.53M live rows stop accumulating.
 ///
 /// THE QUARANTINE IS THE PART THAT IS EASY TO GET WRONG. A slot released in one transaction must
-/// not be handed out in that same transaction. A search in flight may already hold that id in a
-/// candidate list, and if a different chunk's vector has been written into the slot underneath it,
-/// the search scores the wrong content and reports it under the wrong file. Nothing crashes. So
-/// releases land in `quarantine` and only `commit()` - called at a stamp, after the readers that
-/// could be holding stale ids are done - moves them where `allocate` can see them.
+/// not be handed out in that same transaction: a rollback gives it back, and it may still have an
+/// owner. So releases land in `quarantine` and only `commit()` moves them where `allocate` can see
+/// them. What commits them is the first allocation after the releasing transaction's generation
+/// (VectorStore.ensureFreeSlotsLocked), which for a replace is its own placement step, so the caller
+/// has to `claim` whatever that write keeps BEFORE it allocates (seatKeptContentsLocked). A search
+/// cannot be holding the old id across this: it scores, reranks and reduces inside one store-queue
+/// hold, and the write holds the queue from its release to its placement.
 public struct SlotAllocator: Sendable {
 
     /// Slots below `highWater` that no chunk owns and that are safe to hand out now, held as a
@@ -32,13 +34,18 @@ public struct SlotAllocator: Sendable {
     /// where the free list starts to matter. The heap makes `allocate` O(log n) and `commit` O(k
     /// log n) in what was actually released, with no per-mutation pass over the whole list.
     private var heap: [Int] = []
-    /// The free slots, in no particular order. Reporting and tests; the order is the heap's.
-    public var available: [Int] { heap }
+    /// WHICH SLOTS ARE FREE, the one answer. The heap only orders them and may hold an entry a sharer
+    /// has since claimed (removing an arbitrary value from a binary heap is O(n), and a claim runs per
+    /// seated chunk), so `allocate` skips what this no longer holds.
+    ///
+    /// A `claimed` set beside the heap had two ways to be wrong. Claiming a slot that was never free,
+    /// which is every ordinary shared seat, left it in the set for good, and that slot's next release
+    /// was then skipped at commit: the position stayed unusable until the next rebuild.
+    private var free = Set<Int>()
+    /// The free slots, in no particular order. Reporting and tests.
+    public var available: [Int] { Array(free) }
     /// Released during the current transaction. Not allocatable until `commit()`.
-    private(set) var quarantine: [Int] = []
-    /// Free slots that a sharer has taken since they were freed. `allocate` drops them instead of
-    /// handing them out; see `claim`.
-    private var claimed: Set<Int> = []
+    private(set) var quarantine = Set<Int>()
     /// One past the highest slot ever allocated. The vector file is this many rows long.
     private(set) var highWater: Int = 0
 
@@ -47,7 +54,8 @@ public struct SlotAllocator: Sendable {
     /// Restore from what SQLite holds: the free list and the high-water mark.
     public init(available: [Int], highWater: Int) {
         self.highWater = Swift.max(0, highWater)
-        heap = available.filter { $0 >= 0 && $0 < self.highWater }
+        free = Set(available.filter { $0 >= 0 && $0 < self.highWater })
+        heap = Array(free)
         heapify()
     }
 
@@ -55,11 +63,9 @@ public struct SlotAllocator: Sendable {
     /// none. Lowest first, so the file stays as dense at the front as it can and a truncation after
     /// a large delete has a chance of being worth doing.
     public mutating func allocate() -> Int {
-        // Skip anything a sharer took directly (see `claim`). Lazy deletion, because removing an
-        // arbitrary value from a binary heap is O(n) and this runs per written chunk.
+        // Skip anything a sharer took directly (see `claim`).
         while let id = popMin() {
-            if claimed.remove(id) != nil { continue }
-            return id
+            if free.remove(id) != nil { return id }
         }
         let id = highWater
         highWater += 1
@@ -78,20 +84,20 @@ public struct SlotAllocator: Sendable {
     public mutating func claim(_ id: Int) {
         guard id >= 0 else { return }
         if id >= highWater { highWater = id + 1; return }   // never was in the free set
-        if let i = quarantine.firstIndex(of: id) { quarantine.remove(at: i) }
-        claimed.insert(id)
+        quarantine.remove(id)
+        free.remove(id)
     }
 
     /// Give a slot back. It becomes allocatable at the next `commit()`, never before.
     public mutating func release(_ id: Int) {
         guard id >= 0, id < highWater else { return }
-        quarantine.append(id)
+        quarantine.insert(id)
     }
 
     /// End of transaction: quarantined slots become allocatable.
     public mutating func commit() {
         guard !quarantine.isEmpty else { return }
-        for id in quarantine where !claimed.contains(id) { push(id) }
+        for id in quarantine where free.insert(id).inserted { push(id) }
         quarantine.removeAll(keepingCapacity: true)
     }
 
@@ -155,15 +161,15 @@ public struct SlotAllocator: Sendable {
 
     public mutating func forgetFreeList() {
         heap.removeAll(keepingCapacity: true)
+        free.removeAll(keepingCapacity: true)
         quarantine.removeAll(keepingCapacity: true)
-        claimed.removeAll(keepingCapacity: true)
     }
 
     /// Slots that are neither live nor free. A leak is invisible - the vector file simply never
     /// shrinks - so it is checked rather than assumed.
     public func leaked(liveIDs: Set<Int>) -> [Int] {
-        let free = Set(heap).union(quarantine)
-        return (0 ..< highWater).filter { !liveIDs.contains($0) && !free.contains($0) }
+        let unowned = free.union(quarantine)
+        return (0 ..< highWater).filter { !liveIDs.contains($0) && !unowned.contains($0) }
     }
 
     /// Rebuild the free list from the chunk table alone, which is the authority. The free list is a
@@ -178,8 +184,8 @@ public struct SlotAllocator: Sendable {
     /// Live slots plus free slots must exactly cover the file. Anything else means a slot is owned
     /// twice or by nobody.
     public func covers(liveIDs: Set<Int>) -> Bool {
-        let free = Set(heap).union(quarantine)
-        guard free.isDisjoint(with: liveIDs) else { return false }
-        return free.count + liveIDs.count == highWater
+        let unowned = free.union(quarantine)
+        guard unowned.isDisjoint(with: liveIDs) else { return false }
+        return unowned.count + liveIDs.count == highWater
     }
 }

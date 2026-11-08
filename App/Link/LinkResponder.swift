@@ -19,14 +19,53 @@ final class LinkResponder: LinkService, @unchecked Sendable {
     private var store: VectorStore?
     private var modelName = ""
     private let lanes = SearchLanes()
+    private var generation = 0
+    private var heldForBenchmark = false
 
-    func attach(engine: OmniEngine, store: VectorStore, modelName: String) {
-        lock.withLock { self.engine = engine; self.store = store; self.modelName = modelName }
+    /// What these answers come from, moved each time that changes: linked Macs see it in the ping's
+    /// reply and learn this Mac's vector space and sources again. There was nothing to tell them, so
+    /// a model switch here left them mixing this Mac's scores by a space it no longer had, and an
+    /// engine that arrived after they connected left them on "still starting" until the link flapped.
+    var serviceGeneration: Int { lock.withLock { generation } }
+
+    /// What the app knows, as these answers need it. NOTHING PER SERVED REQUEST WAITS ON THE MAIN
+    /// ACTOR, and `space`, `sources` and `list` each did: a Mac whose main thread was held past the
+    /// asking Mac's 10 s lost its link's facts for good.
+    private struct Facts: Sendable {
+        var files = 0
+        var sources: [LinkWire.Source] = []
+        var folders: [String] = []
+        var photos: [PhotoLibrary.Source] = []
     }
 
-    func detach() { lock.withLock { engine = nil; store = nil } }
+    private let facts = RecentValue<Facts> { await MainActor.run { LinkResponder.readFacts() } }
+
+    @MainActor private static func readFacts() -> Facts {
+        guard let m = AppModel.shared else { return Facts() }
+        let clip = AppModel.clipboardDirectory.path
+        let roots = m.roots.filter { $0.path != clip }
+        let folders = roots.map {
+            LinkWire.Source(key: $0.path, name: $0.lastPathComponent, kind: "folder", files: m.folderFileCounts[$0.path] ?? 0)
+        }
+        let photos = m.photoSources.map {
+            LinkWire.Source(key: $0.key, name: $0.title, kind: "photos", files: m.folderFileCounts[$0.key] ?? 0)
+        }
+        return Facts(files: m.indexedFiles, sources: folders + photos, folders: roots.map(\.path), photos: m.photoSources)
+    }
+
+    @MainActor func attach(engine: OmniEngine, store: VectorStore, modelName: String) {
+        facts.seed(Self.readFacts())
+        lock.withLock { self.engine = engine; self.store = store; self.modelName = modelName; generation += 1 }
+    }
+
+    func detach() { lock.withLock { engine = nil; store = nil; generation += 1 } }
+
+    /// A benchmark run has the engine to itself: a linked Mac's search would share it with every case.
+    func holdForBenchmark(_ held: Bool) { lock.withLock { heldForBenchmark = held } }
 
     private func backend() throws -> (OmniEngine, VectorStore, String) {
+        let held = lock.withLock { heldForBenchmark }
+        if held { throw LinkError.refused("Omni on that Mac is running its benchmark.") }
         guard let (e, s, m) = lock.withLock({ () -> (OmniEngine, VectorStore, String)? in
             guard let engine, let store else { return nil }
             return (engine, store, modelName)
@@ -56,9 +95,11 @@ final class LinkResponder: LinkService, @unchecked Sendable {
     /// obsolete on its own Mac (AppModel.vectorSpaceDiffers).
     private func space() async throws -> LinkMessage {
         let (engine, _, model) = try backend()
+        let generation = serviceGeneration
         let probe = try await offPool { LinkResponder.probe(engine) }
-        let files = await MainActor.run { AppModel.shared?.indexedFiles ?? 0 }
-        return try .json(LinkWire.Space(dim: engine.dim, probe: probe, model: model, files: files, fusesText: true))
+        let files = await facts.get().files
+        return try .json(LinkWire.Space(dim: engine.dim, probe: probe, model: model, files: files, fusesText: true,
+                                        generation: generation))
     }
 
     /// The engine keeps it: one forward per encoder, shared with the model stamp.
@@ -69,6 +110,7 @@ final class LinkResponder: LinkService, @unchecked Sendable {
     /// One search per linked Mac at a time, and the newest wins: a Mac typing "b", "be", "bea" must
     /// not queue three searches on this one's GPU, only the last.
     private func search(_ req: LinkWire.SearchRequest, peer: String) async throws -> LinkMessage {
+        if AppModel.servedIndexObsolete.isOn { throw LinkError.refused("Omni on that Mac is rebuilding its index for its current model.") }
         let (engine, store, _) = try backend()
         let ticket = await lanes.enter(peer)
         defer { Task { await lanes.leave(peer) } }
@@ -102,10 +144,10 @@ final class LinkResponder: LinkService, @unchecked Sendable {
 
     private func similar(_ req: LinkWire.PathRequest) async throws -> LinkMessage {
         let (_, store, _) = try backend()
-        try servable(req.path, store)
         let path = req.path
         let clip = AppModel.clipboardDirectory.path
         let (hits, vec): ([SearchHit], [Float]?) = try await offPool {
+            try self.servable(path, store)
             guard let v = store.fileVector(path) else { return ([], nil) }
             var f = SearchFilter()
             f.excludeFolders = [clip]
@@ -116,9 +158,9 @@ final class LinkResponder: LinkService, @unchecked Sendable {
 
     private func passages(_ req: LinkWire.PathRequest) async throws -> LinkMessage {
         let (engine, store, _) = try backend()
-        try servable(req.path, store)
         let path = req.path
         let found: [ChunkHit] = try await offPool {
+            try self.servable(path, store)
             let vec: [Float]
             if let v = req.vector, v.count == engine.dim { vec = v }
             else if let q = req.query, !q.isEmpty { vec = engine.embedQuery(q) }
@@ -132,7 +174,8 @@ final class LinkResponder: LinkService, @unchecked Sendable {
 
     private func thumb(_ req: LinkWire.PathRequest) async throws -> LinkMessage {
         let (_, store, _) = try backend()
-        try servable(req.path, store)
+        let path = req.path
+        try await offPool { try self.servable(path, store) }
         let px = max(32, min(req.px ?? 256, 1024))
         guard let cg = await Thumbnail.render(path: req.path, maxPixel: px, side: CGFloat(px) / 2, scale: 2),
               let jpeg = Self.jpeg(cg) else { return LinkMessage() }
@@ -145,9 +188,9 @@ final class LinkResponder: LinkService, @unchecked Sendable {
 
     private func fetch(_ req: LinkWire.PathRequest) async throws -> LinkMessage {
         let (_, store, _) = try backend()
-        try servable(req.path, store)
         let path = req.path
         return try await offPool {
+            try self.servable(path, store)
             guard let url = PhotoActions.materialize(path) else { throw LinkError.refused("The file is gone.") }
             let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
             let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
@@ -166,18 +209,7 @@ final class LinkResponder: LinkService, @unchecked Sendable {
 
     private func sources() async throws -> LinkMessage {
         _ = try backend()
-        let list: [LinkWire.Source] = await MainActor.run {
-            guard let m = AppModel.shared else { return [] }
-            let clip = AppModel.clipboardDirectory.path
-            let folders = m.roots.filter { $0.path != clip }.map {
-                LinkWire.Source(key: $0.path, name: $0.lastPathComponent, kind: "folder", files: m.folderFileCounts[$0.path] ?? 0)
-            }
-            let photos = m.photoSources.map {
-                LinkWire.Source(key: $0.key, name: $0.title, kind: "photos", files: m.folderFileCounts[$0.key] ?? 0)
-            }
-            return folders + photos
-        }
-        return try .json(LinkWire.Sources(sources: list))
+        return try .json(LinkWire.Sources(sources: await facts.get().sources))
     }
 
     /// A folder's indexed children, or a Photos source's assets. Only inside this Mac's sources.
@@ -186,14 +218,16 @@ final class LinkResponder: LinkService, @unchecked Sendable {
         let folder = req.path
         let clip = AppModel.clipboardDirectory.path
         guard folder != clip, !folder.hasPrefix(clip + "/") else { throw LinkError.refused("Not shared.") }
-        let (inside, photo): (Bool, PhotoLibrary.Source?) = await MainActor.run {
-            guard let m = AppModel.shared else { return (false, nil) }
-            if let s = m.photoSources.first(where: { $0.key == folder }) { return (true, s) }
-            return (m.roots.contains { $0.path != clip && (folder == $0.path || folder.hasPrefix($0.path + "/")) }, nil)
+        let known = await facts.get()
+        let photo = known.photos.first { $0.key == folder }
+        guard photo != nil || known.folders.contains(where: { folder == $0 || folder.hasPrefix($0 + "/") }) else {
+            throw LinkError.refused("Not a shared folder.")
         }
-        guard inside else { throw LinkError.refused("Not a shared folder.") }
         if let photo {
-            let hits = await AppModel.shared?.photoSourceHits(photo, cap: 1000) ?? []
+            var f = SearchFilter()
+            f.folderPrefix = photo.key
+            let filter = f
+            let hits = try await offPool { store.listMatching(filter: filter, topK: 1000) }
             return try .json(LinkWire.Listing(children: hits.map {
                 LinkWire.Child(path: $0.path, folder: false, kind: $0.kind, modified: $0.modified, size: $0.size, files: 0)
             }))
@@ -207,7 +241,8 @@ final class LinkResponder: LinkService, @unchecked Sendable {
 
     // MARK: - Helpers
 
-    /// Throws unless `path` is a file this Mac's index holds, outside the clipboard history.
+    /// Throws unless `path` is a file this Mac's index holds, outside the clipboard history. It reads
+    /// the store, so it runs on the served work queue, not on the pool thread of the request's task.
     private func servable(_ path: String, _ store: VectorStore) throws {
         let clip = AppModel.clipboardDirectory.path
         guard path.hasPrefix("/") || PhotoLibrary.isPhotoPath(path),

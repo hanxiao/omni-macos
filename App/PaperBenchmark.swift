@@ -71,6 +71,7 @@ extension AppModel {
             paperFraction = nil; paperStartedAt = nil
             profilingShowsTiming = false
             serving.pausedForBenchmark = false
+            link.responder.holdForBenchmark(false)
             restartWatcherForPaperRun()
             // Resume where it left off (incremental) AND drain everything the run's guards deferred:
             // buffered FS events, added-folder catch-ups, folder removals, the tag backfill.
@@ -84,6 +85,7 @@ extension AppModel {
         // share the engine with every case. Held, not switched: the saved setting is untouched, so
         // a run that dies part-way still serves at the next launch.
         serving.pausedForBenchmark = true
+        link.responder.holdForBenchmark(true)
 
         // Awake and at full speed for the whole run. Without this, the display's idle sleep (10
         // minutes by default) slowed every later case about 5x on an M3 Ultra and an M4 Pro, with
@@ -101,13 +103,14 @@ extension AppModel {
         // isIndexWorkInFlight, not indexState: a watcher reconcile and a tag-backfill batch (armed
         // 3 s after any search) never set indexState, so waiting on it alone left one of them
         // writing the user's store for the whole run.
-        if isIndexWorkInFlight {
+        // A removed folder's delete and its VACUUM hold no such flag; bulkDeleteInFlight covers them.
+        if isIndexWorkInFlight || bulkDeleteInFlight {
             paperPhase = "Pausing indexing\u{2026}"
             pauseIndexing()
             // 30 s, not 5: a cancel is only observed between files, and one file can be a long
             // video or a 5-crop image batch. The bound is followed by a real check.
             for _ in 0 ..< 300 {
-                if !isIndexWorkInFlight || cancel.on { break }
+                if !(isIndexWorkInFlight || bulkDeleteInFlight) || cancel.on { break }
                 try? await Task.sleep(nanoseconds: 100_000_000)
             }
         }
@@ -120,7 +123,7 @@ extension AppModel {
         // Refused rather than measured through: a pipeline that is still writing shares the GPU
         // with every case AND writes the user's rows under the suite's arms. Both are worse than
         // not running.
-        guard !isIndexWorkInFlight else {
+        guard !isIndexWorkInFlight, !bulkDeleteInFlight else {
             activeSheet = nil   // take the progress sheet down before the modal that explains why
             paperAlert("Indexing did not stop",
                        "A file being indexed did not finish within 30 seconds and would slow down the "

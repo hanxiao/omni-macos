@@ -3497,3 +3497,183 @@ both. First open of a migrated index: 33.5, 35.0 s against 35.1, 38.1 s, of whic
 0.69 s; the rest is not separated from noise at n=2. KILLED at 30, 120 and 240 s of the migration: 0 failing
 checks and the same digest each time; the 30 and 120 s kills landed before the split committed, the 240 s
 one after the migration had finished, so no kill landed between the publish and the drop.
+
+## The state machines, run (2026-11-07)
+
+The second audit's catalogue (`docs/review-2026-11-06/implicit-state-machines.md`), every confirmed
+problem reproduced before it was fixed, each fix with a test that failed on the unfixed code and a
+negative control that fails with the fix taken out. The store's are here; the indexer's, app model's,
+views' and served surfaces' are in their reviews' status tables (same worktree convention, kept with
+the catalogue).
+
+- A NEW CONTENT TOOK THE POSITION A SURVIVING CONTENT STILL NAMED, on any index, no kill. One batch,
+  a passage moved between files, the receiving file first: the source's position was released in T1
+  and handed out again in T2 of the same write, and the moved passage then read the newcomer's bytes.
+  REPRODUCED: score 0.168 instead of 1.0, still wrong after a reopen. `seatKeptContentsLocked` claims
+  every kept content's position before anything is placed; the allocator's free set is now the truth
+  and the heap only orders it (a claim of a position never free used to block its later release for
+  good). The shared-position check runs once more on every index (`_2`). Seeded churn, 8 seeds x 120
+  rounds: 0 positions shared; with the seat removed, 254 failures.
+- THE SPLIT'S BUILD HOLDS THE WRITE GATE from before its first read until its publish. Four states
+  went with that one rule. A write waiting on the SQLite lock held the store queue 5 s an attempt for
+  as long as the build ran (a search waited over 1 s; now under 1 s with a write waiting). A delete
+  that got in between the commit and the publish left an occurrence of a file that was gone, and the
+  next open refused the index (the app then rebuilt it); a rewrite there kept its old content and key
+  for good, and a shorter one kept ghost occurrences. A row committed between the first read and the
+  lock failed the first invariant after the whole transaction. A build that took the lock between a
+  write's two transactions left that row unplaced. The catch-up pass is deleted: nothing can arrive
+  for it to catch up with. AN UNPUBLISHED BUILD IS BUILT AGAIN, not adopted: a rewrite of the same
+  length keeps every count its invariants check, and adoption kept that file on its old key.
+- ONE MAINTENANCE OWNER (`maintenanceOwner`) for the build, the v4 drop and the reclaim. A reclaim
+  that committed before the build's lock renumbered positions the build had already read, and the
+  build wrote them into `chunk.slot` past its invariants.
+- A RELOAD THAT FAILED IN SESSION left an empty, writable store over a full vector file, and the next
+  write mapped a fresh file over it: one page, every vector gone. `beginTxnLocked` now answers busy
+  while the store cannot load, and the reload tries again (30 s, doubling).
+- THE RECLAIM MARKER GOES BEFORE THE COPY, and the copy only if the marker went: copy gone with the
+  marker standing reads as "the rename happened", and every content was renumbered over the file the
+  rename never touched (REPRODUCED with one held lock at the open). A resume that fails for a reason no
+  wait cures is a store error, which reaches the rebuild; it read as busy, retried every 30 s for ever.
+- THE PUBLISH SESSION'S TWO MODELS, twice more: its whole-file reclaim ranked `chunks.slot`, which a
+  content written since does not have (now declined until the next open), and its compaction wrote
+  positions to `chunks` (now through the occurrences, to `chunk`).
+- TWIN FILE ROWS EXIST ON A REAL INDEX: the bench index, copied from Han's, has one group of two. Memory
+  holds them as one file and SQL deleted one spelling, so each rewrite released a position a live
+  content kept. Merged once per index at open: the older row goes, the newer is marked changed. A file
+  row gone with its occurrences left behind is repaired at the refusal instead of rebuilding.
+- Smaller: a wipe took the reuse debts' table with it but not the debts; the two "split done" flags
+  are one statement; a persist already writing put back a quant replica a drop had removed (an epoch
+  now); the slot backfill runs from the caught-up stamp; a killed reclaim's copy is deleted at open;
+  an earlier stamp deadline replaces a later one (a five-minute reclaim wait swallowed the rest); an
+  interrupted vacuum stays owed; a passage whose file was away for a moment is asked again; a key
+  retired twice failed UNIQUE and rolled back every open (the id now follows the four 0xFF bytes); a
+  lock that outlasts the 210 s wait is reported to the caller (`wipeChunks`, `deletePaths`,
+  `deleteUnderFolder` return false), and the app does not settle a folder's removal on it.
+
+NOT REPRODUCED: a second kill during a reopened backfill (a test now covers it, and passes on the unfixed
+code). RESIDUAL: a content that already shared a position with another before this build, whose other
+sharer has since gone, holds bytes nothing can check.
+
+A COMPARISON THAT WARMS ONE ARM. `mutbench --crud rename` read 25% slower SQL on this build, on a clone the
+fixed build had migrated, in every order. Bisected to the store, then to nothing in it: the baseline
+build did not know the renamed `_2` key, so its open ran the once-per-index shared-position check, a
+full read of `chunk`, and the timed op then found those pages warm. With the old key also set on the
+clone, both read 2.53-2.60 s of SQL. An A/B over a once-per-index step has to mark it done for both arms.
+
+The second round, after the first was called done:
+- THE RANGES THE AUDIT HAD NOT READ held four more. A row past the quantized base that reads one of its
+  positions (a copy that shares a folded content, a vector the free list put in a hole) adds no
+  position, so nothing folds it in, and every per-position fact was still its old owner's: a search
+  scoped to a copy's folder never saw the copy (REPRODUCED: `/b/copy.png` absent from `in:/b`), and a
+  date filter read a re-indexed file's old time when its vector went back into a base hole
+  (REPRODUCED). Those positions are candidates by right now (`reusedBasePositionsLocked`), judged per
+  row, whenever a mask or a lift was applied by position; a plain search reaches them by score (the
+  score and the dead mask are right there). Patching changed dates into the GPU table was tried
+  first and changed no answer once the positions were taken: reverted. The 1-bit tier's signs were never cleared, and a model switch in session multiplied
+  [rows, 1024] by 768 signs (fatalError); they are rebuilt at a new width. The folder counts handed back
+  a walk an older request's interrupt had cut short as the answer (REPRODUCED with an interrupt on the
+  first row); it starts over. The lift cache now resets with the slot mirror a tail reclaim moves
+  (REPRODUCED: stale after three slices).
+- THE FOLDER MAP'S FIRST HOLD grew with the folder: 353 ms for the root of the bench index, most of it a
+  path String per file built on the store queue. The streamed pull walks in slices of 2M rows (a write
+  between slices starts it over), builds the names off the queue, and pools the landmarks in a hold of
+  their own (55 ms for 15,000).
+- A RELOAD'S HOLD waited for a label cache build when the cache was missing: indexing held 1.9 s,
+  0.4 s with the cache built before the hold.
+- NEURAL ENGINE BATCHES BESIDE QUERIES wait as 0.19.11's did, with two ways out. 0.19.11's batch waited
+  for the query count to reach zero, so two clients searching back to back starved it, and a Pause
+  waited with it until they stopped (Nano 65.7 s, Small 71.0 s after the Pause). Round one gave the
+  batch a fifth of the Neural Engine and one sequence a call: the batch finished, but every query
+  paid (Nano p99 18 -> 113 ms at two clients, 137 -> 232 at sixteen) and a batch beside one client
+  took 27% longer. Now a batch goes when no query waits (as before), once it has waited 200 of its
+  own last call's lengths (about 0.5% of the Neural Engine), or when indexing stops
+  (`Embedder.indexingStopping`, from `Indexer.cancel`), after which it goes one call at a time with
+  the waiting queries let in between. Counted from the last call instead of the wait, the first wait
+  of a burst went at once and moved Small's 10 s burst p99 38 -> 46 ms; with a 5 s floor before any
+  call was timed, a fresh process's first nonstop minute answered 1% fewer queries (60 s now). Run
+  flat out after a stop, the batch finished 6.9 s (Nano) / 13.7 s (Small) after a Pause, but NSLock's
+  unfairness held queries behind call after call (Small p99 up to 825 ms); one call at a time it
+  finishes 13.4 / 26.8 s after, and a query waits one call (Nano 220, Small 455 ms p99), what a
+  single client waits beside indexing in 0.19.11 (186 / 360 ms). Against 0.19.11, interleaved: query
+  p99 with 1, 2, 4 and 16 clients and in 10 s bursts the same, the burst's batch done when it was,
+  and a Pause beside four clients done in 13-27 s where it waited until the searches stopped (66-71 s).
+- `testFrozenPeerGoesOffline` failed in 2 of 4 full runs, never alone. A's hello reached B through the
+  test's proxy with A's own port, B dialled A straight back (as 0.19.11 does), and when that direct link
+  was the one kept, swallowing the proxy's bytes changed nothing: 1 to 5 misses in 25 under load, with
+  pings and pongs flowing after the "freeze". The test now waits for the proxy to carry the pings
+  before it goes quiet: 0 misses in 50.
+- Served and linked search refuse while the index waits to be rebuilt for a new model (old vectors,
+  new query), and the Link sheet says when Local Network access is off instead of spinning.
+- AGAINST 0.19.11, round two (bench index clones, each arm settled by its own build; load average ~11
+  from other work throughout): the four search digests identical (134b9ff1, a5d92396, 45701c09,
+  ca10cc00), 0 failing checks; `update` 21.3 -> 20.6 s with search p99 305-939 -> 328-496 ms, `delpaths`
+  18.5 s in both with p99 226-259 -> 234-266 ms (four interleaved rounds); retrieval eval (Small)
+  identical on all 175 summary figures; served probe 0 rank changes of 125, load equal (about 140/s with
+  one client, 315/s with eight and 32, 0 errors) with a lower p99.
+- THE EVAL THAT WAS NOT THE SAME EVAL. Round one's baseline read ALL MRR 0.888 against 0.923, `deck-pic` and
+  `numbers` 0: its tree had no `omni-pages` in .build/release, so decks and Numbers documents were indexed
+  without the helper that draws them, and nothing said so. Built there, the baseline reads 0.923. A
+  baseline tree needs every helper the measured path launches, not only the tools named on the command.
+- THE MAP'S HOVER, RUN. A refit with the same file count (a file swapped in the shown folder) bumps the
+  generation while the old points are still drawn; a hover then resolved a dot of the old layout to the
+  new projection's row. No event reaches SwiftUI's hover without the real pointer (NSEvent posted, and
+  a CGEvent posted to the pid: 0 hovers either way), so the handler itself was run, for a grid of
+  points posted to it in the app, with the new points held back 15 s by a temporary launch argument
+  (removed). 40 notes, one swapped: in the held window, without the generation check, 48 of 130 hovers
+  on a dot named another file (pointer on note-35's dot, chip "note-32"); with it, none resolved; on
+  the first map both named every dot right.
+- THE 1-BIT TIER COULD NOT SEE A PATCHED POSITION (found by running, not by the audit; in every version
+  through 0.19.11). `patchScoresLocked` writes a rewritten position's exact cosine into the coarse
+  scores, the affine and full tiers' scale; the 1-bit scan scores the rotated query against a row's
+  signs, about sqrt(dim) larger, so a vector the free list put in a hole scored ~1 among codes scoring
+  ~10 and never reached the candidates until a fold re-packed it. On a bench index clone (`omni-verify
+  basereusecheck`: 40 real files re-indexed with new vectors, each searched for): 0.19.11 found 32
+  plain, 37 in their own folder; the 8 missed were the ones a fold during the write had not reached
+  (stored vectors exact, cosine 1.0000, all 8 in `patchedSlots`). Patched positions on that tier are
+  scored now from sign codes packed on the spot, the way the fold packs them (`patchBitScoresLocked`).
+  At most 16 positions are carried before a rebuild (`patchedRebuildThreshold`). Its cost, apart from
+  the hole reclaim (`OMNI_HOLE_RECLAIM=0` in every arm, 0 relocation slices in every run; with the reclaim
+  running, the slices swamp it), `update 2000` on the bench clone, the old patch and this one switched in
+  ONE binary, three interleaved rounds: 1-bit step p50 1.2 / 1.2 ms, p90 156.5 / 152.1, p99 189.0 / 178.0;
+  whole search p99 per run 250-339 / 251-269 ms (0.19.11's own binary 280-330). A variant that built the
+  query's planes once for both scans and left the packing lazy (two fewer GPU waits a patched search)
+  measured no better on the step (p50 1.2, p90 155.6) and worse on whole-search p99 (334-377, in the
+  host gather it does not touch): not taken. One earlier reclaim-free round read the fix's updates
+  0.7-1.8 s slower; op time within one arm spans 18.9-28.0 s on this machine, and the paired step is
+  equal.
+- AGAINST 0.19.11 ON XCODE 27.2 (26.6 was removed from the Mac mid-run; both arms built with `swift
+  build --build-system native`, kernels from the last 26.6 app build): Neural Engine probe equal on every
+  cell in two interleaved rounds per arm, except the stop cell (finished 65.9 s after the stop -> 13.1-13.4
+  s); retrieval eval identical on all 175 summary figures; parity cosine 0.99994, tokens all match; full
+  suite 1,047 tests, 0 failures, 1,482 s (1,452 s on 26.6; the 747 tests timed in both runs 1,021 ->
+  1,045 s).
+- THE RECLAIM THAT STARTED AT LAUNCH (in 0.19.11 too; found by running, not by the audit). The hole
+  reclaim waits for 30 s without writes and 60 s without a search, "an app nobody is using", and both
+  clocks started at `distantPast`: an index nothing had written to or searched since it opened read as
+  idle for ever, so the first coverage stamp after an open started a reclaim whenever it came before the
+  first write and the first search, beside the catch-up and the user's first queries. The tombstone
+  collection had the same clocks. On a settled bench clone the race went both ways for the same build:
+  `delpaths 4000` took 17-24 s with 0 relocation slices, 70-114 s with 400-770 slices, 226-346 s when the
+  reclaim ran on (1-2.2M moves), search p99 ~270 -> ~650-730 ms. This morning's 26.6 rounds drew none and
+  this afternoon's 27.2 rounds drew it, which first read as a toolchain slowdown; with both arms drawing
+  it the slice costs are equal (memory step 3.9 ms a slice in both). Both clocks now start at the open
+  (`openedAt`). Run: three interleaved rounds, 0.19.11 drew it in 2 (603 and 773 slices, 100 and 114 s),
+  the fix in none (18.5-24.0 s); an open left alone still reclaims, 0.19.11 at 48.8 s after launch, the
+  fix at 63.3 s (60 s after the open); `testAFreshOpenIsNotIdle` fails on the old clocks (2 audits right
+  after the open). Before comparing `mutbench` runs, count `[relocate` lines.
+- THE MAP'S HOVER WITH A REAL POINTER (computer use, Han's approval, 2026-11-07). A scratch copy of the tree
+  held a refit's points 30 s and could switch the generation check off; same 40 notes, same layout in
+  both launches. Before the refit both named every dot read (note-33, note-19, note-17, note-14, note-2).
+  In the held window, check off: 3 of 5 dots named another file (note-19's dot "note-10", note-14's
+  "note-1", note-2's "note-38"); check on: no chip and no ring on any dot tried. After the new points
+  landed, hover named the new layout's dots (the added note an outlier). The shipped app's hover is the
+  same code without the hold.
+- XCODE 27.2 FOR THE APP (Metal Toolchain 27B47 downloaded with Han's approval, 839 MB). Both apps build
+  (`build-app.sh Release`, ~5 min). Its Metal compiler gives different kernels (3,836,652 bytes against
+  26.6's 3,817,916); with them the four search digests are 0.19.11's in both arms, store audits clean.
+  OCR: 40-page digest a35ef0f9c8fe8ad single and f1ed744e12ae453 at width 32 (a 9058f337 variant once,
+  beside another process at 25% of the GPU: admission paces by elapsed time); hard2 page for page the
+  same as the 26.6 build of the same OCR code (greedy 8/10 exact, CER 0.0086, misses at the same
+  characters; width 10 7/10, 0.0087); `--probe-qmm` shows the known MLX 0.31.3 M=2/3 bug untransposed
+  only. In the app, interleaved with the 26.6 app: 44.7 / 45.3 s against 45.0 / 45.2 s for the long scan,
+  first page 12.3 s in both.

@@ -48,28 +48,124 @@ public struct LinkIdentity: Sendable {
     }
 
     /// The identity stored at `url`, created on first use.
+    ///
+    /// WHAT CANNOT BE READ IS NOT WHAT IS ABSENT. All three used to be one branch that made a new key
+    /// and removed the file, and every linked Mac pins the old key: only re-pairing each one came back
+    /// from that. Only a file that is not there gets a key made for it. One that is there and will not
+    /// read throws with nothing touched: the cause (permissions, a disk error) can pass, and the key
+    /// is still in it. One that reads and holds no key is kept aside before a new one takes its name.
     public static func loadOrCreate(at url: URL) throws -> LinkIdentity {
-        let fm = FileManager.default
-        if let data = try? Data(contentsOf: url),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let b64 = obj["key"] as? String, let raw = Data(base64Encoded: b64),
-           let key = try? P256.Signing.PrivateKey(rawRepresentation: raw) {
-            return try LinkIdentity(key: key)
+        switch LinkFile.read(url) {
+        case .absent: break
+        case .unreadable(let why): throw LinkError.identity("\(url.lastPathComponent) cannot be read: \(why)")
+        case .read(let data):
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let b64 = obj["key"] as? String, let raw = Data(base64Encoded: b64),
+               let key = try? P256.Signing.PrivateKey(rawRepresentation: raw) {
+                return try LinkIdentity(key: key)
+            }
+            try LinkFile.keepAside(url)
         }
         let key = P256.Signing.PrivateKey()
-        try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let body = try JSONSerialization.data(withJSONObject: ["version": 1, "key": key.rawRepresentation.base64EncodedString()])
-        // Written 0600 from the start: created, not chmod'ed after, so there is no moment it is readable.
-        let tmp = url.appendingPathExtension("tmp")
-        fm.createFile(atPath: tmp.path, contents: body, attributes: [.posixPermissions: 0o600])
-        _ = try? fm.removeItem(at: url)
-        try fm.moveItem(at: tmp, to: url)
+        try LinkFile.write(body, to: url)
         return try LinkIdentity(key: key)
+    }
+}
+
+/// The two files the link keeps, on disk: read so that "not there" and "will not read" stay apart,
+/// written whole or not at all.
+public enum LinkFile {
+    /// Copy the link's files from `old` into `new`, when `new` has neither its key nor its list and
+    /// `old` has a key. A Mac that linked again at `new` keeps what it has. Copied, not moved: the old
+    /// folder is left as it was, as a move of the index leaves its old copy. True if it copied.
+    public static func adopt(from old: URL, to new: URL) -> Bool {
+        let fm = FileManager.default
+        let names = ["identity", "peers.json"]
+        guard old.standardizedFileURL != new.standardizedFileURL,
+              !names.contains(where: { fm.fileExists(atPath: new.appendingPathComponent($0).path) }),
+              let key = try? Data(contentsOf: old.appendingPathComponent("identity")) else { return false }
+        do {
+            // The list first: the key is what says the folder is in use, so a kill between the two
+            // leaves a folder that adopts again next launch.
+            if let list = try? Data(contentsOf: old.appendingPathComponent("peers.json")) {
+                try write(list, to: new.appendingPathComponent("peers.json"))
+            }
+            try write(key, to: new.appendingPathComponent("identity"))
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    enum Contents {
+        case absent
+        case read(Data)
+        case unreadable(String)
+    }
+
+    static func read(_ url: URL) -> Contents {
+        do {
+            return .read(try Data(contentsOf: url))
+        } catch let e as CocoaError where e.code == .fileReadNoSuchFile || e.code == .fileNoSuchFile {
+            return .absent
+        } catch {
+            return .unreadable(error.localizedDescription)
+        }
+    }
+
+    /// Move what was found out of the way, under a name beside it that nothing reads and nothing
+    /// overwrites, for whoever wants to look at it. Throws if it cannot, and then nothing may be
+    /// written at `url`.
+    static func keepAside(_ url: URL) throws {
+        let stamp = Int(Date().timeIntervalSince1970)
+        var aside = url.appendingPathExtension("unreadable-\(stamp)")
+        var n = 1
+        while FileManager.default.fileExists(atPath: aside.path) {
+            aside = url.appendingPathExtension("unreadable-\(stamp)-\(n)")
+            n += 1
+        }
+        do { try FileManager.default.moveItem(at: url, to: aside) }
+        catch { throw LinkError.storage("\(url.lastPathComponent) could not be kept aside: \(error.localizedDescription)") }
+    }
+
+    /// `data` at `url`, or a throw with `url` as it was. 0600 from the start: created so, not chmod'ed
+    /// after, so there is no moment it is readable. On the disk before it takes the name, so a power
+    /// cut leaves the old file or the new one and never a part of either (a save happens when a link
+    /// changes, not per request, and costs one flush).
+    static func write(_ data: Data, to url: URL) throws {
+        func failed(_ what: String) -> LinkError {
+            .storage("\(url.lastPathComponent) could not be saved: \(what): \(String(cString: strerror(errno)))")
+        }
+        let dir = url.deletingLastPathComponent()
+        do { try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true) }
+        catch { throw LinkError.storage("\(url.lastPathComponent) could not be saved: \(error.localizedDescription)") }
+        let tmp = url.appendingPathExtension("tmp")
+        let fd = open(tmp.path, O_WRONLY | O_CREAT | O_TRUNC, 0o600)
+        guard fd >= 0 else { throw failed("create") }
+        var written = 0
+        let ok = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Bool in
+            while written < raw.count {
+                let n = Foundation.write(fd, raw.baseAddress! + written, raw.count - written)
+                if n < 0 { if errno == EINTR { continue }; return false }
+                written += n
+            }
+            return true
+        }
+        guard ok else { let e = failed("write"); close(fd); unlink(tmp.path); throw e }
+        // F_FULLFSYNC: plain fsync on macOS leaves the data in the drive's cache.
+        guard fcntl(fd, F_FULLFSYNC) == 0 || fsync(fd) == 0 else { let e = failed("sync"); close(fd); unlink(tmp.path); throw e }
+        close(fd)
+        guard rename(tmp.path, url.path) == 0 else { let e = failed("rename"); unlink(tmp.path); throw e }
+        let dirfd = open(dir.path, O_RDONLY)
+        if dirfd >= 0 { _ = fsync(dirfd); close(dirfd) }
     }
 }
 
 public enum LinkError: Error, CustomStringConvertible, Equatable {
     case identity(String)
+    /// A file of the link's could not be read or saved.
+    case storage(String)
     case closed
     case timeout
     case refused(String)
@@ -80,6 +176,7 @@ public enum LinkError: Error, CustomStringConvertible, Equatable {
     public var description: String {
         switch self {
         case .identity(let s): return "identity: \(s)"
+        case .storage(let s): return s
         case .closed: return "the connection closed"
         case .timeout: return "no answer in time"
         case .refused(let s): return s

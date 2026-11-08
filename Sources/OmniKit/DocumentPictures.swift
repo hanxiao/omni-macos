@@ -119,7 +119,7 @@ public enum DocumentPictures {
 
     /// Where the helper is: OMNI_PAGES_HELPER, the app's Contents/Helpers, or beside the running tool
     /// or test bundle (SwiftPM builds every product into one folder).
-    static let helper: URL? = {
+    nonisolated(unsafe) static var helper: URL? = {
         let fm = FileManager.default
         if let p = ProcessInfo.processInfo.environment["OMNI_PAGES_HELPER"], fm.isExecutableFile(atPath: p) {
             return URL(fileURLWithPath: p)
@@ -135,7 +135,7 @@ public enum DocumentPictures {
     /// Each drawing is a Quick Look conversion and a WebKit process: two at a time at most, however
     /// wide the decode stage runs.
     private static let gate = DispatchSemaphore(value: 2)
-    static let timeout: TimeInterval = 120
+    nonisolated(unsafe) static var timeout: TimeInterval = 120   // var: a test draws with a helper that hangs
     private static let root = FileManager.default.temporaryDirectory.appendingPathComponent("omni-pages", isDirectory: true)
 
     /// What a crash left behind (a drawing never takes an hour), swept once per process.
@@ -149,10 +149,24 @@ public enum DocumentPictures {
         }
     }()
 
-    /// The document's pages drawn, the long side at most `maxDimension`; nil when it has no preview,
-    /// the helper is missing, or the drawing did not finish in time.
+    /// What a drawing came to. `render`'s nil said all three, and a deck whose drawing timed out was
+    /// indexed as one that has no preview, for good.
+    public enum Drawing {
+        case drawn(RenderedPages)
+        /// It has no preview, or there is no helper: asking again gets the same answer.
+        case noPreview
+        /// Timed out, or the helper died: another try may well work.
+        case notNow
+    }
+
+    /// The document's pages drawn, the long side at most `maxDimension`; nil when it could not be.
     public static func render(_ url: URL, maxDimension: Int) -> RenderedPages? {
-        guard let helper else { return nil }
+        if case .drawn(let pages) = draw(url, maxDimension: maxDimension) { return pages }
+        return nil
+    }
+
+    public static func draw(_ url: URL, maxDimension: Int) -> Drawing {
+        guard let helper else { return .noPreview }
         _ = swept
         let dir = root.appendingPathComponent(UUID().uuidString, isDirectory: true)
         gate.wait()
@@ -165,21 +179,21 @@ public enum DocumentPictures {
         p.standardError = FileHandle.nullDevice
         let done = DispatchSemaphore(value: 0)
         p.terminationHandler = { _ in done.signal() }
-        guard (try? p.run()) != nil else { return nil }
+        guard (try? p.run()) != nil else { return .noPreview }
         if done.wait(timeout: .now() + timeout) == .timedOut {
             kill(p.processIdentifier, SIGKILL)
             try? FileManager.default.removeItem(at: dir)
-            return nil
+            return .notNow
         }
         struct Entry: Decodable { let label: String; let image: String; let text: String }
         guard p.terminationStatus == 0,
               let data = try? Data(contentsOf: dir.appendingPathComponent("pages.json")),
               let entries = try? JSONDecoder().decode([Entry].self, from: data), !entries.isEmpty else {
             try? FileManager.default.removeItem(at: dir)
-            return nil
+            return p.terminationReason == .uncaughtSignal ? .notNow : .noPreview
         }
         let pages = entries.map { RenderedPages.Page(label: $0.label, image: dir.appendingPathComponent($0.image), text: $0.text) }
         if omniPerfEnabled { omniPerfLog(String(format: "document-drawn %.0fms .%@ pages=%d", -started.timeIntervalSinceNow * 1000, url.pathExtension, pages.count)) }
-        return RenderedPages(pages: pages, dir: dir)
+        return .drawn(RenderedPages(pages: pages, dir: dir))
     }
 }

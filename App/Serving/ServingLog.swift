@@ -77,10 +77,13 @@ final class ServingLogFile: @unchecked Sendable {
         return (dir?.isEmpty ?? true) ? nil : dir
     }()
 
-    /// Rotated at open past this size: one previous file (`serving.log.1`) is kept.
+    /// Rotated past this size: one previous file (`serving.log.1`) is kept. At open it was the only
+    /// check, so a session that ran for weeks grew without limit.
     private static let rotateBytes = 32 << 20
     private let queue = DispatchQueue(label: "omni.serving.log", qos: .utility)
     private var handle: FileHandle?
+    private var written = 0
+    private var sinceCheck = 0
 
     private static let stamp: DateFormatter = {
         let f = DateFormatter()
@@ -126,13 +129,37 @@ final class ServingLogFile: @unchecked Sendable {
     }
 
     func append(_ line: String) {
-        queue.async { [self] in
-            if handle == nil { open() }
-            try? handle?.write(contentsOf: Data((line + "\n").utf8))
-        }
+        queue.async { [self] in write(line) }
+    }
+
+    /// One served request, formatted and written on the log's own queue. This went through the main
+    /// actor, once per request, for a file with a queue of its own: under an agent's load every
+    /// response's log line waited behind whatever the main thread was doing.
+    func append(_ entry: LogEntry) {
+        queue.async { [self] in write(Self.line(for: entry)) }
+    }
+
+    private func write(_ line: String) {
+        if handle == nil || stale() { open() }
+        let bytes = Data((line + "\n").utf8)
+        try? handle?.write(contentsOf: bytes)
+        written += bytes.count
+        if written > Self.rotateBytes { open() }
+    }
+
+    /// A log deleted under the open handle takes the writes and the tab reads nothing. Looked at once
+    /// per hundred lines, since the answer changes only when someone clears the file by hand.
+    private func stale() -> Bool {
+        sinceCheck += 1
+        guard sinceCheck >= 100, let fd = handle?.fileDescriptor else { return false }
+        sinceCheck = 0
+        var st = Darwin.stat()
+        return fstat(fd, &st) == 0 && st.st_nlink == 0
     }
 
     private func open() {
+        try? handle?.close()
+        handle = nil
         let fm = FileManager.default
         try? fm.createDirectory(at: Self.url.deletingLastPathComponent(), withIntermediateDirectories: true)
         if let size = (try? fm.attributesOfItem(atPath: Self.url.path))?[.size] as? Int, size > Self.rotateBytes {
@@ -142,6 +169,7 @@ final class ServingLogFile: @unchecked Sendable {
         }
         if !fm.fileExists(atPath: Self.url.path) { fm.createFile(atPath: Self.url.path, contents: nil) }
         handle = try? FileHandle(forWritingTo: Self.url)
-        _ = try? handle?.seekToEnd()
+        written = Int((try? handle?.seekToEnd()) ?? 0)
+        sinceCheck = 0
     }
 }

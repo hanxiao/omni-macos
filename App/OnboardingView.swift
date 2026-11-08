@@ -39,6 +39,11 @@ struct OnboardingView: View {
                         .padding(.top, 2)
                 }
                 .padding(.top, 4)
+                // The OCR model is the optional one, and it was hiding the one Omni cannot start without.
+                if !embedding {
+                    downloadButton(0, prominent: true) { model.downloadModel(.nano) }
+                        .padding(.top, 4)
+                }
             } else {
                 // No "choose a folder" escape hatch. Omni does not run arbitrary models: these are
                 // the two jina-embeddings-v5-omni builds, and loading merges the retrieval LoRA and
@@ -67,6 +72,9 @@ struct OnboardingView: View {
 
             if model.downloadFailed {
                 Text(model.downloadLabel).font(.callout).foregroundStyle(.red).frame(maxWidth: 440)
+            }
+            if model.ocrDownloadFailed {
+                Text(model.ocrDownloadLabel).font(.callout).foregroundStyle(.red).frame(maxWidth: 440)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

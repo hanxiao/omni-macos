@@ -78,6 +78,32 @@ final class PassageRecoveryTests: XCTestCase {
         return zip(order, texts).map { ($0, locators[$0] ?? "", $1) }
     }
 
+    /// A file away for a moment says nothing about its text: a volume not mounted hid the passage
+    /// until the next launch.
+    func testAFileThatWasAwayComesBack() throws {
+        let text = prose(200)
+        let file = root.appendingPathComponent("away.md")
+        try text.write(to: file, atomically: true, encoding: .utf8)
+        let (indexer, store) = try indexed()
+        defer { store.close() }
+        let keys = store.chunkKeys(path: file.path)
+        let locators = store.chunkLocators(path: file.path)
+        let items = keys.keys.sorted().map { (file.path, $0, locators[$0] ?? "") }
+        XCTAssertFalse(items.isEmpty, "the probe")
+        let recovery = PassageRecovery(indexer: indexer, store: store, settings: IndexSettings())
+        let moved = file.appendingPathExtension("away")
+        try FileManager.default.moveItem(at: file, to: moved)
+        XCTAssertTrue(recovery.texts(items).allSatisfy { $0 == nil }, "the probe: it was recovered with the file gone")
+        try FileManager.default.moveItem(at: moved, to: file)
+        XCTAssertTrue(recovery.texts(items).allSatisfy { $0 != nil }, "still hidden with the file back")
+        // And a readable file without the text is not asked again.
+        try "something else entirely".write(to: file, atomically: true, encoding: .utf8)
+        let other = PassageRecovery(indexer: indexer, store: store, settings: IndexSettings())
+        XCTAssertTrue(other.texts(items).allSatisfy { $0 == nil })
+        try text.write(to: file, atomically: true, encoding: .utf8)
+        XCTAssertTrue(other.texts(items).allSatisfy { $0 == nil }, "a digest that missed in the file was asked again")
+    }
+
     func testEveryChunkOfATextFileComesBack() throws {
         let text = prose(900)
         let file = root.appendingPathComponent("notes.md")

@@ -314,6 +314,21 @@ final class OCRBatchKVCache {
                 v[0 ..< active, 0..., 0 ..< cursor, 0...])
     }
 
+    /// Room for `n` rows again, after `keepRows` took some: the rows added are unused until seeded.
+    /// One copy of the buffer, only when a row dropped while admission was held comes back.
+    func widen(to n: Int) {
+        guard n > batchCount else { return }
+        let more = n - batchCount
+        if let k = keys, let v = values {
+            keys = concatenated([k, MLXArray.zeros([more, k.dim(1), k.dim(2), k.dim(3)], dtype: k.dtype)], axis: 0)
+            values = concatenated([v, MLXArray.zeros([more, v.dim(1), v.dim(2), v.dim(3)], dtype: v.dtype)], axis: 0)
+            eval(keys!, values!)
+        }
+        promptLen += [Int](repeating: 0, count: more)
+        startedAt += [Int](repeating: Self.notStarted, count: more)
+        batchCount = n
+    }
+
     /// Drop the rows a finished sequence occupied. Page lengths here run 75 to 1309 tokens, so
     /// carrying finished rows would spend most of a group's compute on sequences with nothing left
     /// to say.

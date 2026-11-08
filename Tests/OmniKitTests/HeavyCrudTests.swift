@@ -156,6 +156,40 @@ final class HeavyCrudTests: XCTestCase {
         XCTAssertEqual(store.holeAuditsForTest, 1, "quiet writes, and the reclaim was not considered")
     }
 
+    /// An index that has just opened has not been seen idle. Both clocks the reclaim waits on started
+    /// at distantPast, so the first stamp after an open read writes as quiet and nobody as searching,
+    /// and a reclaim started seconds after launch beside the indexer's catch-up and the first searches.
+    /// On a bench clone the same delete took 17 s or 70-346 s depending on whether a stamp came first.
+    func testAFreshOpenIsNotIdle() throws {
+        let saved = (VectorStore.holeReclaimFractionOverride, VectorStore.holeReclaimFloorOverride, VectorStore.reclaimQuietSeconds,
+                     VectorStore.reclaimIdleSeconds)
+        VectorStore.holeReclaimFractionOverride = 0.01
+        VectorStore.holeReclaimFloorOverride = 1
+        defer {
+            VectorStore.holeReclaimFractionOverride = saved.0
+            VectorStore.holeReclaimFloorOverride = saved.1
+            VectorStore.reclaimQuietSeconds = saved.2
+            VectorStore.reclaimIdleSeconds = saved.3
+        }
+        let (first, url) = try tempStore()
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        for i in 0 ..< 40 { try first.replaceMany([("/o/\(i).txt", chunks("/o/\(i).txt", [2000 + i]))]) }
+        _ = first.search(vec(1), filter: SearchFilter(), topK: 3)
+        first.advanceCoverageForTest()
+        first.deletePaths(Set((0 ..< 10).map { "/o/\($0).txt" }))   // holes, past the threshold
+        first.close()
+
+        VectorStore.reclaimQuietSeconds = 1.5
+        VectorStore.reclaimIdleSeconds = 1.5
+        let store = try VectorStore(dbURL: url)
+        defer { store.close() }
+        store.stampCoverageForTest()
+        XCTAssertEqual(store.holeAuditsForTest, 0, "the reclaim was considered right after the open")
+        Thread.sleep(forTimeInterval: 1.7)
+        store.stampCoverageForTest()
+        XCTAssertGreaterThanOrEqual(store.holeAuditsForTest, 1, "quiet since the open, and the reclaim was not considered")
+    }
+
     /// listMatching keeps the K newest files with a bounded heap rather than sorting every file;
     /// the answer must be the sort's: newest first, ties broken by path, deleted files absent, and
     /// a kind filter applied per row.

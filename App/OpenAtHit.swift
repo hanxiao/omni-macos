@@ -28,15 +28,17 @@ enum OpenAtHit {
             // thread, within `openBudget`, never late. ONE OPEN AT A TIME PER FILE: clicks that
             // arrive while it is worked out are the same request (#26: a slow open queued every
             // double-click and Preview came back again and again).
-            guard !pendingOpens.contains(url.path) else { opened?(); return }
-            pendingOpens.insert(url.path)
+            // Per page: another passage of the same PDF is another request, not this one again.
+            let request = "\(url.path)#\(page)"
+            guard !pendingOpens.contains(request) else { opened?(); return }
+            pendingOpens.insert(request)
             Task.detached(priority: .userInitiated) {
                 let t0 = Date()
                 let phrase = phraseCache.phrase(url, page: page, snippet: snippet)
                 omniPerfLog(String(format: "open-at-hit page=%d phrase=%@ %.0fms", page + 1, phrase == nil ? "none" : "yes",
                                    -t0.timeIntervalSinceNow * 1000))
                 await MainActor.run {
-                    pendingOpens.remove(url.path)
+                    pendingOpens.remove(request)
                     send(url, searchText: phrase, line: nil, opened: opened)
                 }
             }

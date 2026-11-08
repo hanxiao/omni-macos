@@ -47,8 +47,16 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
     private let lock = NSLock()
     private var perFile: (@Sendable (Int64, Int64) -> Void)?
     private var continuation: CheckedContinuation<URL, Error>?
-    private var currentTask: URLSessionDownloadTask?
+    private var currentTask: URLSessionTask?
     private var isCancelled = false
+
+    /// The task is theirs to cancel from the moment it exists, and it knows if they already have: a
+    /// cancel that landed after the loop's check cancelled the finished task and the next part, up to
+    /// 2 GiB, ran to its end.
+    private func adopt(_ task: URLSessionTask) {
+        let cancelled = lock.withLock { currentTask = task; return isCancelled }
+        if cancelled { task.cancel() }
+    }
 
     private func setProgressHandler(_ handler: (@Sendable (Int64, Int64) -> Void)?) {
         lock.withLock { perFile = handler }
@@ -64,11 +72,16 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
         lock.withLock { let c = continuation; continuation = nil; return c }
     }
 
-    public override init() {
+    /// `configuration`: a test's protocol stub.
+    init(configuration config: URLSessionConfiguration) {
         super.init()
+        session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }
+
+    public convenience override init() {
         let config = URLSessionConfiguration.default
         config.waitsForConnectivity = true
-        session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+        self.init(configuration: config)
     }
 
     public static let releaseTag = "embed-weights-v1"
@@ -93,7 +106,7 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
         let manifest: Manifest
         do {
             guard let url = Self.releaseURL(variant, "omni-model.json") else { throw OmniError.model("bad release URL") }
-            let (data, response) = try await session.data(from: url)
+            let (data, response) = try await fetchManifest(url)
             guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw OmniError.model("no release manifest") }
             manifest = try JSONDecoder().decode(Manifest.self, from: data)
         } catch {
@@ -102,6 +115,20 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
             return
         }
         try await downloadRelease(variant: variant, manifest: manifest, to: dest, onProgress: onProgress)
+    }
+
+    /// A task Cancel can reach. `session.data` had none: with no network it waits for one
+    /// (`waitsForConnectivity`), and Cancel set a flag nobody was reading, leaving the screen on
+    /// "Preparing..." and the download marked running until the network came back or a relaunch.
+    private func fetchManifest(_ url: URL) async throws -> (Data, URLResponse) {
+        try await withCheckedThrowingContinuation { cont in
+            let task = session.dataTask(with: url) { data, response, error in
+                if let data, let response { cont.resume(returning: (data, response)) }
+                else { cont.resume(throwing: error ?? URLError(.badServerResponse)) }
+            }
+            adopt(task)
+            task.resume()
+        }
     }
 
     private func downloadRelease(variant: ModelVariant, manifest: Manifest, to dest: URL,
@@ -201,11 +228,11 @@ public final class ModelDownloader: NSObject, URLSessionDownloadDelegate, @unche
         }
     }
 
-    private func downloadOne(_ url: URL) async throws -> URL {
+    func downloadOne(_ url: URL) async throws -> URL {
         try await withCheckedThrowingContinuation { cont in
             self.setContinuation(cont)
             let task = session.downloadTask(with: url)
-            lock.withLock { currentTask = task }
+            adopt(task)
             task.resume()
         }
     }

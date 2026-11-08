@@ -34,11 +34,16 @@ public final class OCRModelDownloader: NSObject, URLSessionDownloadDelegate, @un
     private var currentTask: URLSessionDownloadTask?
     private var isCancelled = false
 
-    public override init() {
+    /// `configuration`: a test's protocol stub.
+    init(configuration config: URLSessionConfiguration) {
         super.init()
+        session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }
+
+    public convenience override init() {
         let config = URLSessionConfiguration.default
         config.waitsForConnectivity = true
-        session = URLSession(configuration: config, delegate: self, delegateQueue: nil)
+        self.init(configuration: config)
     }
 
     public func download(variant: OCRModelCatalog.Variant, to destination: URL,
@@ -95,11 +100,14 @@ public final class OCRModelDownloader: NSObject, URLSessionDownloadDelegate, @un
         }
     }
 
-    private func downloadOne(_ url: URL) async throws -> URL {
+    func downloadOne(_ url: URL) async throws -> URL {
         try await withCheckedThrowingContinuation { continuation in
             lock.withLock { self.continuation = continuation }
             let task = session.downloadTask(with: url)
-            lock.withLock { currentTask = task }
+            // A cancel that landed after the loop's check cancelled the finished task, and the next
+            // shard ran to its end. The task knows from the moment it exists.
+            let cancelled = lock.withLock { currentTask = task; return isCancelled }
+            if cancelled { task.cancel() }
             task.resume()
         }
     }

@@ -46,6 +46,16 @@ public enum ANEBlocks {
         }
     }
 
+    /// What a killed build left in `cache`: a working folder with its weight file (ANEProgram), a copy
+    /// not yet in place (`settled`). Builds run one at a time, so none of these is in use when one starts.
+    static func sweepLeftovers(cache: URL) {
+        let fm = FileManager.default
+        for n in (try? fm.contentsOfDirectory(atPath: cache.path)) ?? []
+        where n.contains(".building-") || (n.hasPrefix(".") && n.hasSuffix(".mlmodelc")) {
+            try? fm.removeItem(at: cache.appendingPathComponent(n))
+        }
+    }
+
     /// A program's functions, each loaded for the Neural Engine the FIRST TIME it is asked for: the
     /// compile of one function is seconds (a photo-size vision block ~16 s, a query-length one well
     /// under one), and most Macs never need most sizes, so nothing compiles before it is used. The
@@ -99,7 +109,9 @@ public enum ANEBlocks {
             let s = -t0.timeIntervalSinceNow
             lock.lock()
             loading.remove(name)
-            if let m { models[name] = m; seconds[name] = s } else { failed.insert(name) }
+            // From now, not from when it was asked for: a call to another function during a load past
+            // `idleSeconds` evicted the entry, and the model stayed untracked until its next use.
+            if let m { models[name] = m; seconds[name] = s; lastUse[name] = Date() } else { failed.insert(name) }
             lock.broadcast()
             lock.unlock()
             let program = compiled.deletingPathExtension().lastPathComponent

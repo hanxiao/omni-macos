@@ -25,13 +25,19 @@ final class HTTPServer: @unchecked Sendable {
     /// ours: `start` returning only means the listener object was created.
     var onReady: (@Sendable () -> Void)?
 
-    private let handler: Handler
+    private var handler: Handler
+    private let handlerLock = NSLock()
     private let onLog: @Sendable (LogEntry) -> Void
     private let queue = DispatchQueue(label: "omni.serving.http")
     private let maxBody = HTTPParse.maxBody // 8 MB hard cap -> 413
     private let receiveChunk = 64 * 1024
     /// A client that connects and trickles (or sends nothing) must not hold an fd forever.
     private let idleTimeout: TimeInterval = 60
+    /// A response gets this long to be taken by the client. Measured: a client that sends and then
+    /// reads nothing held its connection past the idle limit with no end in sight (5,244 pipelined
+    /// requests, nothing read, still open 70 s later), since that timer is off while a request is
+    /// answered, and a send does not complete until the client reads.
+    private let writeTimeout: TimeInterval = 120
     /// Accept cap: each connection can hold up to an 8MB buffer, so unbounded accepts are a
     /// memory/fd DoS on the LAN scope. Excess connections are refused at accept.
     private let maxConnections = 64
@@ -56,6 +62,12 @@ final class HTTPServer: @unchecked Sendable {
         self.handler = handler
         self.onLog = onLog
     }
+
+    /// What answers from now on, with the listener and its connections left alone: a new engine
+    /// or store (a model switch) has nothing to do with the port. A restart cut every served
+    /// connection for it: `omni` exited 2 with "sent no response", and a long OCR lost its client
+    /// while its decode ran on.
+    func setHandler(_ h: @escaping Handler) { handlerLock.withLock { handler = h } }
 
     /// Bind and start accepting. Throws if NWListener can't be created. Runtime bind
     /// failures (port in use) arrive asynchronously via `onFailure`.
@@ -209,16 +221,17 @@ final class HTTPServer: @unchecked Sendable {
     /// A kept-alive connection's response is out: it is idle until its next request (runs on `queue`).
     private func answered(_ conn: NWConnection) {
         inFlight.remove(ObjectIdentifier(conn))
+        guard conns[ObjectIdentifier(conn)] != nil else { return }   // closed while it was answered
         lastActive[ObjectIdentifier(conn)] = .now()
     }
 
     /// (Re)arm the per-connection idle deadline. Fires on `queue`; a connection that has not
     /// received bytes for `idleTimeout` is closed (slowloris / abandoned keep-alive protection).
-    private func touchIdle(_ conn: NWConnection) {
+    private func touchIdle(_ conn: NWConnection, after limit: TimeInterval? = nil) {
         let key = ObjectIdentifier(conn)
         idleTimers.removeValue(forKey: key)?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + idleTimeout)
+        timer.schedule(deadline: .now() + (limit ?? idleTimeout))
         timer.setEventHandler { [weak self, weak conn] in
             guard let self, let conn else { return }
             self.idleTimers.removeValue(forKey: key)?.cancel()
@@ -240,7 +253,12 @@ final class HTTPServer: @unchecked Sendable {
         conn.receive(minimumIncompleteLength: 1, maximumLength: receiveChunk) { [weak self] data, _, isComplete, error in
             guard let self else { return }
             self.touchIdle(conn)
-            if let data, !data.isEmpty { buffer.data.append(data) }
+            if let data, !data.isEmpty {
+                buffer.data.append(data)
+                // Part of a request is here: this client is not idle, it is mid-upload, and at the
+                // connection cap it does not give way. `answered` clears it with the rest.
+                self.inFlight.insert(ObjectIdentifier(conn))
+            }
 
             if error != nil {
                 conn.cancel()
@@ -319,7 +337,7 @@ final class HTTPServer: @unchecked Sendable {
             ? buffer.subdata(in: buffer.index(buffer.startIndex, offsetBy: consumed)..<buffer.endIndex)
             : Data()
         let client = self.remoteDescription(conn)
-        let keepAlive = req.wantsKeepAlive
+        let wantsKeepAlive = req.wantsKeepAlive
         let started = DispatchTime.now()
         // The idle deadline is for a client that SENDS nothing. While the handler works the client
         // is waiting on us, and an OCR request runs for minutes - the timer used to close the
@@ -328,9 +346,14 @@ final class HTTPServer: @unchecked Sendable {
 
         // Hand off the (thread-safe) handler to a detached Task. The engine/store are
         // documented thread-safe, so they are called directly off the main actor here.
+        let caller = ServedClient { [weak self] c in self?.queue.async { self?.watchForClose(conn, c) } }
         Task { [weak self] in
             guard let self else { return }
-            let resp = await self.handler(req)
+            let answer = self.handlerLock.withLock { self.handler }
+            let resp = await ServedClient.$current.withValue(caller) { await answer(req) }
+            // The watch has a receive of its own outstanding on this connection, which would take the
+            // next request's bytes. Such a request is long by nature; the client connects again.
+            let keepAlive = wantsKeepAlive && !caller.isWatched
             // A streamed body is only seen as it goes out, so its first bytes are kept for the log.
             let tap = BodyTap()
             let finish: @Sendable () -> Void = {
@@ -381,6 +404,16 @@ final class HTTPServer: @unchecked Sendable {
         return true
     }
 
+    /// Read this connection for its close while a long request runs. Only a request that asks: the
+    /// read loop is otherwise off during a handler, so nothing would see a client go, and a posted
+    /// receive per search would be a cost on the hot path for nothing. On `queue`.
+    private func watchForClose(_ conn: NWConnection, _ client: ServedClient) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: receiveChunk) { [weak self] _, _, complete, error in
+            if complete || error != nil { client.setLeft(); return }
+            self?.watchForClose(conn, client)
+        }
+    }
+
     /// Write a streamed response: the head, then one chunk per `send`, then the terminator.
     /// Returns false if the client went away part-way, in which case the connection is not reused.
     private func streamBody(_ produce: @Sendable (@escaping @Sendable (Data) async -> Bool) async -> Void,
@@ -388,8 +421,15 @@ final class HTTPServer: @unchecked Sendable {
         let broken = Flag()
         let send: @Sendable (Data) async -> Bool = { bytes in
             if broken.isSet { return false }
+            // Limited only while this send is out: between chunks a stream may wait minutes on a decode.
             let ok = await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
-                conn.send(content: bytes, completion: .contentProcessed { error in c.resume(returning: error == nil) })
+                self.queue.async {
+                    self.touchIdle(conn, after: self.writeTimeout)
+                    conn.send(content: bytes, completion: .contentProcessed { error in
+                        self.idleTimers.removeValue(forKey: ObjectIdentifier(conn))?.cancel()
+                        c.resume(returning: error == nil)
+                    })
+                }
             }
             if !ok { broken.set() }
             return ok
@@ -409,6 +449,7 @@ final class HTTPServer: @unchecked Sendable {
     private func write(_ resp: HTTPResponse, to conn: NWConnection, keepAlive: Bool,
                        acceptEncoding: String? = nil, completion: @escaping () -> Void) {
         let bytes = resp.serialize(keepAlive: keepAlive, acceptEncoding: acceptEncoding)
+        touchIdle(conn, after: writeTimeout)
         conn.send(content: bytes, completion: .contentProcessed { _ in
             completion()
         })
@@ -439,7 +480,35 @@ final class HTTPServer: @unchecked Sendable {
     }
 }
 
-/// A one-way latch readable from any thread.
+/// The caller of a request being answered, for work long enough that the caller may give up on it. An
+/// agent's tool timeout closes its socket, and a non-streaming OCR request then decoded on, up to 200
+/// pages with the decode slot held and indexing stood down, for nobody. A handler that runs for that
+/// long calls `watch()`; reading `hasLeft` is then one lock.
+///
+/// A client that half-closes its socket after sending reads as gone: TCP cannot tell the two apart
+/// without writing to it, and no HTTP client this serves does that.
+final class ServedClient: @unchecked Sendable {
+    @TaskLocal static var current: ServedClient?
+    private let lock = NSLock()
+    private var left = false
+    private var watched = false
+    private let startWatch: @Sendable (ServedClient) -> Void
+
+    init(startWatch: @escaping @Sendable (ServedClient) -> Void) { self.startWatch = startWatch }
+
+    var hasLeft: Bool { lock.withLock { left } }
+    var isWatched: Bool { lock.withLock { watched } }
+    func setLeft() { lock.withLock { left = true } }
+
+    func watch() {
+        let first = lock.withLock { () -> Bool in
+            defer { watched = true }
+            return !watched
+        }
+        if first { startWatch(self) }
+    }
+}
+
 /// The first bytes of a streamed response, and how many went out in all.
 private final class BodyTap: @unchecked Sendable {
     private let lock = NSLock()
@@ -455,6 +524,7 @@ private final class BodyTap: @unchecked Sendable {
     }
 }
 
+/// A one-way latch readable from any thread.
 private final class Flag: @unchecked Sendable {
     private let lock = NSLock()
     private var value = false

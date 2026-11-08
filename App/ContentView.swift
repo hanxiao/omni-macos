@@ -25,6 +25,8 @@ struct ContentView: View {
     /// Whether the drawer has anything to show: the search sidebar always does, the page rail only
     /// once a document is open.
     private var ocrDrawerWanted: Bool { !model.ocrMode || ocr.hasPages }
+    @State private var columnsBeforeDrawerFold: NavigationSplitViewVisibility?
+    @State private var holdFoldUntil: Date?
 
     /// Apply a user edit of the search box: parse it into the semantic query + qualifiers, apply the
     /// filters, clear a file query if real text was typed, and schedule the (debounced) search. The
@@ -97,7 +99,13 @@ struct ContentView: View {
         // changes it, and doing that inside `withAnimation` animated the window's first layout -
         // the centered "Search N files" prompt flew in from the top-left corner on every launch.
         .onChange(of: ocrDrawerWanted, initial: true) { old, wanted in
-            let target: NavigationSplitViewVisibility = wanted ? .all : .detailOnly
+            // Back in search, the sidebar returns as the user left it: folded here, it stays folded.
+            if !wanted, old != wanted { columnsBeforeDrawerFold = columns }
+            if wanted, old != wanted, !model.ocrMode, columnsBeforeDrawerFold == .detailOnly {
+                holdFoldUntil = Date().addingTimeInterval(1)
+            }
+            let target: NavigationSplitViewVisibility = wanted
+                ? (model.ocrMode ? .all : columnsBeforeDrawerFold ?? .all) : .detailOnly
             if old == wanted {
                 columns = target
             } else {
@@ -106,6 +114,12 @@ struct ContentView: View {
         }
         .onChange(of: columns, initial: true) { _, c in
             let shown = c != .detailOnly
+            // The split view itself writes `.all` as the search sidebar comes back: measured, with our
+            // own target already `.detailOnly`. For a moment after the flip, a fold the user left stands.
+            if shown, !model.ocrMode, let until = holdFoldUntil, Date() < until {
+                DispatchQueue.main.async { columns = .detailOnly }
+                return
+            }
             if model.sidebarShown != shown { model.sidebarShown = shown }
             // AN EMPTY PAGE RAIL STAYS FOLDED, whoever unfolds it. Folding it when the last
             // document closes was not enough: once in four runs the rail came back empty ~3 s
@@ -129,11 +143,9 @@ struct ContentView: View {
             }
         }
         // Link a Mac goes through the same single sheet route (stacked sheets race each other).
-        .onChange(of: model.link.showWindow) { _, show in
-            guard show else { return }
-            model.link.showWindow = false
-            if model.activeSheet == nil { model.activeSheet = .link }
-        }
+        // Under another sheet the request waits for it: dropped, Link a Mac did nothing, with no word.
+        .onChange(of: model.link.showWindow) { _, show in if show { presentLinkSheet() } }
+        .onChange(of: model.activeSheet == nil) { _, none in if none, model.link.showWindow { presentLinkSheet() } }
         .alert(model.remoteError ?? "", isPresented: Binding(
             get: { model.remoteError != nil }, set: { if !$0 { model.remoteError = nil } })) {
             Button("OK") { model.remoteError = nil }
@@ -141,6 +153,13 @@ struct ContentView: View {
     }
 
     private func focusSearchField() { SearchFieldFocus.focus() }
+
+    private func presentLinkSheet() {
+        if model.activeSheet == .link { model.link.showWindow = false }
+        guard model.activeSheet == nil else { return }
+        model.link.showWindow = false
+        model.activeSheet = .link
+    }
 
     private var split: some View {
         NavigationSplitView(columnVisibility: $columns) {
@@ -262,6 +281,8 @@ struct ContentView: View {
             EngineFailedView(message: msg)
         case .waitingForIndex(let why):
             IndexWaitingView(message: why)
+        case .repairingIndex:
+            IndexWaitingView(message: "Checking the index\u{2026}")
         case .indexNewer:
             IndexNewerView()
         case .ready:
@@ -726,9 +747,15 @@ private struct EmptyResults: View {
         // AppModel.loadRoots). Keyed on hasSources, not on `roots`: a user who added only their
         // photo library has a source and can search, and telling them to add a folder over the
         // top of it would be wrong.
-        if let scope = model.linkedScope, !model.link.isOnline(scope.peer) {
+        if let scope = model.linkedScope, model.link.state(scope.peer) == .unlinked {
+            CenteredStatus(symbol: CenteredStatus.moleSad, title: "Unlinked on \(model.link.name(of: scope.peer))",
+                           subtitle: "", showSpinner: false, action: ("Try Again", { model.link.retry(scope.peer) }))
+        } else if let scope = model.linkedScope, !model.link.isOnline(scope.peer) {
             CenteredStatus(symbol: CenteredStatus.moleSleep, title: "\(model.link.name(of: scope.peer)) is offline",
                            subtitle: "", showSpinner: false, action: ("Try Again", { model.link.retry(scope.peer) }))
+        } else if let scope = model.linkedScope, let why = model.link.scopeFailure, !model.isResolving {
+            CenteredStatus(symbol: CenteredStatus.moleSad, title: "Couldn\u{2019}t search \(model.link.name(of: scope.peer))",
+                           subtitle: why, showSpinner: false)
         } else if !model.hasSources {
             CenteredStatus(symbol: CenteredStatus.moleSleep, title: "Add folders to search",
                            subtitle: "", showSpinner: false,

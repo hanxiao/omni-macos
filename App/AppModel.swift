@@ -262,7 +262,10 @@ final class AppModel {
     /// `failed` carries WHICH half could not start. A store failure - the index needs disk space to
     /// finish its one-time upgrade, say - used to render as "Omni can't load its model" with a
     /// button to go pick a model folder, which is the wrong diagnosis and a remedy that cannot help.
-    enum Phase: Equatable { case loadingModel, noModel, ready, failed(String), waitingForIndex(String), indexNewer }
+    /// `repairingIndex` holds the index's files from the moment a refusal is seen until the repair's
+    /// own reopen: `waitingForIndex` means a retry is asleep and any bootstrap may run, which is what a
+    /// repair must never see beside it (recoverIndex).
+    enum Phase: Equatable { case loadingModel, noModel, ready, failed(String), waitingForIndex(String), repairingIndex, indexNewer }
 
     /// Determinate launch progress (0...1) while phase == .loadingModel; nil once ready/failed
     /// (or before bootstrap has begun). Combined 50/50 from the store's row-load fraction and the
@@ -368,10 +371,20 @@ final class AppModel {
 
     private func recoverIndex(_ why: String) {
         guard let url = try? Self.indexURL() else { phase = .failed(why); return }
-        phase = .waitingForIndex("Checking the index\u{2026}")
+        // ONE REPAIR, AND NOTHING BESIDE IT. This wrote `.waitingForIndex`, the case a sleeping retry
+        // tests, and the failed bootstrap's coalesced rerun ran at once: its open hit the same
+        // refusal and started a second repair, which found the first had set indexRecoveryTried and
+        // deleted the files. Reproduced with an index the repair could fix: `index rebuilt from
+        // files`, every file embedded again. Every bootstrap now returns while this phase holds
+        // (the repair's own reopen reads whatever they asked for), so no store opens against files
+        // being repaired or deleted, and deleteIndexFiles never runs under an open store.
+        phase = .repairingIndex
         releaseOpenIndex()
         Task {
+            if let ms = Self.testArgument("repairDelayMs") as? String, let n = Int(ms) { try? await Task.sleep(for: .milliseconds(n)) }
             let outcome = await Task.detached(priority: .userInitiated) { VectorStore.repairIndex(at: url) }.value
+            omniPerfLog("index repair outcome: \(outcome)")
+            Self.testRefusalsLeft -= 1   // a refused index opens once a repair has run, and refuses until then
             switch outcome {
             case .repaired(let what) where !self.indexRecoveryTried:
                 self.indexRecoveryTried = true
@@ -386,6 +399,7 @@ final class AppModel {
                 let freed = await Task.detached(priority: .userInitiated) { VectorStore.deleteIndexFiles(at: url) }.value
                 omniPerfLog("index rebuilt from files (freed \(freed) bytes): \(why)")
             }
+            self.phase = .loadingModel
             await self.bootstrap()
         }
     }
@@ -428,7 +442,13 @@ final class AppModel {
     /// The literal search-box text (what the user typed, qualifiers and all). `.searchable` binds to
     /// this; `query` is derived from it. Programmatic changes here are reflected in the field but do
     /// NOT re-parse (only user edits, routed through `applyParsedQuery`, do).
-    var rawQuery: String = "" { didSet { refreshSearchFlags() } }
+    var rawQuery: String = "" {
+        didSet {
+            refreshSearchFlags()
+            // The box moved on from the row clicked: that query typed again later is a new search.
+            if let run = lastHistoryRunQuery, run != rawQuery { lastHistoryRunQuery = nil }
+        }
+    }
     /// Whether the typeahead/autocomplete dropdown may open. True only while the user is editing the
     /// box directly; cleared on any PROGRAMMATIC box change (history replay, filter-menu sync, folder
     /// map) so restoring a query's text doesn't pop the suggestions. The `.searchable` suggestions
@@ -598,7 +618,7 @@ final class AppModel {
     /// Rows the passage fill covers per result set: about two screens of the list.
     static let passageRows = 24
 
-    private func withPassages(_ hits: [SearchHit], resolved: String) -> [SearchHit] {
+    func withPassages(_ hits: [SearchHit], resolved: String) -> [SearchHit] {
         if passageCacheQuery != resolved { passageCacheQuery = resolved; passageCache = [:]; passagePages = [:] }
         guard !passageCache.isEmpty else { return hits }
         return hits.map { h in
@@ -926,8 +946,14 @@ final class AppModel {
             if let h = searchHit(for: path) { Moment.applyToQuickLook(url, locator: h.locator) }
             return
         }
+        previewRequest &+= 1
+        let request = previewRequest
         Task { @MainActor in
-            guard let url = await PhotoActions.materialized(path) else { return }
+            var fake: URL?
+            if let file = Self.testArgument("photoPreviewFile") as? String {   // an export that takes a while, with no library
+                try? await Task.sleep(for: .seconds(1)); fake = URL(fileURLWithPath: file)
+            }
+            guard let url = await (fake == nil ? PhotoActions.materialized(path) : fake), previewRequest == request else { return }
             showPreview(url)
         }
     }
@@ -1127,6 +1153,11 @@ final class AppModel {
         selectFolderForVisualization(nil)        // browsing takes the empty-result region
         browsedPhotoSource = nil                 // one browser at a time
         setFilterRecentsQuietly(false)           // the assignment below rewrites the box once
+        if !filterFolderNames.isEmpty {          // an `in:name` scope is a folder scope too: it stayed beside this one
+            suppressFilterEffects = true
+            filterFolderNames = []
+            suppressFilterEffects = false
+        }
         filterFolder = url                       // re-runs the search and rewrites the box
         captureNavStop()
     }
@@ -1162,7 +1193,13 @@ final class AppModel {
     /// `filterFolders` scopes it to folders - and like the browsed folder, it is also what puts the
     /// Recents listing on screen when there is no query. A smart folder: replayed from history it
     /// searches whatever is recent then, not what was recent when it was saved.
-    var filterRecents = false { didSet { if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) } } }
+    var filterRecents = false {
+        didSet {
+            // As `filterFolders`: this Mac's Recents and a linked Mac are two different places.
+            if filterRecents, linkedScope != nil { linkedScope = nil }
+            if !suppressFilterSearch { syncBoxFromFilters(reSearch: true) }
+        }
+    }
 
     private func setFilterRecentsQuietly(_ on: Bool) {
         guard filterRecents != on else { return }
@@ -1485,6 +1522,11 @@ final class AppModel {
     /// It deliberately does NOT touch the sidebar selection. Selecting a folder means BROWSE, and
     /// the selection change would call `enterFolder` straight back over the map.
     func visualizeFolder(_ url: URL, umap: Bool) {
+        // Every browser that comes before the map on the pane goes with the folder scope, or the fit
+        // runs on the GPU unseen behind Recents, a Photos source or a linked Mac.
+        linkedScope = nil
+        browsedPhotoSource = nil
+        setFilterRecentsQuietly(false)
         filterFolder = nil
         guard mapUsesUMAP != umap else { selectFolderForVisualization(url); return }
         selectedFolderForViz = url
@@ -1585,6 +1627,7 @@ final class AppModel {
 
     private func applyNavEntry(_ entry: NavEntry) {
         navApplyingToken = nil; pendingNavSelection = nil   // drop any prior pending restore
+        browsedPhotoSource = nil   // a stop names no source, and that pane outranks the folder it names
         let sameSearch = navCurrent?.searchKey == entry.searchKey
         navCurrent = entry
         if sameSearch {
@@ -1599,7 +1642,10 @@ final class AppModel {
         // A different search - re-run it; the selection is restored when ITS results settle (applyResults).
         pendingNavSelection = entry.selection
         if let fq = entry.fileQuery {
-            setFileQuery(fq.url, similar: fq.similar, fromHistory: true)   // fromHistory: don't re-record
+            // fromHistory: don't re-record. The rest as it was: without sourcePath a Photos Find
+            // Similar came back with the asset as its own top answer.
+            setFileQuery(fq.url, similar: fq.similar, fromHistory: true, transient: fq.transient,
+                         sourcePath: fq.sourcePath, fromPasteboard: fq.fromPasteboard)
             // setFileQuery early-returns (file missing/unreadable/unsupported) without running a search;
             // there's nothing to settle, so don't arm the pending restore (would otherwise leak).
             guard fileQuery != nil else { pendingNavSelection = nil; return }
@@ -1609,7 +1655,10 @@ final class AppModel {
             search()
         }
         // Consume the restore only when the search just launched here settles (search() bumped the token).
-        navApplyingToken = searchToken
+        // A stop with nothing to search (a folder's listing, an empty box) settles nothing: armed
+        // anyway, the token blocked captureNavStop, and the next folder entered was not recorded and
+        // left Forward in place until some text search settled.
+        if searching { navApplyingToken = searchToken } else { pendingNavSelection = nil }
     }
     /// Search by a file (any modality - the embedding space is shared). Owned by the model so the
     /// File menu and the toolbar button trigger the same panel.
@@ -1631,15 +1680,19 @@ final class AppModel {
     /// guessed: a row context menu and the View menu both crash on the first click, the space bar
     /// never does, and the space bar is the one path that already runs off the menu's turn.
     func showPreview(_ url: URL?) {
+        previewRequest &+= 1   // whatever an export still running was for, this is newer
         if let url { CloudStatus.watchDownload(url.path) }   // Quick Look downloads, as in Finder
         Task { @MainActor [weak self] in self?.previewURL = url }
     }
+    /// So a Photos export that ends after the panel was dismissed or moved on does not open it late.
+    @ObservationIgnored private var previewRequest = 0
     /// Finder-style toggle: dismiss the preview if open, else preview the current selection.
     ///
     /// Written DIRECTLY, not through showPreview: the space bar arrives on an ordinary runloop turn,
     /// where the panel opens cleanly, and deferring it there measurably reintroduces the crash the
     /// deferral exists to prevent in menus. Only menu-invoked previews need the hop.
     func toggleQuickLook() {
+        previewRequest &+= 1
         if previewURL != nil { previewURL = nil; return }
         if let p = selection { showPreview(path: p) }
     }
@@ -2231,6 +2284,54 @@ final class AppModel {
     /// Folders whose policy changed while a pass was running. Pruned once it has stopped, so
     /// nothing it indexed under the old rules survives.
     @ObservationIgnored private var policyPruneDirs = Set<String>()
+    /// The same for a central rule whose hold timed out, or one found owed at open: everything.
+    @ObservationIgnored private var policyPruneAll = false
+    /// Kinds whose purge is owed and has not run: its hold timed out, or it was found owed at open.
+    @ObservationIgnored private var kindPurgesOwed = Set<String>()
+    /// Deletes decided with no store open, in the preferences until one opens.
+    @ObservationIgnored private var owedBeforeOpen = Set(UserDefaults.standard.stringArray(forKey: AppModel.owedBeforeOpenKey) ?? [])
+    private static let owedBeforeOpenKey = "omni.owedBeforeOpen"
+
+    private func oweBeforeOpen(_ keys: [String]) {
+        owedBeforeOpen.formUnion(keys)
+        OmniPrefs.set(Array(owedBeforeOpen), forKey: Self.owedBeforeOpenKey)
+    }
+
+    /// One entry of `owed_removals`: a delete the user's change decided, kept beside the rows until
+    /// it has run. A new rule or a switched-off kind is saved with its delete still to come, and
+    /// nothing else ever comes back for it: the next launch sees the rule equal to itself, and no
+    /// pass removes a file a rule matches by name or a kind it does not crawl. So the key goes in
+    /// BEFORE the rule is saved. Killed between the two, what is owed is a delete by the rules in
+    /// force, which then finds nothing.
+    ///
+    /// A plain key is a folder or Photos source, as it always was. Each key is idempotent, and an
+    /// older build reads the prefixed ones as folders with no rows and settles them.
+    enum OwedDelete: Hashable {
+        case folder(String)
+        case moved(old: String, new: String)
+        /// What the rules in force exclude: under this folder, or everywhere with nil.
+        case prune(String?)
+        case kind(String)
+
+        static let movedPrefix = "moved:", prunePrefix = "prune:", kindPrefix = "kind:", pruneEverywhere = "prune:*"
+        init(key: String) {
+            if key == Self.pruneEverywhere { self = .prune(nil) }
+            else if key.hasPrefix(Self.prunePrefix) { self = .prune(String(key.dropFirst(Self.prunePrefix.count))) }
+            else if key.hasPrefix(Self.kindPrefix) { self = .kind(String(key.dropFirst(Self.kindPrefix.count))) }
+            else if key.hasPrefix(Self.movedPrefix) {
+                let parts = key.dropFirst(Self.movedPrefix.count).split(separator: "\u{0}", maxSplits: 1).map(String.init)
+                self = .moved(old: parts.first ?? "", new: parts.count > 1 ? parts[1] : "")
+            } else { self = .folder(key) }
+        }
+        var key: String {
+            switch self {
+            case .folder(let k): k
+            case .moved(let old, let new): Self.movedPrefix + old + "\u{0}" + new
+            case .prune(let dir): dir.map { Self.prunePrefix + $0 } ?? Self.pruneEverywhere
+            case .kind(let k): Self.kindPrefix + k
+            }
+        }
+    }
 
     // Index-time minimum thresholds (0 = no minimum).
     var minImageDimension: Int = 0 { didSet { persistPerf() } }
@@ -2365,8 +2466,10 @@ final class AppModel {
         let unit = computeUnit
         guard unit == .neuralEngine else {
             setStoreOffGPU(false)
-            let released = engine.gpuTowersReleased
             _ = engine.setComputeUnit(.gpu, cache: OmniEngine.defaultANECache)
+            // After the switch: from here a release still waiting for the gate stops, and one that had
+            // already decided has its flag up (OmniEngine.releaseGPUTowers).
+            let released = engine.gpuTowersReleased
             neuralEngineStatus = .off
             // Neural Engine mode let go of the GPU towers: load them again (the programs serve
             // images and recordings meanwhile, text is on the GPU at once).
@@ -2381,6 +2484,7 @@ final class AppModel {
         anePhase = .none
         neuralEngineStatus = .preparing(.init(fraction: 0, stage: .writing))
         if isIndexing { indexingPausedForANE = true; pauseIndexing() }
+        else if isIndexWorkInFlight { pauseIndexing() }   // the stand-down's lift takes what it re-queues
         // An isolated run keeps its programs in scratch (-omni.ane.cache.dir), like the OCR cache.
         let cache = UserDefaults.standard.string(forKey: "omni.ane.cache.dir").map { URL(fileURLWithPath: $0, isDirectory: true) }
             ?? OmniEngine.defaultANECache
@@ -2469,6 +2573,7 @@ final class AppModel {
     /// Title for the launch screen. The store's phase when it has one, because that is the part
     /// that can take tens of seconds; the model otherwise, which is what a normal launch is doing.
     var launchTitle: String {
+        if migratingIndex { return "Moving your index" }
         if warmingIndex { return "Preparing search" }
         switch storePhase {
         case .upgradingIndex: return "Upgrading your index"
@@ -2503,7 +2608,12 @@ final class AppModel {
     /// v4 -> v5 migration has a visible finish line: 5 means it is done, anything less means it
     /// is still on the way. 0 while no index is open.
     var indexSchemaVersion: Int32 = 0
-    var indexObsolete = false
+    /// SERVED SEARCH READS THIS TOO (servedIndexObsolete): between a weights change and the rebuild,
+    /// the vectors are the old model's and a query is the new one's, so a served search would rank
+    /// with nothing in common. The window says the index is waiting; a served search says the same.
+    var indexObsolete = false { didSet { if indexObsolete != oldValue { Self.servedIndexObsolete.set(indexObsolete) } } }
+    nonisolated static let servedIndexObsolete = ServingHold()
+    nonisolated static let servedRebuildingMessage = "Omni is rebuilding its index for the current model; search answers again when it finishes."
     var indexStoredDim = 0                  // actual vector dim of the current index (0 if empty)
     var indexModelVariantRaw: String?       // model variant recorded when the index was built
     /// The model variant the current index was built with - recorded in meta, else inferred from the
@@ -2722,11 +2832,6 @@ final class AppModel {
         if ProcessInfo.processInfo.environment["OMNI_SEARCH_TIMING"] == "1" { setvbuf(stdout, nil, _IONBF, 0) }
         omniPerfLog("launch model-init")
         Self.shared = self
-        Self.sweepDroppedImageTemps()
-        // Reclaim the stores a paper run left behind if it was killed mid-run. Off the main thread:
-        // it is a $TMPDIR scan and can delete hundreds of MB. Unconditional by design - the gate
-        // being closed is exactly the case where nothing else would ever clean up.
-        DispatchQueue.global(qos: .utility).async { PaperFS.sweepAbandonedRuns() }
         // At launch, not when Settings is opened: the workspace asks whether the OCR model is
         // installed long before anyone visits a settings tab, and a model still sitting at the old
         // path would read as missing.
@@ -2749,7 +2854,24 @@ final class AppModel {
         if let raw = UserDefaults.standard.string(forKey: "omni.viewMode"), let m = ResultViewMode(rawValue: raw) { viewMode = m }
         omniPerfLog("launch model-init done")
         Task { await bootstrap() }
+        if Self.testArgument("bootstrapTwice") != nil { Task { await bootstrap() } }   // a Settings switch during the load
         PerfScript.runIfRequested(self)
+    }
+
+    /// THE SHARED TEMPORARY DIRECTORY IS SWEPT ONLY BY THE INSTANCE THAT STAYS. This ran from init, and
+    /// the App struct builds the model before applicationWillFinishLaunching (logged: model built,
+    /// then will-finish), so a redundant launch that was about to exit first deleted the staging
+    /// folders of the instance it was deferring to: everything of theirs is older than its launch.
+    /// From applicationDidFinishLaunching, which a redundant launch never reaches. Not from a run
+    /// isolated by `-omni.dbDir` either: beside the user's Omni, it is that same second process.
+    func sweepTemporaryFilesOnce() {
+        guard !Self.isolatedByLaunchArgument else { return }
+        omniPerfLog("launch temp sweep")
+        Self.sweepDroppedImageTemps()
+        // Reclaim the stores a paper run left behind if it was killed mid-run. Off the main thread:
+        // it is a $TMPDIR scan and can delete hundreds of MB. Unconditional by design - the gate
+        // being closed is exactly the case where nothing else would ever clean up.
+        DispatchQueue.global(qos: .utility).async { PaperFS.sweepAbandonedRuns() }
     }
 
     /// Reclaim leftover staging temp dirs from previous sessions. Two kinds, and both are written
@@ -3308,15 +3430,18 @@ final class AppModel {
     /// Saves, one at a time and off the main actor, always of the newest list. Encoding 100k
     /// searches took 289 ms, which on the main actor was a stall at every save.
     private static let historySaver = HistorySaver()
-    /// Set once the saved history is in memory; nothing is saved before, or an empty list would
-    /// overwrite the file during the launch read.
-    @ObservationIgnored private var historyLoaded = false
+    /// Nothing is saved while `.reading`, or an empty list would overwrite the file during the launch
+    /// read. `.failed`: the file is there and could not be read or moved aside, so nothing is saved
+    /// this session. A read that fails is not an empty history: this read as one, the next search
+    /// wrote over the file, and the sweep below deleted every bookmarked query image.
+    private enum HistoryLoad { case reading, live, failed }
+    @ObservationIgnored private var historyLoad = HistoryLoad.reading
 
     private func persistHistory() {
         // An isolated run (`-omni.dbDir` as a launch argument) READS the user's history, so a perf
         // script can replay it, and never writes it: a test's searches used to land in the real
         // sidebar.
-        guard Self.savesHistory, historyLoaded, let file = Self.historyFileURL() else { return }
+        guard Self.savesHistory, historyLoad == .live, let file = Self.historyFileURL() else { return }
         Self.historySaver.save(searchHistory, to: file)
     }
 
@@ -3333,35 +3458,48 @@ final class AppModel {
     /// Read off the main actor; the sidebar fills in when it arrives. Until 0.19.5 the history was
     /// a UserDefaults blob: read once, collapsed (`canonicalized`), written to the file, and removed.
     private func loadHistory() {
-        guard !Self.ephemeralUIState else { historyLoaded = true; return }
-        Self.readHistory(file: Self.historyFileURL(), legacy: UserDefaults.standard.data(forKey: legacyHistoryKey)) { [weak self] items, migrated in
-            DispatchQueue.main.async { MainActor.assumeIsolated { self?.adoptLoadedHistory(items, migrated: migrated) } }
+        guard !Self.ephemeralUIState else { historyLoad = .live; return }
+        Self.readHistory(file: Self.historyFileURL(), legacy: UserDefaults.standard.data(forKey: legacyHistoryKey)) { [weak self] items, migrated, unreadable in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.adoptLoadedHistory(items, migrated: migrated, unreadable: unreadable) } }
         }
     }
 
-    nonisolated private static func readHistory(file: URL?, legacy: Data?, done: @escaping @Sendable ([HistoryItem], Bool) -> Void) {
+    /// `unreadable`: the file exists and did not read. Nil when it read or was not there; true when it
+    /// could not be moved aside either.
+    nonisolated private static func readHistory(file: URL?, legacy: Data?, done: @escaping @Sendable ([HistoryItem], Bool, Bool?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            var items: [HistoryItem] = [], migrated = false
+            var items: [HistoryItem] = [], migrated = false, unreadable: Bool? = nil
             if let file, let data = try? Data(contentsOf: file), let saved = try? JSONDecoder().decode([HistoryItem].self, from: data) {
                 items = saved
-            } else if let legacy, let saved = try? JSONDecoder().decode([HistoryItem].self, from: legacy) {
-                items = canonicalized(saved); migrated = true
+            } else {
+                if let file, FileManager.default.fileExists(atPath: file.path) {
+                    // Kept, under a name nothing writes: it may be a disk fault or an outside edit that
+                    // can still be put right, and it is the user's.
+                    let aside = file.appendingPathExtension("unreadable-\(Int(Date().timeIntervalSince1970))")
+                    let moved = (try? FileManager.default.moveItem(at: file, to: aside)) != nil
+                    unreadable = !moved
+                    omniPerfLog("history unreadable, \(moved ? "moved aside to \(aside.lastPathComponent)" : "left in place; not saving this session")")
+                }
+                if let legacy, let saved = try? JSONDecoder().decode([HistoryItem].self, from: legacy) {
+                    items = canonicalized(saved); migrated = true
+                }
             }
             items.sort { $0.lastUsed > $1.lastUsed }
-            done(items, migrated)
+            done(items, migrated, unreadable)
         }
     }
 
-    private func adoptLoadedHistory(_ items: [HistoryItem], migrated: Bool) {
+    private func adoptLoadedHistory(_ items: [HistoryItem], migrated: Bool, unreadable: Bool?) {
         // A search recorded while the file was read is newer than anything in it.
         var merged = items
         if !searchHistory.isEmpty {
             let ids = Set(searchHistory.map(\.id))
             merged = (searchHistory + merged.filter { !ids.contains($0.id) }).sorted { $0.lastUsed > $1.lastUsed }
         }
-        historyLoaded = true
+        historyLoad = unreadable == true ? .failed : .live
         searchHistory = merged
-        sweepUnsavedQueryImages()   // both need the bookmarks: before the read they would see none
+        // Both need the bookmarks: before the read they would see none, and after a failed read too.
+        if unreadable == nil { sweepUnsavedQueryImages() }
         pruneDeadFileRecents()
         pruneHistory()
         guard Self.savesHistory else { return }
@@ -3644,8 +3782,7 @@ final class AppModel {
         if fileQuery == nil, !instantSearchEnabled {
             guard (query.isEmpty ? rawQuery : query) == resolvedQuery else { return }
         }
-        backgroundRefreshPending = true
-        scheduleSearch()
+        scheduleSearch(background: true)
     }
 
     /// A refresh the index asked for, not the user (`refreshSearchAfterBackgroundChange`): it keeps
@@ -3737,20 +3874,18 @@ final class AppModel {
             ignoreText = OmniIgnore.synthesize(enabledKinds: settings.enabledKinds, disabledExtensions: settings.disabledExtensions)
             saveIgnoreText()
         }
-        // NOT YET IF A PRUNE IS OWED. Written here, a launch whose store then refused to open had
-        // recorded the step as done with its prune never run - and nothing would run it again.
-        // The merge above is idempotent, so a step re-run on the next launch adds nothing twice.
-        if ignorePrunePending { ignoreVersionOwed = true } else { recordIgnoreDefaultsVersion() }
+        // AT ONCE, WITH THE PRUNE OWED (oweBeforeOpen). Held back until the prune ended, a quit in
+        // between replayed the merge at the next launch and put back a default the user had deleted;
+        // recorded with nothing owed, a store that then refused to open never ran the prune at all.
+        recordIgnoreDefaultsVersion()
         loadFolderPolicies()
+        if ignorePrunePending { oweBeforeOpen([OwedDelete.prune(nil).key]); ignorePrunePending = false }
         ignore = compiledIgnore(ignoreText)
         ignoreHasBackup = Self.ignoreFileURL().map { FileManager.default.fileExists(atPath: $0.appendingPathExtension("bak").path) } ?? false   // one stat at launch, then cached
     }
 
     private static let ignoreDefaultsKey = "omni.ignoreDefaultsVersion"
-    /// The defaults step ran but its prune has not: the version is recorded when the prune finishes.
-    @ObservationIgnored private var ignoreVersionOwed = false
     private func recordIgnoreDefaultsVersion() {
-        ignoreVersionOwed = false
         if !Self.isolatedByLaunchArgument {
             OmniPrefs.set(Self.ignoreDefaultsVersion, forKey: Self.ignoreDefaultsKey)
         }
@@ -3758,8 +3893,7 @@ final class AppModel {
     /// 2: OmniIgnore.addedDefaults. 3: the hidden-name rule as a line in the file, the full
     /// gitignore grammar (issue #24) and OmniIgnore.addedDefaultsV3.
     private static let ignoreDefaultsVersion = 3
-    /// The policy gained rules at launch; the indexed files they exclude are dropped once the
-    /// store is open (bootstrap).
+    /// The policy gained rules at launch; loadIgnore owes the indexed files they exclude.
     @ObservationIgnored private var ignorePrunePending = false
 
     /// Drop every indexed file the policy excludes, then give back the space. Folder rules count:
@@ -3880,15 +4014,28 @@ final class AppModel {
         guard next != folderPolicies else { return }
         let changed = dirs.filter { next[$0] != folderPolicies[$0] }
         folderPolicies = next
-        saveFolderPolicies()
         let before = ignore
         ignore = compiledIgnore(ignoreText)
-        guard ignore != before, let store else { return }
+        guard ignore != before, let store else {
+            if ignore != before { oweBeforeOpen(changed.map { OwedDelete.prune($0).key }) }
+            saveFolderPolicies()
+            return
+        }
         Self.rootLog.info("folder policy changed in \(changed.count, privacy: .public) folder(s)")
+        // Owed before the policy is saved; see OwedDelete.
+        let owed = changed.map { OwedDelete.prune($0).key }
+        Task.detached(priority: .utility) {
+            store.oweRemoval(owed)
+            await MainActor.run { self.saveFolderPolicies() }
+        }
         policyPruneDirs.formUnion(changed)
-        // Re-crawling the folders indexes what a dropped rule lets back in.
+        // Re-crawling the folders indexes what a dropped rule lets back in. Dated like any event, or
+        // the wait limit does not see them behind a long pass.
         pendingFSPaths.formUnion(changed)
-        if isIndexWorkInFlight {
+        if fsEventsWaitingSince == nil { fsEventsWaitingSince = Date() }
+        // A benchmark too: it owns the store and the levers, and the watcher can be back on before
+        // it ends (a followed folder restarts it). Its resume runs the chain that prunes.
+        if isIndexWorkInFlight || isPaperRunning {
             // The pass in flight carries the old rules. A full pass is restarted on the new ones;
             // the prune waits until it has stopped (drainIdleUpkeep), so nothing it wrote under the
             // old rules in the meantime survives.
@@ -3897,12 +4044,27 @@ final class AppModel {
         }
         let dirsNow = Array(policyPruneDirs)
         policyPruneDirs.removeAll()
-        pruneExcluded(store, policy: ignore, under: dirsNow) {
+        runOwedPrune(store, under: dirsNow) {
             if self.indexState != .indexing && self.activeRoots.isEmpty && !self.fsReconcileInFlight {
                 self.drainPendingFSChanges()
             }
         }
     }
+
+    /// Prune by the rules in force and settle what that was owed - unless the same scope was owed
+    /// again meanwhile, by a change this prune did not see.
+    private func runOwedPrune(_ store: VectorStore, under dirs: [String]?, covering: Set<String> = [],
+                              then: (@MainActor () -> Void)? = nil) {
+        pruneExcluded(store, policy: ignore, under: dirs) { [weak self] in
+            guard let self else { return }
+            var settled = (dirs.map(Set.init) ?? covering).subtracting(self.policyPruneDirs).map { OwedDelete.prune($0).key }
+            if dirs == nil, !self.policyPruneAll { settled.append(OwedDelete.prune(nil).key) }
+            Task.detached(priority: .utility) { store.settleRemoval(settled) }
+            then?()
+        }
+    }
+
+    @ObservationIgnored private var ignoreApplySeq = 0
 
     private func saveIgnoreText() {
         guard let url = Self.ignoreFileURL() else { return }
@@ -3936,7 +4098,11 @@ final class AppModel {
         guard text != ignoreText else { ignorePreview = nil; return }
         ignorePreviewSeq += 1
         let seq = ignorePreviewSeq
-        guard let store else { ignorePreview = nil; return }
+        // No index open means nothing to scan: an answer, or the pane says "Calculating..." for good.
+        guard let store else {
+            ignorePreview = IgnorePreview(kept: 0, removed: 0, samples: [], danger: nil, forText: text)
+            return
+        }
         let candidate = compiledIgnore(text)
         let rootPaths = crawlRoots.map { $0.path }
         Task.detached(priority: .userInitiated) {
@@ -3984,12 +4150,33 @@ final class AppModel {
         let changed = new != ignore
         ignoreText = newText
         ignore = new
-        saveIgnoreText()
         ignorePreview = nil
-        guard changed, let store else { return }
+        guard changed, let store else {
+            if changed { oweBeforeOpen([OwedDelete.prune(nil).key]) }
+            saveIgnoreText()
+            return
+        }
         // With indexing stopped: a pass that started on the old rules would add back files the new
         // rules exclude. The pass that resumes afterwards picks up what the new rules allow.
-        Task { await withIndexingStopped { await self.pruneExcludedNow(store, policy: new) } }
+        let owed = OwedDelete.prune(nil).key
+        ignoreApplySeq += 1
+        let seq = ignoreApplySeq
+        Task {
+            await Task.detached(priority: .userInitiated) { store.oweRemoval([owed]) }.value
+            self.saveIgnoreText()   // after the key; see OwedDelete
+            // A writer past the hold's minute: the chain that writer ends with runs it instead.
+            var ran = false
+            let stopped = await self.withIndexingStopped {
+                await self.pruneExcludedNow(store, policy: self.ignore)
+                ran = true
+            }
+            // The key is one for every Apply: only the newest one's prune has covered them all.
+            if ran, seq == self.ignoreApplySeq { await Task.detached(priority: .utility) { store.settleRemoval([owed]) }.value }
+            if !stopped {
+                self.policyPruneAll = true
+                self.drainIdleUpkeep(store)
+            }
+        }
     }
 
 
@@ -4128,24 +4315,39 @@ final class AppModel {
         pendingDisable = nil
         let oldTowers = enabledKindTowers
         settings.set(k, on)
-        if !isIsolatedRun {   // a test toggling a kind must not change the user's own setting
-            OmniPrefs.set(settings.enabledKinds.map { $0.rawValue }, forKey: "omni.indexKinds")
+        func saveKinds() {
+            if !isIsolatedRun {   // a test toggling a kind must not change the user's own setting
+                OmniPrefs.set(settings.enabledKinds.map { $0.rawValue }, forKey: "omni.indexKinds")
+            }
         }
         if on { clearKindExcludesFromIgnore(k) }       // make the toggle authoritative over legacy excludes
+        // scan rows are governed by Text; one deleteKinds pass = one scan + one compaction.
+        let kinds = k == .text ? [k.rawValue, FileKind.scan.rawValue] : [k.rawValue]
+        let owed = kinds.map { OwedDelete.kind($0).key }
         if !on, purge, let store {
             // deleteKind is a SQL DELETE + O(N) in-place row compaction; run it off the main actor like
             // every other index mutation, then refresh stats back on the main actor.
-            // scan rows are governed by Text; one deleteKinds pass = one scan + one compaction.
             // Under a hold: a pass that started with this kind on would put the rows straight back.
-            let kinds = k == .text ? [k.rawValue, FileKind.scan.rawValue] : [k.rawValue]
             Task {
-                await self.withIndexingStopped {
-                    await Task.detached(priority: .utility) { store.deleteKinds(kinds) }.value
+                await Task.detached(priority: .userInitiated) { store.oweRemoval(owed) }.value
+                saveKinds()   // after the key; see OwedDelete
+                var ran = false
+                let stopped = await self.withIndexingStopped {
+                    await Task.detached(priority: .utility) { store.deleteKinds(kinds); store.settleRemoval(owed) }.value
+                    ran = true
+                }
+                if !stopped, !ran {
+                    self.kindPurgesOwed.formUnion(kinds)
+                    self.drainIdleUpkeep(store)
+                    return
                 }
                 // Not the stats alone: purged files stayed in the results on screen and in the
                 // browser until the restarted pass ended, which on a first index is hours.
                 self.afterBulkDelete(store)
             }
+        } else {
+            if !on, purge { oweBeforeOpen(owed) }
+            saveKinds()
         }
         if enabledKindTowers != oldTowers {
             // Debounce so a burst of toggles coalesces into ONE action that reads the FINAL modality
@@ -4183,6 +4385,7 @@ final class AppModel {
     /// and the engine agree.
     private var towersReconciling = false
     private var towersAgain = false
+    private static let towerRetryDelay: Double = 30
     private func reconcileTowers() async {
         if towersReconciling { towersAgain = true; return }
         towersReconciling = true
@@ -4217,15 +4420,32 @@ final class AppModel {
     /// the indexer, serving and search, and indexing resumes to pick up the newly included files.
     /// Search keeps answering on the old engine while the new one loads.
     private var engineReloading = false
+    /// A tower toggle refused because a reload was running: that reload read its towers before the
+    /// toggle, and nothing else looked again when it ended.
+    @ObservationIgnored private var towersChangedDuringReload = false
     @discardableResult
     private func reloadEngine(forGPUTowers: Bool = false) async -> Bool {
         // A reload for the GPU towers that a switch back to the Neural Engine overtook: the engine in
         // hand still has the programs as its towers, and a second model would only be loaded, checked
         // on the GPU and set up for the Neural Engine again (Small: longer than a quick switch back).
         func overtaken() -> Bool { forGPUTowers && computeUnit == .neuralEngine }
+        if engineReloading, !forGPUTowers { towersChangedDuringReload = true }
         guard !overtaken(), !engineReloading, let store, !modelPath.isEmpty else { return false }
         engineReloading = true
-        defer { engineReloading = false }
+        var installed = false, holdTimedOut = false
+        defer {
+            engineReloading = false
+            let again = towersChangedDuringReload
+            towersChangedDuringReload = false
+            if again || (installed && forGPUTowers) { Task { await self.reconcileTowers() } }
+            // Not installed because a writer outlasted the hold: the toggle still stands.
+            if holdTimedOut {
+                Task {
+                    try? await Task.sleep(for: .seconds(Self.towerRetryDelay))
+                    await self.reconcileTowers()
+                }
+            }
+        }
         let dir = URL(fileURLWithPath: modelPath)
         // A switch of model or index during the load: what was loaded is no longer what the app is
         // on, and installing it put the old model under a store stamped for the new one.
@@ -4242,9 +4462,21 @@ final class AppModel {
         }
         if overtaken() { omniPerfLog("engine reload dropped: back on the Neural Engine"); return false }
         if superseded() { omniPerfLog("engine reload dropped: the model or index changed"); return false }
+        // THE LABEL CACHE BEFORE THE HOLD. `ensureTagger` inside the hold built it when it was missing
+        // (another model, a new label list), and indexing stood stopped for the whole build, seconds,
+        // only to load it at the end. Built here, the hold finds it and only loads it. Not in Neural
+        // Engine mode, where the labels wait for the engine the hold installs (`ensureTagCache`).
+        if imageTagsEnabled, loaded.supportsImages, !OmniCompute.offGPU,
+           let cacheDir = try? Self.indexURL().deletingLastPathComponent() {
+            let t0 = Date()
+            _ = await Task.detached(priority: .utility) { await Self.ensureTagCache(engine: loaded, cacheDir: cacheDir) }.value
+            omniPerfLog(String(format: "engine reload: label cache ready before the hold in %.1fs", -t0.timeIntervalSinceNow))
+            if overtaken() || superseded() { return false }
+        }
         // The swap happens only if the writers stopped. Reporting a reload that was not installed
         // sent the reconcile loop round again against the engine it had meant to replace.
         var droppedWhileStopping = false
+        let tHold = Date()
         let swapped = await withIndexingStopped {
             // Checked again: the wait for the writers can be as long as the load.
             if superseded() { droppedWhileStopping = true; return }
@@ -4262,11 +4494,14 @@ final class AppModel {
             self.supportsImages = loaded.supportsImages
             self.audioSupported = loaded.supportsAudio
             await self.ensureTagger()
+            omniPerfLog(String(format: "engine reload: indexing held %.1fs", -tHold.timeIntervalSinceNow))
         }
         guard swapped, !droppedWhileStopping else {
             omniPerfLog("engine reload not installed: " + (swapped ? "the model or index changed" : "indexing did not stop"))
+            holdTimedOut = !swapped
             return false
         }
+        installed = true
         omniPerfLog("engine reloaded vision=\(loaded.supportsImages) audio=\(loaded.supportsAudio)")
         Task {
             await Task.detached(priority: .utility) { loaded.warmText() }.value
@@ -4679,6 +4914,9 @@ final class AppModel {
         var f = SearchFilter()
         f.kinds = Set(filterKinds.map { $0.rawValue })
         f.folderPrefixes = filterFolders.map(\.path)
+        // The source on screen scopes a query as a browsed folder does ("Search in This Source"). Not
+        // in the box, so its own key here: the listing used it (photoSourceHits) and a search did not.
+        if let browsedPhotoSource, filterFolders.isEmpty, filterFolderNames.isEmpty { f.folderPrefixes = [browsedPhotoSource.key] }
         f.recentsLimit = filterRecents ? recentsLimit : nil
         f.ext = filterExt.isEmpty ? nil : filterExt
         f.excludeExts = filterExtExclude.split(separator: ",").map(String.init).filter { !$0.isEmpty }
@@ -4698,10 +4936,13 @@ final class AppModel {
 
     func setModelDir(_ url: URL) {
         OmniPrefs.set(url.path, forKey: "omni.modelDir")
+        retryBootstrap()
+    }
+    func retryBootstrap() {
+        guard phase != .repairingIndex else { return }   // its reopen reads the setting just saved
         phase = .loadingModel
         Task { await bootstrap() }
     }
-    func retryBootstrap() { phase = .loadingModel; Task { await bootstrap() } }
 
     private nonisolated static func resolvedModelDir() -> URL? {
         if let saved = UserDefaults.standard.string(forKey: "omni.modelDir") {
@@ -4748,9 +4989,13 @@ final class AppModel {
     private func powerChanged(_ hold: PowerHold?) {
         powerHold = hold
         if hold != nil {
-            // Stand down the way an OCR run does: a pause keeps every file already embedded.
-            if isIndexing || !activeRoots.isEmpty {
+            // Stand down the way an OCR run does: a pause keeps every file already embedded. A
+            // catch-up re-queues itself, and the lift below takes it. A watcher reconcile goes on
+            // (see above): stopped and marked, it earned a full pass at the lift for a few files.
+            if isIndexing {
                 indexingPausedForPower = true
+                pauseIndexing()
+            } else if !activeRoots.isEmpty, !fsReconcileInFlight {
                 pauseIndexing()
             }
         } else {
@@ -4802,6 +5047,10 @@ final class AppModel {
         ocrRunActive = true
         if isIndexing {
             indexingPausedForOCR = true
+            pauseIndexing()
+        } else if isIndexWorkInFlight, !tagBackfillActive {
+            // A catch-up or a reconcile goes the same way: each re-queues its work, refused until
+            // endOCRRun takes it back. Testing isIndexing alone left one running beside the run.
             pauseIndexing()
         }
         yieldRetagToSearch()   // a tag batch in flight gives the GPU back too; its files re-queue
@@ -5147,6 +5396,7 @@ final class AppModel {
     private var bootstrapAgain = false
 
     private func bootstrap() async {
+        if phase == .repairingIndex { return }   // its reopen comes when it ends; see recoverIndex
         if bootstrapRunning { bootstrapAgain = true; return }
         bootstrapRunning = true
         defer {
@@ -5191,6 +5441,7 @@ final class AppModel {
         storeLoadFrac = 0; engineLoadFrac = 0; warmFrac = 0
         engineTotalBytes = Self.expectedGPULoadBytes(modelDir: dir)
         residentMLXBytes = nil; engineRestBytes = nil
+        requiredMemoryBytes = 0   // the old model's; Settings falls back to what is about to load
         applyMemoryLimit()   // against what is about to load, not the half-of-RAM placeholder
         warmPlanned = (try? Self.indexURL()).map { idx in
             let vecs = idx.deletingLastPathComponent().appendingPathComponent(idx.lastPathComponent + ".vecs")
@@ -5220,6 +5471,10 @@ final class AppModel {
             // until close(), so it refused to open and the index showed the repair screen until a
             // relaunch. Only a different index is opened fresh.
             let indexURL = try Self.indexURL()
+            if Self.testRefusalsLeft > 0 {
+                omniPerfLog("test seam: refusing this open")
+                throw OmniError.store("test refusal")
+            }
             let reuse = self.store.flatMap { $0.dbURL.standardizedFileURL == indexURL.standardizedFileURL ? $0 : nil }
             async let storeC: VectorStore = {
                 if let reuse { return reuse }
@@ -5240,9 +5495,11 @@ final class AppModel {
                 return e
             }()
             let store = try await storeC
+            if Self.testFailEngineLoad { omniPerfLog("test seam: engine load fails"); throw CocoaError(.fileReadCorruptFile) }
             omniPerfLog("launch store-open")
             await MainActor.run { self.storePhase = nil }   // store done; only the model can be left
             let engine = try await engineC
+            if let ms = Self.testArgument("bootstrapLoadDelayMs") as? String, let n = Int(ms) { try? await Task.sleep(for: .milliseconds(n)) }
             omniPerfLog("launch engine-loaded")
             // On a model/db switch, close the PREVIOUS store off the main actor: dropping its last ref
             // here would run a synchronous WAL checkpoint(TRUNCATE) + sqlite_close in deinit on @MainActor
@@ -5263,19 +5520,31 @@ final class AppModel {
                 oldIndexer?.cancel()
                 await waitUntilIndexWorkStops(seconds: 60)
                 // NOT PAST A RUN THAT IS STILL OUT. A pass that outlasted the wait kept writing, and
-                // the new pipeline started beside it on a reused store. A run always comes back (a
-                // cancel reaches it at its next batch, a stuck read gives up), and until it does the
+                // the new pipeline started beside it on a reused store. A run comes back (a cancel
+                // reaches it at its next batch, a stuck read gives up), and until it does the
                 // switch waits. Flags with no run behind them are leaks (see the drain watchdog),
                 // cleared below, so they are not waited for.
+                //
+                // THE ONE EXCEPTION, A RUN THAT CAN NO LONGER WRITE. update() stats and crawls on its
+                // own thread with no such guard, so a dead network volume held the switch on the
+                // loading screen for as long as the volume hung: for ever. Still in that stage a
+                // minute after its cancel, it has stored nothing and will store nothing when it
+                // returns (Indexer.resolvingUpdatePaths), so it is let go.
                 if runsOutstanding > 0 { omniPerfLog("switch waiting for \(runsOutstanding) index run(s) to stop") }
                 while runsOutstanding > 0 {
+                    if oldIndexer?.resolvingUpdatePaths == true {
+                        abandonStuckUpdateRun()
+                        break
+                    }
                     await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { c.resume() }
                     }
                 }
                 indexingHolds -= 1
                 indexGen += 1
-                indexState = .idle
+                // The user's Pause outlives a switch: `.idle` here left every path that tests the
+                // state free to run under it, while the menu still offered Resume.
+                indexState = userPaused ? .paused : .idle
                 restartAfterPause = false
                 pendingRootRemovals.removeAll()
                 pendingCatchUpRoots.removeAll()
@@ -5396,11 +5665,13 @@ final class AppModel {
             indexRetryDelay = 2
             indexRecoveryTried = false
             omniPerfLog("launch ready")
-            if ignorePrunePending {
-                ignorePrunePending = false
-                let owed = ignoreVersionOwed
-                pruneExcluded(store, policy: ignore) { [weak self] in if owed { self?.recordIgnoreDefaultsVersion() } }
-            }
+            // Deletes held by this switch's hold, or a move's: for a paused folder nothing else
+            // comes back for them, and the file stayed searchable until the next Resume.
+            flushHeldRemovals()
+            startQueuedRemovals()
+            // A tower switched on after this load read them. The toggle's own reload can finish
+            // first, and this install then replaced its engine with one that has no such tower.
+            if enabledKindTowers != towers { Task { await self.reconcileTowers() } }
             // A folder renamed or moved while Omni was closed. No pass of its own: the launch pass
             // below covers the new path, while the old rows are still there to reuse.
             followMovedFolders(kick: false)
@@ -5449,6 +5720,7 @@ final class AppModel {
             }
         } catch {
             if self.dbPath.isEmpty { self.dbPath = (try? Self.indexURL())?.path ?? "" }
+            self.storePhase = nil   // a throw from the open skips the line that clears it
             switch error {
             case OmniError.storeUnavailable(let why), OmniError.storeNeedsSpace(let why):
                 omniPerfLog("bootstrap index unavailable: \(why)")
@@ -5460,7 +5732,43 @@ final class AppModel {
                 recoverIndex(why)
             default:
                 self.phase = .failed("\(error)")
+                stopOldPipelineAfterFailedLoad()
             }
+        }
+    }
+
+    /// The reconcile or tag batch running now. A run let go by abandonStuckUpdateRun finds this moved
+    /// on when it finally returns, hands its paths back, and touches nothing else: the flags it would
+    /// clear belong to whatever runs by then.
+    @ObservationIgnored private var updateRunID: UInt64 = 0
+
+    private func abandonStuckUpdateRun() {
+        omniPerfLog("switch stopped waiting for a run stuck reading its paths")
+        Self.rootLog.error("index switch: a reconcile is stuck reading its paths; going on without it")
+        updateRunID &+= 1
+        runsOutstanding -= 1
+        fsReconcileInFlight = false
+        tagBackfillActive = false
+        reconcilingPaths.removeAll()
+        reconcilingNames.removeAll()
+        reconcileToken &+= 1
+        if reconcileShowsProgress { reconcileShowsProgress = false }
+    }
+
+    /// A switch that could not load its model. The failure screen is up and Retry loads afresh, so
+    /// nothing goes on under it: the old engine kept indexing, and any new pass would have stamped
+    /// the new model's name on what the old one embedded (modelPath moves before the load).
+    private func stopOldPipelineAfterFailedLoad() {
+        guard indexer != nil else { return }
+        indexingHolds += 1
+        Task {
+            indexer?.cancel()
+            await waitUntilIndexWorkStops(seconds: 60)
+            indexingHolds -= 1
+            guard case .failed = phase else { return }   // Retry got there first and owns the pipeline
+            watcher?.stop(); watcher = nil
+            releaseOpenIndex()
+            engine = nil
         }
     }
 
@@ -5589,7 +5897,8 @@ final class AppModel {
             await MainActor.run {
                 guard let self else { return }
                 self.filenameRefreshRunning = false
-                if self.filenameRefreshAgain { self.filenameRefreshAgain = false; self.refreshFilenameIndex(store) }
+                // The store open now: the first caller's may have been switched away meanwhile.
+                if self.filenameRefreshAgain, let current = self.store { self.filenameRefreshAgain = false; self.refreshFilenameIndex(current) }
             }
         }
     }
@@ -5612,7 +5921,7 @@ final class AppModel {
         // cancel behind it - a catch-up that finished just as it landed, a cancel the next run's
         // reset cleared - turned this check off until some full pass happened to end.
         let requested = fsDrainThenResume && indexer?.isCancelled == true
-        guard isIndexing || catchUp || reconcile, !requested, !restartAfterPause,
+        guard !userPaused, isIndexing || catchUp || reconcile, !requested, !restartAfterPause,
               eventsDue || tagsDue else { return }
         fsDrainThenResume = true
         indexer?.cancel(.pause)
@@ -5721,7 +6030,11 @@ final class AppModel {
         // User-chosen database folder wins, so the index can live on another volume.
         if let custom = UserDefaults.standard.string(forKey: "omni.dbDir"), !custom.isEmpty {
             let dir = URL(fileURLWithPath: custom)
-            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            // A volume not mounted, a folder not writable just now: nothing is wrong with the index,
+            // so the open waits and tries again. As any other error this read as "Omni can't load its
+            // model", with a button to go and pick one.
+            do { try fm.createDirectory(at: dir, withIntermediateDirectories: true) }
+            catch { throw OmniError.storeUnavailable("The index's folder can't be reached right now.") }
             return dir.appendingPathComponent("index.sqlite")
         }
         let base = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
@@ -5745,6 +6058,7 @@ final class AppModel {
     func moveDatabaseDir(to url: URL) async -> String? {
         let src = (try? Self.indexURL())?.deletingLastPathComponent()
             ?? URL(fileURLWithPath: dbPath).deletingLastPathComponent()
+        if phase == .repairingIndex { return "The index is being checked. Try again in a moment." }
         let files = IndexRelocation.files(in: src)
         let payload = IndexRelocation.byteSize(of: files)
         if let refusal = IndexRelocation.refusal(from: src, to: url, payload: payload) { return refusal }
@@ -5763,13 +6077,18 @@ final class AppModel {
             indexingHolds -= 1
             return "Indexing did not stop in time. Try again in a moment."
         }
+        // THE WINDOW SAYS SO. The phase stayed `.ready` over a nil store: a query spun with nothing
+        // to answer it, and a folder listed empty, for as long as the copy took.
+        phase = .loadingModel
         releaseOpenIndex()
 
         let copied: Result<Void, Error> = await Task.detached(priority: .userInitiated) {
+            if let ms = Self.testArgument("moveDelayMs") as? String, let n = Int(ms) { usleep(UInt32(n) * 1000) }
             do { try IndexRelocation.copy(from: src, to: url); return .success(()) }
             catch { return .failure(error) }
         }.value
 
+        migratingIndex = false   // the reopen below has its own titles
         indexingHolds -= 1
         switch copied {
         case .failure(let error):
@@ -5968,11 +6287,14 @@ final class AppModel {
     /// API-managed source is canonicalized, persisted, watched, queued and preempted identically,
     /// and there is no second implementation of "add a folder" to keep in step with the first.
     ///
-    /// Every closure hops to the main actor: the serving layer calls them from a connection's
-    /// detached Task, and all of this state is main-actor-isolated.
+    /// The sources closures hop to the main actor: the serving layer calls them from a connection's
+    /// detached Task, and all of this state is main-actor-isolated. The linked ones do not: a default
+    /// search asks every linked Mac, and those answers are read from the link's own thread-safe state
+    /// (LinkServed), so a served search never waits for the main thread.
     private func makeSourcesControl() -> SourcesControl {
         let fetch: @Sendable () async -> SourcesSnapshot = { await MainActor.run { AppModel.shared?.sourcesSnapshot() ?? .empty } }
-        let recent = RecentSnapshot(fetch)
+        let recent = RecentValue(fetch)
+        let linked = link.served
         return SourcesControl(
             snapshot: fetch,
             recentSnapshot: { await recent.get() },
@@ -5981,9 +6303,9 @@ final class AppModel {
             setPaused: { k, on in await MainActor.run { AppModel.shared?.apiSetPaused(k, on) ?? .fail("Omni is not ready") } },
             remove: { k in await MainActor.run { AppModel.shared?.apiRemove(k) ?? .fail("Omni is not ready") } },
             linkedSearch: { q, f, k, macs, explicit in
-                await AppModel.shared?.linkedSearchForServing(q, filter: f, topK: k, macs: macs, explicit: explicit) ?? []
+                await linked.servedSearch(q, filter: f, topK: k, macs: macs, explicit: explicit)
             },
-            linkedFetch: { mac, path in await AppModel.shared?.linkedFetchForServing(mac, path: path) ?? (nil, "Omni is not ready") }
+            linkedFetch: { mac, path in await linked.servedFetch(mac, path: path) }
         )
     }
 
@@ -6213,14 +6535,40 @@ final class AppModel {
             indexer?.cancel()
             return
         }
+        dropFolders([key], store: store, oweFirst: true) {}
+    }
+
+    /// Folders whose rows are being deleted now, and the deletes still running with their compaction.
+    /// A pass that starts on one of these folders reads its files as unchanged from rows about to
+    /// go, and the delete then takes "anything indexed meanwhile": a folder added back while its
+    /// delete ran kept no rows at all until the next launch. So what overlaps waits for the delete,
+    /// and the benchmark waits for the VACUUM behind it.
+    @ObservationIgnored private var folderDropsRunning = Set<String>()
+    @ObservationIgnored private var bulkDeletesRunning = 0
+    @ObservationIgnored private var passAfterFolderDrop = false
+    var bulkDeleteInFlight: Bool { bulkDeletesRunning > 0 }
+
+    private func overlapsFolderDrop(_ path: String) -> Bool {
+        folderDropsRunning.contains { RootScope.covers($0, path) || RootScope.covers(path, $0) }
+    }
+
+    /// The one way a removed source's rows leave: deleted, shown as gone, compacted, then whatever
+    /// the delete held back. `then` runs with nothing of this delete left.
+    private func dropFolders(_ folders: [String], store: VectorStore, oweFirst: Bool, then: @escaping @MainActor () -> Void) {
         let keep = roots.map(\.path)
+        folderDropsRunning.formUnion(folders)
+        bulkDeletesRunning += 1
         Task.detached {
-            store.oweRemoval([key])
-            Self.dropRemovedFolder(key, keeping: keep, store: store)
+            if oweFirst { store.oweRemoval(folders) }   // VectorStore.owedRemovals; the drop settles it
+            for path in folders { Self.dropRemovedFolder(path, keeping: keep, store: store) }
+            await MainActor.run { self.folderDropsRunning.subtract(folders) }
+            await self.afterBulkDelete(store)
             store.compact()
             await MainActor.run {
-                self.refreshIndexStats(store)
-                self.refreshSearchAfterBackgroundChange()
+                self.bulkDeletesRunning -= 1
+                then()
+                if self.passAfterFolderDrop { self.passAfterFolderDrop = false; self.startIndexing() }
+                self.drainDeferredAfterPass(store)   // a source added back meanwhile
             }
         }
     }
@@ -6381,6 +6729,10 @@ final class AppModel {
         let known = Set(addedFolders.map(\.path))
         let new = resolved.filter { !known.contains($0.path) }
         guard !new.isEmpty else { return }
+        // Removed during a pass and added back before the pass stopped: its rows are still there and
+        // are wanted. Taken off the queue, not deleted and embedded again.
+        let back = new.map(\.path).filter { pendingRootRemovals.remove($0) != nil }
+        if !back.isEmpty, let store { Task.detached(priority: .utility) { store.settleRemoval(back) } }
         let rootsBefore = Set(roots.map(\.path))
         addedFolders += new
         recomputeRoots()
@@ -6443,13 +6795,14 @@ final class AppModel {
         if !(pendingCatchUpRoots.isEmpty && pendingCatchUpPhotos.isEmpty) { armDrainWatchdog() }
         // indexState != .paused: indexing is paused as a whole, and a Photos change arriving then
         // started a catch-up anyway. Resume's pass drains the queue.
-        guard !indexWritesBlocked, !isPaperRunning, !indexObsolete, !ocrRunActive, !neuralEngineHoldsText, powerHold == nil,
+        guard !userPaused, !indexWritesBlocked, !isPaperRunning, !indexObsolete, !ocrRunActive, !neuralEngineHoldsText, powerHold == nil,
               indexState != .indexing, indexState != .paused, activeRoots.isEmpty,
               !fsReconcileInFlight,
               let indexer, let store, !(pendingCatchUpRoots.isEmpty && pendingCatchUpPhotos.isEmpty) else { return }
         // Not a paused folder: resuming it starts a pass, which covers it.
-        let batch = pendingCatchUpRoots.filter { roots.contains($0) && !pausedRoots.contains($0.path) }
-        pendingCatchUpRoots.removeAll()
+        // A source whose delete is still running stays queued; that delete's end comes back here.
+        let batch = pendingCatchUpRoots.filter { roots.contains($0) && !pausedRoots.contains($0.path) && !overlapsFolderDrop($0.path) }
+        pendingCatchUpRoots.removeAll { !(roots.contains($0) && overlapsFolderDrop($0.path)) }
         let photoBatch = pendingCatchUpPhotos.filter { p in
             photoSources.contains { $0.id == p.id } && !pausedRoots.contains(p.key)
         }
@@ -6552,14 +6905,7 @@ final class AppModel {
         } else {
             // Drop that folder's vectors so removed folders stop appearing in results, then
             // reclaim the disk space those rows held (SQLite keeps freed pages until VACUUM).
-            let keep = roots.map(\.path)
-            Task.detached {
-                store.oweRemoval([url.path])   // VectorStore.owedRemovals; the drop settles it
-                Self.dropRemovedFolder(url.path, keeping: keep, store: store)
-                await self.afterBulkDelete(store)
-                store.compact()
-                await MainActor.run { self.requeuePromoted(promoted) }
-            }
+            dropFolders([url.path], store: store, oweFirst: true) { self.requeuePromoted(promoted) }
         }
     }
 
@@ -6632,9 +6978,64 @@ final class AppModel {
         if scope != filterFolders { filterFolders = scope }
         recomputeRoots()
         restartWatcher()
-        pendingFSPaths.formUnion([new.path, old.path])
+        let move = FolderMove(old: old.path, new: new.path)
+        queueFolderMove(move)
+        if let store { Task.detached(priority: .utility) { store.oweRemoval([move.owedKey]) } }
         guard kick else { return }   // launch: drained with the watcher's first batch or after the launch pass
-        if indexState != .indexing && activeRoots.isEmpty && !fsReconcileInFlight { drainPendingFSChanges() }
+        // A PASS WALKING THE OLD PATH MAKES WAY. What it has not reached is gone from under it, and
+        // what it read as missing is what the batch has to reuse: the batch takes the new path, the
+        // pass comes back on the new roots.
+        if indexState == .indexing || (!activeRoots.isEmpty && !fsReconcileInFlight) {
+            fsDrainThenResume = true
+            indexer?.cancel(.pause)
+        } else if !fsReconcileInFlight {
+            drainPendingFSChanges()
+        }
+    }
+
+    /// A folder followed to its new path, from the moment the list changes until a reconcile has
+    /// indexed the new path and only then deleted under the old one: the order that re-embeds nothing
+    /// (`relocateFolder`). The removal lane leaves these paths alone (`movedFolderOwns`): it reads
+    /// the roots after the move, so the old path was no longer protected and its rows went before
+    /// the reconcile could reuse them. Measured, 400 files renamed: work=400 dedup=0, 34,770 tokens.
+    ///
+    /// DURABLE (`owedKey`): the new list is saved at once, and the old path is in no list after
+    /// that, so a quit before the batch ended left its rows searchable for good.
+    private struct FolderMove: Equatable {
+        let old: String, new: String
+        /// In `owed_removals` beside plain folder keys, kept apart by the prefix. NUL because a path
+        /// cannot hold one. An older build reads it as a folder with no rows, and settles it.
+        var owedKey: String { OwedDelete.moved(old: old, new: new).key }
+    }
+    @ObservationIgnored private var folderMoves: [FolderMove] = []
+
+    private func queueFolderMove(_ move: FolderMove) {
+        if !folderMoves.contains(move) { folderMoves.append(move) }
+        pendingFSPaths.formUnion([move.new, move.old])
+        // Dated like any event: with no date the wait limit could not see it, and the move waited
+        // for the running pass's clean end.
+        if fsEventsWaitingSince == nil { fsEventsWaitingSince = Date() }
+        armDrainWatchdog()
+    }
+
+    /// A path whose rows a move's reconcile still needs: the old path, what is under it, or a folder
+    /// above it (renaming a root's parent reports the parent).
+    private func movedFolderOwns(_ path: String) -> Bool {
+        folderMoves.contains { RootScope.covers($0.old, path) || RootScope.covers(path, $0.old) }
+    }
+
+    /// The batch that held these moves finished: the new path is indexed, the old rows gone. Unless
+    /// a new folder took the old path meanwhile: then the batch had no gone path to delete under,
+    /// and those rows, in no source now, are deleted as a removed folder's are.
+    private func settleFolderMoves(in batch: [String], store: VectorStore) {
+        guard !folderMoves.isEmpty else { return }
+        let done = folderMoves.filter { batch.contains($0.old) || batch.contains($0.new) }
+        guard !done.isEmpty else { return }
+        folderMoves.removeAll { done.contains($0) }
+        let keys = done.map(\.owedKey)
+        Task.detached(priority: .utility) { store.settleRemoval(keys) }
+        let stranded = done.map(\.old).filter { !batch.contains($0) && rootKey(for: $0) == nil }
+        if !stranded.isEmpty { dropFolders(stranded, store: store, oweFirst: true) {} }
     }
 
     nonisolated static let rootLog = Logger(subsystem: "io.hanxiao.omni", category: "roots")
@@ -6692,12 +7093,34 @@ final class AppModel {
     /// The prune owed by a folder policy that changed while a pass was running, once nothing is
     /// indexing: run earlier, it races the pass that is still writing under the old rules.
     private func drainIdleUpkeep(_ store: VectorStore) {
-        guard !policyPruneDirs.isEmpty, !indexWritesBlocked, !isPaperRunning, indexState == .idle,
+        guard !policyPruneDirs.isEmpty || policyPruneAll || !kindPurgesOwed.isEmpty,
+              !indexWritesBlocked, !isPaperRunning, indexState == .idle,
               activeRoots.isEmpty, !fsReconcileInFlight, !restartAfterPause, pendingFSPaths.isEmpty
         else { return }
-        let dirs = Array(policyPruneDirs)
-        policyPruneDirs.removeAll()
-        pruneExcluded(store, policy: ignore, under: dirs)
+        if policyPruneAll {
+            policyPruneAll = false
+            let covered = policyPruneDirs   // everywhere covers them
+            policyPruneDirs.removeAll()
+            runOwedPrune(store, under: nil, covering: covered)
+        } else if !policyPruneDirs.isEmpty {
+            let dirs = Array(policyPruneDirs)
+            policyPruneDirs.removeAll()
+            runOwedPrune(store, under: dirs)
+        }
+        if !kindPurgesOwed.isEmpty {
+            let owed = kindPurgesOwed
+            kindPurgesOwed.removeAll()
+            // Only a kind still off: switched back on since, its rows are wanted again.
+            let off = owed.filter { raw in FileKind(rawValue: raw).map { !kindEnabled($0.governing) } ?? true }
+            let keys = owed.map { OwedDelete.kind($0).key }
+            Task {
+                await Task.detached(priority: .utility) {
+                    if !off.isEmpty { store.deleteKinds(Array(off)) }
+                    store.settleRemoval(keys)
+                }.value
+                if !off.isEmpty { self.afterBulkDelete(store) }
+            }
+        }
     }
 
     /// Folders that became roots because the root covering them was removed. The delete took their
@@ -6716,14 +7139,19 @@ final class AppModel {
     ///
     /// Settles the removal the index was owed (VectorStore.owedRemovals) once the rows are gone.
     nonisolated static func dropRemovedFolder(_ folder: String, keeping roots: [String], store: VectorStore) {
-        defer { store.settleRemoval([folder]) }
+        if let ms = testArgument("dropDelayMs") as? String, let n = Int(ms) { usleep(UInt32(n) * 1000) }
         let keep = roots.filter { $0 != folder && RootScope.covers(folder, $0) }
-        guard !keep.isEmpty else { store.deleteUnderFolder(folder); return }
+        // Settled only if it happened: another process holding the lock past the wait left the rows,
+        // and settling then kept them searchable for good. Still owed, the next open tries again.
+        guard !keep.isEmpty else {
+            if store.deleteUnderFolder(folder) { store.settleRemoval([folder]) }
+            return
+        }
         var drop = Set<String>()
         store.knownFiles().forEach { path, _ in
             if RootScope.covers(folder, path), !keep.contains(where: { RootScope.covers($0, path) }) { drop.insert(path) }
         }
-        store.deletePaths(drop)
+        if store.deletePaths(drop) { store.settleRemoval([folder]) }
     }
 
     /// Removals a quit, a crash or an update's relaunch cut short (VectorStore.owedRemovals), finished
@@ -6732,8 +7160,20 @@ final class AppModel {
     /// removeRoot's delete is: no pass crawls what is no source, so there is no re-insert to race.
     private func finishOwedRemovals(_ store: VectorStore) {
         let keep = roots.map(\.path), photos = Set(photoSources.map(\.key))
+        let carried = Array(owedBeforeOpen)
         Task.detached(priority: .utility) {
-            let owed = store.owedRemovals
+            if !carried.isEmpty {
+                store.oweRemoval(carried)
+                await MainActor.run {
+                    self.owedBeforeOpen.subtract(carried)
+                    OmniPrefs.set(Array(self.owedBeforeOpen), forKey: Self.owedBeforeOpenKey)
+                }
+            }
+            let all = store.owedRemovals
+            guard !all.isEmpty else { return }
+            let others = all.map(OwedDelete.init(key:)).filter { if case .folder = $0 { return false } else { return true } }
+            if !others.isEmpty { await MainActor.run { self.resumeOwedDeletes(others, store: store) } }
+            let owed = all.filter { if case .folder = OwedDelete(key: $0) { return true } else { return false } }
             guard !owed.isEmpty else { return }
             let back = owed.filter { k in photos.contains(k) || keep.contains { RootScope.covers($0, k) } }
             store.settleRemoval(back)
@@ -6744,6 +7184,33 @@ final class AppModel {
             await self.afterBulkDelete(store)
             store.compact()
         }
+    }
+
+    /// The rest of what was owed at open, each as it would have gone on: a move's batch, after the
+    /// launch pass, and the prunes and purges at the first idle moment.
+    private func resumeOwedDeletes(_ owed: [OwedDelete], store: VectorStore) {
+        omniPerfLog("owed at open: \(owed.map(\.key).joined(separator: ", ").replacingOccurrences(of: "\u{0}", with: " -> "))")
+        var settled: [String] = []
+        for item in owed {
+            switch item {
+            case .moved(let old, let new):
+                // Inside a source again: those rows are that source's. Anything else goes through the
+                // batch, whose end also deals with a new folder at the old path (settleFolderMoves).
+                if roots.contains(where: { RootScope.covers($0.path, old) }) {
+                    settled.append(item.key)
+                } else {
+                    queueFolderMove(FolderMove(old: old, new: new))
+                }
+            case .prune(let dir):
+                if let dir { policyPruneDirs.insert(dir) } else { policyPruneAll = true }
+            case .kind(let k):
+                kindPurgesOwed.insert(k)
+            case .folder:
+                break
+            }
+        }
+        if !settled.isEmpty { Task.detached(priority: .utility) { store.settleRemoval(settled) } }
+        drainIdleUpkeep(store)
     }
 
     private func requeuePromoted(_ promoted: [URL]) {
@@ -6794,6 +7261,10 @@ final class AppModel {
             suppressFilterEffects = true
             filterTags = ""; filterTagsExclude = ""
             suppressFilterEffects = false
+            // The chip goes with the filter. Left behind, the next typed word wrote it back into the
+            // box, and the next parse revived the filter.
+            activeQualifiers.removeAll { $0.key == "tag" }
+            syncSearchTokens()
         }
         // A query image (a dropped/pasted bitmap under query-images) is ephemeral regardless of how we
         // got here - fresh search, re-search, or a history re-run - so detect it by path. That keeps it
@@ -6922,6 +7393,8 @@ final class AppModel {
             touchProjection(url); applyProjection(cached); folderProjectionTotal = projectionTotals[url] ?? cached.points.count; return
         }
         folderProjectionFitting = true
+        projectionFitID &+= 1
+        let fit = projectionFitID
         let folder = url.path
         let refine = mapUsesUMAP   // captured on the main actor; the detached worker reads only this Bool
         // The quadratic layout runs on a memory-budgeted LANDMARK sample (mapPointBudget); the rest
@@ -6979,7 +7452,10 @@ final class AppModel {
             var result = ProjectionResult(points: [], knn: [], k: 0)
             var total = 0
             for await (snap, t) in stream { if Task.isCancelled { break }; result = snap; total = t }
-            guard let self, self.selectedFolderForViz?.path == folder else { return }   // folder changed: drop
+            // The fit's own id, not just the folder: a refit of the same folder cancels this one, and
+            // its end cleared the flag under the fit now running: no spinner, and a search could no
+            // longer cancel it.
+            guard let self, self.selectedFolderForViz?.path == folder, self.projectionFitID == fit else { return }
             if !result.points.isEmpty { self.cacheProjection(url, result, total: total); self.applyProjection(result); self.folderProjectionTotal = total }
             self.folderProjectionFitting = false
         }
@@ -7010,6 +7486,7 @@ final class AppModel {
         }
     }
 
+    @ObservationIgnored private var projectionFitID = 0
     private var searchDebounce: Task<Void, Never>?
     /// The in-flight search's worker. Cancelled when a newer search starts so a superseded query
     /// (rapid history/folder/typing switching) skips its remaining embed + store scan instead of
@@ -7019,11 +7496,14 @@ final class AppModel {
 
     /// Debounced search: clicking through history items (or any rapid trigger) coalesces to a single
     /// search instead of enqueuing a full `store.search` scan per click on the shared serial store queue.
-    func scheduleSearch(after ms: Int = 180) {
+    /// `background`: the index asked, not the user. Set as the debounce fires and not before: set
+    /// earlier, a search the user started inside the debounce read it and counted as a refresh.
+    func scheduleSearch(after ms: Int = 180, background: Bool = false) {
         searchDebounce?.cancel()
         searchDebounce = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(ms))
             guard !Task.isCancelled, let self else { return }
+            self.backgroundRefreshPending = background
             self.search()
         }
     }
@@ -7192,10 +7672,15 @@ final class AppModel {
     /// The engine and store go to Linked Macs too: this Mac answers linked Macs' searches with them,
     /// and its index's space probe decides which linked Macs' scores mix with its own.
     func attachLink(engine: OmniEngine, store: VectorStore) {
+        link.startIfItCanNow()   // the index folder may have been unavailable until now
         link.responder.attach(engine: engine, store: store, modelName: "omni-\(modelVariant.rawValue)")
         link.onPeerReady = { [weak self] _ in
             guard let self, self.hasQuery || self.fileQuery != nil else { return }
             self.search()
+        }
+        link.onPeerGone = { [weak self] id in
+            guard let self, self.linkedScope?.peer == id else { return }
+            self.leaveLinkedScope()   // unlinked from the other Mac's side: the scope has nothing left to be
         }
         Task { [link] in
             let probe = await Task.detached(priority: .utility) { LinkResponder.probe(engine) }.value
@@ -7229,7 +7714,14 @@ final class AppModel {
     func search() {
         searchDebounce?.cancel()   // a direct search supersedes any pending debounced one
         searchWorkTask?.cancel()   // and supersedes the previous in-flight search's embed + store scan
-        guard let engine, let store else { return }
+        // No store (an index move): the worker just cancelled would have cleared `searching`, and it
+        // stayed true, which holds back the stats and the tag batches.
+        guard let engine, let store else {
+            if searching { searching = false }
+            return
+        }
+        let background = backgroundRefreshPending
+        backgroundRefreshPending = false
         yieldRetagToSearch()       // background tag refinement gets fully out of a query's way
         // A real query is taking the GPU: cancel any in-flight folder-map fit so it doesn't compete
         // with the embed/search. The folder stays selected; clearing the query returns to the map.
@@ -7238,8 +7730,6 @@ final class AppModel {
         }
         if queryError != nil { queryError = nil }   // a no-op write still re-renders the window
         var scoped = currentFilter()
-        let background = backgroundRefreshPending
-        backgroundRefreshPending = false
         if filterRecents {
             let sig = (fileQuery?.url.path ?? query) + "\u{1}" + filterSignature() + "\u{1}\(recentsLimit)"
             if background, let s = recentsScope, s.sig == sig {
@@ -7510,32 +8000,7 @@ final class AppModel {
         // The detached task builds/loads and SEEDS the tagger but never touches self; the
         // attach happens back on the main actor below, with the world re-checked.
         let task = Task.detached(priority: .utility) { () -> OmniTagger? in
-            let labels = OmniTagger.gatedLabels(modelDir: modelDir)
-            guard !labels.isEmpty, let url = try? Self.tagCacheURL(in: cacheDir, dim: engine.dim, modelDir: modelDir, labels: labels) else { return nil }
-            let fm = FileManager.default
-            if !fm.fileExists(atPath: url.path) {
-                // A cache for this width under another name - the width-only one of early
-                // releases, other weights, another label list - is superseded: derived, rebuilt
-                // from the model in seconds, and 40-50 MB with its prior. (The width-only cache was
-                // once adopted under the keyed name; its labels are not this list's.)
-                let legacy = Self.legacyTagCacheURL(in: cacheDir, dim: engine.dim).lastPathComponent
-                let prefix = "tags-d\(engine.dim)-"
-                for n in (try? fm.contentsOfDirectory(atPath: cacheDir.path)) ?? []
-                where (n.hasPrefix(prefix) && (n.hasSuffix(".cache") || n.hasSuffix(".prior")))
-                    || n == legacy || n == (legacy as NSString).deletingPathExtension + ".prior" {
-                    try? fm.removeItem(at: cacheDir.appendingPathComponent(n))
-                }
-                // Neural Engine mode does not race the GPU: the labels go through the Neural Engine
-                // once it is ready, not the GPU while it prepares (1.3 s of GPU time at a launch
-                // on a new index, measured). Once per index.
-                while OmniCompute.offGPU, !engine.neuralEngineActive, !Task.isCancelled {
-                    try? await Task.sleep(for: .milliseconds(500))
-                }
-                let t0 = Date()
-                guard OmniTagger.buildCache(labels: labels, embedder: engine, to: url,
-                                            isCancelled: { Task.isCancelled }) else { return nil }
-                omniPerfLog(String(format: "[tags] label cache built in %.1fs", -t0.timeIntervalSinceNow))
-            }
+            guard let url = await Self.ensureTagCache(engine: engine, cacheDir: cacheDir) else { return nil }
             guard !Task.isCancelled, let tagger = OmniTagger(cacheURL: url, dim: engine.dim) else { return nil }
             engine.seedTaggerPrior(tagger)   // BEFORE publishing - see doc comment
             return tagger
@@ -7547,6 +8012,39 @@ final class AppModel {
         // the engine was not swapped by a model/db switch while the cache built.
         guard let built, taggerSetupGen == gen, imageTagsEnabled, self.engine === engine else { return }
         engine.tagger = built
+    }
+
+    /// The label cache for `engine`'s model, built from it when missing. Nil when there are no labels
+    /// or the build was cancelled.
+    nonisolated static func ensureTagCache(engine: OmniEngine, cacheDir: URL) async -> URL? {
+        let modelDir = engine.modelDir
+        let labels = OmniTagger.gatedLabels(modelDir: modelDir)
+        guard !labels.isEmpty, let url = try? Self.tagCacheURL(in: cacheDir, dim: engine.dim, modelDir: modelDir, labels: labels) else { return nil }
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: url.path) {
+            // A cache for this width under another name - the width-only one of early
+            // releases, other weights, another label list - is superseded: derived, rebuilt
+            // from the model in seconds, and 40-50 MB with its prior. (The width-only cache was
+            // once adopted under the keyed name; its labels are not this list's.)
+            let legacy = Self.legacyTagCacheURL(in: cacheDir, dim: engine.dim).lastPathComponent
+            let prefix = "tags-d\(engine.dim)-"
+            for n in (try? fm.contentsOfDirectory(atPath: cacheDir.path)) ?? []
+            where (n.hasPrefix(prefix) && (n.hasSuffix(".cache") || n.hasSuffix(".prior")))
+                || n == legacy || n == (legacy as NSString).deletingPathExtension + ".prior" {
+                try? fm.removeItem(at: cacheDir.appendingPathComponent(n))
+            }
+            // Neural Engine mode does not race the GPU: the labels go through the Neural Engine
+            // once it is ready, not the GPU while it prepares (1.3 s of GPU time at a launch
+            // on a new index, measured). Once per index.
+            while OmniCompute.offGPU, !engine.neuralEngineActive, !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+            let t0 = Date()
+            guard OmniTagger.buildCache(labels: labels, embedder: engine, to: url,
+                                        isCancelled: { Task.isCancelled }) else { return nil }
+            omniPerfLog(String(format: "[tags] label cache built in %.1fs", -t0.timeIntervalSinceNow))
+        }
+        return url
     }
 
     // MARK: - Live updates (FSEvents)
@@ -7641,7 +8139,7 @@ final class AppModel {
         // it, not forgetting what was deleted from it. Removing a row needs no model, and a deleted
         // file in a paused folder stayed searchable and counted for as long as it stayed paused.
         arrivingNames.formUnion(arriving)
-        removeVanishedNow(removable)
+        removeVanishedNow(removable.filter { !movedFolderOwns($0) })
         let paths = (rawPaths + rawVanished).filter(wanted)
         guard !paths.isEmpty else { return }
         // Always buffer, then kick a reconcile only if none is running. A full index drains the buffer
@@ -7675,9 +8173,13 @@ final class AppModel {
         if userPaused { return "indexing is paused in Omni" }
         if ocrRunActive { return "an OCR run is using the GPU" }
         if neuralEngineHoldsText { return "the Neural Engine (ANE) is being prepared" }
-        if let powerHold { return powerHold.reason.prefix(1).lowercased() + powerHold.reason.dropFirst() }
+        // Only what a power hold does hold: a pass and a catch-up. File changes go on under one.
+        if let powerHold, indexingPausedForPower || !pendingCatchUpRoots.isEmpty || !pendingCatchUpPhotos.isEmpty {
+            return powerHold.reason.prefix(1).lowercased() + powerHold.reason.dropFirst()
+        }
         if isPaperRunning { return "the benchmark is running" }
         if indexObsolete { return "the index is waiting to be rebuilt for the current model" }
+        if pendingCatchUpRoots.contains(where: { overlapsFolderDrop($0.path) }) { return "a removed folder is still being deleted" }
         if indexWritesBlocked { return "a maintenance step is holding indexing" }
         if indexState == .paused { return "indexing is paused in Omni" }
         return nil
@@ -7740,6 +8242,8 @@ final class AppModel {
                 fsReconcileInFlight = false
                 tagBackfillActive = false
                 reconcilingPaths.removeAll()
+                reconcileToken &+= 1
+                if reconcileShowsProgress { reconcileShowsProgress = false }
                 orphanedSince = nil
                 restartOrPark(store)
             } else if orphanedSince == nil {
@@ -7838,7 +8342,9 @@ final class AppModel {
             heldRemovals.formUnion(queuedRemovals); queuedRemovals.removeAll(); return
         }
         guard let indexer, let store else { return }
-        let paths = Array(queuedRemovals); queuedRemovals.removeAll()
+        // Queued before the move was seen: the reconcile holding the old path takes these too.
+        let paths = Array(queuedRemovals.filter { !movedFolderOwns($0) }); queuedRemovals.removeAll()
+        guard !paths.isEmpty else { return }
         let rootPaths = watcherRootPaths
         let arriving = arrivingNames.union(reconcilingNames)
         removalRunning = true
@@ -7898,6 +8404,9 @@ final class AppModel {
         // none), there is nothing to index.
         let activeRootsToIndex = crawlRoots.filter { !pausedRoots.contains($0.path) }
         let activePhotoSources = photoSources.filter { !pausedRoots.contains($0.key) }
+        // Remembered for the delete's end, and not as restartAfterPause: the chain would hand that
+        // straight back here, and round again. See folderDropsRunning.
+        guard !activeRootsToIndex.contains(where: { overlapsFolderDrop($0.path) }) else { passAfterFolderDrop = true; return }
         guard !activeRootsToIndex.isEmpty || !activePhotoSources.isEmpty else {
             // Nothing to index is not a pause: left `.paused`, the state would hold every file event
             // and catch-up back until some later pass.
@@ -7946,7 +8455,9 @@ final class AppModel {
             // in-flight search/scan/VACUUM. Sequenced at the head of this task, before index(), so the
             // FIFO order vs the index's own writes is unchanged. Vectors/recall identical.
             if force {
-                store.wipeChunks()
+                // Until it happens or the pass is stopped: a pass over a wipe that did not happen
+                // serves the old vectors until each file comes round again.
+                while !store.wipeChunks(), !indexer.isCancelled {}
                 store.compact(minFreeRatio: 0)   // reclaim the wiped index's pages
                 await MainActor.run { self.refreshIndexStats(store) }   // now reads the empty store -> 0
             }
@@ -8034,17 +8545,12 @@ final class AppModel {
         let wantFSDrain = self.fsDrainThenResume; self.fsDrainThenResume = false
         if !removed.isEmpty {
             // Drop the removed folders' vectors now the pass stopped re-inserting them,
-            // reclaim disk, then resume indexing the remaining roots.
+            // reclaim disk, then resume indexing what remains. Whatever remains: this asked
+            // `roots`, which holds neither Photos sources nor the clipboard, so with one folder
+            // beside those the rest of the pass was simply abandoned, with nothing queued for the
+            // watchdog to see. startIndexing is what knows there is nothing to index.
             self.indexState = .idle
-            let keep = self.roots.map(\.path)
-            Task.detached {
-                for path in removed { Self.dropRemovedFolder(path, keeping: keep, store: store) }
-                await self.afterBulkDelete(store)
-                store.compact()
-                await MainActor.run {
-                    if !self.roots.isEmpty { self.restartOrPark(store) }
-                }
-            }
+            dropFolders(Array(removed), store: store, oweFirst: false) { self.restartOrPark(store) }
             return
         }
         if wantFSDrain, p.cancelled, !self.pendingFSPaths.isEmpty {
@@ -8090,12 +8596,11 @@ final class AppModel {
             self.refitFolderMapIfPending()
             return
         }
-        // A full pass has now walked every root under this long-text policy,
-        // so every long text file has been read to it.
-        let policy = Indexer.longTextPolicy(settings)
+        // A full pass has now walked every root it was given: what it left out (a paused folder, one
+        // it could not read) still owes the one-time re-reads.
+        let notWalked = self.crawlRoots.map(\.path).filter { self.pausedRoots.contains($0) }
         Task.detached(priority: .utility) {
-            store.metaSet(Indexer.textStreamMetaKey, policy)
-            store.metaSet(Indexer.textCutMetaKey, "1")
+            Indexer.stampRereads(store: store, settings: settings, progress: p, notWalked: notWalked)
         }
         // The whole deferred chain, not just the watcher queue: a Photos library
         // change during the pass queues a catch-up that only this chain starts, and
@@ -8139,7 +8644,9 @@ final class AppModel {
     @ObservationIgnored private var reconcileStatsClock: CFAbsoluteTime = 0
 
     private func sampleRate() {
-        guard isWorking else { stopRateSampler(); return }
+        // A reconcile too: one of only vanished paths touches no root, and with the sampler gone it
+        // had no wait limit and no stats tick for the rest of its run.
+        guard isWorking || fsReconcileInFlight else { stopRateSampler(); return }
         let now = CFAbsoluteTimeGetCurrent()
         enforceEventWaitLimit()
         // A pass refreshes the stats from its progress callback; a watcher reconcile has none, so
@@ -8181,15 +8688,7 @@ final class AppModel {
         let removed = pendingRootRemovals
         pendingRootRemovals.removeAll()
         if !removed.isEmpty {
-            let keep = roots.map(\.path)
-            Task.detached {
-                for path in removed { Self.dropRemovedFolder(path, keeping: keep, store: store) }
-                await self.afterBulkDelete(store)
-                store.compact()
-                await MainActor.run {
-                    self.drainDeferredAfterPass(store)   // removals drained; continue the chain
-                }
-            }
+            dropFolders(Array(removed), store: store, oweFirst: false) {}   // its end continues the chain
             return
         }
         // Tags the user asked for, before the restart that would hold them for a whole pass. The
@@ -8351,7 +8850,7 @@ final class AppModel {
         // !ocrRunActive, !indexObsolete: the same stand-downs the watcher
         // drain and the catch-up pass observe. This calls indexer.update() directly too, so it
         // took the GPU from a transcription and wrote into an index waiting to be rebuilt.
-        guard !indexWritesBlocked, !isPaperRunning, !ocrRunActive, !neuralEngineHoldsMedia, !indexObsolete,
+        guard !userPaused, !indexWritesBlocked, !isPaperRunning, !ocrRunActive, !neuralEngineHoldsMedia, !indexObsolete,
               imageTagsEnabled, !tagBackfillActive, !searching,
               indexState != .indexing, indexState != .paused,
               activeRoots.isEmpty, !fsReconcileInFlight, pendingFSPaths.isEmpty || explicitRetagSince != nil,
@@ -8381,8 +8880,11 @@ final class AppModel {
         // read as ignored and was deleted from the index by the re-tag meant to improve it.
         let rootPaths = watcherRootPaths
         runsOutstanding += 1
+        updateRunID &+= 1
+        let runID = updateRunID
         Task.detached(priority: .utility) {
             indexer.update(paths: batch, settings: s, force: true, roots: rootPaths)
+            let stopped = indexer.isCancelled
             // Which of the lazily queued files got their tags before any cancel: a picture's row
             // whose snippet no longer comes from its name. An explicit request had tags already,
             // so only its own completion could tell; it goes back whole.
@@ -8390,10 +8892,14 @@ final class AppModel {
                 !batchExplicit.contains(p) && (store.storedChunks(path: p)?.first.map { !OmniTagger.nameDerivedSnippet($0.snippet, path: p) } ?? false)
             })
             await MainActor.run {
+                guard runID == self.updateRunID else { return }   // let go by a switch; it dropped the queue
                 self.runsOutstanding -= 1
                 self.fsReconcileInFlight = false
                 self.tagBackfillActive = false
-                if self.tagBackfillYieldedToSearch {
+                // ANY cancel, not only a search's: an Update Index, a kind switched, a hold or a
+                // removal took a Generate Tags request with it, silently, and retagSeen kept the
+                // lazy route from ever coming back for those files.
+                if self.tagBackfillYieldedToSearch || stopped {
                     // The batch was cancelled to give a search the GPU: put back at the front the
                     // files it had not finished (the ones it did are tagged and stay done), and
                     // let the post-search enqueue path re-arm the kick.
@@ -8438,8 +8944,10 @@ final class AppModel {
         if ocrRunActive, !pendingFSPaths.isEmpty, omniPerfEnabled {
             omniPerfLog("gpu-standdown fs-drain held paths=\(pendingFSPaths.count) (ocr run active)")
         }
-        guard !indexWritesBlocked, !isPaperRunning, !ocrRunActive, !neuralEngineHoldsText, !pendingFSPaths.isEmpty,
-              !fsReconcileInFlight, let indexer, let store else { return }
+        // !userPaused: the state can read .idle under the user's Pause (a pass winding down just
+        // now, a switch), and only their Resume starts anything.
+        guard !userPaused, !indexWritesBlocked, !isPaperRunning, !ocrRunActive, !neuralEngineHoldsText, !vectorSpaceDiffers,
+              !pendingFSPaths.isEmpty, !fsReconcileInFlight, let indexer, let store else { return }
         // Globally paused: keep the events buffered (resume's pass completion re-drains them).
         // Running update() now would also hit the stale cancel and silently DROP the batch.
         guard indexState != .paused else { return }
@@ -8456,9 +8964,11 @@ final class AppModel {
         // looks outside its own roots, so they stayed searchable and counted for good.
         // String checks first: the stat is only for the few that fail them, never per queued path
         // on the main thread.
+        // A move's new path even if its folder is paused: the batch only reuses what was embedded,
+        // and with the old path going through alone a paused folder lost its rows.
         let drained = Array(pendingFSPaths.filter { p in
             (rootKey(for: p) != nil && !pausedRoots.contains(where: { p == $0 || p.hasPrefix($0 + "/") }))
-                || Darwin.access(p, F_OK) != 0
+                || Darwin.access(p, F_OK) != 0 || folderMoves.contains { $0.new == p }
         })
         pendingFSPaths.removeAll()
         reconcilingNames = arrivingNames; arrivingNames.removeAll()
@@ -8486,10 +8996,18 @@ final class AppModel {
         }
         let rootPaths = watcherRootPaths
         runsOutstanding += 1
+        updateRunID &+= 1
+        let runID = updateRunID
         Task.detached(priority: .utility) {
             let changed = indexer.update(paths: drained, settings: settings, roots: rootPaths)
             let cancelled = indexer.isCancelled
             await MainActor.run {
+                guard runID == self.updateRunID else {   // let go by a switch: abandonStuckUpdateRun
+                    self.pendingFSPaths.formUnion(drained.filter { self.rootKey(for: $0) != nil || Darwin.access($0, F_OK) != 0 })
+                    self.fsEventsWaitingSince = self.fsEventsWaitingSince ?? waitedSince
+                    if let store = self.store { self.drainDeferredAfterPass(store) }
+                    return
+                }
                 // A cancelled batch (a folder removal or a restart chain) did not finish: put its
                 // paths back and keep the checkpoint, or its edits stay stale until next launch.
                 // Paths no longer under a root are dropped, so a removed folder is not re-indexed.
@@ -8503,7 +9021,10 @@ final class AppModel {
                     self.pendingFSEventId = max(self.pendingFSEventId, eid)
                     self.arrivingNames.formUnion(self.reconcilingNames)   // queued again with them
                     self.fsDrainThenResume = false   // the drain below takes the waiting events
-                } else if eid > 0 { self.eventCheckpoint = String(eid) }
+                } else {
+                    if eid > 0 { self.eventCheckpoint = String(eid) }
+                    self.settleFolderMoves(in: drained, store: store)
+                }
                 self.runsOutstanding -= 1
                 self.reconcilingPaths.removeAll()
                 self.reconcilingNames.removeAll()
@@ -8571,6 +9092,9 @@ final class AppModel {
     /// its prelude), a catch-up, a watcher reconcile, a tag batch. The proof the watchdog needs:
     /// with none outstanding, a flag that claims work in flight is one nothing will ever clear.
     @ObservationIgnored private var runsOutstanding = 0
+    /// `.paused` with neither the user's Pause nor a stand-down behind it: nothing will ever lift it,
+    /// and a folder added later is refused by it. Each place that lets a hold go checks this.
+    private var parkedWithNoOwner: Bool { indexState == .paused && !userPaused && !indexStandingDown }
     /// A stand-down holding indexing that will restart it when it lifts.
     private var indexStandingDown: Bool {
         ocrRunActive || neuralEngineHoldsText || powerHold != nil || indexWritesBlocked || isPaperRunning
@@ -8606,8 +9130,15 @@ final class AppModel {
         indexingHolds += 1
         defer {
             indexingHolds -= 1
-            if indexingHolds == 0 { flushHeldRemovals() }
-            if indexingHolds == 0, canIndex { startIndexing() }
+            if indexingHolds == 0 {
+                flushHeldRemovals()
+                if canIndex { startIndexing() } else {
+                    // The last source went during the hold: no pass is coming to end the park, and
+                    // the removal that waited behind this hold is all that is left to run.
+                    if parkedWithNoOwner { indexState = .idle }
+                    if phase == .ready, !isIndexWorkInFlight, let store { drainDeferredAfterPass(store) }
+                }
+            }
         }
         indexer?.cancel()
         // isIndexWorkInFlight, not isIndexing: a watcher reconcile, a tag batch or a folder
@@ -8629,6 +9160,7 @@ final class AppModel {
         indexer?.cancel()
         // A clean quit: a long read in flight is not what stopped the app (ExtractionQuarantine).
         indexer?.quarantine.clearJournal()
+        store?.flushIdentifiersBeforeExit(timeout: 2)
         serving.shutdown()      // the CLI socket file goes with the app (a crash leaves it; launch clears it)
         // See VectorStore.stampRowSidecarBeforeExit: without it, the next launch of a large index
         // that was being written to reads every row out of SQLite.
@@ -8642,6 +9174,110 @@ final class AppModel {
 
     static var appVersion: String {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+    }
+}
+
+// MARK: - Test seams
+
+/// What PerfScript and the `-omni.test.*` launch arguments reach: states too narrow to hit by hand,
+/// made on purpose. Launch arguments live in the argument domain, so nothing a user can set.
+extension AppModel {
+    nonisolated static func testArgument(_ name: String) -> Any? {
+        UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)["omni.test." + name]
+    }
+    static var testRefusalsLeft: Int = (testArgument("refuseOpen") as? String).flatMap(Int.init) ?? 0
+    static var testFailEngineLoad = false
+
+    /// The rest of the window's state, for PerfScript's `dumpui`.
+    func perfDump() -> [String: Any] {
+        [
+            "phase": "\(phase)",
+            "navBack": navBack.map { $0.fileQuery?.url.path ?? $0.rawQuery },
+            "navForward": navForward.map { $0.fileQuery?.url.path ?? $0.rawQuery },
+            "navCurrent": navCurrent.map { $0.fileQuery?.url.path ?? $0.rawQuery } ?? "",
+            "searching": searching,
+            "fileQueryPath": fileQuery?.url.path ?? "",
+            "fileQuerySource": fileQuery?.sourcePath ?? "",
+            "browsedPhotoSource": browsedPhotoSource?.key ?? "",
+            "filterFolderNames": filterFolderNames,
+            "filterTags": filterTags,
+            "chips": searchTokens.map(\.queryText),
+            "pendingFS": Array(pendingFSPaths),
+            "pendingCatchUp": pendingCatchUpRoots.map(\.path),
+            "heldBy": fsChangesHeldBy ?? "",
+            "userPaused": userPaused,
+            "indexState": "\(indexState)",
+            "supportsImages": supportsImages,
+            "audioSupported": audioSupported,
+            "kinds": settings.enabledKinds.map(\.rawValue),
+            "activeRoots": Array(activeRoots),
+            "reconcile": fsReconcileInFlight,
+            "runsOutstanding": runsOutstanding,
+            "historyCount": searchHistory.count,
+            "lastHistoryRunQuery": lastHistoryRunQuery ?? "",
+            "fitting": folderProjectionFitting,
+            "paperPhase": paperPhase,
+            "owed": store?.owedRemovals ?? [],
+            "roots": roots.map(\.path),
+            "recentsSig": recentsScope?.sig ?? "",
+            "previewURL": previewURL?.path ?? "",
+            "pendingRetag": pendingRetag,
+            "explicitRetag": Array(explicitRetag),
+            "storePhase": storePhase.map { "\($0)" } ?? "",
+        ]
+    }
+
+    /// `testseam:<name>[:<arg>]`.
+    func perfSeam(_ raw: String) {
+        let parts = raw.split(separator: ":", maxSplits: 1).map(String.init)
+        let arg = parts.count > 1 ? parts[1] : ""
+        switch parts.first ?? "" {
+        case "enginefail": Self.testFailEngineLoad = arg == "on"
+        case "obsolete": indexObsolete = arg == "on"   // what a weights change does until the rebuild starts
+        case "localnet":   // what the browser reports with Local Network access denied (no TCC prompt to answer)
+            link.discoveryIssueForTest = arg == "off" ? nil : LinkNode.localNetworkDenied
+        case "mapreset":   // no cached layout, so the next selection fits
+            let u = URL(fileURLWithPath: arg, isDirectory: true)
+            projectionCache[u] = nil; projectionCacheOrder.removeAll { $0 == u }
+        case "bgrefresh": refreshSearchAfterBackgroundChange()   // what a reconcile's end does
+        case "updateindex": resumeIndexing()   // Update Index
+        case "previewphoto": showPreview(path: "photos://x/y/z.png")
+        case "previewnil": showPreview(nil as URL?)
+        case "gentagscancel":   // Generate Tags on every picture, then Update Index before the batch has started
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: arg)) ?? []
+            requestTags(names.filter { $0.hasSuffix(".png") }.sorted().map { arg + "/" + $0 })
+            resumeIndexing()
+        case "searchgone":   // a search in flight, then the store goes away and another search arrives
+            query = arg; rawQuery = arg
+            search()
+            let open = store
+            store = nil
+            search()
+            store = open
+        case "reloadgpu": Task { await self.reloadEngine(forGPUTowers: true) }   // what leaving the Neural Engine runs
+        case "overdue":   // file events that have waited past the limit
+            pendingFSPaths.insert(arg)
+            fsEventsWaitingSince = Date(timeIntervalSinceNow: -3600)
+        case "overduepause":   // the limit's cancel, then the user's Pause, in one turn
+            pendingFSPaths.insert(arg)
+            fsEventsWaitingSince = Date(timeIntervalSinceNow: -3600)
+            userPauseIndexing()
+            enforceEventWaitLimit()
+        case "paperhold":   // what the benchmark's flag and its resume do, without its run
+            isPaperRunning = arg == "on"
+            if arg != "on" { resumeAfterPaperRun(wasIndexing: false) }
+        case "hangcrawl": indexer?.crawlHangForTest = Double(arg)
+        case "holdfor":   // a writer that outlasts the hold: every Apply and purge sees a run still out
+            fsReconcileInFlight = true; runsOutstanding += 1
+            let s = Double(arg) ?? 90
+            DispatchQueue.main.asyncAfter(deadline: .now() + s) {
+                MainActor.assumeIsolated {
+                    self.fsReconcileInFlight = false; self.runsOutstanding -= 1
+                    if let store = self.store { self.drainDeferredAfterPass(store) }
+                }
+            }
+        default: omniPerfLog("testseam: unknown \(raw)")
+        }
     }
 }
 

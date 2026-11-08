@@ -25,6 +25,10 @@ import UniformTypeIdentifiers
 @Observable
 final class OCRSession {
 
+    /// The session the window owns, for `PerfScript`'s OCR steps.
+    private(set) static weak var current: OCRSession?
+    init() { if Self.current == nil { Self.current = self } }
+
     enum Phase: Equatable {
         case empty
         case needsModel
@@ -38,7 +42,10 @@ final class OCRSession {
     /// Without it, stopping left pages `.pending` and the next drop's run walked the queue from the
     /// beginning - so dropping one new file quietly resumed the document someone had just stopped
     /// and did the new one after it.
-    enum PageState: Equatable { case pending, running, done, failed, stopped }
+    ///
+    /// `closed` is a page of a tab that was closed. Its id stays (`closeDocument`), and it counts for
+    /// nothing: marked `.failed` it stayed in the readout's total, which said "40 of 43".
+    enum PageState: Equatable { case pending, running, done, failed, stopped, closed }
 
     /// One dropped file. A multi-page PDF is ONE tab whose pages run continuously inside it;
     /// several files are several tabs, the way Preview opens them.
@@ -161,21 +168,24 @@ final class OCRSession {
         didSet {
             syncSources(states: oldValue)
             if hasPages == pages.isEmpty { hasPages = !pages.isEmpty }
+            syncCompleted()
         }
     }
     /// `!pages.isEmpty`, for the window: reading `pages` to ask that re-ran the whole window body
     /// - and rebuilt the OCR workspace under it - on every page state change and thumbnail.
     private(set) var hasPages = false
-    private(set) var documents: [Document] = []
+    private(set) var documents: [Document] = [] { didSet { syncCompleted() } }
     /// Which tab is on screen. Follows the file being transcribed until the user picks one.
     /// The id of the tab on screen, never its index. The two used to be conflated: the tab bar
     /// passed `doc.id` to functions that indexed `documents` with it, so once a close made the
     /// two diverge, clicking one tab brought up another.
-    private(set) var selectedDocumentID = 0
+    private(set) var selectedDocumentID = 0 { didSet { syncCompleted() } }
     private(set) var userPinnedDocument = false
     /// Decoded Markdown per page, parallel to `pages`.
     private(set) var texts: [String] = [] { didSet { syncSources(texts: oldValue) } }
-    private(set) var documentName: String = ""
+    /// The tab on screen, for the toolbar and the share sheet. Stored and set by `open`, it followed
+    /// the last drop and named a file other than the one being read.
+    var documentName: String { visibleDocument?.name ?? "" }
 
     /// Source first. What comes out of a transcription run is Markdown, and the thing a person
     /// wants from it is usually that text - the formatted view is the check, not the product.
@@ -183,37 +193,107 @@ final class OCRSession {
     /// Drives Quick Look. On the session rather than in a view because the page navigator and the
     /// preview now live in different views - see the inspector's placement in ContentView.
     var previewing: URL?
-    /// The user's revision of a document's Markdown, once they have made one.
+    /// The user's revision of a document's Markdown, once they have made one, and how it stands
+    /// against the pages and against a file. One value, because this is the only copy of what they
+    /// typed: reopening the document restores the model's text from the cache, not theirs, so Close,
+    /// Start Over and Quit have to be able to ask whether anything would be lost.
     ///
     /// Keyed by TAB, not by page. The panes render one continuous document, so the thing a person
     /// edits and the thing they copy are the same string; a per-page dictionary would mean the raw
     /// pane showed a document that no single buffer corresponded to. Per tab because tabs are now
     /// how documents accumulate - a single buffer would have shown one tab's edit under another's
     /// name the moment a second file was dropped.
-    private var documentEdits: [Int: String] = [:]
-    /// Each edited document already split on its page rules, so the panes do not re-split on every
-    /// frame.
-    private var editSectionsByDocument: [Int: [String]] = [:]
+    private struct TranscriptEdit {
+        var text: String
+        /// Split on its page rules, so the panes do not re-split on every frame.
+        var sections: [String]
+        /// The pages `text` already contains: every page that was done when it was last written.
+        /// A page that finishes AFTER the edit (a stopped page clicked back into the queue) is not
+        /// in it, and used to be invisible - in the panes, in Copy and in Save - because the edit
+        /// was the whole document. Such pages follow the edit instead, in page order.
+        var base: Set<Int>
+        /// What the tab read before the first keystroke. Typed back to this, nothing would be lost.
+        let original: String
+        /// What Save last wrote. Copy and Share are not a save: nothing says they arrived anywhere.
+        var saved: String?
+        var isUnsaved: Bool { text != original && text != saved }
+    }
+    private var edits: [Int: TranscriptEdit] = [:] { didSet { syncCompleted() } }
 
-    /// The pages each edit already contains: every page that was done when it was last written.
-    /// A page that finishes AFTER the edit (a stopped page clicked back into the queue) is not in
-    /// it, and used to be invisible - in the panes, in Copy and in Save - because the edit was the
-    /// whole document. Such pages follow the edit instead, in page order.
-    private var editBaseByDocument: [Int: Set<Int>] = [:]
-
-    var documentEdit: String? { visibleDocument.flatMap { documentEdits[$0.id] } }
-    private var editSections: [String] { visibleDocument.flatMap { editSectionsByDocument[$0.id] } ?? [] }
+    var documentEdit: String? { visibleDocument.flatMap { edits[$0.id]?.text } }
+    private var editSections: [String] { visibleDocument.flatMap { edits[$0.id]?.sections } ?? [] }
 
     /// Pages of the visible tab that are not in its edit, in the form `sectionIDs` lists pages.
     private var pagesAfterEdit: [Int] {
-        guard let doc = visibleDocument, let base = editBaseByDocument[doc.id] else { return [] }
+        guard let doc = visibleDocument, let base = edits[doc.id]?.base else { return [] }
         return doc.pageIDs.filter { id in
             guard !base.contains(id), pages.indices.contains(id) else { return false }
             switch pages[id].state {
             case .done: return true
             case .running: return !texts[id].isEmpty
-            case .failed, .pending, .stopped: return false
+            case .failed, .pending, .stopped, .closed: return false
             }
+        }
+    }
+
+    /// Whether any open tab holds an edit nothing has saved. For the quit path, which has to ask
+    /// before it exits (`reviewUnsavedEdits`).
+    var hasUnsavedEdits: Bool { documents.contains { hasUnsavedEdit($0.id) } }
+    private func hasUnsavedEdit(_ id: Int) -> Bool { edits[id]?.isUnsaved ?? false }
+
+    /// A question about unsaved edits is on screen.
+    @ObservationIgnored private(set) var reviewingEdits = false
+
+    /// The standard save prompt, for every tab in `ids` (nil: all of them) that would lose an edit,
+    /// one at a time and each brought forward so the reader sees what they are being asked about.
+    /// `done(true)` means all were answered, by a save or by Don't Save, and those edits are gone;
+    /// Cancel at the prompt or at the save panel is `done(false)` with nothing changed.
+    func reviewUnsavedEdits(in ids: [Int]? = nil, then done: @escaping @MainActor (Bool) -> Void) {
+        guard !reviewingEdits else { return done(false) }
+        reviewingEdits = true
+        let left = (ids ?? documents.map(\.id)).filter(hasUnsavedEdit)
+        reviewNext(left[...], discarding: []) { [weak self] proceed in
+            self?.reviewingEdits = false
+            done(proceed)
+        }
+    }
+
+    private func reviewNext(_ left: ArraySlice<Int>, discarding: [Int],
+                            _ done: @escaping @MainActor (Bool) -> Void) {
+        guard let id = left.first else {
+            for id in discarding { edits[id] = nil }
+            return done(true)
+        }
+        guard let doc = documents.first(where: { $0.id == id }) else {
+            return reviewNext(left.dropFirst(), discarding: discarding, done)
+        }
+        selectDocument(id: id)
+        let alert = NSAlert()
+        alert.messageText = "Do you want to save the changes you made to \u{201C}\(doc.name)\u{201D}?"
+        alert.informativeText = "Your changes will be lost if you don\u{2019}t save them."
+        alert.addButton(withTitle: "Save\u{2026}")
+        alert.addButton(withTitle: "Cancel")
+        let dontSave = alert.addButton(withTitle: "Don\u{2019}t Save")
+        dontSave.keyEquivalent = "d"
+        dontSave.keyEquivalentModifierMask = .command
+        let answered: @MainActor (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard let self else { return done(false) }
+            switch response {
+            case .alertFirstButtonReturn:
+                alert.window.orderOut(nil)   // one sheet at a time: the save panel goes on the same window
+                self.saveVisibleDocument { saved in
+                    if saved { self.reviewNext(left.dropFirst(), discarding: discarding, done) } else { done(false) }
+                }
+            case .alertThirdButtonReturn:
+                self.reviewNext(left.dropFirst(), discarding: discarding + [id], done)
+            default:
+                done(false)
+            }
+        }
+        if let window = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible }) {
+            alert.beginSheetModal(for: window) { response in MainActor.assumeIsolated { answered(response) } }
+        } else {
+            answered(alert.runModal())
         }
     }
 
@@ -236,12 +316,22 @@ final class OCRSession {
     private var settledTokens = 0
     private var liveTokens: [Int: Int] = [:]
     private(set) var elapsed: Double = 0
-    private(set) var completedPages: Int = 0 {
-        didSet { if hasCompletedPages != (completedPages > 0) { hasCompletedPages = completedPages > 0 } }
-    }
-    /// `completedPages > 0`, for the toolbar and the menus that gate Copy, Save and Share on it:
-    /// read as the count, they re-rendered - and AppKit re-laid out the toolbar - once per page.
+    /// Pages with text, in every tab still open. Read off the pages: a counter bumped where a page
+    /// settled counted failures on one path, and never fell when a tab closed.
+    private(set) var completedPages: Int = 0
+    /// Whether the tab on screen has anything to give, for the toolbar and the menus that gate Copy,
+    /// Save and Share on it. A stored Bool: read as a count, they re-rendered - and AppKit re-laid out
+    /// the toolbar - once per page.
     private(set) var hasCompletedPages = false
+
+    private func syncCompleted() {
+        let done = pages.reduce(0) { $1.state == .done ? $0 + 1 : $0 }
+        if completedPages != done { completedPages = done }
+        let any = visibleDocument.map { doc in
+            edits[doc.id] != nil || doc.pageIDs.contains { pages.indices.contains($0) && pages[$0].state == .done }
+        } ?? false
+        if hasCompletedPages != any { hasCompletedPages = any }
+    }
     /// The readout is a status toast, not permanent chrome: it stays for the run and a few seconds
     /// after, then gets out of the way of the text it was reporting on.
     private(set) var readoutVisible = false
@@ -335,7 +425,7 @@ final class OCRSession {
     /// What the readout counts: pages finished, over the pages THIS RUN queued. Not a range of the
     /// group in flight - a group is a decode detail, and "Pages 1-32 of 40" tells a reader nothing
     /// about how much of their document is done.
-    var queueTotal: Int { pages.reduce(0) { carriedOver($1) ? $0 : $0 + 1 } }
+    var queueTotal: Int { pages.reduce(0) { carriedOver($1) || $1.state == .closed ? $0 : $0 + 1 } }
 
     var queueCompleted: Int {
         pages.reduce(0) { isSettled($1) && !carriedOver($1) ? $0 + 1 : $0 }
@@ -461,7 +551,7 @@ final class OCRSession {
         switch sources[id].state {
         case .done, .failed: return true
         case .running: return sources[id].hasText
-        case .pending, .stopped: return false
+        case .pending, .stopped, .closed: return false
         }
     }
 
@@ -529,6 +619,11 @@ final class OCRSession {
         // and falling into the same branch.
         guard let index = documents.firstIndex(where: { $0.id == id }) else { return }
         guard documents.count > 1 else { clear(); return }
+        guard !hasUnsavedEdit(id) else {
+            reviewUnsavedEdits(in: [id]) { [weak self] proceed in if proceed { self?.closeDocument(id: id) } }
+            return
+        }
+        edits[id] = nil
         let removed = Set(documents[index].pageIDs)
         // Only the tab's presence is removed. Its pages keep their ids so nothing that captured an
         // index - a running decode, a thumbnail render - can write into the wrong page.
@@ -538,12 +633,33 @@ final class OCRSession {
         gate.drop(removed)
         for id in removed where pages.indices.contains(id) {
             liveTokens[id] = nil
-            pages[id].state = .failed
+            pages[id].state = .closed
         }
+        // Nothing goes on naming a page of the tab that went: arrows walked from it and found
+        // nothing, and Space previewed it.
+        if let page = selection, removed.contains(page) {
+            selection = nil
+            userPinnedSelection = false
+        }
+        if let page = runningIndex, removed.contains(page) {
+            runningIndex = pages.indices.first { pages[$0].state == .running }
+        }
+        if let page = lastDoneIndex, removed.contains(page) { lastDoneIndex = nil }
         if selectedDocumentID == id {
             selectedDocumentID = documents[min(index, documents.count - 1)].id
         }
         if !find.isEmpty { rebuildMatches() }
+    }
+
+    /// Nothing on this tab is decoding or queued: a Stop, or a load that failed, left it dim.
+    var isVisibleDocumentStopped: Bool {
+        visibleDocument?.pageIDs.allSatisfy { let s = pageState($0); return s == .stopped || s == .closed } ?? false
+    }
+
+    /// A page of the tab on screen is decoding. Not `isBusy`: a Stop writes `.finished` at once,
+    /// and the pages in flight settle a decode step later.
+    var isDecodingVisibleDocument: Bool {
+        visibleDocument?.pageIDs.contains { pageState($0) == .running } ?? false
     }
 
     /// How far through its pages a tab is, for its progress ring.
@@ -622,15 +738,26 @@ final class OCRSession {
         return (text, offsets)
     }
 
+    /// The key `documentSource` files a page under. Once edited its offsets are by section, not page
+    /// id: page 12 of a second tab scrolled to section 12 of the edit, or nowhere past the last one.
+    func sourceKey(forPage page: Int) -> Int {
+        guard let doc = visibleDocument, let edit = edits[doc.id] else { return page }
+        guard edit.base.contains(page) else { return edit.sections.count + page }
+        return doc.pageIDs.filter(edit.base.contains).firstIndex(of: page) ?? 0
+    }
+
     func setDocumentEdit(_ text: String) {
         guard let doc = visibleDocument else { return }
         let id = doc.id
-        // The editor is only editable once nothing is decoding, and it shows every done page, so
-        // what was just written contains all of them.
-        editBaseByDocument[id] = Set(doc.pageIDs.filter { pages.indices.contains($0) && pages[$0].state == .done })
-        documentEdits[id] = text
-        editSectionsByDocument[id] = text.components(separatedBy: "\n---\n")
-            .map { $0.trimmingCharacters(in: .newlines) }
+        // The editor mounts only once this tab has nothing decoding (`isDecodingVisibleDocument`),
+        // and it shows every done page, so what was just written contains all of them.
+        let base = Set(doc.pageIDs.filter { pages.indices.contains($0) && pages[$0].state == .done })
+        let sections = text.components(separatedBy: "\n---\n").map { $0.trimmingCharacters(in: .newlines) }
+        var edit = edits[id] ?? TranscriptEdit(text: text, sections: sections, base: base, original: documentMarkdown)
+        edit.text = text
+        edit.sections = sections
+        edit.base = base
+        edits[id] = edit
         if !find.isEmpty { rebuildMatches() }
     }
 
@@ -715,6 +842,8 @@ final class OCRSession {
     /// the click does anything happen.
     @ObservationIgnored private var interruptAskedAt: Date?
     @ObservationIgnored private var firstTokenPending = true
+    /// Which `run` the workspace is showing.
+    @ObservationIgnored private var currentRun = 0
 
     private func notePauseHeld() {
         guard let asked = interruptAskedAt else { return }
@@ -755,6 +884,9 @@ final class OCRSession {
         }
 
         guard let installed = Self.installedModel() else {
+            // Not over a run: its weights are already up, and the screen this would bring up has no
+            // Stop or Pause while the run carries on behind it.
+            guard !isBusy else { return post(notice: "The OCR model is not downloaded.") }
             if pages.isEmpty { pages = []; texts = [] }
             // Kept for when the model lands. Nothing else remembers them: the screen had no way out
             // once the download finished, and the files that brought it up were gone.
@@ -820,7 +952,6 @@ final class OCRSession {
             return
         }
 
-        documentName = sources.count == 1 ? sources[0].lastPathComponent : "\(sources.count) files"
         pages.append(contentsOf: enumerated)
         texts.append(contentsOf: Array(repeating: "", count: enumerated.count))
         jobs.append(contentsOf: added)
@@ -831,9 +962,17 @@ final class OCRSession {
         userPinnedDocument = adding
         selection = nil
         userPinnedSelection = false
+        // A workspace with pages in it is neither the prompt nor an old rejection, whatever the
+        // lookup below finds and whenever it lands. Left `.empty`, the prompt showed through the
+        // lookup, and stayed over a fully cached document if the answer came while out of OCR mode;
+        // left `.failed`, "Nothing to transcribe" stayed beside the restored rail.
+        switch phase {
+        case .empty, .failed: phase = .finished
+        default: break
+        }
         logDocumentState("after open")
 
-        renderThumbnails(from: firstNewPage, token: runToken)
+        renderThumbnails(from: firstNewPage)
 
         // The cache is consulted BEFORE the run starts, and the run is started from the lookup's
         // continuation. That order is what lets a document which is entirely cached come back
@@ -845,7 +984,8 @@ final class OCRSession {
         if OCRCache.isEnabled {
             awaitingCache.formUnion(arrived)
             restoreFromCache(arrived, variant: installed.variant)
-        } else {
+        } else if !standingDown {
+            // Out of OCR mode nothing runs, as with a lookup's answer: `activate` starts these.
             startRunIfNeeded(installed, token: runToken)
         }
     }
@@ -869,11 +1009,15 @@ final class OCRSession {
         guard pages.contains(where: { $0.state == .pending && !awaitingCache.contains($0.id) })
         else {
             // Every page came from the cache. The workspace is finished rather than idle - but a
-            // failure that is already on screen is not overwritten with success.
+            // failure on screen with still nothing to show stays.
             let failed: Bool = if case .failed = phase { true } else { false }
-            if !pages.isEmpty, !failed { phase = .finished }
+            if !pages.isEmpty, !failed || pages.contains(where: { $0.state == .done }) { phase = .finished }
             return
         }
+        beginRun(installed)
+    }
+
+    private func beginRun(_ installed: InstalledModel) {
         gate = OCRRunGate()
         isPaused = false
         isHolding = false
@@ -928,15 +1072,15 @@ final class OCRSession {
     private func applyCacheHits(_ hits: [(id: Int, text: String)], of ids: [Int], epoch: Int) {
         guard documentEpoch == epoch else { return }
         var restored = 0
-        for hit in hits where pages.indices.contains(hit.id) && pages[hit.id].state == .pending {
+        // `.stopped` too, while the lookup was out: a Stop dims these with the rest of the queue, and
+        // passing over what it found left cached pages to decode again, one click at a time.
+        for hit in hits where pages.indices.contains(hit.id)
+            && (pages[hit.id].state == .pending || (pages[hit.id].state == .stopped && awaitingCache.contains(hit.id))) {
             texts[hit.id] = hit.text
             pages[hit.id].state = .done
             pages[hit.id].restored = true
             lastDoneIndex = hit.id
             restored += 1
-            // Counted, or a fully cached document could not be copied, saved or edited: every
-            // one of those is gated on `completedPages > 0`.
-            completedPages += 1
         }
         awaitingCache.subtract(ids)
         if restored > 0 {
@@ -946,20 +1090,9 @@ final class OCRSession {
         }
         // Away from OCR mode nothing runs: coming back starts what is left (resumeAfterStandDown).
         guard !standingDown, let installed = Self.installedModel() else { return }
-        let token = runToken
-        startRunIfNeeded(installed, token: token)
-        // A run that was already winding down may have taken its LAST look at the queue while
-        // these pages were still held back, and then finished - which would leave the ones that
-        // missed pending with nothing running. Narrow, but the cost of losing it is a document
-        // that never transcribes, so it is checked once more after the run has settled.
-        if isBusy {
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(400))
-                guard let self, self.runToken == token,
-                      let installed = Self.installedModel() else { return }
-                self.startRunIfNeeded(installed, token: token)
-            }
-        }
+        // A run still out finds these on its next look at the queue: from that look to `.finished`
+        // the run loop has no suspension point, so this cannot land between them.
+        startRunIfNeeded(installed, token: runToken)
     }
 
     /// Save a finished page's Markdown. Off the main actor because it is a file write, and skipped
@@ -994,6 +1127,9 @@ final class OCRSession {
     /// run's writes from landing in the new document.
     private func reset() {
         cancel()
+        thumbs.forEach { $0.cancel() }; thumbs = []
+        previewing = nil
+        clearGroupFigures()
         runToken += 1
         documentEpoch += 1
         pages = []
@@ -1007,12 +1143,9 @@ final class OCRSession {
         userPinnedSelection = false
         runningIndex = nil
         lastDoneIndex = nil
-        completedPages = 0
         elapsed = 0
         resetRate()
-        documentEdits = [:]
-        editSectionsByDocument = [:]
-        editBaseByDocument = [:]
+        edits = [:]
         previewCache = [:]
         pageImages = [:]
         pageImageOrder = []
@@ -1021,6 +1154,15 @@ final class OCRSession {
         runVariant = nil
         find = ""
         notice = nil
+    }
+
+    /// What the workspace says about a group in flight. A run told to go away returns before it
+    /// clears these, and a later document under the batch width would then read "Reading 3 of 8
+    /// pages" and "Warming up" for its whole run.
+    private func clearGroupFigures() {
+        prefilled = 0
+        prefillTarget = 0
+        isGroupRunning = false
     }
 
 
@@ -1058,7 +1200,6 @@ final class OCRSession {
         isPaused = false
         isHolding = false
         ticker?.cancel(); ticker = nil
-        thumbs.forEach { $0.cancel() }; thumbs = []
         discardQueue()
         if phase == .running || phase == .loading { phase = pages.isEmpty ? .empty : .finished }
         scheduleReadoutDismissal()
@@ -1083,6 +1224,7 @@ final class OCRSession {
             case .running: st = "running"
             case .pending: st = "pending"
             case .stopped: st = "stopped"
+            case .closed: st = "closed"
             }
             return "\(id):\(st):\(texts.indices.contains(id) ? texts[id].count : -1)"
         }
@@ -1096,20 +1238,27 @@ final class OCRSession {
     /// only way: the queue does not resume itself. A run already in flight simply finds it - the
     /// loop takes the next pending page wherever it sits.
     func transcribe(_ index: Int) {
-        guard pages.indices.contains(index),
-              pages[index].state == .pending || pages[index].state == .stopped,
+        guard pages.indices.contains(index), canAskFor(pages[index]),
               let installed = Self.installedModel() else { return }
+        if pages[index].state == .done {
+            // A page a Stop cut: asked for again from the start, not from where it was cut. An edit
+            // made meanwhile keeps the part it holds, and the whole page follows it.
+            texts[index] = ""
+            pages[index].truncatedByStop = false
+            if let doc = documents.first(where: { $0.pageIDs.contains(index) }) { edits[doc.id]?.base.remove(index) }
+        }
         pages[index].state = .pending
         selection = index
         userPinnedSelection = true
         guard !isBusy else { return }
-        gate = OCRRunGate()
-        isPaused = false
-        isHolding = false
-        phase = .loading
-        readoutVisible = true
-        willRun?()
-        run(modelDir: installed.dir, variant: installed.variant, token: runToken)
+        beginRun(installed)
+    }
+
+    /// A page clicking asks for: one the run never reached, or one a Stop cut. A cut page's text stays
+    /// in the document, but with nothing to ask with, a Stop in the first second of a page left a
+    /// one-token transcript for good (the first token lands before the first check for a stop).
+    private func canAskFor(_ page: Page) -> Bool {
+        page.state == .pending || page.state == .stopped || (page.state == .done && page.truncatedByStop)
     }
 
     /// Take the pages the run never reached out of the QUEUE, not out of the document.
@@ -1140,6 +1289,9 @@ final class OCRSession {
     /// Pages a STAND-DOWN left unreached - leaving OCR mode, not a Stop. Empty after an explicit
     /// Stop, which is the distinction the resume below depends on.
     @ObservationIgnored private var stoodDown: Set<Int> = []
+    /// The run was on hold when OCR mode was left. Coming back holds it again: starting it up took
+    /// the GPU back with nobody having asked.
+    @ObservationIgnored private var stoodDownPaused = false
 
     func deactivate() {
         // LEAVING OCR MODE IS NOT A STOP, and until now it produced the identical state. Switching
@@ -1151,10 +1303,12 @@ final class OCRSession {
         // flight and nothing is owed a resume.
         // Captured BEFORE `cancel()` - which marks these pages `.stopped` - and re-assigned after,
         // because `cancel()` deliberately clears the debt (an explicit Stop has nothing to resume).
-        let owed = isBusy
+        // With any debt still unpaid: an `activate` with the model missing left it standing.
+        let owed = stoodDown.union(isBusy
             ? Set(pages.filter { $0.state == .pending || $0.state == .running }.map(\.id))
-            : []
+            : [])
         let awaiting = awaitingCache
+        let paused = isPaused
         standingDown = true
         cancel()
         // A page still waiting on its cache lookup is not a stopped one: `cancel` dims it, and the
@@ -1170,6 +1324,8 @@ final class OCRSession {
             pages[index].state = .stopped
         }
         stoodDown = owed
+        stoodDownPaused = paused
+        clearGroupFigures()
         work = nil
         runToken += 1
         // Releasing 4.5 GB of weights is 80 ms of work with nothing to show for it, and it was
@@ -1190,15 +1346,20 @@ final class OCRSession {
     /// so a page the user had stopped earlier stays stopped, and a page that settled with partial
     /// text keeps what it has rather than silently restarting.
     private func resumeAfterStandDown() {
+        // The debt stays until it can be paid: with no model, the pages were left dim and clickable
+        // for nothing, and a later `activate` with the model back had no record of them. A run
+        // already out takes them where it finds them.
+        guard let installed = Self.installedModel() else { return }
         let owed = stoodDown
         stoodDown = []
-        guard !isBusy, let installed = Self.installedModel() else { return }
+        let paused = stoodDownPaused
+        stoodDownPaused = false
         var requeued = 0
         for index in pages.indices where owed.contains(pages[index].id) && pages[index].state == .stopped {
             pages[index].state = .pending
             requeued += 1
         }
-        if requeued > 0 {
+        if requeued > 0, !paused {
             post(notice: requeued == 1 ? "Resumed 1 page" : "Resumed \(requeued) pages",
                  symbol: "play.circle", seconds: 3)
         }
@@ -1206,10 +1367,16 @@ final class OCRSession {
         if pages.contains(where: { $0.state == .pending && !awaitingCache.contains($0.id) }) {
             startRunIfNeeded(installed, token: runToken)
         }
+        if paused, isBusy { pause() }
     }
 
     func clear() {
+        guard !hasUnsavedEdits else {
+            reviewUnsavedEdits { [weak self] proceed in if proceed { self?.clear() } }
+            return
+        }
         stoodDown = []
+        stoodDownPaused = false
         waitingForModel = []
         // THE SAME TEARDOWN A NEW DROP DOES. This kept its own list and the list left `documents`
         // out: the closed tab stayed with page ids into the emptied `pages`, so leaving OCR mode
@@ -1219,7 +1386,6 @@ final class OCRSession {
         reset()
         work?.cancel(); work = nil
         readoutTimer?.cancel(); readoutTimer = nil
-        documentName = ""
         readoutVisible = false
         phase = .empty
     }
@@ -1227,7 +1393,8 @@ final class OCRSession {
     /// Show a page. Selecting the page that is currently decoding means "follow along again", so it
     /// releases the pin - otherwise the first click on a thumbnail permanently stops the view from
     /// tracking the run, with no way back.
-    func select(_ index: Int) {
+    /// `asking: false` moves the reader only: arrows walking over pages a Stop cut must not decode each.
+    func select(_ index: Int, asking: Bool = true) {
         // Kept: this is the instrument that found the half-second the selection used to spend
         // waiting for the double-click window to close. Silent unless `-omni.hangwatch` is on.
         UIProbe.markEventAge("CLICK.select event age")
@@ -1238,8 +1405,8 @@ final class OCRSession {
             userPinnedSelection = false
             return
         }
-        // A page the run never reached: clicking its dim thumbnail is how you ask for it.
-        if pages[index].state == .pending || pages[index].state == .stopped {
+        // A page the run never reached or a Stop cut: clicking its dim thumbnail is how you ask for it.
+        if asking, canAskFor(pages[index]) {
             transcribe(index)
             return
         }
@@ -1268,12 +1435,14 @@ final class OCRSession {
         // Within the tab on screen. Page ids are global across tabs, so walking them stepped off
         // the last page of one document onto the first page of the next.
         let ids = visibleDocument?.pageIDs ?? Array(pages.indices)
-        guard let here = ids.firstIndex(of: visibleIndex ?? ids.first ?? 0) else { return }
+        // From the page the navigator marks. `visibleIndex` is global, and on a tab it does not name
+        // a page of, the walk had nowhere to start from and the arrows did nothing.
+        guard let here = ids.firstIndex(of: railSelection ?? ids.first ?? 0) else { return }
         var k = here + delta
         while ids.indices.contains(k) {
             let next = ids[k]
             if pages.indices.contains(next), pages[next].state == .done || pages[next].state == .failed
-                || pages[next].state == .running { select(next); return }
+                || pages[next].state == .running { select(next, asking: false); return }
             k += delta
         }
     }
@@ -1302,7 +1471,9 @@ final class OCRSession {
         readoutTimer?.cancel()
         readoutTimer = Task { [weak self] in
             try? await Task.sleep(for: .seconds(4))
-            guard let self, !self.isBusy else { return }
+            // The check matters: cancelling makes that sleep return at once, so the run's own
+            // dismissal, scheduled over Stop's, hid the readout as soon as the run wound down.
+            guard !Task.isCancelled, let self, !self.isBusy else { return }
             self.readoutVisible = false
         }
     }
@@ -1328,7 +1499,13 @@ final class OCRSession {
                         loopGuard: Settings.loopGuard)
         runVariant = installed
         let gate = self.gate
-        ticker = Task { [weak self] in
+        // A Stop leaves the old run winding down, and clicking a dim page in that time starts a new
+        // one under the same token. What the old run does on its way out is its own: its ticker, and
+        // none of the workspace's state, or it stopped the new run's clock, wrote `.finished` over
+        // its `.loading` and took its readout away.
+        currentRun += 1
+        let thisRun = currentRun
+        let tick = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(250))
                 guard let self, self.runToken == token else { return }
@@ -1338,6 +1515,7 @@ final class OCRSession {
                 }
             }
         }
+        ticker = tick
         work = Task { [weak self] in
             guard let self else { return }
             // Exactly one `didFinishRun` per `willRun`, on every way out. AppModel counts runs now
@@ -1393,8 +1571,10 @@ final class OCRSession {
                 // group rasterised, then `rampRows` of them prefilled - and it is the one stretch
                 // of a run with no decode step to carry a cancellation check.
                 omniPerfLog("ocr-model-ready")
-                self.markPreSettled()
-                self.phase = .running
+                if self.currentRun == thisRun {
+                    self.markPreSettled()
+                    self.phase = .running
+                }
 
                 // One PDFDocument per file, not per page. `PDFDocument(url:)` re-parses the whole
                 // cross-reference table, and doing that twice for every page of a 200-page scan is
@@ -1535,10 +1715,9 @@ final class OCRSession {
                         self.pages[index].state = .failed
                     }
                     self.pages[index].seconds = Date().timeIntervalSince(pageStart)
-                    self.completedPages += 1
                     if gate.isStopped { break }
                 }
-                self.ticker?.cancel()
+                tick.cancel()
                 self.runningIndex = nil
                 if omniPerfEnabled {
                     let done = self.pages.filter { $0.state == .done && !$0.restored }
@@ -1548,14 +1727,28 @@ final class OCRSession {
                                        done.count, tokens, secs, secs > 0 ? Double(tokens) / secs : 0))
                 }
                 self.noteRunEnded()
-                if self.runToken == token {
+                if self.runToken == token, self.currentRun == thisRun {
+                    // A Pause on the last group: the loop leaves before it reaches its hold, and the
+                    // finished readout showed Resume, Stop and "Finishing this page".
+                    self.isPaused = false
+                    self.isHolding = false
                     self.phase = .finished
                     self.scheduleReadoutDismissal()
                 }
             } catch {
-                self.ticker?.cancel()
-                guard self.runToken == token else { return }
-                self.phase = .failed("Loading \(modelDir.lastPathComponent): \(error)")
+                tick.cancel()
+                guard self.runToken == token, self.currentRun == thisRun else { return }
+                // `.failed` is for when there is nothing left to show, and its one button wipes the
+                // workspace. With text on screen the document stays; the queue goes dim, and clicking
+                // a page tries the load again.
+                if self.pages.contains(where: { $0.state == .done }) {
+                    self.discardQueue()
+                    self.phase = .finished
+                    self.scheduleReadoutDismissal()
+                    self.post(notice: "Could not load the OCR model.")
+                } else {
+                    self.phase = .failed("Loading \(modelDir.lastPathComponent): \(error)")
+                }
             }
         }
     }
@@ -1734,7 +1927,6 @@ final class OCRSession {
         pages[index].tokensPerSecond = result.decodeTokensPerSecond
         pages[index].state = .done
         lastDoneIndex = index
-        completedPages += 1
         if completedPages == 1, let decodeStart {
             omniPerfLog(String(format: "ocr-first-page-done %.1fs", Date().timeIntervalSince(decodeStart)))
         }
@@ -1776,8 +1968,12 @@ final class OCRSession {
 
     /// Thumbnails are rendered off the main actor and land as they finish, so a long document
     /// fills its sidebar progressively instead of blocking the drop.
-    private func renderThumbnails(from start: Int, token: Int) {
+    ///
+    /// Tied to the document, not to a run: this is the only render a page gets, so stopping the run
+    /// or leaving OCR mode must not cost it, or the rail's rows stay blank until the file is reopened.
+    private func renderThumbnails(from start: Int) {
         let pending = Array(jobs[start...])
+        let epoch = documentEpoch
         thumbs.append(Task.detached(priority: .utility) {
             let documents = PDFCache()
             for (offset, job) in pending.enumerated() {
@@ -1787,7 +1983,7 @@ final class OCRSession {
                 await MainActor.run { [weak self] in
                     // Without the token, a slow render from the PREVIOUS document lands on this
                     // one and the rail shows the wrong pages.
-                    guard let self, self.runToken == token,
+                    guard let self, self.documentEpoch == epoch,
                           self.pages.indices.contains(index) else { return }
                     self.pages[index].thumbnail = image
                 }
@@ -1896,16 +2092,22 @@ final class OCRSession {
         post(notice: "Copied", symbol: "checkmark.circle.fill", seconds: 1.6)
     }
 
-    func exportMarkdown() {
+    func exportMarkdown() { saveVisibleDocument { _ in } }
+
+    /// `done(true)`: written to the file the reader chose.
+    private func saveVisibleDocument(then done: @escaping @MainActor (Bool) -> Void) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [Self.markdownType]
         panel.nameFieldStringValue = suggestedFileName
-        present(panel) { [weak self] in
-            guard let self, let url = panel.url else { return }
+        present(panel, onCancel: { done(false) }) { [weak self] in
+            guard let self, let url = panel.url else { return done(false) }
             do {
                 try self.documentMarkdown.write(to: url, atomically: true, encoding: .utf8)
+                if let id = self.visibleDocument?.id, let text = self.edits[id]?.text { self.edits[id]?.saved = text }
+                done(true)
             } catch {
                 self.post(notice: "Could not save: \(error.localizedDescription)")
+                done(false)
             }
         }
     }
@@ -1917,13 +2119,13 @@ final class OCRSession {
         return (base as NSString).deletingPathExtension + ".md"
     }
 
-    private func present(_ panel: NSSavePanel, onOK: @escaping () -> Void) {
+    private func present(_ panel: NSSavePanel, onCancel: (() -> Void)? = nil, onOK: @escaping () -> Void) {
         guard let window = NSApp.keyWindow ?? NSApp.windows.first(where: { $0.isVisible }) else {
-            if panel.runModal() == .OK { onOK() }
+            if panel.runModal() == .OK { onOK() } else { onCancel?() }
             return
         }
         panel.beginSheetModal(for: window) { response in
-            guard response == .OK else { return }
+            guard response == .OK else { onCancel?(); return }
             onOK()
         }
     }

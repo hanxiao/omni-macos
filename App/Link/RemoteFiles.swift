@@ -19,9 +19,20 @@ final class RemoteFiles: @unchecked Sendable {
 
     private let lock = NSLock()
     private var node: LinkNode?
-    private var inflight: [String: Task<URL, Error>] = [:]
+    private var inflight: [String: Fetch] = [:]
     /// What a running fetch has received, by remote path (0...1), for the progress line.
     private var progress: [String: Double] = [:]
+
+    /// One download and who is waiting for it. Guarded by `lock`. Whose it is matters at both ends:
+    /// a waiter finishing late cleared the entry of the download started after a Cancel, so a third
+    /// caller started a parallel one; and the status line's Cancel stopped a download a
+    /// `get_linked_file` or a drag was also waiting for.
+    private final class Fetch {
+        let task: Task<URL, Error>
+        var waiters = 0
+        var abandoned = 0
+        init(_ task: Task<URL, Error>) { self.task = task }
+    }
 
     /// The cache: ~/Library/Caches/<bundle>/Linked/<peer>/<hash of path>/<name>. Bounded; the
     /// oldest copies go first.
@@ -57,22 +68,31 @@ final class RemoteFiles: @unchecked Sendable {
     /// A local copy of `remote`, fetched if the cache does not hold the current version. One fetch
     /// per file at a time; a second caller waits for the first.
     func fetch(_ remote: String) async throws -> URL {
-        let task: Task<URL, Error> = lock.withLock {
-            if let t = inflight[remote] { return t }
-            let t = Task<URL, Error> { try await self.download(remote) }
-            inflight[remote] = t
-            return t
+        let f: Fetch = lock.withLock {
+            let f = inflight[remote] ?? Fetch(Task<URL, Error> { try await self.download(remote) })
+            inflight[remote] = f
+            f.waiters += 1
+            return f
         }
-        defer { lock.withLock { inflight[remote] = nil; progress[remote] = nil } }
-        return try await task.value
+        defer {
+            lock.withLock {
+                f.waiters -= 1
+                if f.waiters == 0, inflight[remote] === f { inflight[remote] = nil; progress[remote] = nil }
+            }
+        }
+        return try await f.task.value
     }
 
-    /// Stop a fetch in flight. Its slices stop at the other end too (LinkChannel.call), and the
-    /// partial file goes with the download's scope.
+    /// One caller no longer wants this fetch (the status line's Cancel). With nobody else waiting it
+    /// stops: its slices stop at the other end too (LinkChannel.call), and the partial file goes with
+    /// the download's scope. Asked for again at once, it starts over rather than joining this one.
     func cancel(_ remote: String) {
         lock.withLock {
-            inflight[remote]?.cancel()
-            inflight[remote] = nil   // asked for again at once, it starts over rather than joining this one
+            guard let f = inflight[remote] else { return }
+            f.abandoned += 1
+            guard f.waiters <= f.abandoned else { return }
+            f.task.cancel()
+            inflight[remote] = nil
             progress[remote] = nil
         }
     }
@@ -94,7 +114,28 @@ final class RemoteFiles: @unchecked Sendable {
             .appendingPathComponent(name)
     }
 
+    /// How many times a download starts again for a file that changed under it, before saying so.
+    static let attemptsForAChangingFile = 3
+
     private func download(_ remote: String) async throws -> URL {
+        var attempts = 0
+        while true {
+            do {
+                return try await downloadOnce(remote)
+            } catch FileChanged.underTheFetch {
+                attempts += 1
+                lock.withLock { progress[remote] = 0 }
+                guard attempts < Self.attemptsForAChangingFile else {
+                    throw LinkError.refused("The file keeps changing on that Mac.")
+                }
+                try await Task.sleep(for: .seconds(1))   // a save in progress is given time to end
+            }
+        }
+    }
+
+    private enum FileChanged: Error { case underTheFetch }
+
+    private func downloadOnce(_ remote: String) async throws -> URL {
         guard let (peer, path) = RemotePath.parse(remote) else { throw LinkError.refused("not a linked Mac's file") }
         guard let node = current else { throw LinkError.refused("Linked Macs is off") }
         let infoMsg = try await node.call(peer, "fetch", .json(LinkWire.PathRequest(path: path, length: 0)), timeout: 30)
@@ -117,7 +158,7 @@ final class RemoteFiles: @unchecked Sendable {
         let count = info.size == 0 ? 0 : Int((info.size + slice - 1) / slice)
         var done = 0
         do {
-            try await withThrowingTaskGroup(of: (Int, Data).self) { group in
+            try await withThrowingTaskGroup(of: (Int, Data, LinkWire.FileInfo?).self) { group in
                 var next = 0
                 func add() {
                     let i = next
@@ -126,11 +167,14 @@ final class RemoteFiles: @unchecked Sendable {
                         let r = try await node.call(peer, "fetch",
                                                     .json(LinkWire.PathRequest(path: path, offset: Int64(i) * slice, length: Int(slice))),
                                                     timeout: 60)
-                        return (i, r.blob)
+                        return (i, r.blob, try? r.decode(LinkWire.FileInfo.self))
                     }
                 }
                 while next < min(count, Self.parallel) { add() }
-                while let (i, data) = try await group.next() {
+                while let (i, data, seen) = try await group.next() {
+                    // Every slice says what the file was when it was read. The total size was the only
+                    // check, so a same-size rewrite mid-download was cached torn under the old date.
+                    if let seen, seen.size != info.size || seen.modified != info.modified { throw FileChanged.underTheFetch }
                     try fh.seek(toOffset: UInt64(Int64(i) * slice))
                     try fh.write(contentsOf: data)
                     done += 1
