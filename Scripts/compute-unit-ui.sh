@@ -15,7 +15,7 @@ APP=${OMNI_CHAOS_APP:?a renamed copy (Scripts/chaos-app.sh)}
 TESTS=($@)
 [ ${#TESTS} -gt 0 ] || TESTS=(testSwitchBothWaysFromSettings testRapidToggles testSwitchWhileIndexing testRelaunchInEachMode
                               testChoosesTheNeuralEngineAtFirstRun testTurnedOffDuringTheOneTimeBuild)
-export DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode-26.6.0.app/Contents/Developer}
+export DEVELOPER_DIR=${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}
 DD=.build/xcode-rel
 ART="$PWD/$DD/SourcePackages/artifacts/swift-tokenizers/TokenizersRust/TokenizersRust.artifactbundle"
 apppid() { pgrep -f "$APP/Contents/MacOS/" | head -1; }

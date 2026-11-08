@@ -49,19 +49,22 @@ jobs:
           echo "version=$NEW" >> "$GITHUB_OUTPUT"
           echo "tag=v$NEW" >> "$GITHUB_OUTPUT"
 
-      # The app needs Xcode 26 (Swift 6.2 + the swift-tokenizers SE-0482 artifact). Select it via
-      # DEVELOPER_DIR (written to the job env) instead of `sudo xcode-select` - the self-hosted
-      # runner has no passwordless sudo. Both spellings: this box's 26.6 is `Xcode-26.6.0.app`, which
-      # `Xcode_26*` never matched, so releases were quietly built with the 26.2 that xcode-select
-      # points at - not the toolchain everything was measured on. Falls back to the active one.
-      - name: Select Xcode 26
+      # The app is built and measured with Xcode 27 (Swift 6.4; docs/notes/index.md, "Xcode 27.2 for
+      # the app"). Selected via DEVELOPER_DIR (written to the job env) instead of `sudo xcode-select` -
+      # the self-hosted runner has no passwordless sudo. A versioned name first (`Xcode-27.x.app` or
+      # `Xcode_27*`), then the plain `Xcode.app`, and the step FAILS on anything that is not 27: a
+      # pattern that matched nothing used to fall back quietly to whatever xcode-select pointed at
+      # (26.2 once, while everything was measured on 26.6), and a release built on an unmeasured
+      # toolchain is worse than no release.
+      - name: Select Xcode 27
         run: |
-          XC=$(ls -d /Applications/Xcode[-_]26*.app 2>/dev/null | sort -V | tail -1 || true)
-          [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode[-_]*.app 2>/dev/null | sort -V | tail -1 || true)
-          if [ -n "$XC" ]; then echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"; echo "Using $XC"; fi
-          xcodebuild -version
+          XC=$(ls -d /Applications/Xcode[-_]27*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$XC" ] || XC=/Applications/Xcode.app
+          V=$(DEVELOPER_DIR="$XC/Contents/Developer" xcodebuild -version | sed -n 1p)
+          case "$V" in "Xcode 27"*) ;; *) echo "::error::need Xcode 27, $XC is '$V'"; exit 1 ;; esac
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"; echo "Using $XC ($V)"
 
-      # MLX-Swift compiles Metal shaders; Xcode 26 needs the Metal toolchain component.
+      # MLX-Swift compiles Metal shaders; Xcode 26 and later need the Metal toolchain component.
       - name: Install Metal toolchain
         run: xcodebuild -downloadComponent MetalToolchain
 
