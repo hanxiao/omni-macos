@@ -156,6 +156,8 @@ struct LinkedSearchAnswer: Sendable {
     let note: String?
     /// That Mac lets this one open its files, so `get_linked_file` will work on these paths.
     var canOpen = false
+    /// What that Mac said of the hits that are its screenshots, by path there.
+    var shots: [String: ScreenHints.Moment] = [:]
 }
 
 // MARK: - HTTP

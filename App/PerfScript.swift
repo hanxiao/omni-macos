@@ -14,7 +14,7 @@ import OmniLink
 /// `wait:<seconds>`, `intent:<text>` (the Shortcuts search action's own search, logged). For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
 /// (window size, centered), `front`, `appearance:light|dark`, `ocrview:raw|rendered|split|triple`, `ocrpage:<n>`, `history:<n>`, `sort:<order>`,
-/// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `menu:<title>`, `historybench:<n>`, `seedhistory:<n>[:<m>]`, `note:<text>`, `menustate:<menu>`, `historyfold:<n>`, `sidebarscroll:<top|bottom|f>`, `recents`, `clipboard:on|off`, `powerhold:hot|lowpower|battery|none`, `ocrrun:on|off`, `stall:queue:<path>|flag`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
+/// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `menu:<title>`, `historybench:<n>`, `seedhistory:<n>[:<m>]`, `note:<text>`, `menustate:<menu>`, `historyfold:<n>`, `sidebarscroll:<top|bottom|f>`, `recents`, `clipboard:on|off`, `screenshots:on|off|clear`, `shotfeed:<dir>[|hoursAgo]`, `shotselect:<n>`, `shotscrub:<n>`, `shotday:<-1|1>`, `powerhold:hot|lowpower|battery|none`, `ocrrun:on|off`, `stall:queue:<path>|flag`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
 enum PerfScript {
@@ -220,7 +220,7 @@ enum PerfScript {
                 sv.contentView.scroll(to: NSPoint(x: 0, y: max(0, (doc - view) * f)))
                 sv.reflectScrolledClipView(sv.contentView)
             }
-        case "sidebarselect":   // select the n-th indexed folder in the sidebar (-1: Recents, -2: Clipboard), as a click would
+        case "sidebarselect":   // select the n-th indexed folder in the sidebar (-1: Recents, -2: Clipboard, -3: Screenshots), as a click would
             NotificationCenter.default.post(name: .omniPerfSidebarSelect, object: Int(arg) ?? 0)
         case "sidebarhistory":  // select the n-th history row in the sidebar, as a click would
             NotificationCenter.default.post(name: .omniPerfSidebarSelect, object: -100 - (Int(arg) ?? 0))
@@ -365,6 +365,12 @@ enum PerfScript {
                 "clipboardCurrent": model.clipboardCurrentPath ?? "",
                 "clipboardClips": model.clipboardClipCount,
                 "clipboardHasClips": model.clipboardHasClips,
+                "screenshotsOff": model.showsScreenshotsOff,
+                "screenshotsEnabled": model.screenshotsEnabled,
+                "screenshotsAccess": model.screenshotsAccess.map { $0 ? "allowed" : "denied" } ?? "unknown",
+                "screenshotsHasShots": model.screenshotsHasShots,
+                "screenshotsRevision": model.screenshotsRevision,
+                "timeline": ScreenTimelineState.current?.perfSummary ?? [:],
                 "folderCounts": model.folderFileCounts,   // the sidebar's per-folder numbers
                 "history": model.searchHistory.prefix(20).map { ["text": $0.displayText, "source": $0.source] },
                 "indexing": model.indexState == .indexing,
@@ -447,6 +453,19 @@ enum PerfScript {
             if parts.count == 2 { model.setFolderPaused(path: parts[0], parts[1] == "on") }
         case "clipboard":   // on | off | clear (Clear without its confirmation)
             if arg == "clear" { model.clearClipboardHistory() } else { model.setClipboardEnabled(arg == "on") }
+        case "screenshots": // on | off | clear (Clear without its confirmation)
+            if arg == "clear" { model.clearScreenshots() } else { model.setScreenshotsEnabled(arg == "on") }
+        case "shotfeed":    // <dir>[|hoursAgo]: record a prepared session of PNG frames instead of the screen
+            let parts = arg.split(separator: "|").map(String.init)
+            if let dir = parts.first {
+                model.feedScreenshots(from: URL(fileURLWithPath: dir), hoursAgo: parts.count > 1 ? Double(parts[1]) ?? 1 : 1)
+            }
+        case "shotselect":  // the n-th shot of the day on the timeline (negative: from the newest)
+            NotificationCenter.default.post(name: .omniPerfShot, object: "select:" + arg)
+        case "shotscrub":   // walk n shots back and forward on the timeline and log the decode times
+            NotificationCenter.default.post(name: .omniPerfShot, object: "scrub:" + arg)
+        case "shotday":     // the timeline a day back (-1) or forward (1)
+            NotificationCenter.default.post(name: .omniPerfShot, object: "day:" + arg)
         case "appearance": NSApp.appearance = NSAppearance(named: arg == "dark" ? .darkAqua : .aqua)
         default: omniPerfLog("script: unknown step \(step)")
         }

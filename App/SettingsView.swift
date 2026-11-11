@@ -364,6 +364,27 @@ private struct ActivityTab: View {
                 }
             }
 
+            // Clear is on the sidebar row's menu, as the clipboard's is.
+            Section("Screenshots") {
+                Toggle("Record screenshots", isOn: Binding(get: { model.screenshotsEnabled },
+                                                           set: { model.setScreenshotsEnabled($0) }))
+                .help("A screenshot when you use the Mac, searchable in Screenshots")
+                if model.screenshotsEnabled, model.screenshotsAccess == false {
+                    LabeledContent("Screen recording is denied") {
+                        Button("Open Privacy Settings") { AppModel.openScreenRecordingSettings() }
+                            .controlSize(.small)
+                    }
+                    .foregroundStyle(.secondary)
+                }
+                Picker("Keep screenshots for", selection: Binding(get: { model.screenshotsRetentionDays },
+                                                                  set: { model.screenshotsRetentionDays = $0 })) {
+                    Text("7 days").tag(7)
+                    Text("30 days").tag(30)
+                    Text("90 days").tag(90)
+                    Text("Forever").tag(0)
+                }
+            }
+
             Section("Folders") {
                 ForEach(model.roots, id: \.self) { url in
                     let rp = model.progress.perRoot[url.path]

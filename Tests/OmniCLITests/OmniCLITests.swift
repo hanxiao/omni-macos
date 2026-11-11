@@ -67,6 +67,24 @@ final class OmniCLITests: XCTestCase {
         XCTAssertEqual(m, "omni search: --modified-after must be an ISO 8601 date; <query> is required")
     }
 
+    /// `search` takes a query or a time range, so nothing is required and the tool names where the
+    /// bare words go: they still lead the usage and the help, marked optional.
+    func testAnOptionalBareWordIsShownOptionalAndFirst() throws {
+        var tool = search
+        var schema = tool["inputSchema"] as! [String: Any]
+        schema["required"] = nil
+        tool["inputSchema"] = schema
+        tool["_meta"] = [CLIProtocol.bareWordsKey: "query"]
+        let s = ToolSchema(tool)
+        XCTAssertEqual(s.usage("search"), "search [<query>] [options]")
+        XCTAssertEqual(s.params.first?.name, "query")
+        XCTAssertEqual(try arguments(for: tool, ["red", "car"])["query"] as? String, "red car")
+        let ranged = try arguments(for: tool, ["--modified-after", "2026-11-10T13:00:00+01:00"])
+        XCTAssertNil(ranged["query"])
+        XCTAssertEqual(ranged["modified_after"] as? String, "2026-11-10T13:00:00+01:00")
+        XCTAssertEqual(ToolSchema(search).usage("search"), "search <query> [options]")
+    }
+
     func testHelpComesInLayers() {
         let short = toolHelp(search, full: false), full = toolHelp(search, full: true)
         XCTAssertTrue(short.contains("Find files.") && !short.contains("Longer explanation"))

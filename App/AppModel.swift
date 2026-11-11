@@ -1150,6 +1150,7 @@ final class AppModel {
     func enterFolder(_ url: URL?) {
         linkedScope = nil
         showsClipboardOff = false
+        showsScreenshotsOff = false
         selectFolderForVisualization(nil)        // browsing takes the empty-result region
         browsedPhotoSource = nil                 // one browser at a time
         setFilterRecentsQuietly(false)           // the assignment below rewrites the box once
@@ -1183,6 +1184,7 @@ final class AppModel {
     func enterPhotoSource(_ source: PhotoLibrary.Source) {
         linkedScope = nil
         showsClipboardOff = false
+        showsScreenshotsOff = false
         selectFolderForVisualization(nil)
         setFilterRecentsQuietly(false)
         filterFolder = nil                 // the browsers share one region; the last click wins
@@ -1225,6 +1227,7 @@ final class AppModel {
     func enterRecents() {
         linkedScope = nil
         showsClipboardOff = false
+        showsScreenshotsOff = false
         selectFolderForVisualization(nil)
         browsedPhotoSource = nil
         suppressFilterEffects = true
@@ -1272,10 +1275,16 @@ final class AppModel {
     /// The Clipboard row was clicked while there is nothing to show: capture off and no clips.
     var showsClipboardOff = false
 
-    /// The folders the indexer crawls and the watcher follows: the user's, plus the clipboard.
+    /// The folders the indexer crawls and the watcher follows: the user's, plus the clipboard
+    /// history and the screenshots.
     /// `roots` stays the user's folders alone, which is what the sidebar, Settings, the Go menu
     /// and the served root check list.
-    var crawlRoots: [URL] { clipboardFolderExists ? roots + [Self.clipboardDirectory] : roots }
+    var crawlRoots: [URL] {
+        var all = roots
+        if clipboardFolderExists { all.append(Self.clipboardDirectory) }
+        if screenshotsFolderExists { all.append(Self.screenshotsDirectory) }
+        return all
+    }
 
     /// Clips on disk. STORED, and recounted off the main thread when it can have changed: counting
     /// lists the folder, 7 ms at 3,000 clips, and the sidebar row's context menu - which macOS builds
@@ -1410,6 +1419,205 @@ final class AppModel {
         // finds what the clipboard holds, which is nothing.
         enterFolder(Self.clipboardDirectory)
         if !(clipboardEnabled || clipboardHasClips) { showsClipboardOff = true }
+    }
+
+    // MARK: - Screenshots (docs/screenshots.md)
+
+    /// A folder of Omni's own: under Application Support, or beside the index for a run isolated by
+    /// `-omni.dbDir`. Fixed for the process.
+    private nonisolated static func ownFolder(_ name: String) -> URL {
+        if isolatedByLaunchArgument, let index = try? indexURL() {
+            return index.deletingLastPathComponent().appendingPathComponent(name, isDirectory: true)
+        }
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return support.appendingPathComponent("Omni/" + name, isDirectory: true)
+    }
+
+    /// The shots worth finding again, as picture files: a crawl root, like the clipboard's folder.
+    nonisolated static let screenshotsDirectory = ownFolder("Screenshots")
+    /// Every shot, as video. Omni's own data: never crawled.
+    nonisolated static let screenHistoryDirectory = ownFolder("Screen History")
+    /// One for the process: the recorder writes it, the timeline and the served surfaces read it.
+    nonisolated static let screenHistory = ScreenHistory(history: screenHistoryDirectory, stills: screenshotsDirectory)
+
+    /// What no linked Mac is given: the clipboard history, which no served surface returns. The
+    /// screenshots are served like the user's files, to this Mac's agents and to linked Macs (Han,
+    /// 2026-11-10).
+    nonisolated static let unsharedFolders = [clipboardDirectory.path]
+    nonisolated static func isUnshared(_ path: String) -> Bool {
+        unsharedFolders.contains { path == $0 || path.hasPrefix($0 + "/") }
+    }
+
+    /// An isolated run carries the app's bundle id, and with it the app's Screen Recording grant:
+    /// it reads the setting and records the real screen only when its own arguments say so
+    /// (`-omni.screenshots.enabled`, `-omni.screenshots.capture`). Its shots are fed (`shotfeed`).
+    private nonisolated static func screenshotsArgument(_ key: String) -> Bool? {
+        guard isolatedByLaunchArgument else { return nil }
+        let args = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+        return (args[key] as? NSString)?.boolValue ?? false
+    }
+    private nonisolated static let screenshotsMayCapture = screenshotsArgument("omni.screenshots.capture") ?? true
+
+    @ObservationIgnored private var screenRecorder: ScreenRecorder?
+    @ObservationIgnored private var screenshotsPruneTimer: Timer?
+
+    /// Recording is opt-in; a user who never turned it on has neither folder.
+    var screenshotsEnabled: Bool = AppModel.screenshotsArgument("omni.screenshots.enabled")
+        ?? UserDefaults.standard.bool(forKey: "omni.screenshots.enabled")
+
+    var screenshotsRetentionDays: Int = {
+        let d = UserDefaults.standard
+        return d.object(forKey: "omni.screenshots.retentionDays") == nil ? 30 : d.integer(forKey: "omni.screenshots.retentionDays")
+    }() {
+        didSet {
+            if !isIsolatedRun { OmniPrefs.set(screenshotsRetentionDays, forKey: "omni.screenshots.retentionDays") }
+            pruneScreenshots()
+        }
+    }
+
+    /// Crawled while it exists, on or off, so a shot deleted by retention or in the Finder leaves the index.
+    private(set) var screenshotsFolderExists = FileManager.default.fileExists(atPath: AppModel.screenshotsDirectory.path)
+
+    /// The Screenshots row was clicked while there is nothing to show: recording off and no shots.
+    var showsScreenshotsOff = false
+
+    /// What macOS allows, as the recorder last found it. nil until it has looked.
+    private(set) var screenshotsAccess: Bool?
+
+    /// The history holds at least one shot. STORED: finding out lists a folder.
+    private(set) var screenshotsHasShots = false
+
+    /// Moves when the history changes (a shot stored, retention, Clear). The timeline reloads on it.
+    private(set) var screenshotsRevision = 0
+
+    /// Launch: resume recording if it is on, and apply retention.
+    func startScreenshots() {
+        if screenshotsEnabled { startScreenRecorder() }
+        pruneScreenshots()
+        refreshScreenshotsHasShots()
+        screenshotsPruneTimer?.invalidate()
+        let t = Timer(timeInterval: 3600, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.pruneScreenshots() }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        screenshotsPruneTimer = t
+    }
+
+    func setScreenshotsEnabled(_ on: Bool) {
+        guard on != screenshotsEnabled else { return }
+        screenshotsEnabled = on
+        if !isIsolatedRun { OmniPrefs.set(on, forKey: "omni.screenshots.enabled") }
+        if on {
+            for dir in [Self.screenshotsDirectory, Self.screenHistoryDirectory] {
+                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            }
+            // macOS asks the user once, in its own dialog. From an isolated run only when its
+            // arguments let it record the real screen. Off the main thread: the call asks a system
+            // service.
+            if Self.screenshotsMayCapture { DispatchQueue.global(qos: .userInitiated).async { _ = CGRequestScreenCaptureAccess() } }
+            startScreenRecorder()
+            refreshScreenshotsFolder()
+            if showsScreenshotsOff { showsScreenshotsOff = false }
+        } else {
+            screenRecorder?.stop()
+            screenRecorder = nil
+            screenshotsAccess = nil
+        }
+    }
+
+    private func makeScreenRecorder() -> ScreenRecorder {
+        ScreenRecorder(history: Self.screenHistory,
+                       onStored: { [weak self] stored in self?.screenshotsStored(stored) },
+                       onAccess: { [weak self] allowed in
+                           guard let self, self.screenshotsAccess != allowed else { return }
+                           self.screenshotsAccess = allowed
+                       })
+    }
+
+    private func startScreenRecorder() {
+        guard screenRecorder == nil else { return }
+        let r = makeScreenRecorder()
+        if Self.screenshotsMayCapture { r.start() }
+        screenRecorder = r
+    }
+
+    private func screenshotsStored(_ stored: [ScreenHistory.Recorded]) {
+        if !screenshotsHasShots { screenshotsHasShots = true }
+        screenshotsRevision += 1
+        if stored.contains(where: { $0.still != nil }) { refreshScreenshotsFolder() }
+    }
+
+    /// The folder appeared or went away: the watcher and the next pass follow it.
+    private func refreshScreenshotsFolder() {
+        let exists = FileManager.default.fileExists(atPath: Self.screenshotsDirectory.path)
+        guard exists != screenshotsFolderExists else { return }
+        screenshotsFolderExists = exists
+        restartWatcher()
+        if exists { requestIndexPass() }
+    }
+
+    private func refreshScreenshotsHasShots() {
+        let history = Self.screenHistory
+        Task.detached(priority: .utility) {
+            let has = !history.isEmpty
+            await MainActor.run { if self.screenshotsHasShots != has { self.screenshotsHasShots = has } }
+        }
+    }
+
+    private func pruneScreenshots() {
+        let days = screenshotsRetentionDays, history = Self.screenHistory
+        guard days > 0 else { return }
+        Task.detached(priority: .utility) {
+            guard history.prune(olderThan: Date().timeIntervalSince1970 - Double(days) * 86_400) > 0 else { return }
+            await MainActor.run { self.screenshotsRevision += 1; self.refreshScreenshotsHasShots() }
+        }
+    }
+
+    /// Delete every shot: the history, the files written for the index, and their rows, in order
+    /// on one task, as Clear does for the clipboard.
+    func clearScreenshots() {
+        let dir = Self.screenshotsDirectory, history = Self.screenHistory
+        let store = self.store
+        screenshotsHasShots = false
+        Task.detached(priority: .userInitiated) {
+            history.clear()
+            store?.deleteUnderFolder(dir.path)
+            await MainActor.run {
+                self.screenshotsRevision += 1
+                if let store, self.store === store {
+                    self.refreshIndexStats(store)
+                    self.refreshSearchAfterBackgroundChange()
+                }
+            }
+        }
+    }
+
+    nonisolated static func openScreenRecordingSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// The Screenshots row: the timeline, or that recording is off when there is nothing to show.
+    /// Scoped to the folder either way, as the Clipboard row is.
+    func enterScreenshots() {
+        enterFolder(Self.screenshotsDirectory)
+        if !(screenshotsEnabled || screenshotsHasShots) { showsScreenshotsOff = true }
+    }
+
+    /// Record a prepared session instead of the screen (the `shotfeed` script step): PNG frames in
+    /// name order, 5 s apart, the first `hoursAgo` back from now. `<n>[!] <App> - <Title>.png`; a
+    /// "!" after the number marks the shot the user stopped on.
+    func feedScreenshots(from dir: URL, hoursAgo: Double) {
+        for d in [Self.screenshotsDirectory, Self.screenHistoryDirectory] {
+            try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        }
+        refreshScreenshotsFolder()
+        let recorder = screenRecorder ?? makeScreenRecorder()
+        recorder.feed(dir, start: Date().timeIntervalSince1970 - hoursAgo * 3600) { stored, indexed in
+            omniPerfLog("shotfeed stored=\(stored) indexed=\(indexed)")
+        }
     }
 
     /// The newest `limit` files by index time, off the main thread on the browse connection.
@@ -3147,6 +3355,7 @@ final class AppModel {
     /// 34 results in another, against the 25 it was saved with).
     private func restoreRecordedFilters(_ item: HistoryItem) {
         showsClipboardOff = false
+        showsScreenshotsOff = false
         browsedPhotoSource = nil
         selectFolderForVisualization(nil)
         suppressFilterEffects = true
@@ -5677,6 +5886,7 @@ final class AppModel {
             followMovedFolders(kick: false)
             finishOwedRemovals(store)
             startClipboard()
+            startScreenshots()
             restartWatcher()
             // Off the main thread: it lists the shared temporary directory, which measured 2.7 s of
             // main-thread block at 50k entries - the stall every launch showed right after ready.
@@ -6196,7 +6406,7 @@ final class AppModel {
 
     /// Has the user given Omni anywhere to look yet? Folders OR a photo library - either one means
     /// the app has work to do and the empty state should stop asking.
-    var hasSources: Bool { !addedFolders.isEmpty || !photoSources.isEmpty || clipboardEnabled }
+    var hasSources: Bool { !addedFolders.isEmpty || !photoSources.isEmpty || clipboardEnabled || screenshotsEnabled }
 
     private func saveRoots() {
         guard !isIsolatedRun else { return }   // see isIsolatedRun
@@ -7909,7 +8119,7 @@ final class AppModel {
         var s = settings
         s.ignore = ignore   // single source of truth for what the crawl excludes
         s.ownDataPaths = Self.ownDataPaths()
-        s.ownDataExceptions = [Self.clipboardDirectory.path]
+        s.ownDataExceptions = [Self.clipboardDirectory.path, Self.screenshotsDirectory.path]
         s.maxImageDimension = maxImageDimension
         s.maxVideoFrames = maxVideoFrames
         s.maxCharsPerChunk = maxTextChunkChars
@@ -8079,7 +8289,7 @@ final class AppModel {
             realpath(p, nil).map { r in defer { free(r) }; return String(cString: r) } ?? p
         }
         let own = Self.ownDataPaths().map(real)
-        let ownExceptions = [real(Self.clipboardDirectory.path)]
+        let ownExceptions = [real(Self.clipboardDirectory.path), real(Self.screenshotsDirectory.path)]
         let w = FSWatcher(paths: crawlRoots.map { $0.path }, since: since) { [weak self] paths, flags in
             let renamed = flags.renamed, rescan = flags.rescan
             // Sorted into present and gone HERE, on the watcher's queue: a drag-in reports

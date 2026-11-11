@@ -324,6 +324,30 @@ struct ContentView: View {
             && model.filterFolders.map(\.standardizedFileURL.path) == [AppModel.clipboardDirectory.standardizedFileURL.path]
     }
 
+    /// The scope is exactly the Screenshots folder: the place its sidebar row opens.
+    private var inScreenshots: Bool {
+        model.filterFolders.map(\.standardizedFileURL.path) == [AppModel.screenshotsDirectory.standardizedFileURL.path]
+    }
+
+    /// The Screenshots row was clicked with recording off and no shots. With a query too, as for
+    /// the clipboard.
+    private var showsScreenshotsOff: Bool {
+        model.showsScreenshotsOff && model.fileQuery == nil && !model.hasResults
+            && model.queryError == nil && !model.isResolving && inScreenshots
+    }
+
+    /// The Screenshots place with nothing search-related active: the timeline, or what stands in
+    /// for it. Checked before the folder browser, which the same scope would otherwise show.
+    private var showsScreenshots: Bool {
+        inScreenshots && !model.hasQuery && model.fileQuery == nil
+            && !model.hasResults && model.queryError == nil && !model.isResolving
+    }
+
+    /// Recording is on, macOS has not allowed it, and there is nothing recorded to show instead.
+    private var showsScreenshotsDenied: Bool {
+        showsScreenshots && model.screenshotsEnabled && model.screenshotsAccess == false && !model.screenshotsHasShots
+    }
+
     /// A linked Mac (or a folder on it) is selected and nothing search-related is active.
     private var showsRemoteBrowser: Bool {
         model.linkedScope != nil && !model.hasQuery && model.fileQuery == nil
@@ -377,6 +401,18 @@ struct ContentView: View {
                                subtitle: "Saves the text and images you copy so you can search them.",
                                action: ("Turn On", { model.setClipboardEnabled(true) }),
                                prominent: true)
+            } else if showsScreenshotsOff {
+                CenteredStatus(symbol: CenteredStatus.moleSleep, title: "Screenshots are off",
+                               subtitle: "Takes a screenshot when you use the Mac, so you can search what was on screen.",
+                               action: ("Turn On", { model.setScreenshotsEnabled(true) }),
+                               prominent: true)
+            } else if showsScreenshotsDenied {
+                CenteredStatus(symbol: CenteredStatus.moleSerious, title: "Screen recording is not allowed",
+                               subtitle: "Allow Omni in System Settings > Privacy & Security > Screen & System Audio Recording.",
+                               action: ("Open Privacy Settings", { AppModel.openScreenRecordingSettings() }),
+                               prominent: true)
+            } else if showsScreenshots {
+                ScreenTimeline()
             } else if showsRemoteBrowser, let scope = model.linkedScope {
                 RemoteBrowser(scope: scope)
             } else if showsRecents {
@@ -407,6 +443,7 @@ struct ContentView: View {
     private var browseMode: SearchToolbar.BrowseMode {
         if showsRecents { return .recents }
         if showsClipboardOff { return .clipboardOff }
+        if showsScreenshotsOff || showsScreenshots { return .screenshots }
         if showsPhotoBrowser { return .photos }
         if showsFolderBrowser { return .folder }
         return .none

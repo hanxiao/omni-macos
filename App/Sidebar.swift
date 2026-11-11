@@ -10,6 +10,7 @@ enum SidebarSelection: Hashable {
     case folder(URL)
     case photos(String)   // a Photos source, by its root key
     case clipboard
+    case screenshots
     case history(String)
     /// A linked Mac (by peer id), or a folder it shares (docs/notes/link.md).
     case linkedMac(String)
@@ -254,6 +255,7 @@ struct Sidebar: View {
             // smart folder, so it sits beside Recents rather than among the user's sources.
             RecentsRow().sidebarRow(.recents)
             ClipboardRow().sidebarRow(.clipboard)
+            ScreenshotsRow().sidebarRow(.screenshots)
 
             sourcesSection
 
@@ -309,6 +311,7 @@ struct Sidebar: View {
             else if case .linkedMac(let id) = sel { model.enterLinkedMac(id) }
             else if case .linkedFolder(let id, let key) = sel { model.enterLinkedMac(id, folder: key) }
             else if sel == .clipboard { model.enterClipboard() }
+            else if sel == .screenshots { model.enterScreenshots() }
             else if case .photos(let key) = sel,
                     let source = model.photoSources.first(where: { $0.key == key }) {
                 // Was missing entirely: `.photos` fell into the else below, so clicking a photo
@@ -372,7 +375,7 @@ struct Sidebar: View {
             case .history(let id):
                 if let item = model.searchHistory.first(where: { $0.id == id }) { model.removeHistory(item) }
                 selection = nil
-            case .recents, .clipboard, .linkedMac, .linkedFolder, .none: break   // unlinking asks first: Settings or the row's menu
+            case .recents, .clipboard, .screenshots, .linkedMac, .linkedFolder, .none: break   // unlinking asks first: Settings or the row's menu
             }
         }
         // Drag a folder in from Finder to add it as a search root - the most natural gesture on
@@ -400,6 +403,7 @@ struct Sidebar: View {
         guard let i = object as? Int else { return }
         if i == -1 { selection = .recents }
         else if i == -2 { selection = .clipboard }
+        else if i == -3 { selection = .screenshots }
         else if i <= -100, model.searchHistory.indices.contains(-100 - i) { selection = .history(model.searchHistory[-100 - i].id) }
         else if model.roots.indices.contains(i) { selection = .folder(model.roots[i]) }
     }
@@ -419,6 +423,7 @@ struct Sidebar: View {
         switch selection {
         case .folder(let url) where scope != [url.path]: deselectQuietly()
         case .clipboard where scope != [AppModel.clipboardDirectory.path]: deselectQuietly()
+        case .screenshots where scope != [AppModel.screenshotsDirectory.path]: deselectQuietly()
         case .recents where !model.filterRecents: deselectQuietly()
         case .photos(let key) where model.browsedPhotoSource?.key != key: deselectQuietly()
         default: break
@@ -429,6 +434,7 @@ struct Sidebar: View {
             else if let linked = model.linkedScope { place = linked.folder.map { .linkedFolder(linked.peer, $0) } ?? .linkedMac(linked.peer) }
             else if model.filterRecents { place = scope.isEmpty ? .recents : nil }
             else if scope == [AppModel.clipboardDirectory.path] { place = .clipboard }
+            else if scope == [AppModel.screenshotsDirectory.path] { place = .screenshots }
             else if scope.count == 1, let root = model.roots.first(where: { $0.path == scope[0] }) { place = .folder(root) }
             if let place { markedOnly = place; selection = place }
             return
@@ -947,6 +953,61 @@ private struct ClipboardRow: View {
                 Divider()
                 Button(role: .destructive) { ClipboardClear.confirm(model) } label: {
                     Label("Clear Clipboard History\u{2026}", systemImage: "trash")
+                }
+            }
+        }
+    }
+}
+
+/// The screen history: always present, like the Clipboard row, so recording can be found and
+/// turned on from here. The count is the shots the index holds.
+private struct ScreenshotsRow: View {
+    @Environment(\.sidebarRowSelected) private var selected
+    @Environment(AppModel.self) private var model: AppModel
+
+    private var key: String { AppModel.screenshotsDirectory.path }
+
+    private var help: String {
+        if !model.screenshotsEnabled { return "Screenshots are off" }
+        if model.screenshotsAccess == false { return "Screen recording is denied in System Settings" }
+        return "Screenshots"
+    }
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "camera.viewfinder").sidebarTint(selected, else: .secondary).frame(width: 16)
+            Text("Screenshots").sidebarTint(selected, else: .primary)
+            Spacer()
+            if model.screenshotsEnabled, RootIndexState.isActive(model, key: key), !RootIndexState.isFinished(model, key: key),
+               let fraction = RootIndexState.activeFraction(model, key: key) {
+                CloudSyncPie(fraction: fraction)
+            } else if model.hasIndexedFiles, let c = model.folderFileCounts[key], c > 0 {
+                Text(c.formatted())
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(model.screenshotsEnabled ? .secondary : .tertiary)
+            }
+        }
+        .help(help)
+        .contextMenu {
+            Button { model.enterScreenshots() } label: { Label("Open", systemImage: "arrow.up.forward.app") }
+            if model.screenshotsEnabled || model.screenshotsHasShots {
+                Button { model.enterScreenshots(); SearchFieldFocus.focus() } label: {
+                    Label("Search in Screenshots", systemImage: "magnifyingglass")
+                }
+            }
+            Divider()
+            Toggle(isOn: Binding(get: { model.screenshotsEnabled }, set: { model.setScreenshotsEnabled($0) })) {
+                Label("Record Screenshots", systemImage: "camera.viewfinder")
+            }
+            if model.screenshotsFolderExists {
+                Button { NSWorkspace.shared.activateFileViewerSelecting([AppModel.screenshotsDirectory]) } label: {
+                    Label("Show in Finder", systemImage: "folder")
+                }
+            }
+            if model.screenshotsHasShots {
+                Divider()
+                Button(role: .destructive) { ScreenshotsClear.confirm(model) } label: {
+                    Label("Clear Screenshots\u{2026}", systemImage: "trash")
                 }
             }
         }

@@ -491,7 +491,7 @@ final class LinkController {
     // MARK: - Asking linked Macs
 
     nonisolated func search(_ req: LinkWire.SearchRequest, peer: String, timeout: Double) async throws -> [SearchHit] {
-        try await served.search(req, peer: peer, timeout: timeout)
+        try await served.search(req, peer: peer, timeout: timeout).hits
     }
 
     func similar(_ remote: String) async throws -> (hits: [SearchHit], vector: [Float]?) {
@@ -542,7 +542,15 @@ final class LinkController {
 final class LinkServed: @unchecked Sendable {
     private let lock = NSLock()
     private var node: LinkNode?
-    private var cache: [String: (at: Date, hits: [SearchHit])] = [:]
+    private var cache: [String: (at: Date, reply: Reply)] = [:]
+
+    /// One linked Mac's answer: its hits under this Mac's keys for them, what it said of the ones
+    /// that are its screenshots (by path on that Mac), and whether it answered a listing as one.
+    struct Reply: Sendable {
+        var hits: [SearchHit]
+        var shots: [String: ScreenHints.Moment] = [:]
+        var listed = false
+    }
 
     func attach(_ n: LinkNode?) { lock.withLock { node = n; cache = [:] } }
 
@@ -558,20 +566,20 @@ final class LinkServed: @unchecked Sendable {
     /// Search one linked Mac. A repeat of the same request within a few seconds is answered from
     /// the last reply: a live refresh of this Mac's results (its index changed, not the other's)
     /// must not send the other Mac the same search again.
-    func search(_ req: LinkWire.SearchRequest, peer: String, timeout: Double) async throws -> [SearchHit] {
+    func search(_ req: LinkWire.SearchRequest, peer: String, timeout: Double) async throws -> Reply {
         guard let node = current else { throw LinkError.refused("off") }
         let key = peer + "\u{1}" + ((try? JSONEncoder().encode(req)).map { String(decoding: $0, as: UTF8.self) } ?? "")
-        let hit: [SearchHit]? = lock.withLock {
+        let hit: Reply? = lock.withLock {
             guard let c = cache[key], Date().timeIntervalSince(c.at) < 20 else { return nil }
-            return c.hits
+            return c.reply
         }
         if let hit { return hit }
-        let reply = try await node.call(peer, "search", .json(req), timeout: timeout).decode(LinkWire.SearchReply.self)
-        let hits = reply.hits.map { $0.hit(peer: peer) }
+        let wire = try await node.call(peer, "search", .json(req), timeout: timeout).decode(LinkWire.SearchReply.self)
+        let reply = Reply(hits: wire.hits.map { $0.hit(peer: peer) }, shots: wire.shots ?? [:], listed: wire.listed == true)
         lock.withLock {
             if cache.count > 64 { cache = cache.filter { Date().timeIntervalSince($0.value.at) < 20 } }
-            cache[key] = (Date(), hits)
+            cache[key] = (Date(), reply)
         }
-        return hits
+        return reply
     }
 }

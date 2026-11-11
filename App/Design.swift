@@ -70,6 +70,27 @@ extension View {
     }
 }
 
+/// A Liquid Glass panel for a group of controls floating over content (the screenshot timeline),
+/// with the same fallback as the chip: a material before macOS 26 or with Reduce Transparency on.
+private struct GlassPanel: ViewModifier {
+    var cornerRadius: CGFloat
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    func body(content: Content) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        if #available(macOS 26, *), !reduceTransparency {
+            content.glassEffect(.regular, in: shape)
+        } else {
+            content.background(.regularMaterial, in: shape)
+        }
+    }
+}
+
+extension View {
+    func glassPanel(cornerRadius: CGFloat) -> some View {
+        modifier(GlassPanel(cornerRadius: cornerRadius))
+    }
+}
+
 extension View {
     /// A small badge over a thumbnail: score, page, stack count. CONTENT, not a control, so it is a
     /// standard material and not Liquid Glass - "Don't use Liquid Glass in the content layer" (HIG,

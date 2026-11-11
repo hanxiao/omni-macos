@@ -54,6 +54,11 @@ Mac", A's consent. Each Mac switches its own grants later; neither can switch th
 - A sends the query text and its filters; B embeds with its own model and searches its own index,
   the same code path as a served search (clipboard history excluded). File queries and Find Similar
   send a vector, and only to Macs in the same vector space.
+- B's screenshots are files of its index and are answered like any other (Han, 2026-11-10); only
+  the clipboard stays out (`AppModel.unsharedFolders`). B attaches each shot's moment (its time,
+  the app in front, the stretch of work: `LinkWire.SearchReply.shots`), since A holds no history
+  of B's screen; A's session line names B, and the range with no query goes to B only when `macs`
+  names it (`listed`). An older B sends no moments and A shows the shots as plain images.
 - Remote hits are `omni-link://<peer-id>/<path>` keys on A, handled like `photos://` keys:
   materialized on demand (fetched into a cache, read-only), thumbnails rendered by B.
 - A's search never waits: remote calls run on their own queue, never on A's store queue, GPU or
@@ -88,7 +93,9 @@ B killed, frozen and unplugged against the feature off; B's own search latency w
 - The space probe is the loaded model's embedding of the probe text, not the index's stored probe:
   a new index has none until its first pass, which made two same-model Macs "different".
 - Two isolated instances on one Mac (`-omni.link.port`, `-omni.link.name`, `-omni.link.bonjour`)
-  pair through the real UI paths (perf script `linkpair` / `linkcode` / `linkaccept`). Same model:
+  pair through the real UI paths (perf script `linkpair` / `linkcode` / `linkaccept`; a fresh
+  instance needs `linkwindow:open` first, and keeps the files it fetches beside its index, not in
+  the installed app's cache). Same model:
   hits mix by score. Nano against small: the other Mac's hits are their own group under its name.
 - Search to local results on A (40 distinct queries per arm, ms): link off p50 35.4/36.0, B online
   33.3, B killed 26.8, B frozen (SIGSTOP) 42.5. B's replies join at p50 ~80 ms. A frozen Mac is

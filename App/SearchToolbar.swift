@@ -17,7 +17,7 @@ struct SearchToolbar: ViewModifier {
     /// What the detail pane is browsing, decided by `ContentView` (a query always wins).
     let browse: BrowseMode
 
-    enum BrowseMode: Equatable { case none, recents, clipboardOff, photos, folder }
+    enum BrowseMode: Equatable { case none, recents, clipboardOff, screenshots, photos, folder }
     private var showsBrowser: Bool { browse == .recents || browse == .photos || browse == .folder }
 
     func body(content: Content) -> some View {
@@ -178,7 +178,7 @@ struct SearchToolbar: ViewModifier {
         // bookmarking a browsed folder saves a state you can actually return to.)
         // `resultControlsShown` FIRST: while it holds, `filtersActive` is never read here, so a
         // filter turned on or off redraws the menu's own item and nothing else.
-        if model.phase == .ready, !model.ocrMode, !showsBrowser, browse != .clipboardOff,
+        if model.phase == .ready, !model.ocrMode, !showsBrowser, browse != .clipboardOff, browse != .screenshots,
            model.resultControlsShown || model.filtersActive {
         // Filter joins sort/view in the trailing placement so on Tahoe the three result controls
         // share ONE Liquid Glass pill (search-by-file + bookmark form the other). filterPlacement
@@ -313,6 +313,7 @@ private struct NavTitleItem: View {
         }
         if browse == .recents { return ("Recents", "Recents") }
         if browse == .clipboardOff { return ("Clipboard", "Clipboard") }
+        if browse == .screenshots { return ("Screenshots", "Screenshots") }
         if browse == .photos, let source = model.browsedPhotoSource {
             return (source.title, source.title)
         }

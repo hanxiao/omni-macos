@@ -12,7 +12,8 @@ import UniformTypeIdentifiers
 /// ONLY WHAT THE INDEX HOLDS. Every path a request names is checked against this Mac's index before
 /// anything is read: a linked Mac can reach the files Omni indexed here and nothing else - not an
 /// arbitrary path, not a file in an excluded folder, and never the clipboard history, which no
-/// served surface returns.
+/// served surface returns (AppModel.unsharedFolders). The screenshots Omni took here are files of
+/// the index like any other, and a linked Mac finds them as this Mac's own surfaces do.
 final class LinkResponder: LinkService, @unchecked Sendable {
     private let lock = NSLock()
     private var engine: OmniEngine?
@@ -116,41 +117,58 @@ final class LinkResponder: LinkService, @unchecked Sendable {
         defer { Task { await lanes.leave(peer) } }
         guard await lanes.isLatest(peer, ticket), !Task.isCancelled else { throw LinkError.refused("superseded") }
         var f = req.filter.searchFilter
-        f.excludeFolders.append(AppModel.clipboardDirectory.path)
+        f.excludeFolders += AppModel.unsharedFolders
         let filter = f
         let topK = max(1, min(req.topK, VectorStore.shippedTopK))
         let exclude = Set(req.exclude ?? [])
         let t0 = DispatchTime.now().uptimeNanoseconds
-        let hits: [SearchHit] = try await offPool {
-            let q = req.query.flatMap { $0.isEmpty ? nil : $0 }
-            if let v = req.vector {
-                guard v.count == engine.dim else { throw LinkError.refused("Not from this Mac's model.") }
-                return store.search(v, filter: filter, topK: topK + exclude.count, textQuery: q)
+        if req.isListing {
+            // The served listing itself (screenshots left out unless their folder is named).
+            let (hits, shots) = try await offPool { () -> ([SearchHit], [String: ScreenHints.Moment]) in
+                let hits = EngineServingBackend.list(store, filter: filter, topK: topK)
+                return (hits, ScreenHints.moments(hits))
             }
-            guard let q else { return [] }
-            if let v = engine.cachedQueryVector(q) { return store.search(v, filter: filter, topK: topK, textQuery: q) }
-            let generation = engine.encoderGeneration
-            if let g = engine.queryVectorGraph(q) {
-                let (hits, v) = store.search(queryGraph: g, filter: filter, topK: topK, textQuery: q)
-                engine.rememberQueryVector(q, v, since: generation)
-                return hits
-            }
-            return store.search(engine.embedQuery(q), filter: filter, topK: topK, textQuery: q)
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
+            return try .json(LinkWire.SearchReply(hits: hits.map(LinkWire.Hit.init), ms: ms,
+                                                  shots: shots.isEmpty ? nil : shots, listed: true))
         }
-        let kept = hits.filter { !exclude.contains($0.path) }.prefix(topK)
+        let (hits, shots): ([SearchHit], [String: ScreenHints.Moment]) = try await offPool {
+            let hits = try Self.ranked(req, engine, store, filter: filter, topK: topK, extra: exclude.count)
+            let kept = Array(hits.filter { !exclude.contains($0.path) }.prefix(topK))
+            // A screenshot Omni took here: when, and the stretch of work around it, from this
+            // Mac's screen history. Read with the search, on the served work queue.
+            return (kept, ScreenHints.moments(kept))
+        }
         let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6
-        return try .json(LinkWire.SearchReply(hits: kept.map(LinkWire.Hit.init), ms: ms))
+        return try .json(LinkWire.SearchReply(hits: hits.map(LinkWire.Hit.init), ms: ms, shots: shots.isEmpty ? nil : shots))
+    }
+
+    private static func ranked(_ req: LinkWire.SearchRequest, _ engine: OmniEngine, _ store: VectorStore,
+                               filter: SearchFilter, topK: Int, extra: Int) throws -> [SearchHit] {
+        let q = req.query.flatMap { $0.isEmpty ? nil : $0 }
+        if let v = req.vector {
+            guard v.count == engine.dim else { throw LinkError.refused("Not from this Mac's model.") }
+            return store.search(v, filter: filter, topK: topK + extra, textQuery: q)
+        }
+        guard let q else { return [] }
+        if let v = engine.cachedQueryVector(q) { return store.search(v, filter: filter, topK: topK, textQuery: q) }
+        let generation = engine.encoderGeneration
+        if let g = engine.queryVectorGraph(q) {
+            let (hits, v) = store.search(queryGraph: g, filter: filter, topK: topK, textQuery: q)
+            engine.rememberQueryVector(q, v, since: generation)
+            return hits
+        }
+        return store.search(engine.embedQuery(q), filter: filter, topK: topK, textQuery: q)
     }
 
     private func similar(_ req: LinkWire.PathRequest) async throws -> LinkMessage {
         let (_, store, _) = try backend()
         let path = req.path
-        let clip = AppModel.clipboardDirectory.path
         let (hits, vec): ([SearchHit], [Float]?) = try await offPool {
             try self.servable(path, store)
             guard let v = store.fileVector(path) else { return ([], nil) }
             var f = SearchFilter()
-            f.excludeFolders = [clip]
+            f.excludeFolders = AppModel.unsharedFolders
             return (store.search(v, filter: f, topK: VectorStore.shippedTopK + 1).filter { $0.path != path }, v)
         }
         return try .json(LinkWire.Similar(hits: hits.map(LinkWire.Hit.init), vector: vec))
@@ -216,8 +234,7 @@ final class LinkResponder: LinkService, @unchecked Sendable {
     private func list(_ req: LinkWire.PathRequest) async throws -> LinkMessage {
         let (_, store, _) = try backend()
         let folder = req.path
-        let clip = AppModel.clipboardDirectory.path
-        guard folder != clip, !folder.hasPrefix(clip + "/") else { throw LinkError.refused("Not shared.") }
+        guard !AppModel.isUnshared(folder) else { throw LinkError.refused("Not shared.") }
         let known = await facts.get()
         let photo = known.photos.first { $0.key == folder }
         guard photo != nil || known.folders.contains(where: { folder == $0 || folder.hasPrefix($0 + "/") }) else {
@@ -241,12 +258,11 @@ final class LinkResponder: LinkService, @unchecked Sendable {
 
     // MARK: - Helpers
 
-    /// Throws unless `path` is a file this Mac's index holds, outside the clipboard history. It reads
-    /// the store, so it runs on the served work queue, not on the pool thread of the request's task.
+    /// Throws unless `path` is a file this Mac's index holds, outside the clipboard history. It
+    /// reads the store, so it runs on the served work queue, not on the pool thread of the
+    /// request's task.
     private func servable(_ path: String, _ store: VectorStore) throws {
-        let clip = AppModel.clipboardDirectory.path
-        guard path.hasPrefix("/") || PhotoLibrary.isPhotoPath(path),
-              path != clip, !path.hasPrefix(clip + "/"),
+        guard path.hasPrefix("/") || PhotoLibrary.isPhotoPath(path), !AppModel.isUnshared(path),
               store.fileStatus(paths: [path])[path] != nil
         else { throw LinkError.refused("Not in that Mac's index.") }
     }

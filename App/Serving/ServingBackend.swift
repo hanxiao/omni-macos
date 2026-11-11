@@ -61,6 +61,9 @@ protocol ServingBackend: Sendable {
     /// The same search, and the query's vector, so a caller that goes on to pick passages does not
     /// embed the query a second time.
     func searchReturningVector(_ query: String, topK: Int, filter: SearchFilter, surface: ServedSurface) -> ([SearchHit], [Float])
+    /// The files a filter keeps, newest first, with no query: what a search answers when it is
+    /// given a time range alone. Nothing is embedded, and it is not recorded as a search.
+    func list(filter: SearchFilter, topK: Int) -> [SearchHit]
     /// For each hit, the part of its chunk that matches `query`, at most `width` characters: the
     /// whole chunk when it fits, else its best window (PassageWindow). nil where there is no text to
     /// recover (media, a file changed since it was indexed) - the caller shows the stored snippet.
@@ -160,6 +163,24 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
         let floor = filter.minScore ?? Self.minScore
         guard floor > 0 else { return (hits, vec) }
         return (hits.filter { Double($0.score) / $0.lift >= VectorStore.relevanceFloor($0, base: floor) }, vec)
+    }
+
+    func list(filter: SearchFilter, topK: Int) -> [SearchHit] { Self.list(store, filter: filter, topK: topK) }
+
+    /// The files last modified in the filter's range. One for this Mac's surfaces and for a linked
+    /// Mac that asks (LinkResponder).
+    static func list(_ store: VectorStore, filter: SearchFilter, topK: Int) -> [SearchHit] {
+        var filter = filter
+        filter.excludeFolders.append(AppModel.clipboardDirectory.path)
+        // A SCREENSHOT IS DATED AT THE MOMENT IT SHOWS, so every one Omni took in a range is a
+        // file modified in it, and a list of what changed then would be mostly pictures of the
+        // screen. Left out unless the caller names their folder.
+        let shots = AppModel.screenshotsDirectory.path
+        if !filter.folderPrefixes.contains(where: { $0 == shots || $0.hasPrefix(shots + "/") }) {
+            filter.excludeFolders.append(shots)
+        }
+        // The window's own listing (a filter with an empty search box): one row a file, newest first.
+        return store.listMatching(filter: filter, topK: topK)
     }
 
     func passages(for hits: [(path: String, chunk: Int, locator: String)], query: String, vector: [Float]?, width: Int) -> [Passage?] {

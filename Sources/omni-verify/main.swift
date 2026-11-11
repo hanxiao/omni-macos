@@ -4323,6 +4323,12 @@ if args.count >= 4 && args[1] == "soundcost" {
     exit(0)
 }
 
+// What the screen history costs as video against one picture at a time: see ShotBench.
+if args.count >= 2 && args[1] == "shotbench" {
+    ShotBench.run(Array(args[2...]))
+    exit(0)
+}
+
 // Screenshot OCR, cold and warm: omni-verify ocrcost <png>...
 if args.count >= 3 && args[1] == "ocrcost" {
     let imgs = args[2...].compactMap { p -> CGImage? in

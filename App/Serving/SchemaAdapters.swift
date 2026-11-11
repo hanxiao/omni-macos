@@ -350,9 +350,7 @@ enum GeminiAdapter {
 enum SearchAdapter {
     static func handle(_ req: HTTPRequest, _ backend: any ServingBackend) -> HTTPResponse {
         guard let body = JSONBody.object(req) else { return badRequest("invalid JSON body") }
-        guard let query = body["query"] as? String, !query.isEmpty else {
-            return badRequest("'query' is required")
-        }
+        let query = (body["query"] as? String) ?? ""
 
         let topK = (body["top_k"] as? Int) ?? 20
         // Refused, not clamped: a caller that asked for 5000 and got 200 read 200 as all there were.
@@ -382,6 +380,13 @@ enum SearchAdapter {
             filter = parsed
         }
 
+        // No query, a time range: the files last modified in it, newest first, as the MCP tool
+        // lists them.
+        let listing = query.isEmpty
+        if listing, filter.since == nil, filter.until == nil {
+            return badRequest("'query' is required, unless 'modified_after' or 'modified_before' gives a time range to list")
+        }
+
         // Duplicate collapsing, on by default: copies of one file waste an agent's top-k and its
         // context exactly as they waste a human's screen. Pass "group_duplicates": false for the
         // flat, pre-grouping list. When on, the search over-fetches so collapsing cannot leave the
@@ -396,6 +401,12 @@ enum SearchAdapter {
         // of one ranking. Cut to top_k + offset, a small top_k fetched fewer name matches
         // (fuseLexical) and tied copies reordered from page to page.
         let deep = min(max(topK + offset, MCPAdapter.summaryPool), 400)
+        if listing {
+            let pool = backend.groupedResults(backend.list(filter: filter, topK: deep), enabled: false, limit: deep)
+            let groups = offset < pool.count ? Array(pool[offset ..< min(pool.count, offset + topK)]) : []
+            return HTTPResponse.json(["results": rows(groups, backend: backend, scored: false),
+                                      "grouped": false, "offset": offset, "ranked": pool.count])
+        }
         let fetch = group ? min(deep * 3, 600) : deep
         let (hits, vector) = backend.searchReturningVector(query, topK: fetch, filter: filter, surface: .rest)
         var pool = backend.groupedResults(hits, enabled: group, limit: deep)
@@ -429,11 +440,16 @@ enum SearchAdapter {
     /// The JSON row for each result - REST's `results`, and the MCP search tool's
     /// structuredContent for the `omni` command line, so `omni search --json` and /v1/search
     /// answer in the same shape.
-    static func rows(_ groups: [ResultGroup], backend: any ServingBackend, passages: [Passage?] = []) -> [[String: Any]] {
+    ///
+    /// `scored` false for a listing, which ranks nothing: its rows carry no score. `screen` is the
+    /// moment of each row that is a screenshot Omni took, when the caller already has it.
+    static func rows(_ groups: [ResultGroup], backend: any ServingBackend, passages: [Passage?] = [],
+                     scored: Bool = true, screen: [String: ScreenHints.Moment]? = nil) -> [[String: Any]] {
         // Lockstep rule as duplicateChunks: only trust a key whose modified matches the hit's.
         let contentKeys = backend.contentKeys(paths: groups.map { $0.representative.path })
         // Present only on a weaker match (VectorStore.weakFold), so a strong row is unchanged.
-        let weaker = VectorStore.weakFold(groups.map(\.representative))
+        let weaker = scored ? VectorStore.weakFold(groups.map(\.representative)) : groups.map { _ in false }
+        let screen = screen ?? ScreenHints.moments(groups.map(\.representative))
         return groups.enumerated().map { i, g in
             let hit = g.representative
             let passage = i < passages.count ? passages[i] : nil
@@ -460,6 +476,10 @@ enum SearchAdapter {
             if let mime = mimeType(forPath: hit.path) { row["mime_type"] = mime }
             if let ck = contentKeys[hit.path], ck.modified == hit.modified { row["content_key"] = ck.key }
             if weaker[i] { row["weaker"] = true }
+            if !scored { row.removeValue(forKey: "score") }
+            // A screenshot Omni took: when, what was in front, and the stretch of work around it
+            // with the range that lists the files changed in it.
+            if let moment = screen[hit.path] { row["screenshot"] = ScreenHints.row(moment) }
             // What this row stands for. Present only on a stack, so a flat result set is byte-for-byte
             // what it was before grouping existed. "exact" = byte-identical (same content key AND
             // size); "near" = same kind and extension, sizes within 10%, cosine >= 0.98.

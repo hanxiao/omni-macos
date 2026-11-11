@@ -105,11 +105,22 @@ enum LinkWire {
         var topK: Int
         /// Paths (on the answering Mac) never to return: the file a Find Similar started from.
         var exclude: [String]?
+        /// Neither a query nor a vector, and a time range in the filter: a listing (`SearchReply.listed`).
+        var isListing: Bool { (query ?? "").isEmpty && vector == nil && (filter.since != nil || filter.until != nil) }
     }
 
     struct SearchReply: Codable, Sendable {
         var hits: [Hit]
         var ms: Double
+        /// For the hits that are screenshots the answering Mac's Omni took, by path there: when, what
+        /// was in front, and the stretch of work around it (ScreenHints), read from that Mac's screen
+        /// history. Optional both ways: a Mac before screenshots sends none and ignores these.
+        var shots: [String: ScreenHints.Moment]?
+        /// The request had no query and no vector, and this is its listing: the files last modified
+        /// in the filter's time range, newest first. A Mac from before listings answers such a
+        /// request with no hits and without this, which is how the asking Mac tells "nothing changed
+        /// then" from "cannot say".
+        var listed: Bool?
     }
 
     /// The answering Mac's vector space: the probe its index was stamped with (AppModel's

@@ -147,6 +147,7 @@ extension AppModel {
     /// Browse and search a linked Mac, or one of its folders.
     func enterLinkedMac(_ peer: String, folder: String? = nil) {
         showsClipboardOff = false
+        showsScreenshotsOff = false
         selectFolderForVisualization(nil)
         browsedPhotoSource = nil
         clearLocalScopeQuietly()
@@ -228,7 +229,8 @@ extension AppModel {
 extension LinkServed {
     /// The same search on the named linked Macs ("all" for every one), each answering from its own
     /// index. Paths come back as paths on that Mac. A folder scope is a folder on THIS Mac, which
-    /// means nothing on another, so a scoped search does not go out.
+    /// means nothing on another, so a scoped search does not go out. No query and a time range is
+    /// a listing there too: the files that Mac changed in the range.
     func servedSearch(_ q: String, filter: SearchFilter, topK: Int, macs: [String], explicit: Bool) async -> [LinkedSearchAnswer] {
         let everyone = macs.contains { $0.caseInsensitiveCompare("all") == .orderedSame }
         let linked = self.peers
@@ -248,20 +250,24 @@ extension LinkServed {
         await withTaskGroup(of: LinkedSearchAnswer.self) { group in
             for p in peers {
                 let online = isOnline(p.id), shared = p.theyAllowSearch
-                let req = LinkWire.SearchRequest(query: q, vector: nil, filter: LinkWire.Filter(filter, folders: nil),
+                let req = LinkWire.SearchRequest(query: q.isEmpty ? nil : q, vector: nil, filter: LinkWire.Filter(filter, folders: nil),
                                                  topK: topK, exclude: nil)
                 group.addTask {
                     guard online else { return LinkedSearchAnswer(mac: p.name, hits: [], note: "offline") }
                     guard shared else { return LinkedSearchAnswer(mac: p.name, hits: [], note: "does not share its files with this Mac") }
                     do {
-                        let hits = try await self.search(req, peer: p.id, timeout: Self.servedRemoteTimeout)
-                            .filter { !filter.rejectsByExtension($0.path) }
+                        let reply = try await self.search(req, peer: p.id, timeout: Self.servedRemoteTimeout)
+                        // An Omni from before listings answers one with nothing, which is not "no file".
+                        guard !req.isListing || reply.listed else {
+                            return LinkedSearchAnswer(mac: p.name, hits: [], note: "its Omni is older and cannot list files by time")
+                        }
+                        let hits = reply.hits.filter { !filter.rejectsByExtension($0.path) }
                         return LinkedSearchAnswer(mac: p.name, hits: hits.map { h in
                             SearchHit.make(path: RemotePath.parse(h.path)?.path ?? h.path, score: h.score, snippet: h.snippet,
                                            kind: h.kind, chunkIndex: h.chunkIndex, modified: h.modified, width: h.width,
                                            height: h.height, duration: h.duration, size: h.size, locator: h.locator,
                                            chunkCount: h.chunkCount)
-                        }, note: nil, canOpen: p.theyAllowFetch)
+                        }, note: nil, canOpen: p.theyAllowFetch, shots: reply.shots)
                     } catch {
                         return LinkedSearchAnswer(mac: p.name, hits: [], note: LinkController.describe(error))
                     }

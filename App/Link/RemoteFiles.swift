@@ -35,8 +35,13 @@ final class RemoteFiles: @unchecked Sendable {
     }
 
     /// The cache: ~/Library/Caches/<bundle>/Linked/<peer>/<hash of path>/<name>. Bounded; the
-    /// oldest copies go first.
+    /// oldest copies go first. An isolated run keeps its own beside its index: it has the installed
+    /// app's bundle id, and a test's fetch landed in the user's cache, inside the bound that evicts
+    /// the user's copies.
     let root: URL = {
+        if AppModel.isolatedByLaunchArgument, let index = try? AppModel.indexURL() {
+            return index.deletingLastPathComponent().appendingPathComponent("linked-cache", isDirectory: true)
+        }
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
         return caches.appendingPathComponent(Bundle.main.bundleIdentifier ?? "io.hanxiao.omni", isDirectory: true)
             .appendingPathComponent("Linked", isDirectory: true)

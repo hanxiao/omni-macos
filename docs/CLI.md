@@ -10,8 +10,9 @@ The MCP tools in `App/Serving/MCPAdapter.swift` are the interface. Everything el
 - MCP clients call them over `POST /mcp`.
 - `omni` is a generic MCP client. It asks for `tools/list` and turns each tool into a subcommand
   whose flags are the tool's parameters (`top_k` is `--top-k`, a list repeats its flag, a boolean
-  is `--flag` / `--no-flag`, and the first required parameter takes the bare words). A tool or
-  parameter added to the app shows up here with no CLI change.
+  is `--flag` / `--no-flag`, and the first required parameter takes the bare words; a tool with
+  none names the one that does in its `_meta`, shown as `[<query>]`: `search` lists a time range
+  with no query). A tool or parameter added to the app shows up here with no CLI change.
 - SKILL.md is rendered from the server's `initialize` instructions plus `tools/list`
   (`Sources/OmniCLI/AgentSkill.swift`, compiled into both the app and the CLI). `omni skill` and
   Settings > Serving > SKILL.md print the same bytes.
@@ -85,6 +86,10 @@ x --json | jq -r '.results[].path'`) rather than cutting lines.
 
     omni search "invoice from february" --top-k 5 --modified-after 2026-02-01 --ext pdf
     omni search "tax return 2025" --macs none  # this Mac only (linked Macs are searched by default)
+    omni search --modified-after 2026-11-10T14:00:00-08:00 --modified-before 2026-11-10T15:00:00-08:00
+                          # no query: the files last modified in that hour, newest first
+    omni search --modified-after 2026-11-10T14:00:00-08:00 --modified-before 2026-11-10T15:00:00-08:00 --macs Studio
+                          # the same hour on a linked Mac, which is asked only when named
     omni get_linked_file /Users/me/tax-2025.pdf --mac Studio   # a linked Mac's file, copied here
     omni file_status /path/a.pdf /path/b.png
     omni tools            # the tool list

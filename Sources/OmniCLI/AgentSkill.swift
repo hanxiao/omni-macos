@@ -134,8 +134,10 @@ struct ToolSchema {
         let required = schema["required"] as? [String] ?? []
         let first = required.first { (props[$0] as? [String: Any])?["type"] as? String != "object" }
             ?? ((tool["_meta"] as? [String: Any])?[CLIProtocol.bareWordsKey] as? String).flatMap { props[$0] != nil ? $0 : nil }
-        // Required first in the schema's order, then the rest by name: JSON objects carry no order.
-        let names = required.filter { props[$0] != nil } + props.keys.filter { !required.contains($0) }.sorted()
+        // Required first in the schema's order, then the one the bare words go to, then the rest by
+        // name: JSON objects carry no order.
+        let lead = required.filter { props[$0] != nil } + (first.map { required.contains($0) ? [] : [$0] } ?? [])
+        let names = lead + props.keys.filter { !lead.contains($0) }.sorted()
         params = names.map { n in
             let p = props[n] as? [String: Any] ?? [:]
             let items = p["items"] as? [String: Any] ?? [:]
@@ -161,7 +163,10 @@ struct ToolSchema {
 
     func usage(_ tool: String) -> String {
         var u = tool
-        if let p = params.first(where: \.positional) { u += p.type == "array" ? " <\(p.name)>..." : " <\(p.name)>" }
+        if let p = params.first(where: \.positional) {
+            let word = p.type == "array" ? "<\(p.name)>..." : "<\(p.name)>"
+            u += p.required ? " \(word)" : " [\(word)]"       // `omni search` lists a time range with no query
+        }
         if params.contains(where: { !$0.positional }) { u += " [options]" }
         return u
     }

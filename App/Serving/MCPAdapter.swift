@@ -57,7 +57,7 @@ enum MCPAdapter {
 
     /// What `initialize` tells a client about the whole server. Also the body of SKILL.md
     /// (AgentSkill), so it is written for an agent reading it cold.
-    static let instructions = "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `read_file` reads an indexed file's text by page, line or offset, including formats you cannot open; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, the passage that matched and media metadata; a search ends with how many more there are (`offset` pages) and where the top matches are.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. Linked Macs (other Macs running Omni that this one is linked with) are searched too, and their results are listed under each Mac's name: get_linked_file copies one here to read. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
+    static let instructions = "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `read_file` reads an indexed file's text by page, line or offset, including formats you cannot open; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, the passage that matched and media metadata; a search ends with how many more there are (`offset` pages) and where the top matches are.\n\nIf the user has Omni record screenshots, what was on their screen is found like any picture. A screenshot result gives the time it was taken, and under the results the stretch of work around it: when it ran and which apps and windows were in front. To find what they were working on then, call `search` with that range as `modified_after` and `modified_before` and no query: it lists the files last modified in it, newest first. A linked Mac's screenshots are found the same way, and their line names the Mac to pass as `macs` for the files changed on it.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. Linked Macs (other Macs running Omni that this one is linked with) are searched too, and their results are listed under each Mac's name: get_linked_file copies one here to read. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
 
     /// Every tool, as `tools/list` returns them - and as the `omni` command line and SKILL.md
     /// present them. The source tools are only advertised once the app has wired the control:
@@ -92,13 +92,14 @@ enum MCPAdapter {
     static let examplesMetaKey = CLIProtocol.examplesKey
     /// The parameter `omni <tool>` gives the bare words to, for a tool with no required one:
     /// `omni add_source ~/Projects` was refused as "takes no bare arguments".
-    private static let bareWords = ["add_source": "path"]
+    private static let bareWords = ["add_source": "path", "search": "query"]
     nonisolated(unsafe) private static let examples: [String: [[String: Any]]] = [   // immutable
         "search": [
             ["query": "invoice from anthropic in february"],
             ["query": "photos of a red sports car", "kinds": ["image"], "top_k": 5],
             ["query": "meeting notes about the launch", "modified_after": "2026-09-01", "ext": "md"],
             ["query": "tax return 2025", "macs": []],
+            ["modified_after": "2026-11-10T13:00:00+01:00", "modified_before": "2026-11-10T14:00:00+01:00"],
         ],
         "search_inline": [["query": "termination clause", "paths": ["/Users/me/Documents/contract.pdf"]]],
         "read_file": [["path": "/Users/me/Documents/contract.pdf", "page": 7], ["path": "/Users/me/Projects/app/server.log", "line": 1200],
@@ -229,13 +230,13 @@ enum MCPAdapter {
         [
             "name": "search",
             "title": "Search local files by meaning",
-            "description": "Semantic search over the files Omni has indexed on this Mac (text, code, PDFs, images, audio, video - one embedding space). Describe the content in any language; keywords are not required. Returns paths with scores and the passage that matched; copies of a file count once.",
+            "description": "Semantic search over the files Omni has indexed on this Mac (text, code, PDFs, images, audio, video - one embedding space). Describe the content in any language; keywords are not required. Returns paths with scores and the passage that matched; copies of a file count once. With no query and a time range, lists the files last modified in it.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
                     "query": [
                         "type": "string",
-                        "description": "What to find, described by meaning, e.g. 'invoice from Anthropic in February' or 'photos of a red sports car'."
+                        "description": "What to find, described by meaning, e.g. 'invoice from Anthropic in February' or 'photos of a red sports car'. Leave it out and give modified_after or modified_before to list the files last modified in that range, newest first."
                     ],
                     "top_k": [
                         "type": "integer",
@@ -267,11 +268,11 @@ enum MCPAdapter {
                     ],
                     "modified_after": [
                         "type": "string",
-                        "description": "Only files modified at or after this ISO 8601 date or date-time ('2026-10-01')."
+                        "description": "Only files last modified at or after this ISO 8601 date or date-time ('2026-10-01', '2026-10-01T14:30:00+02:00')."
                     ],
                     "modified_before": [
                         "type": "string",
-                        "description": "Only files modified before this date or date-time."
+                        "description": "Only files last modified before this date or date-time."
                     ],
                     "ext": [
                         "type": "string",
@@ -319,14 +320,13 @@ enum MCPAdapter {
                     "macs": [
                         "type": "array",
                         "items": ["type": "string"],
-                        "description": "Linked Macs to search too, by name (default: all; [] for this Mac only). Their paths are on that Mac: get_linked_file copies one here."
+                        "description": "Linked Macs to search too, by name (default: all; [] for this Mac only). Their paths are on that Mac: get_linked_file copies one here. A listing with no query asks a linked Mac only when named here."
                     ],
                     "group_duplicates": [
                         "type": "boolean", "default": true,
                         "description": "Collapse copies of a file into one result (default true); false lists every copy."
                     ]
-                ] as [String: Any],
-                "required": ["query"]
+                ] as [String: Any]
             ] as [String: Any],
             "annotations": ["readOnlyHint": true, "destructiveHint": false,
                             "idempotentHint": true, "openWorldHint": false]
@@ -338,13 +338,7 @@ enum MCPAdapter {
         if AppModel.servedIndexObsolete.isOn {
             return result(id: id, ["content": [["type": "text", "text": AppModel.servedRebuildingMessage]], "isError": true])
         }
-        guard let query = args["query"] as? String, !query.isEmpty else {
-            // Tool-level (not protocol-level) failure: isError true with a readable message.
-            return result(id: id, [
-                "content": [["type": "text", "text": "search failed: 'query' is required"]],
-                "isError": true
-            ])
-        }
+        let query = (args["query"] as? String) ?? ""
         // Ranges are checked against the schema before any tool runs (invalidArgument).
         let topK = (args["top_k"] as? Int) ?? 10
         let maxSnippet = (args["max_snippet"] as? Int) ?? Self.defaultSnippet
@@ -352,6 +346,14 @@ enum MCPAdapter {
         let (parsed, err) = SearchArgs.filter(args)
         if let err { return toolError(id: id, "search failed: \(err)") }
         let filter = parsed
+        // NO QUERY, A TIME RANGE: the files last modified in it, newest first - the store's own
+        // listing, with nothing embedded and nothing ranked. It is the second half of finding work
+        // by what was on screen: a screenshot gives the time, this gives the files (ScreenHints).
+        let listing = query.isEmpty
+        if listing, filter.since == nil, filter.until == nil {
+            // Tool-level (not protocol-level) failure: isError true with a readable message.
+            return toolError(id: id, "search failed: 'query' is required, unless 'modified_after' or 'modified_before' gives a time range to list")
+        }
         let offset = (args["offset"] as? Int) ?? 0
         let byDate: Bool
         switch (args["sort"] as? String)?.lowercased() ?? "relevance" {
@@ -378,9 +380,15 @@ enum MCPAdapter {
         // same ranking. A page is a slice of it - a second call with offset=10 runs the same search
         // and returns the next ten, and no ranking is held between calls.
         let poolSize = min(max(k + offset, Self.summaryPool), 190)
-        let (hits, pool, groups, passages, tQueued, tRan) = await ServedWork.run {
-            () -> ([SearchHit], [ResultGroup], [ResultGroup], [Passage?], Date, Date) in
+        let (hits, pool, groups, passages, screen, tQueued, tRan) = await ServedWork.run {
+            () -> ([SearchHit], [ResultGroup], [ResultGroup], [Passage?], [String: ScreenHints.Moment], Date, Date) in
             let tQueued = Date()
+            if listing {
+                let hits = backend.list(filter: filter, topK: poolSize)
+                let pool = backend.groupedResults(hits, enabled: false, limit: poolSize)
+                let groups = offset < pool.count ? Array(pool[offset ..< min(pool.count, offset + k)]) : []
+                return (hits, pool, groups, groups.map { _ in nil }, ScreenHints.moments(groups.map(\.representative)), tQueued, Date())
+            }
             let (hits, vector) = backend.searchReturningVector(query, topK: group ? min(poolSize * 3, 300) : poolSize, filter: filter, surface: surface)
             var pool = backend.groupedResults(hits, enabled: group, limit: poolSize)
             if byDate { pool.sort { $0.representative.modified > $1.representative.modified } }
@@ -389,7 +397,9 @@ enum MCPAdapter {
             // when it fits `max_snippet`, else the window of it that matches the query. Media and
             // anything that cannot be recovered keep the stored snippet.
             let passages = SearchAdapter.textPassages(groups.map(\.representative), query: query, vector: vector, width: width, backend: backend)
-            return (hits, pool, groups, passages, tQueued, Date())
+            // A screenshot Omni took: when, and the stretch of work around it.
+            let screen = ScreenHints.moments(groups.map(\.representative))
+            return (hits, pool, groups, passages, screen, tQueued, Date())
         }
         let reps = groups.map(\.representative)
         let dupesByPath = Dictionary(uniqueKeysWithValues: groups.map { ($0.representative.path, $0) })
@@ -419,7 +429,7 @@ enum MCPAdapter {
         if let note { content.append(diagnostic(note)) }
         if hits.isEmpty {
             // Say WHICH kind of nothing this is, so the agent's next move is right.
-            var text = "No results for \"\(query)\"."
+            var text = listing ? "No indexed file was last modified in that range." : "No results for \"\(query)\"."
             if let snap {
                 if snap.sources.isEmpty {
                     text += " Omni has no sources yet, so nothing is searchable"
@@ -432,7 +442,7 @@ enum MCPAdapter {
             var cappedSkips = 0      // media hits skipped specifically because the cap was already reached
             // The app folds these under "Show N weaker matches"; an agent is told the same thing.
             // Judged over the whole pool, so a later page is folded by the same measure as the first.
-            let poolWeak = VectorStore.weakFold(pool.map(\.representative))
+            let poolWeak = listing ? [] : VectorStore.weakFold(pool.map(\.representative))
             let weaker = reps.indices.map { offset + $0 < poolWeak.count ? poolWeak[offset + $0] : false }
             for (i, h) in reps.enumerated() {
                 let score = Int((max(0, min(1, h.score)) * 100).rounded())
@@ -454,9 +464,12 @@ enum MCPAdapter {
                 // does next: chunk_count says whether search_inline has more of this file to give,
                 // and the date is what a "most recent" question turns on. A few characters each.
                 if h.chunkCount > 1 { meta += ", \(h.chunkCount) passages" }
-                meta += ", \(Self.shortDate(h.modified))"
+                // To the second where the time is the point: a listing is ordered by it, and a
+                // screenshot's is the moment it shows.
+                meta += ", " + (listing || screen[h.path] != nil ? ScreenHints.stamp(h.modified) : Self.shortDate(h.modified))
                 if weaker[i] { meta += ", weaker match" }
-                var text = "\(offset + i + 1). \(h.path)  (\(h.fileKind), \(score)%\(loc)\(meta))"
+                // A listing ranks nothing, so it has no score to show.
+                var text = "\(offset + i + 1). \(h.path)  (\(h.fileKind)\(listing ? "" : ", \(score)%")\(loc)\(meta))"
                 if maxSnippet > 0 {
                     let snippet = oneLine(passages[i]?.text ?? h.snippet)
                     if !snippet.isEmpty { text += "\n   \(String(snippet.prefix(maxSnippet)))" }
@@ -478,8 +491,12 @@ enum MCPAdapter {
                 content.append(diagnostic("(\(cappedSkips) more image result(s) not inlined; cap is \(maxInlineImages). Open them by path.)"))
             }
             let roots = snap?.sources.filter { $0.kind == "folder" }.map(\.key) ?? []
+            for line in ScreenHints.sessionLines(reps, screen, offset: offset, cli: cli) {
+                content.append(["type": "text", "text": line])
+            }
             if reps.isEmpty {
-                content.append(diagnostic("No results past \(pool.count) for \"\(query)\": offset \(offset) is beyond the end."))
+                content.append(diagnostic(listing ? "No files past \(pool.count) in that range: offset \(offset) is beyond the end."
+                                                  : "No results past \(pool.count) for \"\(query)\": offset \(offset) is beyond the end."))
             } else if let line = poolSummary(pool, offset: offset, shown: reps.count, pageSize: topK, roots: roots) {
                 content.append(["type": "text", "text": line])
             }
@@ -490,14 +507,17 @@ enum MCPAdapter {
         // Every linked Mac unless the caller names some, or none with [].
         var named = args["macs"] as? [String]
         if named?.count == 1, named?.first?.caseInsensitiveCompare("none") == .orderedSame { named = [] }
-        if named?.isEmpty != true, let search = sources?.linkedSearch {
-            let floor = filter.minScore ?? EngineServingBackend.minScore
+        // A listing is this Mac's unless the caller names a linked Mac: the files changed in a
+        // stretch of work are asked of the Mac the work was on (a linked screenshot's line names it).
+        if !listing || named?.isEmpty == false, named?.isEmpty != true, let search = sources?.linkedSearch {
+            let floor = listing ? 0 : filter.minScore ?? EngineServingBackend.minScore
             for a in await search(query, filter, topK, named ?? ["all"], named != nil) {
                 let hits = Array(a.hits.filter { floor <= 0 || Double($0.score) / $0.lift >= VectorStore.relevanceFloor($0, base: floor) }.prefix(topK))
                 if let note = a.note {
                     content.append(diagnostic("On \(a.mac): \(note.hasSuffix(".") ? note : note + ".")"))
                 } else if hits.isEmpty {
-                    content.append(diagnostic("On \(a.mac): no results for \"\(query)\"."))
+                    content.append(diagnostic(listing ? "On \(a.mac): no indexed file was last modified in that range."
+                                                      : "On \(a.mac): no results for \"\(query)\"."))
                 } else {
                     // THE WAY TO THE FILE GOES WITH THE PATHS. An agent given paths on another Mac and
                     // nothing else concluded it could only read the snippets: the tool's name was in
@@ -509,24 +529,34 @@ enum MCPAdapter {
                     for (i, h) in hits.enumerated() {
                         let score = Int((max(0, min(1, h.score)) * 100).rounded())
                         let loc = h.locator.isEmpty ? "" : ", \(h.locator)"
-                        var text = "\(i + 1). \(h.path)  (\(h.fileKind), \(score)%\(loc), \(Self.shortDate(h.modified)))"
+                        // To the second where the time is the point, as for this Mac's results.
+                        let when = listing || a.shots[h.path] != nil ? ScreenHints.stamp(h.modified) : Self.shortDate(h.modified)
+                        var text = "\(i + 1). \(h.path)  (\(h.fileKind)\(listing ? "" : ", \(score)%")\(loc), \(when))"
                         if maxSnippet > 0 {
                             let snippet = h.snippet.replacingOccurrences(of: "\n", with: " ")
                             if !snippet.isEmpty { text += "\n   \(String(snippet.prefix(maxSnippet)))" }
                         }
                         content.append(["type": "text", "text": text])
                     }
+                    // That Mac's screenshots: the stretch of work each was taken in, on that Mac.
+                    for line in ScreenHints.sessionLines(hits, a.shots, offset: 0, cli: cli, mac: a.mac) {
+                        content.append(["type": "text", "text": line])
+                    }
                 }
                 linked.append(["mac": a.mac, "note": a.note ?? NSNull(), "canOpen": a.canOpen, "results": hits.map { h -> [String: Any] in
-                    ["path": h.path, "kind": h.fileKind, "score": Double(max(0, min(1, h.score))), "snippet": h.snippet,
-                     "locator": h.locator, "modified": h.modified, "size": h.size]
+                    var row: [String: Any] = ["path": h.path, "kind": h.fileKind, "snippet": h.snippet,
+                                              "locator": h.locator, "modified": h.modified, "size": h.size]
+                    if !listing { row["score"] = Double(max(0, min(1, h.score))) }
+                    if let moment = a.shots[h.path] { row["screenshot"] = ScreenHints.row(moment) }
+                    return row
                 }])
             }
         }
 
         return answer(id: id, content, cli: cli) {
-            var body: [String: Any] = ["query": query, "results": SearchAdapter.rows(groups, backend: backend, passages: passages), "grouped": group,
-                                       "offset": offset, "ranked": pool.count]
+            var body: [String: Any] = ["results": SearchAdapter.rows(groups, backend: backend, passages: passages, scored: !listing, screen: screen),
+                                       "grouped": group && !listing, "offset": offset, "ranked": pool.count]
+            if !listing { body["query"] = query }
             if !linked.isEmpty { body["linked"] = linked }
             return body
         }

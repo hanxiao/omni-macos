@@ -147,6 +147,15 @@ enum OmniPasteboard {
         if concealed { pb.setString("", forType: concealedType) }
     }
 
+    /// A picture Omni made (a shot from the screen history), as PNG.
+    static func copyImage(png: Data) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.declareTypes([.png, ownType], owner: nil)
+        pb.setData(png, forType: .png)
+        pb.setString("", forType: ownType)
+    }
+
     /// Files, as Finder copies them - one pasteboard item per file - with `text` on the first item
     /// for a paste into a text field. The clipboard history records NONE of this, twice over: it
     /// skips anything carrying a file URL, and the first item carries `ownType` as well. Without
