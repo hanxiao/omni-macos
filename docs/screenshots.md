@@ -27,8 +27,10 @@ That is the chain an agent follows: query -> a screenshot -> its time -> the fil
   field holding the keyboard (secure input). Omni's own windows are left out of the shot (a search
   in Omni would otherwise be found by the picture of its own results). The pointer is not drawn.
   Windows an app marks as not shareable are left out by the system.
-- Retention 30 days by default; 7 / 30 / 90 days / forever in Settings. Clear is on the sidebar
-  row's context menu.
+- Retention 30 days by default; 7 / 30 / 90 days / forever in Settings, with the space used
+  (video and stills). Clear is on the sidebar row's context menu.
+- Apps left out (Settings > Files, "Apps left out of screenshots"): their windows are not in a
+  shot, and no shot is taken while one of them is in front.
 - Served to this Mac's agents (MCP, CLI, REST, Shortcuts) as the user's files are, and to Linked
   Macs as the rest of the index is (Han, 2026-11-10; the first build kept them back with the
   clipboard, which alone stays in `AppModel.unsharedFolders`).
@@ -46,14 +48,27 @@ That is the chain an agent follows: query -> a screenshot -> its time -> the fil
    crawled. A record cut short by a kill is the last thing in its file and a reader stops at it:
    nothing to repair. The frame table is read from the segments; there is no second file.
    `Application Support/Omni/Screenshots` is the crawl root: an indexed shot is also written there
-   as `2026-11-10/2026-11-10 13.16.27 Editor - source.swift.heic`, at most 1568 on its long side
-   (what the reader reads at), dated at the shot and marked `kMDItemIsScreenCapture`.
+   as `2026-11-10/2026-11-10 13.16.27 Editor - source.swift.heic`, a pixel a point of the display
+   (`ScreenHistory.stillSide`; 0.20.0 wrote at most 1568 wide, which a desktop wider than that
+   could not be read from: "The reader"), dated at the shot and marked `kMDItemIsScreenCapture`.
 4. `App/ScreenRecorder.swift`: one `SCScreenshotManager` still per look and display (not a stream:
    a stream delivers frames whether or not anything moved), on its own queue.
 5. `App/ScreenTimeline.swift`: the Screenshots place. One day on a track true to time, a point a
    shot (indexed ones larger), a playhead to drag, arrow keys, a day picker, the shot's time, app
    and window. A decoded shot goes straight into a layer, so a drag draws frames with no SwiftUI
-   render. Off and empty it is the standard empty state with Turn On; denied, a button to Settings.
+   render. Off and empty it is the standard empty state with Turn On. Without the grant (recording
+   on, macOS saying no) the place, the sidebar row's badge and the Settings row say so and open
+   Screen & System Audio Recording; the shots already held stay on the track, where the badge is
+   what says it.
+   The track zooms down to two minutes across: a pinch or a vertical scroll about the pointer,
+   Command-= / Command-- / Command-0 and the track's menu (Zoom In, Zoom Out, Show Whole Day)
+   about the playhead; a sideways scroll pans. A shot drags out as a PNG
+   of the whole frame, a real file written when the button goes down (a promised file is taken by
+   the Finder and Mail, not by a browser's upload area or a chat window). Delete (the shot's
+   menu; Command-Delete for the one shown) removes this screenshot, this session or this day after a
+   confirmation that names the count: the stills first, then the frames (`ScreenHistory.delete`:
+   the frames after a deleted one, up to the next key frame, are encoded again from a new key
+   frame, the segment written beside itself and renamed over).
 6. `App/Serving/ScreenHints.swift`: what a served screenshot result says (below).
 7. AppModel: the folder joins `crawlRoots` when it exists, outside `addedFolders`, exempt from the
    ignore rules as the clipboard's is.
@@ -118,7 +133,7 @@ Codec, per shot:
   on the track waits for, 74 ms against 134 and 343, for 1.5% more bytes than key 60.
 - 3840 x 2160: HEVC q0.7 key 30 is 42.2 KB a shot, encode 25.2 ms, decode 5.5 ms, cold jump
   161 ms, 41.8 dB; HEIC q0.8 235.4 KB; PNG 638.6 KB.
-- Signature 0.38 ms a frame, compare 0.33 ms a pair. The reader at 1568 wide: 144 ms a frame.
+- Signature 0.38 ms a frame, compare 0.33 ms a pair. The reader: "The reader" below.
 
 Gate (indexed of 150, share of the session's distinct words still found in what was indexed):
 
@@ -136,8 +151,16 @@ threshold. The curve is flat from 5% to 10% and falls after; 10% is the last poi
 
 In the app (isolated run fed the same session, Nano): 150 stored, 47 indexed; the segment
 3,047,740 bytes (5 key frames of mean 91,791, deltas of mean 17,801); the 47 files for the index
-3.9 MB, about 83 KB each, so the indexed pictures take more disk than the whole video. A scrub of
-349 steps: 347 decodes, p50 2.6 ms, p90 22.2 ms, max 54.0 ms.
+5.30 MB, about 113 KB each at a pixel a point (0.20.0: 3.9 MB, 83 KB at 1568 wide), so the indexed
+pictures take more disk than the whole video. A scrub of 349 steps: 347 decodes, p50 2.6 ms, p90
+22.2 ms, max 54.0 ms.
+
+Renders per step on the timeline (`-omni.hangwatch YES`, 0.20.1): opening the place draws
+ScreenTimeline 3 times, the bar once and each part of it twice; a selected shot draws the playhead,
+the count and the label once each and neither the picture's pane nor the track (4-6 ms of main
+thread); a zoom or a pan draws the playhead, the track and its points once (15-24 ms); a deleted
+shot ScreenTimeline twice and the five parts once (14 ms); a scrub of 71 shots draws playhead,
+count and label 71 times each in 138 ms of main thread in all.
 
 Served:
 
@@ -146,11 +169,93 @@ Served:
   a day's segments are read (max 9.7). Thirty screenshot results walked one by one were 22.6 ms;
   a stretch is walked once however many results fall in it (`sessions(around:)`): 2.5 ms for
   thirty over three days.
-- The range listing (`shotbench listrange <clone>/index.sqlite`, the 9.73M-row bench index):
-  162 ms p50 whatever the range is (13 min, an hour, a day, 30 days, top 30 or 190), against 183
-  ms for the same listing with no filter. It is a walk of every resident row on the store queue,
-  the hold the app's own tag browsing already takes. OPEN: a search that arrives during one waits
-  it out. A walk by file (2.7M) instead of by row needs a change in the store and was not made.
+- The range listing (`shotbench listrange <clone>/index.sqlite`, the 9.73M-row bench index).
+  0.20.0 walked every resident row on the store queue, 160-194 ms whatever the range was, and a
+  search that arrived during one waited it out. `VectorStore.listMatching` now walks by file (2.7M
+  against 9.73M rows): a range of 13 min to a day about 10 ms, 30 days 27-28 ms, no filter 76 ms, a
+  served filter with no range 95-97 ms; the same files in the same order as before (digests equal).
+
+## The reader (0.20.1)
+
+0.20.0 READ EVERY SCREENSHOT WHOLE AT 1568 ON ITS LONG SIDE, and wrote its stills at that size. A
+desktop wider than 1568 points was read at less than a pixel a point, and its text was not there
+to find: of an editor's words 97% on a 1512-point desktop, 80% at 2560, 29% at 3008, 1% at 3840.
+The same held for every screenshot file in the index, not only Omni's own. Found while measuring
+"displays above 4K"; a quality bug in the existing reader, fixed there (`ScreenText`).
+
+Now: a screenshot is read from its file at 1.5 pixels a point (points: long side over dpi / 72;
+enlarged with high-quality interpolation when the file has fewer pixels; 32 million pixels at
+most), in 1024 x 1024 pieces that share at least 196 pixels. One that fits one piece is read whole.
+A still is written at a pixel a point. Scans are read whole as before (a page at 1108 x 1568 with
+14-22 pt text: 99-100%).
+
+Chosen on 48 drawn pages at 1920 x 1080 (words read): whole at 1568 44.2%, none at all on 20; a
+1.0 still enlarged to 1.5 in 1024 pieces 96.6%; pieces of 784, 1176 or 1568 and densities of 1.25,
+1.75 or 2.0 all read less. On 38 real screenshots: 79.0% of confirmed words whole (20 files under
+90%, the worst 45.3%), 94.9% in pieces (2 files, the worst 88.9%).
+
+Through the app's own code, `omni-verify shotbench stillsize <source> <prose> <photo> [desktop]`
+(4 editor frames a desktop; lines = drawn lines of 12+ characters read exactly):
+
+| desktop | arm | read at | pieces | words | lines | ms | KB a still |
+|---|---|---|---|---|---|---|---|
+| 1512 x 982 @2x | 0.20.0, whole | 1568 | 1 | 97.3% | 75.7% | 172 | 137 |
+| | still, in pieces | 2268 | 6 | 98.4% | 79.9% | 723 | 129 |
+| 1920 x 1080 @1x | 0.20.0, whole | 1568 | 1 | 96.7% | 76.6% | 132 | 100 |
+| | still, in pieces | 2880 | 8 | 97.4% | 73.4% | 789 | 136 |
+| 1920 x 1080 @2x | 0.20.0, whole | 1568 | 1 | 97.4% | 83.5% | 134 | 105 |
+| | still, in pieces | 2880 | 8 | 98.0% | 78.5% | 777 | 140 |
+| 2560 x 1440 @1x | 0.20.0, whole | 1568 | 1 | 80.0% | 34.4% | 203 | 87 |
+| | still, in pieces | 3840 | 15 | 97.2% | 79.4% | 1249 | 182 |
+| 2560 x 1440 @2x | 0.20.0, whole | 1568 | 1 | 77.1% | 37.6% | 186 | 91 |
+| | still, in pieces | 3840 | 15 | 98.0% | 81.2% | 1242 | 189 |
+| 3008 x 1692 @2x | 0.20.0, whole | 1568 | 1 | 29.3% | 4.6% | 159 | 81 |
+| | still, in pieces | 4512 | 18 | 97.6% | 76.6% | 1333 | 220 |
+| 3840 x 2160 @1x | 0.20.0, whole | 1568 | 1 | 1.1% | 0.0% | 96 | 66 |
+| | still, in pieces | 5760 | 28 | 96.9% | 74.8% | 1867 | 270 |
+
+Reading the native frame instead of the still (the third arm) is within 0.7 points of words on
+every desktop, so the still at a pixel a point is enough and no second file is kept. The lines
+still missed at 1920 x 1080 are the reader's own misreads of punctuation ("{" as "1", "->" as ">"),
+in the whole read as well. The eval bed's nine screenshots (1280 x 800; English, Chinese,
+Japanese; 38 known lines): 37 whole, 37 in pieces, a different line each. Han's 38 real
+screenshots: 7,257 words whole, 7,614 in pieces (`shotbench reader <paths>`, counts only).
+
+PUTTING THE PIECES BACK (`ScreenText.recognize(pieces:)`). The first merge read 68-76% of lines at
+96-98% of words: it broke lines. Three things, each found from a missed line:
+
+- Vision boxes a Latin word, not its letters (`boundingBox(for:)` of one letter is the word's);
+  Chinese and Japanese characters have boxes of their own. A Latin word is taken whole from the
+  piece that has all of it; one longer than what the pieces share and cut by both edges (an
+  identifier, a URL) is laid together from both readings (`stitch`). CJK is split at the seam.
+- Vision gives one drawn line as several observations ("import", "SwiftUI"), never exactly level:
+  sorted by height they came out scrambled. Runs are grouped into rows and ordered left to right.
+- A box moves 1-3 pixels from one piece to the next: what is within 4 pixels of a seam is kept by
+  both pieces and matched by place, every shared word, not only the last and the first.
+
+WHAT IT COSTS. A still at a pixel a point is larger: the 150-shot session fed to the app writes 47
+stills of 5.30 MB, 113 KB each (73-171), against 3.9 MB and 83 KB at 1568 wide; the video is the
+same 3,047,740 bytes. Indexing those 47 end to end (`omni-verify imgindex <nano> <folder>
+[--whole-screens]`, three runs each, interleaved): 10.9-11.2 s read whole, 41.5-42.0 s in pieces, 0.23 s
+against 0.89 s a screenshot. All of it is Vision, which reads one picture at a time whoever asks:
+2, 4 or 8 pieces at once took 41.1, 41.2 and 41.0 s against 42.0 (arm retired). The gate indexes
+a shot about every 16 s of use, and the reader holds neither the store queue nor the engine gate.
+
+The upgrade: a screenshot's content key and picture chunk key carry `|t2`, its ledger key `|r2`,
+and the enrichment scope is s4, so every screenshot an index holds is read again once, by the
+existing enrichment pass (`enrichOne`: the picture's vector kept under today's key, the text
+beside it replaced, by nothing when there is none now). No schema change. `ScreenText.inPieces = false` is the 0.20.0 read, for tests.
+
+Through the app, on an index a 0.20.0-reader build made (32 stills at 1568 wide, isolated): opened
+with this build, the pass names 32 candidates and reads them in 22.2 s (0.69 s each); 49 text chunks
+become 60, the 32 pictures keep their vectors, `storeaudit` 0 failing checks; opened again, no
+candidates and nothing read. The same index killed (SIGKILL) 4 s, 7 s and 2 s into the pass, then
+left to finish: the same text, keys, ledger and search digests as the run that was not killed
+(`searchreal` 32c49651d5a8d6be), 0 failing checks.
+
+The labeled eval, Nano, a fresh index each (`omni-verify eval ... --rebuild`, `--whole-screens` for
+0.20.0's read): ALL MRR 0.896 both, screenshot 1.000 and shot-exact 1.000 both, every one of the
+155 queries at the same rank. The bed's screenshots are 1280 x 800, which 0.20.0 read well.
 
 ## The still that cost the video its reference
 
@@ -163,14 +268,18 @@ and 40-45 ms (84 the first); software 49,802 bytes and 33 ms.
 
 Why HEIC: the six real stills (1568 wide, q0.8) are 71-86 KB; the same pictures as JPEG q0.8 are
 152-164 KB (1.9x) and as PNG 307-319 KB (3.8x), re-encoded from the stills with `sips`. The stills
-are about half of what the feature stores. The cost: a HEIC is a path some agents cannot open; MCP
-`search` inlines image hits as JPEG thumbnails (800 px), the CLI gives the path alone.
+are about half of what the feature stores. The cost: a HEIC is a file most agents cannot open
+(of the model APIs only Gemini's takes one; Claude Code's reader refuses it). So the file stays a
+HEIC and the picture is converted when asked for: `read_file` on an indexed image answers with a
+JPEG whatever the file is, a screenshot up to the display's own size from the history
+(`ScreenHistory.frame(ofStill:maxDimension:)`), and `omni` saves each picture a command returns and
+prints its path (docs/CLI.md). MCP `search` inlines image hits as JPEG thumbnails (800 px).
 
 ## A real session (2026-11-10)
 
 An isolated development build with `-omni.screenshots.capture YES` on Han's Mac: one display,
-1920 x 1080, the installed app's grant (no prompt). Han was away, so only the idle look ran on real
-content; a shot driven by input, and a settled one, have not run on a real screen.
+1920 x 1080, the grant of the terminal it was started from (no prompt). First with nobody at the
+Mac (the idle look), then a working session.
 
 - Capture 46-111 ms. Record 8-11 ms for a delta, 87-280 ms when a segment starts or a still is
   written. A key frame 72-88 KB, an idle look's delta 0.6-3.4 KB at novelty 0.005-0.009 (stored,
@@ -180,6 +289,51 @@ content; a shot driven by input, and a settled one, have not run on a real scree
   holds about 585 MB more for about 60 s after any image.
 - Scrub on real shots: 63 decodes, p50 3.7 ms, p90 11.9, max 16.9.
 - A search in the window with no scope returns a real shot first among ordinary files.
+
+A WORKING SESSION, 464 s (2026-11-11). The app in use was a second Omni in front at 1500 x 950 (a
+renamed copy: "Isolated runs"), driven through its script: a new search every 16 s, selections,
+arrow keys, list and grid, folders. Pointer events that move nothing kept the session's idle time
+under 5 s. The recorder's log against the script's marks:
+
+- In use, 206 s: 41 looks 4-6 s apart, 36 stored (5 the frame before, not stored), 6 indexed
+  (novelty 0.113-0.195; the others 0.013-0.099). Video 562,973 bytes, 13.7 KB a look; 6 stills
+  544,045 bytes.
+- Input stops: the last shot 2 s in, the settled one at 7 s (indexed at 0.098), looks at 37 s and
+  72 s (0.001, stored, not indexed).
+- Input on a screen that does not change, 61 s: 12 looks, 6 stored at about 0.6 KB each, 6 not
+  stored, none indexed.
+- An excluded app in front, 35 s of use: no shot. Allowed again: a shot within 1 s (indexed, 0.107),
+  then 7 looks in 35 s, 6 stored, 3 indexed.
+- An excluded app behind another one: `screen-targets displays=1 left_out=1`, its window gone from
+  the shot (0.243, indexed), its turning dark not seen (0.006 three times), back when allowed
+  (0.274, indexed).
+- The whole session: 68 looks, 56 stored, 12 indexed, 3 of them settled. Video 867,207 bytes, 12
+  stills 1,068,806 (89.1 KB each). Capture p50 58.5 ms (max 81), record p50 10 ms (max 52, a still
+  written). Footprint 2.1-3.1 GB, median 2.6: an indexed shot is an image through the engine.
+
+A GRANT TAKEN AWAY WHILE OMNI RUNS was only logged: the capture failed, the targets were looked up
+again and the next tick tried again, every 5 s, with nothing in the window saying so. Now a capture
+or a content fetch that macOS answers with `SCStreamError.userDeclined` is no access
+(`screen-access allowed=false`): the pane when no shots are held, the Settings row, and on the
+sidebar row the badge a folder macOS denied has, which opens Screen & System Audio Recording. The
+recorder asks again every 5 minutes instead of every tick, and the first frame that arrives ends
+it. macOS's own answer takes a change to the user's privacy settings to provoke, which a test
+never makes: perf-script `shotdecline:<seconds>` enters the state at a tick, as the answer does.
+Through the app on the real screen: 173 shots held, declined, no access at the next tick, no look
+with the Mac in use until the retry 30 s later, the held shots on the track, the badge on the row;
+then the retry's frame, access at the next tick, a look every 5 s again, the badge gone. The row
+renders once when access goes and once when it comes back, and not at all between
+(`body.ScreenshotsRow`, per script step); no main-thread block over 250 ms.
+
+THE SYSTEM'S RECORDING INDICATOR AND ITS RECURRING PROMPT are macOS's own; Omni neither draws nor
+hides them, and a no to the prompt is the grant taken away, above.
+
+SEVERAL DISPLAYS, fed (this Mac has one): three in one session across midnight, one of them
+3840 x 2160, 116 frames. A segment per display, every frame stored, 39 indexed. The earlier day
+lists three displays (47, 27 and 6 shots), the later one two (33 and 3); the day's menu switches
+between them. A query for words shown only on the 3840 display returns its three shots first
+(stills 3840 x 2160, 194-216 KB) and the session line runs 23:56:05 to 00:02:40 across the day. No
+main-thread block over 250 ms.
 
 EVERY START INDEXED THE SAME SCREEN AGAIN. A recorder that starts (a launch, Turn On) had an empty
 gate, and an empty gate admits anything: four of the first five real stills were one screen. A
@@ -223,46 +377,56 @@ against 2, every shot of every day, to save a key frame when another encoder sta
 AN ISOLATED RUN'S LINKED FILES WENT TO THE USER'S CACHE (same bundle id). They go beside its index
 now (`RemoteFiles.root`).
 
-Thirty days, estimated and not measured: 400-720 shots an hour of use at 16-48 KB a shot (video
-plus stills; the low end typing and reading with a tenth indexed, the high end the drawn session
-unbroken) is 6-35 MB an hour, 1.5-8.4 GB for 240 hours at 1920 x 1080. The cadence of real work is
-the assumption.
+Thirty days, from the working session: unbroken use is 716 looks and 105 indexed shots an hour,
+9.84 MB of video and 9.5 MB of stills, 19.3 MB an hour: 4.6 GB for 240 hours at 1920 x 1080. The
+session's own mix, pauses included, is 15.0 MB an hour: 3.6 GB. Settings shows the space really
+used.
 
 ## Isolated runs
 
 An isolated run (`-omni.dbDir`) reads `-omni.screenshots.enabled` from its arguments only and
 captures the real screen only with `-omni.screenshots.capture YES`; without it it never asks macOS
-for the grant. A development build run isolated has the installed app's bundle id and so its grant:
-with the flag it records the real desktop at once, no prompt. What it records is the user's screen:
-it goes to scratch and is deleted with the run. Otherwise its shots are fed: perf-script `shotfeed:<dir>[|hoursAgo]` puts PNG frames
-(`<n>[!] <App> - <Title>.png`, "!" for a settled shot, 5 s apart) through the path a capture
+for the grant. Started from a terminal that may record the screen, it has the terminal's grant
+(macOS holds the terminal responsible for what it starts) and records the real desktop at once, no
+prompt; started through LaunchServices (`open -n`), it has its own, which a build nobody granted
+does not have (`screen-access allowed=false`, the no-access pane). What it records is the user's
+screen: it goes to scratch and is deleted with the run. A second Omni on that screen is in the
+shots only under another bundle id: ScreenCaptureKit leaves an app out by bundle id, whatever pid
+the filter was built from (a 1500 x 950 window turning dark read novelty 0.001; from the renamed
+copy of `Scripts/chaos-app.sh`, 0.149 and 0.126, indexed). Otherwise its shots are fed: perf-script `shotfeed:<dir>[|hoursAgo]` puts PNG frames
+(`<n>[@<display>][!] <App> - <Title>.png`, "!" for a settled shot, 5 s apart) through the path a capture
 takes. Other steps: `screenshots:on|off|clear`, `shotselect:<n>`, `shotscrub:<n>`,
-`shotday:<-1|1>`, `sidebarselect:-3`.
+`shotday:<-1|1>`, `shotdisplay:<n>`, `shotzoom:<factor|reset>`, `shotpan:<fraction>`,
+`shotdragfile`, `shotdelete:<shot|session|day>` and `shotexclude:<bundle ids>` (both without their
+confirmation), `shotdecline:<seconds>` (macOS declining a capture, asked again after that long),
+`sidebarselect:-3`; `dumpui:<path>` carries the feature's state (on, access, the
+excluded apps, bytes on disk).
 
 ## Verification
 
-- Unit (`ScreenHistoryTests`, 18): signature and gate, codec round trip, the record format and a
+- Unit (`ScreenHistoryTests`, 23): signature and gate, codec round trip, the record format and a
   cut record, segments by hour and launch, stills and their dates, sessions (a gap, a long one,
-  several moments at once), retention, clear, a recorder that starts again. `OmniCLITests`: an
-  optional bare word. The suite: 1067 tests, 6 skipped, 0 failures.
+  several moments at once), retention, clear, a recorder that starts again, a deleted span, the
+  whole frame of a still. `ScreenTextTests` (5): the size read, the pieces, a line and a long word
+  across pieces read once. `EnrichmentTests` (8). `OmniCLITests`: an optional bare word. The suite:
+  1080 tests, 6 skipped, 0 failures.
 - Linked, two isolated instances paired on one Mac: a query on the asking one returns the other's
   shots in the window, over MCP, the CLI and `--json`, each with its moment; the session line
-  names the Mac; the range with no query on the named Mac; `get_linked_file` of a shot. Find
-  Similar across the link was not run.
-- The real screen (above): capture, the gate after a start, the shot dropped at Turn Off.
+  names the Mac; the range with no query on the named Mac; `get_linked_file` of a shot, and
+  `read_file` of that copy as a JPEG (1568 x 882 of a 1920 x 1080 still). In the window: 44 linked
+  shots for a query, one fetched in 2.7 ms (91 KB), its thumbnail drawn by the answering Mac
+  (456 x 256), and Find Similar on a linked shot: 24 of that Mac's shots, the nearest ones the same
+  window seconds apart, the shot itself not among them.
+- The real screen (above): capture, the gate after a start, the shot dropped at Turn Off, a
+  working session (cadence, the settled shot, an unchanged screen, an excluded app in front and
+  behind, bytes), a declined capture and the retry.
+- Fed, three displays across midnight, one at 3840 x 2160 (above).
+- The timeline's zoom and pan, a shot dragged out as a file, Delete by shot, session and day, the
+  apps left out and the space used in Settings: each through the app by its script step, the
+  window shown to Han.
 - Isolated, through the app: consent screen, Turn On, feed, timeline in light and dark, scrub, a
   search scoped to Screenshots, Settings, Clear (files, rows and the sidebar count gone).
 - Served, on the isolated port and socket: a query that finds a shot (time, session line), the
   range with no query (the two files dated inside it; a file dated after it and the shots left
   out), the folder named (shots listed), neither (the error), an empty range, REST both forms,
   `omni search` both forms, `--json`, `--help`; the listing absent from the sidebar history.
-
-## Not measured, not built
-
-- A working session. The real run above had nobody at the Mac: the cadence under input, the gate
-  on real work and disk use per day are still to be read. A shot every 5 s for 8 h is 5,760 shots.
-- The system's recording indicator and its recurring prompt, more than one display, and displays
-  above 4K, where a still read at 1568 wide may lose small text.
-- A picture an agent can open from the CLI: the still is a HEIC, and nothing converts it on request.
-- Deleting a span of shots, a list of apps never to record, zooming the track, dragging a shot
-  out, a disk-use line in Settings (`ScreenHistory.diskUse` exists).

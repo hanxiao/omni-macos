@@ -31,6 +31,8 @@ enum ShotBench {
 
     final class Renderer {
         let width: Int, height: Int, scale: CGFloat
+        /// The desktop in points: what decides how large 13 pt text is in a picture of a given width.
+        let pw: CGFloat, ph: CGFloat
         let source: [Character]
         let prose: NSAttributedString
         let photo: CGImage?
@@ -39,8 +41,9 @@ enum ShotBench {
                                   .init(red: 0.65, green: 0.89, blue: 0.18, alpha: 1), .init(red: 0.90, green: 0.86, blue: 0.45, alpha: 1),
                                   .init(red: 0.68, green: 0.51, blue: 1.00, alpha: 1), .init(white: 0.92, alpha: 1), .init(white: 0.92, alpha: 1)]
 
-        init(scale: Int, source: String, prose: String, photo: CGImage?) {
-            self.scale = CGFloat(scale); width = 1920 * scale; height = 1080 * scale
+        init(scale: Int, points: (Int, Int) = (1920, 1080), source: String, prose: String, photo: CGImage?) {
+            self.scale = CGFloat(scale); width = points.0 * scale; height = points.1 * scale
+            pw = CGFloat(points.0); ph = CGFloat(points.1)
             self.source = Array(source); self.photo = photo
             mono = NSFont(name: "Menlo", size: 13)!; body = NSFont.systemFont(ofSize: 15); ui = NSFont.systemFont(ofSize: 13)
             let p = NSMutableParagraphStyle(); p.lineSpacing = 5; p.paragraphSpacing = 10
@@ -60,24 +63,32 @@ enum ShotBench {
             defer { NSGraphicsContext.restoreGraphicsState() }
             if s.app == 0 { editor(s, cg) } else { browser(s, cg) }
             // The menu bar, with a clock that moves once a minute.
-            cg.setFillColor(NSColor(white: s.app == 0 ? 0.16 : 0.93, alpha: 1).cgColor); cg.fill(CGRect(x: 0, y: 0, width: 1920, height: 24))
+            cg.setFillColor(NSColor(white: s.app == 0 ? 0.16 : 0.93, alpha: 1).cgColor); cg.fill(CGRect(x: 0, y: 0, width: pw, height: 24))
             let fg = s.app == 0 ? NSColor(white: 0.9, alpha: 1) : NSColor(white: 0.1, alpha: 1)
             (s.app == 0 ? "Editor   File   Edit   View   Navigate   Product   Window   Help" : "Browser   File   Edit   View   History   Bookmarks   Window   Help")
                 .draw(at: CGPoint(x: 48, y: 4), withAttributes: [.font: ui, .foregroundColor: fg])
-            String(format: "Tue 10 Nov  14:%02d", s.minute % 60).draw(at: CGPoint(x: 1780, y: 4), withAttributes: [.font: ui, .foregroundColor: fg])
+            String(format: "Tue 10 Nov  14:%02d", s.minute % 60).draw(at: CGPoint(x: pw - 140, y: 4), withAttributes: [.font: ui, .foregroundColor: fg])
             return pb
         }
 
+        /// The lines the editor shows in this state, as `editor` draws them.
+        func visibleLines(_ s: State) -> [Substring] {
+            let text = String(source[0 ..< min(s.typed, source.count)])
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+            let top = min(s.top, max(0, lines.count - 1))
+            return Array(lines[top ..< min(lines.count, top + Int((ph - 72) / 18))])
+        }
+
         private func editor(_ s: State, _ cg: CGContext) {
-            cg.setFillColor(NSColor(white: 0.12, alpha: 1).cgColor); cg.fill(CGRect(x: 0, y: 0, width: 1920, height: 1080))
-            cg.setFillColor(NSColor(white: 0.16, alpha: 1).cgColor); cg.fill(CGRect(x: 0, y: 24, width: 240, height: 1056))
+            cg.setFillColor(NSColor(white: 0.12, alpha: 1).cgColor); cg.fill(CGRect(x: 0, y: 0, width: pw, height: ph))
+            cg.setFillColor(NSColor(white: 0.16, alpha: 1).cgColor); cg.fill(CGRect(x: 0, y: 24, width: 240, height: ph - 24))
             for (i, name) in ["AppModel.swift", "Sidebar.swift", "ContentView.swift", "Indexer.swift", "VectorStore.swift", "ScreenCodec.swift",
                               "SettingsView.swift", "SearchToolbar.swift", "FolderBrowser.swift", "MCPAdapter.swift"].enumerated() {
                 name.draw(at: CGPoint(x: 28, y: 64 + CGFloat(i) * 24), withAttributes: [.font: ui, .foregroundColor: NSColor(white: i == 1 ? 1 : 0.7, alpha: 1)])
             }
             let text = String(source[0 ..< min(s.typed, source.count)])
             let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-            let rows = 56
+            let rows = Int((ph - 72) / 18)
             let top = min(s.top, max(0, lines.count - 1))
             for r in 0 ..< rows where top + r < lines.count {
                 let y = 40 + CGFloat(r) * 18
@@ -96,9 +107,9 @@ enum ShotBench {
         }
 
         private func browser(_ s: State, _ cg: CGContext) {
-            cg.setFillColor(NSColor.white.cgColor); cg.fill(CGRect(x: 0, y: 0, width: 1920, height: 1080))
+            cg.setFillColor(NSColor.white.cgColor); cg.fill(CGRect(x: 0, y: 0, width: pw, height: ph))
             cg.saveGState()
-            cg.clip(to: CGRect(x: 0, y: 76, width: 1920, height: 1004))
+            cg.clip(to: CGRect(x: 0, y: 76, width: pw, height: ph - 76))
             let y0 = 100 - CGFloat(s.scrollY)
             if let photo {
                 // Drawn upright: the context is flipped for text.
@@ -107,7 +118,7 @@ enum ShotBench {
             }
             prose.draw(with: CGRect(x: 420, y: y0 + 560, width: 924, height: 100_000), options: [.usesLineFragmentOrigin])
             cg.restoreGState()
-            cg.setFillColor(NSColor(white: 0.95, alpha: 1).cgColor); cg.fill(CGRect(x: 0, y: 24, width: 1920, height: 52))
+            cg.setFillColor(NSColor(white: 0.95, alpha: 1).cgColor); cg.fill(CGRect(x: 0, y: 24, width: pw, height: 52))
             "omni.jina.ai/docs/clipboard".draw(at: CGPoint(x: 640, y: 42), withAttributes: [.font: ui, .foregroundColor: NSColor(white: 0.25, alpha: 1)])
         }
     }
@@ -242,6 +253,100 @@ enum ShotBench {
         }
     }
 
+    /// What the index reads of a desktop, by the desktop's size in points and the display's pixels
+    /// a point: the reader the index uses (`ScreenText`) on the still 0.20.0 wrote (1568 on the long
+    /// side, read whole), on the still written now (a pixel a point, read in pieces) and on the
+    /// frame itself as a screenshot file holds it, counted against the words and lines the editor
+    /// frames were drawn with (four scroll positions; two page frames add to the time and bytes
+    /// only). With each still's bytes and the video encoder at the display's own size.
+    /// shotbench stillsize <source> <prose> <photo>
+    static func stillSize(_ args: [String]) {
+        guard args.count >= 3 else { print("usage: shotbench stillsize <source> <prose> <photo> [desktop whose missed lines to print]"); return }
+        let source = (try? String(contentsOfFile: args[0], encoding: .utf8)) ?? ""
+        let prose = (try? String(contentsOfFile: args[1], encoding: .utf8)) ?? ""
+        let photo = CGImageSourceCreateWithURL(URL(fileURLWithPath: args[2]) as CFURL, nil).flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) }
+        func tokens(_ text: String) -> Set<String> {
+            Set(text.split(whereSeparator: { $0 == " " || $0 == "\n" }).map(String.init).filter { $0.count >= 3 })
+        }
+        /// A drawn line is whole in what was read when its characters are there in a row.
+        func squeezed(_ text: some StringProtocol) -> String { String(text.filter { !$0.isWhitespace }) }
+        /// The picture as the file gives it back.
+        func decoded(_ data: Data) -> CGImage? {
+            CGImageSourceCreateWithData(data as CFData, nil).flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) }
+        }
+        _ = ScreenText.recognize(ScreenCodec.cgImage(Renderer(scale: 1, source: source, prose: prose, photo: photo).render(State()))!)   // the reader's first call loads it
+        let desktops: [(String, Int, Int, Int)] = [("1512x982 @2x", 1512, 982, 2), ("1920x1080 @1x", 1920, 1080, 1),
+                                                  ("1920x1080 @2x", 1920, 1080, 2), ("2560x1440 @1x", 2560, 1440, 1),
+                                                  ("2560x1440 @2x", 2560, 1440, 2), ("3008x1692 @2x", 3008, 1692, 2),
+                                                  ("3840x2160 @1x", 3840, 2160, 1)]
+        for (name, w, h, scale) in desktops where args.count < 4 || args[3] == name {
+            let renderer = Renderer(scale: scale, points: (w, h), source: source, prose: prose, photo: photo)
+            var states: [State] = []
+            for top in [0, 70, 140, 210] { var s = State(); s.typed = min(renderer.source.count, 40_000); s.top = top; states.append(s) }
+            let editors = states.count
+            for y in [0.0, 700.0] { var s = State(); s.app = 1; s.scrollY = y; states.append(s) }
+            let shots = states.map { renderer.render($0) }
+            let drawn = states.prefix(editors).map { tokens(renderer.visibleLines($0).joined(separator: "\n")) }
+            let drawnLines = states.prefix(editors).map { renderer.visibleLines($0).map(squeezed).filter { $0.count >= 12 } }
+            let all = drawn.map(\.count).reduce(0, +), allLines = drawnLines.map(\.count).reduce(0, +)
+            var line = "\(name)  \(renderer.width)x\(renderer.height) px  drawn: \(all) words on \(editors) editor frames"
+            if let encoder = ScreenFrameEncoder(width: renderer.width, height: renderer.height, quality: 0.7, keyInterval: 30) {
+                var sizes: [Int] = [], times: [Double] = []
+                for shot in shots + shots { let t = Date(); if let f = encoder.encode(shot) { sizes.append(f.data.count); times.append(ms(t)) } }
+                line += String(format: "  video: key %d KB, %.0f ms a shot (%d of %d encoded)", (sizes.first ?? 0) / 1024,
+                               times.dropFirst().reduce(0, +) / Double(max(times.count - 1, 1)), sizes.count, shots.count * 2)
+            } else { line += "  video: NO ENCODER" }
+            print(line)
+            let now = ScreenHistory.stillSide(width: renderer.width, height: renderer.height, scale: Double(scale))
+            /// (the picture read, in pieces or whole, its bytes as a file; 0 for the frame itself)
+            let arms: [(String, (CVPixelBuffer) -> (CGImage, Bool, Int)?)] = [
+                ("0.20.0 still, 1568, whole", { shot in
+                    guard let image = scaled(shot, maxDimension: 1568) else { return nil }
+                    let data = still(image, type: .heic, quality: ScreenHistory.stillQuality)
+                    return decoded(data).map { ($0, false, data.count) }
+                }),
+                ("still, \(now), in pieces", { shot in
+                    guard let image = scaled(shot, maxDimension: now) else { return nil }
+                    let data = still(image, type: .heic, quality: ScreenHistory.stillQuality)
+                    guard let back = decoded(data),
+                          let read = ScreenText.fitted(back, long: ScreenText.readSide(width: back.width, height: back.height, dpi: nil)) else { return nil }
+                    return (read, true, data.count)
+                }),
+                ("the frame, in pieces", { shot in
+                    guard let image = ScreenCodec.cgImage(shot),
+                          let read = ScreenText.fitted(image, long: ScreenText.readSide(width: image.width, height: image.height, dpi: 72 * Double(scale))) else { return nil }
+                    return (read, true, 0)
+                }),
+            ]
+            for (arm, make) in arms {
+                var words = 0, lines = 0, time = 0.0, bytes = 0, pieces = 0, side = 0
+                for (k, shot) in shots.enumerated() {
+                    guard let (image, inPieces, size) = make(shot) else { continue }
+                    let t = Date()
+                    let text = inPieces ? ScreenText.recognize(pieces: image) : ScreenText.recognize(image)
+                    time += ms(t)
+                    pieces = inPieces ? ScreenText.tiles(width: image.width, height: image.height).count : 1
+                    side = max(image.width, image.height)
+                    bytes += size
+                    if k < editors {
+                        let read = tokens(text), row = squeezed(text)
+                        words += drawn[k].filter { read.contains($0) }.count
+                        lines += drawnLines[k].filter { row.contains($0) }.count
+                        if args.count > 3, args[3] == name, k == 0 {
+                            for l in renderer.visibleLines(states[k]) where squeezed(l).count >= 12 && !row.contains(squeezed(l)) {
+                                print("        drawn  \(l)\n        read   \(nearest(String(l), in: text))")
+                            }
+                        }
+                    }
+                }
+                func pct(_ n: Int, _ of: Int) -> Double { Double(n) / Double(max(of, 1)) * 100 }
+                print(String(format: "    %@: read at %d, %d pieces  %5.1f%% words %5.1f%% lines  %4.0f ms", arm.padding(toLength: 28, withPad: " ", startingAt: 0),
+                             side, pieces, pct(words, all), pct(lines, allLines), time / Double(shots.count))
+                      + (bytes > 0 ? "  \(bytes / shots.count / 1024) KB a still" : ""))
+            }
+        }
+    }
+
     /// What the hint on a served screenshot costs: the session around a shot, in a history of whole
     /// working days (a shot every 5 s, 8 h unbroken: the longest walk `session(around:)` makes).
     /// Cold is a history just opened, its segment tables not read yet; warm is every one after.
@@ -327,10 +432,16 @@ enum ShotBench {
         guard let newest = store.listMatching(filter: SearchFilter(), topK: 1).first?.modified else { print("empty index"); return }
         func time(_ name: String, _ f: SearchFilter, topK: Int) {
             var v: [Double] = [], n = 0
-            for _ in 0 ..< reps { let t = Date(); n = store.listMatching(filter: f, topK: topK).count; v.append(ms(t)) }
+            var digest: UInt64 = 0xcbf2_9ce4_8422_2325
+            for k in 0 ..< reps {
+                let t = Date(); let hits = store.listMatching(filter: f, topK: topK); v.append(ms(t))
+                n = hits.count
+                // What was listed and in what order (FNV-1a), to hold the two walks against each other.
+                if k == 0 { for h in hits { for b in "\(h.path)|\(h.kind)|\(h.chunkIndex)\n".utf8 { digest = (digest ^ UInt64(b)) &* 0x100_0000_01b3 } } }
+            }
             let first = v[0]; v.sort()
-            print(String(format: "%@  hits %3d  first %.1f ms  p50 %.1f ms  max %.1f ms", name.padding(toLength: 34, withPad: " ", startingAt: 0),
-                         n, first, v[v.count / 2], v.last!))
+            print(String(format: "%@  hits %3d  first %.1f ms  p50 %.1f ms  max %.1f ms  digest %016llx", name.padding(toLength: 34, withPad: " ", startingAt: 0),
+                         n, first, v[v.count / 2], v.last!, digest))
         }
         time("no filter, top 30 (control)", SearchFilter(), topK: 30)
         time("served filter, no range, top 30", served, topK: 30)
@@ -492,10 +603,86 @@ enum ShotBench {
         }
     }
 
+    /// What was read in a drawn line's place: the read line with the most of its characters, in order.
+    static func nearest(_ line: String, in text: String) -> String {
+        func squeezed(_ t: some StringProtocol) -> [Character] { t.filter { !$0.isWhitespace } }
+        func common(_ a: [Character], _ b: [Character]) -> Int {
+            var row = [Int](repeating: 0, count: b.count + 1)
+            for x in a { var diagonal = 0; for (j, y) in b.enumerated() { let up = row[j + 1]; row[j + 1] = x == y ? diagonal + 1 : max(up, row[j]); diagonal = up } }
+            return row[b.count]
+        }
+        let want = squeezed(line)
+        return text.split(separator: "\n").max { common(want, squeezed($0)) < common(want, squeezed($1)) }.map(String.init) ?? ""
+    }
+
+    /// THE READER ON REAL FILES: each screenshot read whole at the index's picture size (0.20.0)
+    /// and in pieces (ScreenText.recognize(screenshot:)), through the app's own code. Prints
+    /// counts only, never what was read: the files may be anyone's screen. With the eval bed's
+    /// list (`Tools/eval/bed.json`), the share of each file's known lines read, and the lines missed.
+    /// shotbench reader <file of paths> [bed.json]
+    static func reader(_ args: [String]) {
+        guard let list = args.first, let text = try? String(contentsOfFile: list, encoding: .utf8) else {
+            print("usage: shotbench reader <file of paths> [bed.json]"); return
+        }
+        let paths = text.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+        var truth: [String: [String]] = [:]
+        if args.count > 1, let data = FileManager.default.contents(atPath: args[1]),
+           let bed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let shots = bed["screenshots"] as? [[String: Any]] {
+            for s in shots { if let p = s["path"] as? String, let l = s["lines"] as? [String] { truth[(p as NSString).lastPathComponent] = l } }
+        }
+        func squeezed(_ t: some StringProtocol) -> String { String(t.filter { !$0.isWhitespace }) }
+        func words(_ t: String) -> [String] { t.split(whereSeparator: \.isWhitespace).map(String.init) }
+        struct Arm { var ms = 0.0, pieces = 0, words = 0, distinct = 0, shared = 0, lines = 0, read = 0, files = 0, missed: [String] = [] }
+        var arms = [Arm(), Arm()]
+        for path in paths {
+            let url = URL(fileURLWithPath: path)
+            var out = ["", ""]
+            for k in [0, 1, 0, 1] {   // each twice, interleaved; the second is timed (the first pays Vision's load)
+                let t0 = CFAbsoluteTimeGetCurrent()
+                var n = 1
+                let r: String? = autoreleasepool {
+                    if k == 0 { return FileExtractor.loadImage(url, maxDimension: 1568).map { ScreenText.recognize($0) } }
+                    guard let image = ScreenText.picture(url) else { return nil }
+                    n = ScreenText.tiles(width: image.width, height: image.height).count
+                    return ScreenText.recognize(pieces: image)
+                }
+                guard let r else { continue }
+                if out[k].isEmpty { out[k] = r; continue }
+                arms[k].ms += (CFAbsoluteTimeGetCurrent() - t0) * 1000; arms[k].pieces += n; arms[k].files += 1
+            }
+            let sets = out.map { Set(words($0)) }
+            for k in 0 ..< 2 {
+                arms[k].words += words(out[k]).count
+                arms[k].distinct += sets[k].count
+                arms[k].shared += sets[1 - k].filter { sets[k].contains($0) }.count
+                guard let lines = truth[url.lastPathComponent] else { continue }
+                let got = squeezed(out[k])
+                for line in lines {
+                    arms[k].lines += 1
+                    if got.contains(squeezed(line)) { arms[k].read += 1; continue }
+                    arms[k].missed.append("\(url.lastPathComponent): \(line)\n            read    \(nearest(line, in: out[k]))")
+                }
+            }
+        }
+        print("\(paths.count) files")
+        func cell(_ t: String, _ n: Int) -> String { t.padding(toLength: n, withPad: " ", startingAt: 0) }
+        print(cell("arm", 26) + cell("pieces/file", 13) + cell("ms/file", 9) + cell("words", 8) + cell("distinct", 10) + cell("in both", 9) + "known lines read")
+        for (k, name) in ["whole at 1568 (0.20.0)", "in pieces"].enumerated() {
+            let a = arms[k], n = Double(max(a.files, 1))
+            print(cell(name, 26) + cell(String(format: "%.1f", Double(a.pieces) / n), 13) + cell(String(format: "%.0f", a.ms / n), 9)
+                  + cell("\(a.words)", 8) + cell("\(a.distinct)", 10) + cell("\(a.shared)", 9)
+                  + (a.lines > 0 ? String(format: "%d of %d (%.1f%%)", a.read, a.lines, 100 * Double(a.read) / Double(a.lines)) : "-"))
+            for m in a.missed { print("    missed  \(m)") }
+        }
+    }
+
     static func run(_ args: [String]) {
         if args.first == "reference" { reference(Array(args.dropFirst())); return }
         if args.first == "neighbour" { neighbour(Array(args.dropFirst())); return }
         if args.first == "hints" { hints(Array(args.dropFirst())); return }
+        if args.first == "stillsize" { stillSize(Array(args.dropFirst())); return }
+        if args.first == "reader" { reader(Array(args.dropFirst())); return }
         if args.first == "listrange" { do { try listRange(Array(args.dropFirst())) } catch { print("listrange: \(error)") }; return }
         guard args.count >= 3 else { print("usage: shotbench <source> <prose> <photo> [--scale 1|2] [--frames N] [--dump dir]"); return }
         var scale = 1, frames = 150, dump: String?, feed: String?, only = "codec,gate"

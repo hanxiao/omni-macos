@@ -45,6 +45,11 @@ enum MCPAdapter {
     /// Hard cap on inlined thumbnails per response, so an all-images search can't flood the
     /// client's context with base64. Image hits past this are still returned as links/text.
     private static let maxInlineImages = 10
+    /// Longest edge of the picture `read_file` returns unless asked otherwise: the size a vision
+    /// model takes whole, and the size of a screenshot's indexed still. Up to `pictureEdgeLimit`
+    /// on request (a screenshot then comes from the history, as the display showed it).
+    private static let pictureMaxEdge = 1568
+    private static let pictureEdgeLimit = 4096
 
     /// yyyy-MM-dd in the local calendar. The only date format that is unambiguous to a reader who
     /// does not know the server's locale, and the only precision a relevance question ever needs.
@@ -57,7 +62,7 @@ enum MCPAdapter {
 
     /// What `initialize` tells a client about the whole server. Also the body of SKILL.md
     /// (AgentSkill), so it is written for an agent reading it cold.
-    static let instructions = "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `read_file` reads an indexed file's text by page, line or offset, including formats you cannot open; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, the passage that matched and media metadata; a search ends with how many more there are (`offset` pages) and where the top matches are.\n\nIf the user has Omni record screenshots, what was on their screen is found like any picture. A screenshot result gives the time it was taken, and under the results the stretch of work around it: when it ran and which apps and windows were in front. To find what they were working on then, call `search` with that range as `modified_after` and `modified_before` and no query: it lists the files last modified in it, newest first. A linked Mac's screenshots are found the same way, and their line names the Mac to pass as `macs` for the files changed on it.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. Linked Macs (other Macs running Omni that this one is linked with) are searched too, and their results are listed under each Mac's name: get_linked_file copies one here to read. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
+    static let instructions = "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `read_file` reads an indexed file's text by page, line or offset, including formats you cannot open, and returns an indexed image as a picture to look at; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, the passage that matched and media metadata; a search ends with how many more there are (`offset` pages) and where the top matches are.\n\nIf the user has Omni record screenshots, what was on their screen is found like any picture. A screenshot result gives the time it was taken, and under the results the stretch of work around it: when it ran and which apps and windows were in front. To find what they were working on then, call `search` with that range as `modified_after` and `modified_before` and no query: it lists the files last modified in it, newest first. A linked Mac's screenshots are found the same way, and their line names the Mac to pass as `macs` for the files changed on it.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. Linked Macs (other Macs running Omni that this one is linked with) are searched too, and their results are listed under each Mac's name: get_linked_file copies one here to read. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
 
     /// Every tool, as `tools/list` returns them - and as the `omni` command line and SKILL.md
     /// present them. The source tools are only advertised once the app has wired the control:
@@ -103,7 +108,7 @@ enum MCPAdapter {
         ],
         "search_inline": [["query": "termination clause", "paths": ["/Users/me/Documents/contract.pdf"]]],
         "read_file": [["path": "/Users/me/Documents/contract.pdf", "page": 7], ["path": "/Users/me/Projects/app/server.log", "line": 1200],
-                      ["path": "/Users/me/Documents/proposal.docx", "offset": 4000]],
+                      ["path": "/Users/me/Documents/proposal.docx", "offset": 4000], ["path": "/Users/me/Pictures/whiteboard.heic"]],
         "file_status": [["paths": ["/Users/me/Documents/report.pdf", "/Users/me/Desktop/notes.md"]]],
         "tag_image": [["paths": ["/Users/me/Pictures/IMG_0001.jpg"]]],
         "ocr": [["path": "/Users/me/Downloads/scan.pdf"], ["path": "/Users/me/Downloads/scan.pdf", "pages": "11-20"]],
@@ -480,7 +485,7 @@ enum MCPAdapter {
                     if inlined >= maxInlineImages {
                         cappedSkips += 1                         // genuinely skipped by the cap
                     } else if let b64 = thumbnailBase64(for: h) {
-                        content.append(["type": "image", "data": b64, "mimeType": "image/jpeg"])
+                        content.append(["type": "image", "data": b64, "mimeType": "image/jpeg", pictureMark: h.path])
                         inlined += 1
                     }
                     // else: a decode failure (missing/corrupt file) - the text block still carries the
@@ -698,15 +703,16 @@ enum MCPAdapter {
     private static func readFileToolDescriptor() -> [String: Any] {
         [
             "name": "read_file",
-            "title": "Read the text of an indexed file",
-            "description": "DOCUMENTS ONLY: the text Omni read from an indexed text, code, PDF, Word, Pages, RTF, Keynote, PowerPoint, Excel or Numbers file, a stretch at a time (pages, lines, or characters; a slide or a sheet is a page). For reading past a search result in formats you may not open yourself. Audio, video and images have no text to read; scans: use ocr.",
+            "title": "Read an indexed file",
+            "description": "The text Omni read from an indexed text, code, PDF, Word, Pages, RTF, Keynote, PowerPoint, Excel or Numbers file, a stretch at a time (pages, lines, or characters; a slide or a sheet is a page): for reading past a search result in formats you may not open yourself. An indexed IMAGE comes back as a picture to look at, a JPEG whatever the file is (HEIC, a screenshot Omni took, a photo in Apple Photos); a screenshot also says when it was taken and what was in front. Reads a copy get_linked_file made too. Audio and video have nothing to read; scans: use ocr.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
-                    "path": ["type": "string", "description": "Absolute path of a file Omni has indexed."],
+                    "path": ["type": "string", "description": "Absolute path of a file Omni has indexed, as search listed it."],
                     "page": ["type": "integer", "minimum": 1, "description": "PDF, deck or workbook: first page, slide or sheet (default 1)."],
                     "line": ["type": "integer", "minimum": 1, "description": "Text and code: first line (default 1). A workbook: first row of the sheet `page` names (a hit's \"Stock A508:D518\" is row 508)."],
                     "offset": ["type": "integer", "minimum": 0, "description": "First character, for documents (default 0)."],
+                    "max_edge": ["type": "integer", "minimum": 256, "maximum": pictureEdgeLimit, "description": "An image: the longest edge of the picture, in pixels (default \(pictureMaxEdge)). Ask for more to read small text; a screenshot goes up to the display's own size."],
                     "max_chars": ["type": "integer", "minimum": 100, "maximum": 20000, "description": "Default 4000."]
                 ] as [String: Any],
                 "required": ["path"]
@@ -721,11 +727,19 @@ enum MCPAdapter {
         guard let raw = args["path"] as? String, !raw.trimmingCharacters(in: .whitespaces).isEmpty else {
             return toolError(id: id, "read_file failed: 'path' is required")
         }
-        let path = normalizeStorePath((raw.trimmingCharacters(in: .whitespaces) as NSString).expandingTildeInPath)
+        let typed = raw.trimmingCharacters(in: .whitespaces)
+        let photo = PhotoLibrary.Ref(typed) != nil
+        let path = photo ? typed : normalizeStorePath((typed as NSString).expandingTildeInPath)
         let clip = AppModel.clipboardDirectory.path
-        guard path.hasPrefix("/"), path != clip, !path.hasPrefix(clip + "/"),
-              backend.fileStatus(paths: [path])[path] != nil else {
+        // A copy get_linked_file made is read like the file it is a copy of: the Mac it came from
+        // served it from its own index.
+        let linkedCopy = path.hasPrefix(RemoteFiles.shared.root.path + "/")
+        guard photo || path.hasPrefix("/"), path != clip, !path.hasPrefix(clip + "/"),
+              linkedCopy && FileManager.default.fileExists(atPath: path) || backend.fileStatus(paths: [path])[path] != nil else {
             return toolError(id: id, "read_file failed: \(path) is not in Omni's index. read_file reads only indexed files; file_status says which are.")
+        }
+        if photo || FileExtractor.kind(forExtension: (path as NSString).pathExtension.lowercased()) == .image {
+            return readPicture(id: id, path: path, maxEdge: args["max_edge"] as? Int, cli: cli)
         }
         let maxChars = (args["max_chars"] as? Int) ?? 4000
         let outcome = TextSlice.read(path: path, page: args["page"] as? Int, line: args["line"] as? Int,
@@ -734,7 +748,7 @@ enum MCPAdapter {
         case .scanned(let n):
             return toolError(id: id, "read_file: \(path) is a scanned PDF (\(n) page\(n == 1 ? "" : "s")) with no text layer. Use ocr with this path and the pages you want, e.g. pages \"1-3\".")
         case .media(let kind):
-            return toolError(id: id, "read_file: \(path) is \(kind == "image" ? "an image" : kind == "audio" ? "audio" : "a video"); Omni searches it by meaning but keeps no text of it to read.\(kind == "image" ? " tag_image describes it." : "")")
+            return toolError(id: id, "read_file: \(path) is \(kind == "audio" ? "audio" : "a video"); Omni searches it by meaning but keeps no text of it to read.")
         case .unreadable(let why):
             return toolError(id: id, "read_file failed: \(why) (\(path)).")
         case .text(let s):
@@ -756,6 +770,53 @@ enum MCPAdapter {
                 return out
             }
         }
+    }
+
+    /// An indexed image as a picture an agent can look at: a JPEG, because that is what every
+    /// model that reads images reads (HEIC, which Omni's own screenshots are, only one of them
+    /// does, and Claude Code's file reader refuses it). The file is converted when asked for and
+    /// never stored twice. Runs on the served work queue.
+    private static func readPicture(id: Any, path: String, maxEdge: Int?, cli: Bool) -> HTTPResponse {
+        let edge = min(max(maxEdge ?? pictureMaxEdge, 256), pictureEdgeLimit)
+        var size = imageSize(path: path)
+        var image: CGImage?
+        // A screenshot's file is the desktop at a pixel a point; asked for more, the shot itself.
+        if ScreenHints.isShot(path), let s = size, edge > max(s.width, s.height),
+           let whole = AppModel.screenHistory.frame(ofStill: URL(fileURLWithPath: path), maxDimension: edge) {
+            image = whole.image
+            size = (whole.width, whole.height)
+        }
+        guard let image = image ?? Self.image(path: path, maxEdge: edge), let data = jpegBase64(image, quality: 0.8) else {
+            return toolError(id: id, "read_file failed: the image could not be opened (\(path)).")
+        }
+        var head = "\(path): image"
+        if let size { head += ", \(size.width) x \(size.height) pixels" }
+        if size == nil || image.width != size!.width || image.height != size!.height { head += ", shown at \(image.width) x \(image.height)" }
+        var shot: [String: Any]?
+        if let moment = ScreenHints.moment(ofStill: path) {
+            let front = [moment.app, moment.title].filter { !$0.isEmpty }.joined(separator: " - ")
+            head += "\nScreenshot taken \(ScreenHints.stamp(moment.taken))" + (front.isEmpty ? "" : ", in front: \(front)")
+            if let span = moment.span { head += "\nIt was " + ScreenHints.sessionText(span, cli: cli) }
+            shot = ScreenHints.row(moment)
+        }
+        var picture: [String: Any] = ["type": "image", "data": data, "mimeType": "image/jpeg"]
+        picture[pictureMark] = path
+        return answer(id: id, [cli ? diagnostic(head) : ["type": "text", "text": head], picture], cli: cli) {
+            var out: [String: Any] = ["path": path, "kind": "image", "shown_width": image.width, "shown_height": image.height]
+            if let size { out["width"] = size.width; out["height"] = size.height }
+            if let shot { out["screenshot"] = shot }
+            return out
+        }
+    }
+
+    /// An image file's pixel size as it is shown (its orientation applied). nil for a Photos asset
+    /// and for a file that does not open.
+    private static func imageSize(path: String) -> (width: Int, height: Int)? {
+        guard path.hasPrefix("/"), let src = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Int, let h = props[kCGImagePropertyPixelHeight] as? Int else { return nil }
+        let turned = ((props[kCGImagePropertyOrientation] as? Int) ?? 1) >= 5
+        return turned ? (h, w) : (w, h)
     }
 
     // MARK: - The file_status tool
@@ -1129,21 +1190,24 @@ enum MCPAdapter {
     }
 
     private static func imageThumbnail(path: String) -> String? {
+        image(path: path, maxEdge: inlineImageMaxEdge).flatMap { jpegBase64($0) }
+    }
+
+    /// An image file or a Photos asset, its longest edge no more than `maxEdge` (never enlarged).
+    private static func image(path: String, maxEdge: Int) -> CGImage? {
         // A Photos asset has no file to open; PhotoKit renders it at the same edge cap. Network
-        // access stays off - a search response must not trigger an iCloud download.
+        // access stays off - a served response must not trigger an iCloud download.
         if let ref = PhotoLibrary.Ref(path) {
-            guard let cg = PhotoLibrary.image(ref, maxDimension: inlineImageMaxEdge, allowNetwork: false) else { return nil }
-            return jpegBase64(cg)
+            return PhotoLibrary.image(ref, maxDimension: maxEdge, allowNetwork: false)
         }
         let url = URL(fileURLWithPath: path)
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }
         let opts: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,   // honor EXIF orientation
-            kCGImageSourceThumbnailMaxPixelSize: inlineImageMaxEdge
+            kCGImageSourceThumbnailMaxPixelSize: maxEdge
         ]
-        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
-        return jpegBase64(cg)
+        return CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary)
     }
 
     /// Render the matching PDF page with Core Graphics (CGPDFDocument + a CGBitmapContext) rather than
@@ -1590,6 +1654,9 @@ enum MCPAdapter {
     static let cliMetaKey = CLIProtocol.cliKey
     static let stderrMetaKey = CLIProtocol.stderrKey
     private static let diagnosticMark = "omni.diagnostic"
+    /// On an image block: the file it is a picture of. The command line saves the picture and
+    /// says which file each one is; any other client gets the block without it.
+    private static let pictureMark = "omni.picture"
 
     /// A text block that is ABOUT the answer - nothing found, an empty index, a cap, a page range -
     /// rather than part of it. An MCP client reads it like any other block; the command line sends
@@ -1606,6 +1673,7 @@ enum MCPAdapter {
         let blocks = content.map { block -> [String: Any] in
             var b = block
             if b.removeValue(forKey: diagnosticMark) != nil, cli { b["_meta"] = [stderrMetaKey: true] }
+            if let of = b.removeValue(forKey: pictureMark), cli { b["_meta"] = [CLIProtocol.pictureKey: of] }
             return b
         }
         var value: [String: Any] = ["content": blocks, "isError": false]

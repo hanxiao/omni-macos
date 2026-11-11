@@ -59,6 +59,9 @@ final class SearchUnderIndexBG: @unchecked Sendable {
 }
 
 let args = CommandLine.arguments
+// --whole-screens, on any command: a screenshot's text read whole at 1568, as 0.20.0 read it (the
+// negative control of ScreenText, for an arm against today's read in pieces).
+if args.contains("--whole-screens") { ScreenText.inPieces = false }
 
 // omni-verify extract <file>... : what the indexer's extractor reads from each file - kind, length,
 // the opening characters. No model. For checking an extractor against real documents, which a

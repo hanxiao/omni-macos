@@ -974,17 +974,27 @@ private struct ScreenshotsRow: View {
     }
 
     var body: some View {
+        let _ = UIProbe.count("body.ScreenshotsRow")
         HStack(spacing: 7) {
             Image(systemName: "camera.viewfinder").sidebarTint(selected, else: .secondary).frame(width: 16)
             Text("Screenshots").sidebarTint(selected, else: .primary)
             Spacer()
+            let denied = model.screenshotsEnabled && model.screenshotsAccess == false
             if model.screenshotsEnabled, RootIndexState.isActive(model, key: key), !RootIndexState.isFinished(model, key: key),
                let fraction = RootIndexState.activeFraction(model, key: key) {
                 CloudSyncPie(fraction: fraction)
             } else if model.hasIndexedFiles, let c = model.folderFileCounts[key], c > 0 {
                 Text(c.formatted())
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(model.screenshotsEnabled ? .secondary : .tertiary)
+                    .foregroundStyle(model.screenshotsEnabled && !denied ? .secondary : .tertiary)
+            }
+            // Recording is on and macOS says no: the badge a folder macOS denied has, to the pane
+            // that allows it. The shots already held stay on the timeline, so the place cannot say it.
+            if denied {
+                Button { AppModel.openScreenRecordingSettings() } label: {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
+                }
+                .buttonStyle(.plain)
             }
         }
         .help(help)

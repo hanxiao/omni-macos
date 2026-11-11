@@ -4548,8 +4548,17 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     /// Filter-only listing (no semantic query): every file passing `filter`, newest first.
-    /// Powers standalone tag browsing ("tag:beard" with an empty search box). Resident walk +
-    /// the winners' snippet fill - no GPU, no embedding.
+    /// Powers standalone tag browsing ("tag:beard" with an empty search box) and the served time
+    /// range with no query. Resident walk + the winners' snippet fill - no GPU, no embedding.
+    ///
+    /// ONE DECISION A FILE, THEN THAT FILE'S OWN ROWS. The date and the path clauses are facts of
+    /// a file, so they are judged once per file id (`fileMeta`, the accepted table) and only a file
+    /// that passes has its rows read, through its row window, for the first live row of a kind the
+    /// filter takes. The walk used to be every resident row: 162 ms on the store queue at 9.73M
+    /// rows for a 13-minute range that matches thirty files (docs/screenshots.md, "Served"). A
+    /// window is proven before it is trusted, as every other window reader does (the file's live
+    /// rows inside it are counted against `fileChunkCount`); one that fails sends the whole listing
+    /// back to the row walk, which is the answer as it was before.
     public func listMatching(filter: SearchFilter, topK: Int = 60) -> [SearchHit] {
         queue.sync {
             guard dbOpen(), !rows.isEmpty else { return [] }
@@ -4558,12 +4567,10 @@ public final class VectorStore: @unchecked Sendable {
             let hasDead = !dead.isEmpty
             // The path clauses once per FILE; kind and date per row, exactly as `accepts` ordered them.
             let pathFiltered = f.hasPathClause
-            let pathOK = pathFiltered ? acceptedFilesLocked(f, count: filePaths.count) : []
+            let pathOK = pathFiltered ? (cachedAcceptedFilesLocked(f) ?? acceptedFilesLocked(f, count: filePaths.count)) : []
             // Kind by CODE, one table lookup a row - not a String hashed into a Set per row.
             var kindOK = [Bool](repeating: f.kinds.isEmpty, count: 256)
             for k in f.kinds { if let c = kindID[k] { kindOK[Int(c)] = true } }
-            // The first live row of each file, by file id: an array, not a 2.7M-entry dictionary.
-            var seen = [Bool](repeating: false, count: fileChunkCount.count)
             // Sorted on mtime alone, files that share one - a checkout, an unpack, a synced folder,
             // any corpus whose timestamps were not preserved - ordered by Dictionary iteration,
             // which is seeded per process. The browse list therefore reshuffled between launches
@@ -4589,17 +4596,8 @@ public final class VectorStore: @unchecked Sendable {
                     heap.swapAt(i, m); i = m
                 }
             }
-            for i in rows.indices {
-                if hasDead, dead.contains(Int32(i)) { continue }   // see indexedFiles: filter, never compact
-                let r = rows[i]
-                guard kindOK[Int(r.kc)] else { continue }
-                if pathFiltered, !(Int(r.fid) < pathOK.count && pathOK[Int(r.fid)]) { continue }
-                if let since = f.since, metaOf(r).modified < since { continue }
-                if let until = f.until, metaOf(r).modified >= until { continue }
-                let fid = Int(fileID[i])
-                guard fid < seen.count, !seen[fid] else { continue }
-                seen[fid] = true
-                guard topK > 0 else { continue }
+            func offer(_ i: Int) {
+                guard topK > 0 else { return }
                 if heap.count < topK {
                     heap.append(i)
                     var c = heap.count - 1
@@ -4607,6 +4605,56 @@ public final class VectorStore: @unchecked Sendable {
                 } else if before(i, heap[0]) {
                     heap[0] = i
                     siftDown(0)
+                }
+            }
+            // Only where a clause narrows FILES, and only while the windows to read stay under half
+            // the rows: past that the row walk is the cheaper one (the rule of provenRowRangesLocked).
+            // "Everything, newest first" and a kind alone are still the row walk.
+            var byFile = rowWindowsUsableLocked && fileMeta.count >= fileChunkCount.count
+                && (pathFiltered || f.since != nil || f.until != nil)
+            if byFile {
+                var passing: [Int32] = []
+                var span = 0
+                for fid in 0 ..< fileChunkCount.count where fileChunkCount[fid] > 0 {
+                    if pathFiltered, !(fid < pathOK.count && pathOK[fid]) { continue }
+                    let modified = fileMeta[fid].modified
+                    if let since = f.since, modified < since { continue }
+                    if let until = f.until, modified >= until { continue }
+                    span += rawRowWindowLocked(Int32(fid)).count
+                    if span * 2 >= rows.count { rowWindowNoWin += 1; byFile = false; break }
+                    passing.append(Int32(fid))
+                }
+                if byFile {
+                    for fid in passing {
+                        var first = -1, found = 0
+                        for i in rawRowWindowLocked(fid) where fileID[i] == fid {
+                            if hasDead, dead.contains(Int32(i)) { continue }   // see indexedFiles: filter, never compact
+                            found += 1
+                            if first < 0, kindOK[Int(rows[i].kc)] { first = i }
+                        }
+                        // A window that does not hold every live row of its file: the row walk answers.
+                        guard found == Int(fileChunkCount[Int(fid)]) else { rowWindowUnproven += 1; byFile = false; break }
+                        if first >= 0 { offer(first) }
+                    }
+                    if !byFile { heap.removeAll(keepingCapacity: true) }
+                }
+            }
+            if !byFile {
+                // The first live row of each file, by file id: an array, not a 2.7M-entry dictionary.
+                // A row is looked up in the dead set last, once it is the first of its file to pass
+                // everything else: that lookup hashes, and asked of every row it was most of the walk.
+                var seen = [Bool](repeating: false, count: fileChunkCount.count)
+                for i in rows.indices {
+                    let r = rows[i]
+                    guard kindOK[Int(r.kc)] else { continue }
+                    let fid = Int(r.fid)
+                    guard fid < seen.count, !seen[fid] else { continue }
+                    if pathFiltered, !(fid < pathOK.count && pathOK[fid]) { continue }
+                    if let since = f.since, metaOf(r).modified < since { continue }
+                    if let until = f.until, metaOf(r).modified >= until { continue }
+                    if hasDead, dead.contains(Int32(i)) { continue }
+                    seen[fid] = true
+                    offer(i)
                 }
             }
             let winners = heap.sorted(by: before)

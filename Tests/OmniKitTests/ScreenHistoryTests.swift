@@ -164,7 +164,7 @@ final class ScreenHistoryTests: XCTestCase {
 
     func testAnIndexedShotIsAScreenCaptureFileDatedAtTheShot() throws {
         let big = frame(page: 1, width: 2560, height: 1440)
-        let r = try XCTUnwrap(history.record(big, time: t0, display: 1, app: "Xcode", title: "OmniKit/Sidebar.swift: edited\n", settled: false))
+        let r = try XCTUnwrap(history.record(big, time: t0, display: 1, app: "Xcode", title: "OmniKit/Sidebar.swift: edited\n", settled: false, scale: 2))
         let url = try XCTUnwrap(r.still)
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
@@ -177,9 +177,20 @@ final class ScreenHistoryTests: XCTestCase {
         XCTAssertEqual((attributes[.modificationDate] as? Date)?.timeIntervalSince1970, t0)
         let source = try XCTUnwrap(CGImageSourceCreateWithURL(url as CFURL, nil))
         let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(source, 0, nil))
-        XCTAssertEqual(max(image.width, image.height), ScreenHistory.stillDimension)
+        XCTAssertEqual([image.width, image.height], [1280, 720], "a pixel a point of a display at two")
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: url.deletingLastPathComponent().path).count, 1,
                        "no temporary file is left beside it")
+    }
+
+    func testAStillIsAPixelAPointAndNeverMoreThanTheFrame() {
+        XCTAssertEqual(ScreenHistory.stillSide(width: 1920, height: 1080, scale: 1), 1920)
+        XCTAssertEqual(ScreenHistory.stillSide(width: 3840, height: 2160, scale: 2), 1920)
+        XCTAssertEqual(ScreenHistory.stillSide(width: 3024, height: 1964, scale: 2), 1512)
+        XCTAssertEqual(ScreenHistory.stillSide(width: 5120, height: 2880, scale: 2), 2560)
+        XCTAssertEqual(ScreenHistory.stillSide(width: 3440, height: 1440, scale: 1), 3440)
+        XCTAssertEqual(ScreenHistory.stillSide(width: 1440, height: 2560, scale: 1), 2560, "a display turned on its side")
+        XCTAssertEqual(ScreenHistory.stillSide(width: 2560, height: 1440, scale: 0), 2560, "no scale known: the frame")
+        XCTAssertEqual(ScreenHistory.stillSide(width: 2560, height: 1440, scale: 0.5), 2560)
     }
 
     func testNamesAreOneLineWithNoSeparators() {
@@ -346,6 +357,117 @@ final class ScreenHistoryTests: XCTestCase {
         try FileManager.default.removeItem(at: XCTUnwrap(first.still))
         let again = try XCTUnwrap(open().record(frame(page: 1), time: t0 + 60, display: 1, app: "Xcode", title: "a.swift", settled: false))
         XCTAssertTrue(again.shot.indexed)
+    }
+
+    // MARK: Deleting a span
+
+    /// Forty shots, a key frame every thirty: a span cut from the middle of a run of changes, one
+    /// that takes a key frame, one at each end, and the shots left decode to what they showed.
+    func testADeletedSpanLeavesTheOtherShotsAsTheyWere() throws {
+        var sources: [CVPixelBuffer] = []
+        for i in 0 ..< 40 {
+            let f = frame(page: 1 + i / 10, typed: i % 10)
+            sources.append(f)
+            XCTAssertNotNil(history.record(f, time: t0 + Double(i) * 5, display: 1, app: "App", title: "Window \(i)", settled: false))
+        }
+        history.stop()
+        // One recording, a copy of it for each span.
+        let recorded = dir.deletingLastPathComponent().appendingPathComponent(dir.lastPathComponent + "-recorded", isDirectory: true)
+        try FileManager.default.moveItem(at: dir, to: recorded)
+        defer { try? FileManager.default.removeItem(at: recorded) }
+        for (label, span) in [("inside a run", 12 ... 14), ("over a key frame", 28 ... 31), ("the first shots", 0 ... 2),
+                              ("the last shots", 37 ... 39), ("one shot", 7 ... 7), ("a key frame alone", 30 ... 30)] {
+            try? FileManager.default.removeItem(at: dir)
+            try FileManager.default.copyItem(at: recorded, to: dir)
+            let h = open()
+            let before = stills().count
+            let indexedInSpan = h.shots(from: t0 + Double(span.lowerBound) * 5, to: t0 + Double(span.upperBound) * 5).filter(\.indexed).count
+            let deleted = h.delete(from: t0 + Double(span.lowerBound) * 5, to: t0 + Double(span.upperBound) * 5)
+            XCTAssertEqual(deleted.shots, span.count, label)
+            XCTAssertEqual(deleted.lost, 0, label)
+            XCTAssertEqual(deleted.stills.count, indexedInSpan, label)
+            XCTAssertEqual(stills().count, before - indexedInSpan, label)
+            let kept = (0 ..< 40).filter { !span.contains($0) }
+            // The open history stepping forward, and one that reads the file fresh stepping back.
+            for (reader, backward) in [(h, false), (open(), true)] {
+                let shots = reader.shots(from: t0, to: t0 + 1000)
+                XCTAssertEqual(shots.map(\.title), kept.map { "Window \($0)" }, label)
+                XCTAssertEqual(shots.map(\.index), Array(0 ..< kept.count), label)
+                for (n, i) in backward ? Array(kept.enumerated().reversed()) : Array(kept.enumerated()) {
+                    let back = try XCTUnwrap(reader.pixels(shots[n]), "\(label): shot \(i)")
+                    XCTAssertLessThan(meanDifference(sources[i], back), 4, "\(label): shot \(i)")
+                }
+            }
+            XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.appendingPathComponent("Screen History").path).count, 1,
+                           "\(label): no copy is left beside the segment")
+            // Recording goes on, in a new segment.
+            XCTAssertNotNil(h.record(frame(page: 30), time: t0 + 500, display: 1, app: "App", title: "After", settled: false))
+            XCTAssertEqual(h.shots(from: t0, to: t0 + 1000).count, kept.count + 1, label)
+            h.stop()
+        }
+    }
+
+    func testADeletedSpanTakesWholeSegmentsAndOnlyTheDisplayAsked() throws {
+        let short = open(segmentFrames: 4)
+        for i in 0 ..< 12 {
+            _ = short.record(frame(page: i + 1), time: t0 + Double(i) * 5, display: 1, app: "One", title: "\(i)", settled: false)
+            _ = short.record(frame(page: i + 50), time: t0 + Double(i) * 5 + 0.04, display: 2, app: "Two", title: "\(i)", settled: false)
+        }
+        XCTAssertEqual(stills().count, 24)
+        // One display's shot: the other display's of the same look stays, file and all.
+        let one = short.delete(from: t0 + 5, to: t0 + 5, display: 1)
+        XCTAssertEqual(one.shots, 1)
+        XCTAssertEqual(one.stills.count, 1)
+        XCTAssertEqual(short.shots(from: t0, to: t0 + 100).filter { $0.display == 2 }.count, 12)
+        XCTAssertEqual(stills().count, 23)
+        // Every display, across three segments of each: the middle ones go as files.
+        let folder = dir.appendingPathComponent("Screen History")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).count, 6)
+        let span = short.delete(from: t0 + 10, to: t0 + 50)
+        XCTAssertEqual(span.shots, 17, "the second display's shot of the last look was taken after the span ended")
+        XCTAssertEqual(span.stills.count, 17)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).count, 4)
+        let left = short.shots(from: t0, to: t0 + 100)
+        XCTAssertEqual(left.filter { $0.display == 1 }.map(\.title), ["0", "11"])
+        XCTAssertEqual(left.filter { $0.display == 2 }.map(\.title), ["0", "1", "10", "11"])
+        for s in left { XCTAssertNotNil(short.pixels(s)); XCTAssertNotNil(short.still(of: s)) }
+        XCTAssertEqual(stills().count, 6)
+        XCTAssertEqual(short.delete(from: t0 + 2000, to: t0 + 3000).shots, 0)
+        // What was deleted is not remembered as indexed: the same screen is new again.
+        let again = try XCTUnwrap(short.record(frame(page: 6), time: t0 + 200, display: 1, app: "One", title: "5", settled: false))
+        XCTAssertTrue(again.shot.indexed)
+        short.stop()
+    }
+
+    /// Two displays showing the same title in one second share a name; each shot's file is its own.
+    func testAShotsFileIsItsOwnWhenTwoShareAName() throws {
+        let a = try XCTUnwrap(history.record(frame(page: 1), time: t0 + 0.25, display: 1, app: "Keynote", title: "Deck", settled: false))
+        let b = try XCTUnwrap(history.record(frame(page: 2), time: t0 + 0.31, display: 2, app: "Keynote", title: "Deck", settled: false))
+        let fileA = try XCTUnwrap(a.still), fileB = try XCTUnwrap(b.still)
+        XCTAssertNotEqual(fileA, fileB)
+        XCTAssertTrue(fileB.lastPathComponent.hasSuffix(" 2.heic"))
+        XCTAssertEqual(history.still(of: a.shot), fileA)
+        XCTAssertEqual(history.still(of: b.shot), fileB)
+        let whole = try XCTUnwrap(history.frame(ofStill: fileB, maxDimension: 4096))
+        XCTAssertEqual([whole.width, whole.height, whole.image.width], [width, height, width])
+        XCTAssertEqual(history.delete(from: t0 + 0.31, to: t0 + 0.31, display: 2).stills, [fileB])
+        XCTAssertEqual(history.still(of: a.shot), fileA)
+        XCTAssertEqual(stills().map(\.lastPathComponent), [fileA.lastPathComponent])
+    }
+
+    /// The still is cut to what the index reads; the shot it was written from is whole in the history.
+    func testTheWholeFrameOfAStillComesFromTheHistory() throws {
+        let big = frame(page: 1, width: 2560, height: 1440)
+        let r = try XCTUnwrap(history.record(big, time: t0, display: 1, app: "Xcode", title: "a.swift", settled: false))
+        let url = try XCTUnwrap(r.still)
+        let whole = try XCTUnwrap(history.frame(ofStill: url, maxDimension: 4096))
+        XCTAssertEqual([whole.image.width, whole.image.height, whole.width, whole.height], [2560, 1440, 2560, 1440])
+        let fitted = try XCTUnwrap(history.frame(ofStill: url, maxDimension: 2000))
+        XCTAssertEqual([fitted.image.width, fitted.image.height, fitted.width], [2000, 1125, 2560])
+        XCTAssertNil(history.frame(ofStill: dir.appendingPathComponent("Screenshots/2020-01-01/2020-01-01 10.00.00 X.heic"), maxDimension: 4096))
+        XCTAssertNil(history.frame(ofStill: URL(fileURLWithPath: "/tmp/photo.heic"), maxDimension: 4096))
+        history.clear()
+        XCTAssertNil(history.frame(ofStill: url, maxDimension: 4096), "a cleared history has no frame; the still is all there is")
     }
 
     func testClearLeavesNothingAndRecordingGoesOn() throws {

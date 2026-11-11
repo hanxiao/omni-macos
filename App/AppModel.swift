@@ -1476,6 +1476,41 @@ final class AppModel {
         }
     }
 
+    /// Apps never recorded, by bundle id: their windows are left out of every shot, and no shot is
+    /// taken while one of them is in front (ScreenRecorder.setExcluded).
+    var screenshotsExcludedApps: [String] = AppModel.storedExcludedApps() {
+        didSet {
+            guard screenshotsExcludedApps != oldValue else { return }
+            if !isIsolatedRun { OmniPrefs.set(screenshotsExcludedApps, forKey: "omni.screenshots.excludedApps") }
+            screenRecorder?.setExcluded(Set(screenshotsExcludedApps))
+        }
+    }
+
+    /// A list in the app's settings; a comma-separated argument for an isolated run.
+    private nonisolated static func storedExcludedApps() -> [String] {
+        let stored = UserDefaults.standard.object(forKey: "omni.screenshots.excludedApps")
+        if let list = stored as? [String] { return list }
+        return (stored as? String)?.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } ?? []
+    }
+
+    func excludeFromScreenshots(_ app: URL) {
+        guard let id = Bundle(url: app)?.bundleIdentifier, !screenshotsExcludedApps.contains(id) else { return }
+        screenshotsExcludedApps.append(id)
+    }
+
+    /// Bytes the screen history and its indexed files take. STORED: finding out walks two folders
+    /// (`refreshScreenshotsDiskUse`, asked for by Settings and after anything that deletes).
+    private(set) var screenshotsDiskBytes: Int?
+
+    func refreshScreenshotsDiskUse() {
+        let history = Self.screenHistory
+        Task.detached(priority: .utility) {
+            let use = history.diskUse()
+            let bytes = use.history + use.stills
+            await MainActor.run { if self.screenshotsDiskBytes != bytes { self.screenshotsDiskBytes = bytes } }
+        }
+    }
+
     /// Crawled while it exists, on or off, so a shot deleted by retention or in the Finder leaves the index.
     private(set) var screenshotsFolderExists = FileManager.default.fileExists(atPath: AppModel.screenshotsDirectory.path)
 
@@ -1527,13 +1562,16 @@ final class AppModel {
     }
 
     private func makeScreenRecorder() -> ScreenRecorder {
-        ScreenRecorder(history: Self.screenHistory,
+        ScreenRecorder(history: Self.screenHistory, excluded: Set(screenshotsExcludedApps),
                        onStored: { [weak self] stored in self?.screenshotsStored(stored) },
                        onAccess: { [weak self] allowed in
                            guard let self, self.screenshotsAccess != allowed else { return }
                            self.screenshotsAccess = allowed
                        })
     }
+
+    /// `shotdecline:<seconds>` (perf script).
+    func perfDeclineScreenshots(retryAfter: Double) { screenRecorder?.declineForScript(retryAfter: retryAfter) }
 
     private func startScreenRecorder() {
         guard screenRecorder == nil else { return }
@@ -1570,7 +1608,11 @@ final class AppModel {
         guard days > 0 else { return }
         Task.detached(priority: .utility) {
             guard history.prune(olderThan: Date().timeIntervalSince1970 - Double(days) * 86_400) > 0 else { return }
-            await MainActor.run { self.screenshotsRevision += 1; self.refreshScreenshotsHasShots() }
+            await MainActor.run {
+                self.screenshotsRevision += 1
+                self.refreshScreenshotsHasShots()
+                if self.screenshotsDiskBytes != nil { self.refreshScreenshotsDiskUse() }
+            }
         }
     }
 
@@ -1585,7 +1627,34 @@ final class AppModel {
             store?.deleteUnderFolder(dir.path)
             await MainActor.run {
                 self.screenshotsRevision += 1
+                if self.screenshotsDiskBytes != nil { self.refreshScreenshotsDiskUse() }
                 if let store, self.store === store {
+                    self.refreshIndexStats(store)
+                    self.refreshSearchAfterBackgroundChange()
+                }
+            }
+        }
+    }
+
+    /// Delete the shots of a span, on one display or (nil) on all: the history and the files
+    /// written for the index first, then those files' rows, in order on one task. The rows go by
+    /// path through the sliced delete (`deletePaths`), as a file moved to the Trash does; the
+    /// watcher's pass over the same paths afterwards finds nothing left to do.
+    func deleteScreenshots(from: Double, to: Double, display: UInt32?) {
+        let history = Self.screenHistory, store = self.store
+        Task.detached(priority: .userInitiated) {
+            let t0 = Date()
+            let deleted = history.delete(from: from, to: to, display: display)
+            let t1 = Date()
+            if !deleted.stills.isEmpty { store?.deletePaths(Set(deleted.stills.map(\.path))) }
+            omniPerfLog(String(format: "shot-delete shots=%d stills=%d lost=%d history_ms=%.0f rows_ms=%.0f", deleted.shots,
+                               deleted.stills.count, deleted.lost, t1.timeIntervalSince(t0) * 1000, Date().timeIntervalSince(t1) * 1000))
+            guard deleted.shots > 0 || !deleted.stills.isEmpty else { return }
+            await MainActor.run {
+                self.screenshotsRevision += 1
+                self.refreshScreenshotsHasShots()
+                if self.screenshotsDiskBytes != nil { self.refreshScreenshotsDiskUse() }
+                if let store, self.store === store, !deleted.stills.isEmpty {
                     self.refreshIndexStats(store)
                     self.refreshSearchAfterBackgroundChange()
                 }

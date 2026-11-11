@@ -42,8 +42,9 @@ public final class EnrichLedger: @unchecked Sendable {
     }
 
     /// What the enrichment covers. s1: screenshots, videos, long audio, multi-page PDFs; s2: scans;
-    /// s3: text PDFs' page pictures (`key(digest:path:textPDF:)`).
-    static let scope = "s3"
+    /// s3: text PDFs' page pictures (`key(digest:path:textPDF:)`); s4: every screenshot, read
+    /// again in pieces (`key(digest:path:screenshot:)`).
+    static let scope = "s4"
 
 
     private func resetLocked() {
@@ -96,6 +97,12 @@ public final class EnrichLedger: @unchecked Sendable {
     /// A text PDF recorded before them is not done for that, and is done again, once; nothing else is.
     public static func key(digest: String, path: String, textPDF: Bool) -> String {
         key(digest: digest, path: path) + (textPDF ? "|f1" : "")
+    }
+
+    /// r2: a screenshot's text is read in pieces (ScreenText). One recorded when it was read whole
+    /// is not done for that, and is read again, once; a scan's pages are read as they were.
+    public static func key(digest: String, path: String, screenshot: Bool) -> String {
+        key(digest: digest, path: path) + (screenshot && ScreenText.inPieces ? "|r2" : "")
     }
 
     public func record(_ digests: [String]) {

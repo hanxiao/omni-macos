@@ -57,9 +57,16 @@ public final class ScreenHistory: @unchecked Sendable {
     public static let sessionGap = 300.0
     /// The furthest either side of a moment its session is followed.
     public static let sessionReach = 16 * 3600.0
-    /// The index reads a picture no larger than this (IndexSettings.maxImageDimension), so the file
-    /// written for it is no larger either; the full frame is in the history.
-    public static let stillDimension = 1568
+    /// THE STILL IS THE DESKTOP AT A PIXEL A POINT, never more than the frame has: 1920 x 1080 for a
+    /// 1920-point desktop on any display. The index embeds it at its own picture size and reads its
+    /// text from the file (ScreenText), and the text is what the size is for: of the words confirmed
+    /// on 38 real screenshots, a still of 1568 on the long side (0.20.0) gave the reader 87.4%, one
+    /// at a pixel a point 92.9%, for 126 KB against 92 KB a file; more pixels a point gained nothing
+    /// (docs/screenshots.md, "The reader"). The full frame is in the history.
+    public static func stillSide(width: Int, height: Int, scale: Double) -> Int {
+        let long = max(width, height)
+        return min(long, Int((Double(long) / max(scale, 1)).rounded()))
+    }
     public static let stillQuality = 0.8
 
     public let history: URL
@@ -111,7 +118,10 @@ public final class ScreenHistory: @unchecked Sendable {
     ///
     /// `settled`: the user has just stopped. What the screen was left showing is indexed if any of it
     /// is new, even when that is the shot already stored.
-    public func record(_ pixels: CVPixelBuffer, time: Double, display: UInt32, app: String, title: String, settled: Bool) -> Recorded? {
+    ///
+    /// `scale`: the display's pixels a point (2 on a Retina display), which sizes the still.
+    public func record(_ pixels: CVPixelBuffer, time: Double, display: UInt32, app: String, title: String, settled: Bool,
+                       scale: Double = 1) -> Recorded? {
         writing.lock(); defer { writing.unlock() }
         guard let signature = ScreenSignature(pixels) else { return nil }
         if gates[display] == nil { gates[display] = gate(for: display) }
@@ -121,7 +131,7 @@ public final class ScreenHistory: @unchecked Sendable {
             guard let stored, !stored.shot.indexed else { return nil }
             let novelty = gates[display, default: ScreenGate()].novelty(signature)
             guard gates[display, default: ScreenGate()].admit(signature, settled: true) else { return nil }
-            guard let still = writeStill(pixels, time: stored.shot.time, app: stored.shot.app, title: stored.shot.title) else { return nil }
+            guard let still = writeStill(pixels, scale: scale, time: stored.shot.time, app: stored.shot.app, title: stored.shot.title) else { return nil }
             // The record is already on disk; only its flag changes.
             try? writer.handle.seek(toOffset: stored.record + 16)
             try? writer.handle.write(contentsOf: Data([(stored.isKey ? 1 : 0) | 2]))
@@ -136,7 +146,7 @@ public final class ScreenHistory: @unchecked Sendable {
         guard let writer = writer(for: display, pixels: pixels, time: time),
               let encoded = writer.encoder.encode(pixels) else { return nil }
         let cleanApp = Self.clean(app, limit: 40), cleanTitle = Self.clean(title, limit: 80)
-        let still = indexed ? writeStill(pixels, time: time, app: cleanApp, title: cleanTitle) : nil
+        let still = indexed ? writeStill(pixels, scale: scale, time: time, app: cleanApp, title: cleanTitle) : nil
         let flagged = indexed && still != nil
         let (record, payloadOffset) = Self.record(time: time, isKey: encoded.isKey, indexed: flagged, app: cleanApp, title: cleanTitle,
                                                   sets: encoded.parameterSets, payload: encoded.data)
@@ -428,11 +438,35 @@ public final class ScreenHistory: @unchecked Sendable {
     }
 
     /// The file the index holds for a shot, while it is still there.
+    ///
+    /// A name is to the second, so two displays showing the same window title in one second share
+    /// it and the later file is numbered ("... 2.heic"). Each file is dated at its shot to the
+    /// millisecond, which tells them apart: the file dated at this shot is this shot's. A file
+    /// whose date something has rounded (a restore, a copy) is taken by its plain name, as before.
     public func still(of shot: Shot) -> URL? {
         guard shot.indexed else { return nil }
         let name = Self.stillName(time: shot.time, app: shot.app, title: shot.title)
-        let url = stills.appendingPathComponent(name.folder, isDirectory: true).appendingPathComponent(name.base + ".heic")
-        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        let folder = stills.appendingPathComponent(name.folder, isDirectory: true)
+        let plain = folder.appendingPathComponent(name.base + ".heic")
+        let plainDate = Self.modified(plain)
+        if let plainDate, abs(plainDate - shot.time) <= Self.stillDateTolerance { return plain }
+        for n in 2 ... Self.stillNumbers {
+            let url = folder.appendingPathComponent("\(name.base) \(n).heic")
+            if let date = Self.modified(url), abs(date - shot.time) <= Self.stillDateTolerance { return url }
+        }
+        return plainDate == nil ? nil : plain
+    }
+
+    /// How far a file's date may sit from its shot and still be that shot's: what a file system
+    /// keeps of a date, not the tens of milliseconds between two displays of one look.
+    private static let stillDateTolerance = 0.002
+    /// The highest number a shared name is looked for under: one per display past the first.
+    private static let stillNumbers = 8
+
+    private static func modified(_ url: URL) -> Double? {
+        var info = stat()
+        guard stat(url.path, &info) == 0 else { return nil }
+        return Double(info.st_mtimespec.tv_sec) + Double(info.st_mtimespec.tv_nsec) / 1e9
     }
 
     /// When a file under `stills` was taken, read from its name. nil for any other file.
@@ -445,9 +479,22 @@ public final class ScreenHistory: @unchecked Sendable {
         return f.date(from: String(name.prefix(19)))?.timeIntervalSince1970
     }
 
+    /// The shot a still was written from, whole: the still is a pixel a point (`stillSide`), the
+    /// history keeps the frame as the display showed it. No larger than
+    /// `maxDimension`. nil when the history no longer holds the shot (cleared, or pruned ahead of
+    /// the index), and the still is then all there is.
+    public func frame(ofStill url: URL, maxDimension: Int) -> (image: CGImage, width: Int, height: Int)? {
+        guard let second = Self.shotTime(ofStill: url) else { return nil }
+        // The name is to the second; the shot whose own still this is, is the one.
+        guard let shot = shots(from: second - 1, to: second + 2).first(where: { still(of: $0)?.path == url.path }),
+              let pixels = pixels(shot), let image = Self.fitted(pixels, maxDimension: maxDimension) else { return nil }
+        return (image, CVPixelBufferGetWidth(pixels), CVPixelBufferGetHeight(pixels))
+    }
+
     /// The picture file of a shot, dated at the shot.
-    private func writeStill(_ pixels: CVPixelBuffer, time: Double, app: String, title: String) -> URL? {
-        guard let image = Self.fitted(pixels, maxDimension: Self.stillDimension) else { return nil }
+    private func writeStill(_ pixels: CVPixelBuffer, scale: Double, time: Double, app: String, title: String) -> URL? {
+        let side = Self.stillSide(width: CVPixelBufferGetWidth(pixels), height: CVPixelBufferGetHeight(pixels), scale: scale)
+        guard let image = Self.fitted(pixels, maxDimension: side) else { return nil }
         let date = Date(timeIntervalSince1970: time)
         let name = Self.stillName(time: time, app: app, title: title)
         let folder = stills.appendingPathComponent(name.folder, isDirectory: true)
@@ -515,6 +562,7 @@ public final class ScreenHistory: @unchecked Sendable {
     public func prune(olderThan cutoff: Double) -> Int {
         writing.lock(); defer { writing.unlock() }
         let fm = FileManager.default
+        removeStaleRewrites()
         var removed = 0
         let live = Set(writers.values.map(\.name))
         for ref in refs() where ref.start + Self.maxSegmentSeconds < cutoff && !live.contains(ref.name) {
@@ -536,6 +584,143 @@ public final class ScreenHistory: @unchecked Sendable {
             if left == 0 { try? fm.removeItem(at: folder) }
         }
         return removed
+    }
+
+    public struct Deleted: Sendable {
+        /// Shots that left the history.
+        public let shots: Int
+        /// Their files, removed from `stills`: the index drops these.
+        public let stills: [URL]
+        /// Shots outside the span that went with it: ones that could not be encoded again.
+        public let lost: Int
+    }
+
+    /// Delete the shots taken in a span of time, on one display or on all of them: their frames
+    /// leave the history and their files leave `stills`.
+    ///
+    /// A frame is stored as what changed since the one before it, so the frames after a deleted one,
+    /// up to the next key frame (at most `ScreenCodec.keyInterval`), are decoded and encoded again
+    /// from a new key frame; everything else is copied as it is. The segment is written beside
+    /// itself and renamed over, so a kill leaves the old segment or the new one. The files go
+    /// first: a kill between the two leaves shots with no file (shown, not in the index), never a
+    /// file in the index for a shot that was deleted.
+    @discardableResult
+    public func delete(from: Double, to: Double, display: UInt32? = nil) -> Deleted {
+        writing.lock(); defer { writing.unlock() }
+        let fm = FileManager.default
+        removeStaleRewrites()
+        func doomed(_ f: Frame) -> Bool { f.shot.time >= from && f.shot.time <= to }
+        let touched = refs().filter { ref in
+            ref.start <= to && ref.start >= from - Self.maxSegmentSeconds - 1 && (display == nil || ref.display == display)
+                && frames(of: ref.name).contains(where: doomed)
+        }
+
+        // The files of the index.
+        var gone: [URL] = []
+        for ref in touched {
+            for f in frames(of: ref.name) where doomed(f) {
+                if let url = still(of: f.shot), (try? fm.removeItem(at: url)) != nil { gone.append(url) }
+            }
+        }
+        if display == nil {
+            // Every display: also any file dated in the span that no shot led to (a numbered name
+            // whose date was rounded).
+            let days = Self.stillName(time: from, app: "", title: "").folder ... Self.stillName(time: max(from, to), app: "", title: "").folder
+            for folder in (try? fm.contentsOfDirectory(at: stills, includingPropertiesForKeys: nil)) ?? [] where days.contains(folder.lastPathComponent) {
+                for file in (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [] where file.pathExtension == "heic" {
+                    guard let date = Self.modified(file), date >= from - Self.stillDateTolerance, date <= to + Self.stillDateTolerance else { continue }
+                    if (try? fm.removeItem(at: file)) != nil { gone.append(file) }
+                }
+            }
+        }
+        for folder in Set(gone.map { $0.deletingLastPathComponent() }) {
+            if ((try? fm.contentsOfDirectory(atPath: folder.path)) ?? []).isEmpty { try? fm.removeItem(at: folder) }
+        }
+        // What the index held of a display is what its gate remembers: read again from what is left.
+        if !gone.isEmpty { gates.removeAll() }
+
+        // The frames.
+        var shots = 0, lost = 0, removedFile = false
+        for ref in touched {
+            let table = frames(of: ref.name)
+            let url = history.appendingPathComponent(ref.name)
+            if let (d, w) = writers.first(where: { $0.value.name == ref.name }) {
+                try? w.handle.close()
+                writers[d] = nil; lastStored[d] = nil; gates[d] = nil
+            }
+            let rewritten = rewrite(url, table: table, without: doomed)
+            decoding.withLock { try? reading?.handle.close(); reading = nil; decoded = nil; decoder = ScreenFrameDecoder() }
+            guard let rewritten else { continue }       // the segment is as it was: nothing of it is counted
+            shots += table.count - rewritten.kept - rewritten.lost
+            lost += rewritten.lost
+            if rewritten.kept == 0 { removedFile = true }
+            lock.withLock { tables[ref.name] = nil }
+        }
+        if removedFile { lock.withLock { listing = nil } }
+        return Deleted(shots: shots, stills: gone, lost: lost)
+    }
+
+    /// A segment without some of its frames, written beside it and renamed over it; the file is
+    /// removed when no frame is left. nil when it could not be written, and the segment is then
+    /// untouched. Called under `writing`.
+    private func rewrite(_ url: URL, table: [Frame], without doomed: (Frame) -> Bool) -> (kept: Int, lost: Int)? {
+        let fm = FileManager.default
+        guard table.contains(where: { !doomed($0) }) else {
+            return (try? fm.removeItem(at: url)) != nil ? (0, 0) : nil
+        }
+        guard let old = try? Data(contentsOf: url, options: .alwaysMapped), old.count >= Self.headerLength else { return nil }
+        let temp = url.appendingPathExtension(Self.rewriteExtension)
+        guard fm.createFile(atPath: temp.path, contents: old.prefix(Self.headerLength)),
+              let out = try? FileHandle(forWritingTo: temp) else { return nil }
+        _ = try? out.seekToEnd()
+        var kept = 0, lost = 0
+        var encoder: ScreenFrameEncoder?
+        var broken = false          // a frame this one was encoded against is gone or encoded again
+        var fromEncoder = false     // the frame before this one in the new file came from `encoder`
+        do {
+            for f in table {
+                if doomed(f) { broken = true; continue }
+                if f.isKey { broken = false }
+                if !broken {
+                    try out.write(contentsOf: old.sub(Int(f.record), Int(f.payload) + f.length + 4 - Int(f.record)))
+                    kept += 1; fromEncoder = false
+                    continue
+                }
+                guard let pixels = pixels(f.shot) else { lost += 1; continue }
+                if encoder == nil { encoder = ScreenFrameEncoder(width: CVPixelBufferGetWidth(pixels), height: CVPixelBufferGetHeight(pixels)) }
+                guard let encoded = encoder?.encode(pixels, forceKey: !fromEncoder), fromEncoder || encoded.isKey else {
+                    // Without this frame the ones after it have nothing to decode from either.
+                    lost += 1; fromEncoder = false
+                    continue
+                }
+                let (record, _) = Self.record(time: f.shot.time, isKey: encoded.isKey, indexed: f.shot.indexed, app: f.shot.app,
+                                              title: f.shot.title, sets: encoded.parameterSets, payload: encoded.data)
+                try out.write(contentsOf: record)
+                kept += 1; fromEncoder = true
+            }
+            try out.synchronize()
+            try out.close()
+        } catch {
+            try? out.close()
+            try? fm.removeItem(at: temp)
+            return nil
+        }
+        if kept == 0 {
+            try? fm.removeItem(at: temp)
+            return (try? fm.removeItem(at: url)) != nil ? (0, lost) : nil
+        }
+        guard rename(temp.path, url.path) == 0 else { try? fm.removeItem(at: temp); return nil }
+        return (kept, lost)
+    }
+
+    private static let rewriteExtension = "rewrite"
+
+    /// A rewrite a kill cut short: the segment it was replacing is whole, the copy is not.
+    private func removeStaleRewrites() {
+        let fm = FileManager.default
+        for name in (try? fm.contentsOfDirectory(atPath: history.path)) ?? [] where name.hasSuffix("." + Self.rewriteExtension) {
+            try? fm.removeItem(at: history.appendingPathComponent(name))
+        }
     }
 
     /// Delete everything: every segment and every file written for the index. The folders stay.

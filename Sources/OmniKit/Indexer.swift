@@ -3042,9 +3042,16 @@ public final class Indexer: @unchecked Sendable {
     /// A scanned PDF's too, page by page (readScanText).
     func readScreenText(_ file: CrawledFile, settings: IndexSettings) -> [TextPiece]? {
         if FileExtractor.pdfExtensions.contains(file.ext.lowercased()) { return readScanText(file, settings: settings) }
-        guard case .images(let images) = ContentSources.source(for: file).content(file, kind: .image, settings: settings),
-              let image = images.first else { return nil }
-        let text = ScreenText.recognize(image)
+        let text: String
+        if ScreenText.inPieces {
+            // From the file, at the reader's own size, not from the picture the index embeds.
+            guard let read = ScreenText.recognize(screenshot: file.url) else { return nil }
+            text = read
+        } else {
+            guard case .images(let images) = ContentSources.source(for: file).content(file, kind: .image, settings: settings),
+                  let image = images.first else { return nil }
+            text = ScreenText.recognize(image)
+        }
         return text.isEmpty ? [] : chunk(text, settings: settings, origin: .opaque)
     }
 
@@ -3071,14 +3078,18 @@ public final class Indexer: @unchecked Sendable {
 
     /// A screenshot's text added beside its stored picture, its identifiers recorded: one
     /// transaction. False: the file changed or is not stored as one picture, or an embed failed.
-    func addScreenText(_ file: CrawledFile, digest: String, pieces: [TextPiece], settings: IndexSettings) -> Bool {
+    /// What the file had beside its picture is replaced, by nothing when `pieces` is empty.
+    /// `pictureKey`: the picture's chunk key from now on (an older reading's, brought to today's).
+    func addScreenText(_ file: CrawledFile, digest: String, pieces: [TextPiece], settings: IndexSettings,
+                       pictureKey: String? = nil) -> Bool {
         // The file's own chunks are kept: a screenshot's one picture, a scan's page pictures.
         let isScan = FileExtractor.pdfExtensions.contains(file.ext.lowercased())
         let own = isScan ? FileKind.scan.rawValue : FileKind.image.rawValue
         guard let f = store.storedFiles(paths: [file.path])[file.path], f.modified == file.modified,
-              let base = store.storedChunks(path: file.path)?.filter({ $0.kind == own }).sorted(by: { $0.chunkIndex < $1.chunkIndex }),
+              var base = store.storedChunks(path: file.path)?.filter({ $0.kind == own }).sorted(by: { $0.chunkIndex < $1.chunkIndex }),
               isScan ? !base.isEmpty : base.count == 1
         else { return false }
+        if let pictureKey { base[0].chunkKey = pictureKey }
         let first = (base.map(\.chunkIndex).max() ?? -1) + 1
         recordIdentifiers(pieces, digest: digest, firstChunk: first)
         guard let more = extraChunks(file: file, screen: pieces, soundtrack: nil, duration: 0, first: first, settings: settings),
@@ -3097,7 +3108,8 @@ public final class Indexer: @unchecked Sendable {
             if isCancelled { notDone += 1; continue }
             guard let pieces = r.pieces else { notDone += 1; continue }
             if pieces.isEmpty || addScreenText(r.job.file, digest: r.job.digest, pieces: pieces, settings: r.job.settings) {
-                store.enrichLedger.record([EnrichLedger.key(digest: r.job.digest, path: r.job.file.path)])
+                let scan = FileExtractor.pdfExtensions.contains(r.job.file.ext.lowercased())
+                store.enrichLedger.record([EnrichLedger.key(digest: r.job.digest, path: r.job.file.path, screenshot: !scan)])
             } else { notDone += 1 }
         }
         if notDone > 0 { store.enrichLedger.backfilled = false }
@@ -3181,8 +3193,12 @@ public final class Indexer: @unchecked Sendable {
         for start in stride(from: 0, to: candidates.count, by: 64) {
             let batch = Array(candidates[start ..< min(candidates.count, start + 64)])
             let digests = store.contentDigests(paths: batch.map(\.path))
+            // A screenshot (the candidates' only pictures) has a key of its own: one recorded when it
+            // was read whole is not done, and is read again, once (EnrichLedger.key(...screenshot:)).
             func key(_ c: (path: String, kind: String, modified: Double, size: Int, duration: Double), _ d: String) -> String {
-                EnrichLedger.key(digest: d, path: c.path, textPDF: c.kind == FileKind.text.rawValue && c.path.lowercased().hasSuffix(".pdf"))
+                c.kind == FileKind.image.rawValue
+                    ? EnrichLedger.key(digest: d, path: c.path, screenshot: true)
+                    : EnrichLedger.key(digest: d, path: c.path, textPDF: c.kind == FileKind.text.rawValue && c.path.lowercased().hasSuffix(".pdf"))
             }
             let done = ledger.done(batch.compactMap { c in digests[c.path].map { key(c, $0) } })
             for c in batch {
@@ -3254,20 +3270,41 @@ public final class Indexer: @unchecked Sendable {
             return pieces.isEmpty || addScreenText(file, digest: digest, pieces: pieces, settings: settings)
         case FileKind.image.rawValue:
             guard settings.screenText, Self.isScreenshot(c.path) else { return true }   // not a screenshot: nothing to add
+            // THE FILE BECOMES WHAT INDEXING IT TODAY MAKES IT. One stored when a screenshot was read
+            // whole (0.20.0 and before) has that reading's content key, picture key and text: its
+            // text is read again, in pieces, and replaces the old - by nothing when there is none
+            // now - and its keys become today's, so a copy made later takes its rows and a copy
+            // done before it is taken from here. One already under today's key only lacks its text.
+            guard let today = ContentSources.source(for: file).contentKey(file, kind: .image, dim: embedder.dim,
+                                                                      chunkOverlap: chunkOverlap, settings: settings) else { return false }
+            let now = StoreSchema.contentDigestHex(today)
+            func settle() -> Bool {
+                store.recordContentKeys([(c.path, today, c.modified, c.size)])
+                store.enrichLedger.record([EnrichLedger.key(digest: now, path: c.path, screenshot: true)])
+                return true
+            }
             // A COPY OF A SCREENSHOT whose text is already in: its rows, taken over as content dedup
             // takes them, not Vision again over the same pixels (the lane adds the original's text
             // after its picture is stored, so a copy deduplicated in between has none yet).
-            for other in store.pathsForContentDigests([digest])[digest] ?? [] where other != c.path {
+            for other in store.pathsForContentDigests([now])[now] ?? [] where other != c.path {
                 guard let rows = store.storedChunks(path: other), rows.contains(where: { $0.kind == FileKind.text.rawValue })
                 else { continue }
                 return write(rows.map { r in
                     IndexedChunk(path: c.path, modified: c.modified, size: c.size, kind: r.kind, chunkIndex: r.chunkIndex,
                                  snippet: r.snippet, embedding: r.embedding, width: r.width, height: r.height,
                                  duration: r.duration, locator: r.locator, chunkKey: r.chunkKey)
-                })
+                }) && settle()
             }
             guard let pieces = readScreenText(file, settings: settings) else { return false }
-            return pieces.isEmpty || addScreenText(file, digest: digest, pieces: pieces, settings: settings)
+            if now == digest {   // today's already: only its text was missing
+                return (pieces.isEmpty || addScreenText(file, digest: now, pieces: pieces, settings: settings)) && settle()
+            }
+            // The picture's key is of what the model saw and of how its text is read (imagePayloadKey).
+            guard case .images(let images) = ContentSources.source(for: file).content(file, kind: .image, settings: settings),
+                  let image = images.first else { return false }
+            let pictureKey = Self.imagePayloadKey(OmniVisionPreprocess.preprocessRaw(image), settings: settings,
+                                                  screenText: Self.screenTextMark(file, settings: settings), dim: embedder.dim)
+            return addScreenText(file, digest: now, pieces: pieces, settings: settings, pictureKey: pictureKey) && settle()
         case FileKind.text.rawValue:
             guard c.path.lowercased().hasSuffix(".pdf"),
                   case .pagedText(let text, let starts) = ContentSources.source(for: file).content(file, kind: .text, settings: settings),
@@ -4533,8 +4570,9 @@ public final class Indexer: @unchecked Sendable {
             // Still images: run the CPU preprocess (resize + parallel patchify) HERE, in the
             // concurrent decode stage, so the serialized GPU thread only does the tower.
             let raws = images.map { OmniVisionPreprocess.preprocessRaw($0) }
-            let screenshot = settings.screenText && images.count == 1 && Self.isScreenshot(file.path)
-            let keys = raws.map { Self.imagePayloadKey($0, settings: settings, screenshot: screenshot, dim: embedder.dim) }
+            let mark = images.count == 1 ? Self.screenTextMark(file, settings: settings) : ""
+            let screenshot = !mark.isEmpty
+            let keys = raws.map { Self.imagePayloadKey($0, settings: settings, screenText: mark, dim: embedder.dim) }
             // THE SAME PIXELS ARE THE SAME VECTORS. A known file whose bytes changed but whose
             // pixels did not (an EXIF or XMP edit, a re-save that keeps them) gets its stored rows
             // back - vector, tags and screen text - when their keys are these: no forward.
@@ -4601,8 +4639,8 @@ public final class Indexer: @unchecked Sendable {
                 // x1: a converted document read from its text. Under the old key a long one from the
                 // watcher holds its raw bytes' rows, which must not be copied back to it (Rereads).
                 + (FileExtractor.officeExtensions.contains(ext) ? "|x1" : "")
-        // t1: a screenshot is indexed with its text.
-        case .image: fp = "d\(settings.maxImageDimension)" + (settings.screenText && isScreenshot(file.path) ? "|t1" : "")
+        // t1: a screenshot is indexed with its text; t2: read in pieces (ScreenText.keyMark).
+        case .image: fp = "d\(settings.maxImageDimension)" + screenTextMark(file, settings: settings)
         // v2: uniform frame sampling + 240 s segmentation (pre-upgrade rows must not alias).
         // a: the soundtrack is indexed with the frames, in windows of that many mel frames.
         case .video: fp = "v2|d\(settings.maxImageDimension)|f\(settings.maxVideoFrames)|s\(Int(mediaSegmentSeconds))"
@@ -4642,14 +4680,21 @@ public final class Indexer: @unchecked Sendable {
     /// Rewrite a duplicate source's rows for this file: same vectors, snippets and locators, new
     /// path/mtime/size. A media row written before snippets stopped carrying the file name still
     /// has the source's name as its snippet - swap in ours.
+    /// What a screenshot's keys carry for its text (ScreenText.keyMark); "" for a picture that is
+    /// not one, or indexed without its text.
+    static func screenTextMark(_ file: CrawledFile, settings: IndexSettings) -> String {
+        settings.screenText && isScreenshot(file.path) ? ScreenText.keyMark : ""
+    }
+
     /// A STILL OR AN AUDIO WINDOW IS KEYED BY WHAT THE MODEL SEES: the tower's input (the
     /// preprocessed patches, the mel), not the file's bytes, so a change to metadata alone leaves
-    /// the key where it was (ChunkKey.media). `t1`: a screenshot's rows include its text.
-    static func imagePayloadKey(_ raw: OmniVisionPreprocess.RawPatches, settings: IndexSettings, screenshot: Bool, dim: Int) -> String {
+    /// the key where it was (ChunkKey.media). `screenText`: the file's screenTextMark - a
+    /// screenshot's rows include its text, and how it was read.
+    static func imagePayloadKey(_ raw: OmniVisionPreprocess.RawPatches, settings: IndexSettings, screenText: String, dim: Int) -> String {
         let grid = raw.gridTHW.map { "\($0.0)x\($0.1)x\($0.2)" }.joined(separator: ",")
         return raw.pixels.withUnsafeBytes { p in
             ChunkKey.media(kind: .image, slices: [Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: p.baseAddress!), count: p.count, deallocator: .none)],
-                           preprocess: "d\(settings.maxImageDimension)|g\(grid)" + (screenshot ? "|t1" : ""), dim: dim)
+                           preprocess: "d\(settings.maxImageDimension)|g\(grid)" + screenText, dim: dim)
         }
     }
 

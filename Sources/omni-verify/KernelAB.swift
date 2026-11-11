@@ -213,7 +213,7 @@ enum KernelAB {
     }
 
     /// Index a folder of images end to end on a scratch store, the indexer's own pipeline:
-    /// omni-verify imgindex <modelDir> <imageDir>
+    /// omni-verify imgindex <modelDir> <imageDir> [--whole-screens]
     static func imageIndex(modelDir: URL, dir: URL) async throws {
         let engine = try await OmniEngine.loadValidated(modelDir: modelDir, keepVision: true, keepAudio: false)
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("imgidx-\(UUID().uuidString)")

@@ -262,6 +262,41 @@
       ]
     },
     {
+      "title": "Screenshots",
+      "items": [
+        {
+          "q": "What does Screenshots do?",
+          "a": "When you turn it on, Omni takes a picture of the desktop while you use the Mac and makes it searchable like any other screenshot, by what it shows and by the text on it. Click Screenshots in the sidebar to turn it on and to browse the shots on a timeline. It is off until you turn it on, and macOS asks once for Screen & System Audio Recording.",
+          "shortcut": ""
+        },
+        {
+          "q": "When is a screenshot taken?",
+          "a": "Every 5 seconds while you type, click or scroll, once more when you stop, then at longer intervals while the screen stays as it was. A screen that has not changed stores nothing. Every stored shot is on the timeline; only a shot that differs enough from the recent ones is added to the index.",
+          "shortcut": ""
+        },
+        {
+          "q": "What is left out of screenshots?",
+          "a": "Omni's own windows, the pointer, and the apps you add under Settings > Files > Screenshots: their windows are not recorded, and no screenshot is taken while one of them is in front. Nothing is taken while the screen is locked, the screen saver runs, the display sleeps, or a password field has the keyboard.",
+          "shortcut": ""
+        },
+        {
+          "q": "How do I browse and delete screenshots?",
+          "a": "Drag the playhead along the day's track or use the arrow keys. Pinch, or press ⌘= and ⌘-, to zoom the track; ⌘0 shows the whole day. Drag a shot out to use it as a file. The Delete menu removes this screenshot, this session or this day, and Clear on the sidebar row's context menu removes everything.",
+          "shortcut": "⌘="
+        },
+        {
+          "q": "How much disk do screenshots use?",
+          "a": "Shots are stored as video, so a shot where little changed costs a few kilobytes; the ones added to the index are also kept as picture files. Settings > Files > Screenshots shows the space in use and how long shots are kept: 7, 30 (the default) or 90 days, or forever.",
+          "shortcut": ""
+        },
+        {
+          "q": "Can agents use my screenshots?",
+          "a": "Yes, when Serving is on. A screenshot result says when it was taken and which apps were in use around then, and search accepts a time range with no query to list the files changed in that stretch. An agent can ask for the picture itself as a JPEG. Linked Macs find screenshots as they find other files.",
+          "shortcut": ""
+        }
+      ]
+    },
+    {
       "title": "Settings, model, and privacy",
       "items": [
         {
@@ -321,7 +356,7 @@
         },
         {
           "q": "Which MCP tools are available?",
-          "a": "Eleven: search, search_inline, read_file, file_status, tag_image, ocr, get_linked_file, list_sources, add_source, pause_source, and remove_source. They return paths, scores, the passage that matched, tags, and transcripts; read_file returns a document's text by page, line, or offset, including Word, Pages, Keynote, PowerPoint, Excel, and Numbers files, a slide or a sheet at a time.",
+          "a": "Eleven: search, search_inline, read_file, file_status, tag_image, ocr, get_linked_file, list_sources, add_source, pause_source, and remove_source. They return paths, scores, the passage that matched, tags, and transcripts; read_file returns a document's text by page, line, or offset, including Word, Pages, Keynote, PowerPoint, Excel, and Numbers files, a slide or a sheet at a time, and an image as a JPEG.",
           "shortcut": ""
         },
         {

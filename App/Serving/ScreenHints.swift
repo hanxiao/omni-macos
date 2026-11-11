@@ -53,6 +53,16 @@ enum ScreenHints {
         return out
     }
 
+    /// The moment of one screenshot file, for a read of it. nil for any other file.
+    static func moment(ofStill path: String) -> Moment? {
+        guard isShot(path),
+              let taken = ((try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date)?.timeIntervalSince1970
+        else { return nil }
+        let session = AppModel.screenHistory.sessions(around: [taken]).first ?? nil
+        let shot = session.map(\.nearest).flatMap { abs($0.time - taken) < 1 ? $0 : nil }
+        return Moment(taken: taken, app: shot?.app ?? "", title: shot?.title ?? "", span: session.map(Span.init))
+    }
+
     /// ISO 8601 to the second with the local offset ("2026-11-10T13:16:27+01:00"): what
     /// `modified_after` and `modified_before` read back (SearchArgs.parseTime).
     static func stamp(_ epoch: Double) -> String {
@@ -94,15 +104,21 @@ enum ScreenHints {
         }
         return order.compactMap { key in
             guard let s = sessions[key], let which = numbers[key] else { return nil }
-            let (since, until) = range(s)
-            let who = apps(s)
-            let call = cli ? "omni search --modified-after \(stamp(since)) --modified-before \(stamp(until))" + (mac.map { " --macs \"\($0)\"" } ?? "")
-                           : "search with modified_after \"\(stamp(since))\", modified_before \"\(stamp(until))\"" + (mac.map { ", macs [\"\($0)\"]" } ?? "") + " and no query"
             return "Screenshot\(which.count == 1 ? "" : "s") \(which.map(String.init).joined(separator: ", "))\(mac.map { " on \($0)" } ?? ""): "
-                + "taken while \(mac ?? "the Mac") was in use from \(stamp(s.start)) to \(stamp(s.end))"
-                + (who.isEmpty ? "" : ", in \(who)")
-                + ". Files changed then: \(call)."
+                + sessionText(s, cli: cli, mac: mac)
         }
+    }
+
+    /// What one stretch of work says: its span, what was in front, the call that lists the files
+    /// changed in it.
+    static func sessionText(_ s: Span, cli: Bool, mac: String? = nil) -> String {
+        let (since, until) = range(s)
+        let who = apps(s)
+        let call = cli ? "omni search --modified-after \(stamp(since)) --modified-before \(stamp(until))" + (mac.map { " --macs \"\($0)\"" } ?? "")
+                       : "search with modified_after \"\(stamp(since))\", modified_before \"\(stamp(until))\"" + (mac.map { ", macs [\"\($0)\"]" } ?? "") + " and no query"
+        return "taken while \(mac ?? "the Mac") was in use from \(stamp(s.start)) to \(stamp(s.end))"
+            + (who.isEmpty ? "" : ", in \(who)")
+            + ". Files changed then: \(call)."
     }
 
     /// The same, as a result row's `screenshot` object (REST and `omni search --json`).

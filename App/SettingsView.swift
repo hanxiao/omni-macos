@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 import OmniKit
 
 private enum SettingsTab: String, Hashable { case files, content, performance, storage, ocr, history, serving }
@@ -369,6 +370,7 @@ private struct ActivityTab: View {
                 Toggle("Record screenshots", isOn: Binding(get: { model.screenshotsEnabled },
                                                            set: { model.setScreenshotsEnabled($0) }))
                 .help("A screenshot when you use the Mac, searchable in Screenshots")
+                .onAppear { model.refreshScreenshotsDiskUse() }
                 if model.screenshotsEnabled, model.screenshotsAccess == false {
                     LabeledContent("Screen recording is denied") {
                         Button("Open Privacy Settings") { AppModel.openScreenRecordingSettings() }
@@ -383,6 +385,23 @@ private struct ActivityTab: View {
                     Text("90 days").tag(90)
                     Text("Forever").tag(0)
                 }
+                if let bytes = model.screenshotsDiskBytes {
+                    LabeledContent("Space used") { Text(ByteSize.file(Int64(bytes))).monospacedDigit() }
+                }
+            }
+
+            Section {
+                ForEach(model.screenshotsExcludedApps, id: \.self) { id in
+                    ExcludedAppRow(bundleID: id) {
+                        model.screenshotsExcludedApps.removeAll { $0 == id }
+                    }
+                }
+                Button("Add App\u{2026}") { addExcludedApps() }
+            } header: {
+                Text("Apps left out of screenshots")
+            } footer: {
+                Text("Their windows are not recorded, and no screenshot is taken while one of them is in front.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section("Folders") {
@@ -463,6 +482,15 @@ private struct ActivityTab: View {
         }
     }
 
+    private func addExcludedApps() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true; panel.canChooseDirectories = false; panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.application]
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.prompt = "Add"
+        if panel.runModal() == .OK { panel.urls.forEach(model.excludeFromScreenshots) }
+    }
+
     @ViewBuilder private func orderRow(_ k: FileKind) -> some View {
         // While a disable is awaiting the purge/keep dialog the kind is still in enabledKinds, so reflect
         // the pending-off state so the switch doesn't snap back to ON under the dialog.
@@ -482,6 +510,30 @@ private struct ActivityTab: View {
         .opacity(on ? 1 : 0.55)
     }
 
+}
+
+/// An app left out of screenshots: its icon and name as the Finder shows them, or its bundle id
+/// when it is no longer installed.
+private struct ExcludedAppRow: View {
+    let bundleID: String
+    let remove: () -> Void
+
+    var body: some View {
+        let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+        HStack(spacing: 8) {
+            if let app {
+                Image(nsImage: NSWorkspace.shared.icon(forFile: app.path)).resizable().frame(width: 20, height: 20)
+            } else {
+                Image(systemName: "app.dashed").frame(width: 20, height: 20).foregroundStyle(.secondary)
+            }
+            Text(app.map { FileManager.default.displayName(atPath: $0.path) } ?? bundleID)
+            Spacer()
+            Button(action: remove) { Image(systemName: "minus.circle") }
+                .buttonStyle(.borderless)
+                .help("Record this app again")
+                .accessibilityLabel("Remove")
+        }
+    }
 }
 
 private struct ContentTypesTab: View {

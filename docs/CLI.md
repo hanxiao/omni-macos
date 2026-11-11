@@ -64,6 +64,16 @@ From "CLI is All Agents Need", reviewed 2026-10-07:
   - with `_meta` `io.hanxiao.omni/stderr`, only on calls the CLI marks with
   `io.hanxiao.omni/cli`. So `omni ocr scan.pdf > scan.md` is Markdown, and an empty search leaves
   stdout empty and explains itself on stderr. Other MCP clients get the same bytes as before.
+- A picture is a file. A terminal shows no image and Claude Code's reader refuses HEIC, which
+  Omni's own screenshots are, so `read_file` on an indexed image answers with a JPEG whatever the
+  file is (`--max_edge` for more pixels; a screenshot up to the display's own size, from the
+  history), and `omni` saves each picture a command returns under `$TMPDIR/omni-pictures`, named by
+  its content, and prints the path where the picture was: `omni read_file shot.heic` prints one
+  path, `omni search ... --include_images` a `picture:` line under each result that has one, and
+  `--json` adds `pictures` (each the file and its picture). Saved by `omni`, not by the app, so it
+  is on the disk of whoever ran the command; pictures older than a day are removed. The server
+  names the file of each image block in `_meta` `io.hanxiao.omni/picture`, on CLI calls only. REST
+  has no read route and gained none: `/v1/search` returns paths and the `screenshot` object.
 - Progressive help. `omni --help`: the commands and two examples. `omni <tool> --help`: usage, the
   first sentence, examples, one line per option. `--help-all`: every description in full.
   Examples live once, as argument sets in each tool's `_meta`, and are rendered as commands. A

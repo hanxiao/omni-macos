@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import CryptoKit
 
 // `omni` - the command line for the running Omni app. A generic MCP client: it asks the app for
 // its tools (`tools/list`) and turns each one into a subcommand whose flags are the tool's
@@ -265,6 +266,24 @@ var requestID = 0
     return obj["result"] as? [String: Any] ?? [:]
 }
 
+/// Where the pictures a command returns are saved: `$TMPDIR/omni-pictures`.
+let pictureFolder = FileManager.default.temporaryDirectory.appendingPathComponent("omni-pictures", isDirectory: true)
+
+/// One returned picture as a JPEG file, named by its content: the same picture asked for twice is
+/// one file. Pictures saved more than a day ago are removed on the way.
+func savePicture(_ data: Data) -> String? {
+    let fm = FileManager.default
+    try? fm.createDirectory(at: pictureFolder, withIntermediateDirectories: true)
+    let dayAgo = Date().addingTimeInterval(-86400)
+    for old in (try? fm.contentsOfDirectory(at: pictureFolder, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [] {
+        if let at = (try? old.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate, at < dayAgo { try? fm.removeItem(at: old) }
+    }
+    let name = SHA256.hash(data: data).prefix(8).map { String(format: "%02x", $0) }.joined()
+    let url = pictureFolder.appendingPathComponent(name + ".jpg")
+    do { try data.write(to: url, options: .atomic) } catch { return nil }
+    return url.path
+}
+
 func printJSON(_ obj: Any) {
     let d = (try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])) ?? Data()
     print(String(decoding: d, as: UTF8.self))
@@ -520,21 +539,33 @@ do {
             fail(inCLITerms(content.compactMap { $0["text"] as? String }.joined(separator: "\n"), tool: tool), code: Exit.user)
         }
         // Blocks the server marked as ABOUT the answer go to stderr; the rest is the answer.
+        // A picture is saved beside the shell's temporary files and its path printed where the
+        // picture was in the answer: a terminal shows no image, and the agent reading this output
+        // opens the path. Saved here and not by the app: `omni` may be talking to an app whose
+        // disk the caller cannot see.
         var out: [String] = []
-        var images = 0
+        var pictures: [[String: String]] = []
         for c in content {
-            let toStderr = (c["_meta"] as? [String: Any])?[CLIProtocol.stderrKey] as? Bool == true
+            let meta = c["_meta"] as? [String: Any]
             if let t = c["text"] as? String {
-                if toStderr { FileHandle.standardError.write(Data((t + "\n").utf8)) } else { out.append(t) }
-            } else if c["type"] as? String == "image" {
-                images += 1
+                if meta?[CLIProtocol.stderrKey] as? Bool == true { FileHandle.standardError.write(Data((t + "\n").utf8)) } else { out.append(t) }
+            } else if c["type"] as? String == "image", let b64 = c["data"] as? String, let data = Data(base64Encoded: b64) {
+                guard let saved = savePicture(data) else { fail("omni: the picture could not be saved in \(pictureFolder.path)", code: Exit.unavailable) }
+                var row = ["picture": saved]
+                if let of = meta?[CLIProtocol.pictureKey] as? String { row["path"] = of }
+                pictures.append(row)
+                out.append((first == "read_file" ? "" : "   picture: ") + saved)
             }
         }
         if jsonOutput {
-            printJSON(result["structuredContent"] ?? ["content": content])
-        } else {
-            if images > 0 { FileHandle.standardError.write(Data("(\(images) inline image(s) not printed: the command line prints text; open the paths instead)\n".utf8)) }
-            if !out.isEmpty { print(out.joined(separator: "\n")) }
+            if var structured = result["structuredContent"] as? [String: Any] {
+                if !pictures.isEmpty { structured["pictures"] = pictures }
+                printJSON(structured)
+            } else {
+                printJSON(result["structuredContent"] ?? ["content": content])
+            }
+        } else if !out.isEmpty {
+            print(out.joined(separator: "\n"))
         }
         exit(Exit.ok)
     }

@@ -29,11 +29,14 @@ final class ScreenTimelineState {
     private(set) var pixelSize = CGSize(width: 16, height: 10)
     /// False until the first listing: the empty state is not shown over a history not read yet.
     private(set) var loaded = false
+    /// The stretch of the day the track shows when it is zoomed in; nil is the whole day.
+    private(set) var window: ClosedRange<Double>?
 
     @ObservationIgnored private let history: ScreenHistory
     @ObservationIgnored private weak var surface: ShotSurfaceView?
     /// Held while it is on screen, so the decoder's pool does not hand its surface out again.
-    @ObservationIgnored private var shown: (id: String, pixels: CVPixelBuffer)?
+    /// By id AND time: after a delete rewrites a segment, the same id is another shot.
+    @ObservationIgnored private var shown: (id: String, time: Double, pixels: CVPixelBuffer)?
     @ObservationIgnored private var wanted: ScreenHistory.Shot?
     @ObservationIgnored private var decoding = false
     @ObservationIgnored private var generation = 0
@@ -49,6 +52,73 @@ final class ScreenTimelineState {
     }
 
     var shot: ScreenHistory.Shot? { selected.flatMap { shots.indices.contains($0) ? shots[$0] : nil } }
+
+    // MARK: The track's span
+
+    /// The day on the track: first shot to last, never under ten minutes.
+    var daySpan: ClosedRange<Double> {
+        guard let first = shots.first?.time, let last = shots.last?.time else { return 0 ... 1 }
+        let pad = max(0, 600 - (last - first)) / 2
+        return (first - pad) ... (last + pad)
+    }
+
+    /// What the track covers now.
+    var span: ClosedRange<Double> { window ?? daySpan }
+
+    /// The closest the track zooms: two minutes across, a shot every 5 s well apart.
+    static let shortestWindow = 120.0
+
+    /// Zoom by `factor` (over 1: in), the moment at `fraction` of the track's width staying under
+    /// the pointer.
+    func zoom(by factor: Double, around fraction: Double) {
+        let day = daySpan, now = span
+        let dayLength = day.upperBound - day.lowerBound, length = now.upperBound - now.lowerBound
+        let next = min(dayLength, max(min(Self.shortestWindow, dayLength), length / factor))
+        guard abs(next - length) > 0.001 else { return }
+        if next >= dayLength { showWholeDay(); return }
+        setWindow(start: now.lowerBound + fraction * (length - next), length: next)
+    }
+
+    /// Zoom about the playhead, or the middle when it is off the track.
+    func zoomAboutSelection(by factor: Double) {
+        let now = span
+        let f = shot.flatMap { now.contains($0.time) ? ($0.time - now.lowerBound) / (now.upperBound - now.lowerBound) : nil } ?? 0.5
+        zoom(by: factor, around: f)
+    }
+
+    /// Move a zoomed track along the day by a fraction of its width.
+    func pan(by fraction: Double) {
+        guard let w = window else { return }
+        let length = w.upperBound - w.lowerBound
+        setWindow(start: w.lowerBound + fraction * length, length: length)
+    }
+
+    func showWholeDay() { if window != nil { window = nil } }
+
+    private func setWindow(start: Double, length: Double) {
+        let day = daySpan
+        guard length < day.upperBound - day.lowerBound else { showWholeDay(); return }
+        let lo = min(max(start, day.lowerBound), day.upperBound - length)
+        let next = lo ... (lo + length)
+        if window != next { window = next }
+    }
+
+    /// A zoomed track follows the playhead when a key or a new shot moves it off either end.
+    private func reveal(_ time: Double) {
+        guard let w = window, !w.contains(time) else { return }
+        let length = w.upperBound - w.lowerBound
+        setWindow(start: time - length * (time < w.lowerBound ? 0.1 : 0.9), length: length)
+    }
+
+    /// The first shot at or after a moment; `shots.count` when there is none.
+    private func firstIndex(atOrAfter time: Double) -> Int {
+        var lo = 0, hi = shots.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if shots[mid].time < time { lo = mid + 1 } else { hi = mid }
+        }
+        return lo
+    }
 
     // MARK: Listing
 
@@ -69,7 +139,8 @@ final class ScreenTimelineState {
         let wantDisplay = requestedDisplay ?? display
         let follows = requested == nil && requestedDisplay == nil && day == days.last
             && (selected == nil || selected == shots.count - 1)
-        let keep = requested == nil && requestedDisplay == nil ? shot : nil
+        // Another display opens at the moment the playhead is on.
+        let keep = requested == nil ? shot : nil
         Self.list(history, day: follows ? nil : wantDay, display: wantDisplay) { [weak self] listing in
             guard let self, self.generation == generation else { return }
             self.apply(listing, keep: follows ? nil : keep)
@@ -81,7 +152,8 @@ final class ScreenTimelineState {
         queue.async {
             var out = Listing()
             out.days = history.days()
-            out.day = day.flatMap { out.days.contains($0) ? $0 : nil } ?? out.days.last
+            // A day that is gone (deleted, or past retention) gives way to the one after it.
+            out.day = day.flatMap { d in out.days.contains(d) ? d : out.days.first { $0 > d } } ?? out.days.last
             if let d = out.day, let next = Calendar.current.date(byAdding: .day, value: 1, to: d) {
                 let all = history.shots(from: d.timeIntervalSince1970, to: next.timeIntervalSince1970 - 0.001)
                 var counts: [UInt32: Int] = [:]
@@ -98,15 +170,23 @@ final class ScreenTimelineState {
 
     private func apply(_ listing: Listing, keep: ScreenHistory.Shot?) {
         if days != listing.days { days = listing.days }
+        if day != listing.day || display != listing.display { showWholeDay() }
         if day != listing.day { day = listing.day }
         if displays != listing.displays { displays = listing.displays }
         if display != listing.display { display = listing.display }
         if shots != listing.shots { shots = listing.shots }
         if !loaded { loaded = true }
-        let index = keep.flatMap { k in shots.firstIndex { $0.index == k.index && $0.segment == k.segment } }
-            ?? (shots.isEmpty ? nil : shots.count - 1)
+        if let w = window { setWindow(start: w.lowerBound, length: w.upperBound - w.lowerBound) }
+        // The shot kept is found by its time: a delete renumbers the shots after it in their
+        // segment. One that is gone leaves the playhead on its nearest neighbour.
+        var index = shots.isEmpty ? nil : shots.count - 1
+        if let keep, !shots.isEmpty {
+            var i = min(firstIndex(atOrAfter: keep.time), shots.count - 1)
+            if i > 0, keep.time - shots[i - 1].time < shots[i].time - keep.time { i -= 1 }
+            index = i
+        }
         if selected != index { selected = index }
-        if let shot { show(shot) } else { clearPicture() }
+        if let shot { reveal(shot.time); show(shot) } else { clearPicture() }
     }
 
     // MARK: Moving
@@ -114,19 +194,18 @@ final class ScreenTimelineState {
     func select(_ index: Int) {
         guard shots.indices.contains(index), index != selected else { return }
         selected = index
+        reveal(shots[index].time)
         show(shots[index])
     }
 
-    /// The shot nearest a moment of the day.
+    /// The shot nearest a moment, among those on the track: a drag never leaves what it shows.
     func select(nearest time: Double) {
-        guard !shots.isEmpty else { return }
-        var lo = 0, hi = shots.count - 1
-        while lo < hi {
-            let mid = (lo + hi) / 2
-            if shots[mid].time < time { lo = mid + 1 } else { hi = mid }
-        }
-        if lo > 0, time - shots[lo - 1].time <= shots[lo].time - time { lo -= 1 }
-        select(lo)
+        let on = span
+        let lo = firstIndex(atOrAfter: on.lowerBound), hi = firstIndex(atOrAfter: on.upperBound.nextUp) - 1
+        guard lo <= hi else { return }
+        var i = min(max(firstIndex(atOrAfter: time), lo), hi)
+        if i > lo, time - shots[i - 1].time <= shots[i].time - time { i -= 1 }
+        select(i)
     }
 
     func step(_ by: Int) {
@@ -158,7 +237,7 @@ final class ScreenTimelineState {
 
     func attach(_ view: ShotSurfaceView) {
         surface = view
-        view.show(shown?.pixels)
+        view.show(shown?.pixels, time: shown?.time ?? 0)
     }
 
     /// LATEST WINS. A drag asks for a shot per pointer event and a decode takes a few ms: one
@@ -172,17 +251,17 @@ final class ScreenTimelineState {
     private func decodeNext() {
         guard let shot = wanted else { return }
         wanted = nil
-        guard shown?.id != shot.id else { return }
+        guard shown?.id != shot.id || shown?.time != shot.time else { return }
         decoding = true
         Self.decode(shot, from: history) { [weak self] box, ms in
             guard let self else { return }
             self.decoding = false
             self.decodeTimes.append(ms)
             if let pixels = box.pixels, !self.shots.isEmpty {
-                self.shown = (shot.id, pixels)
+                self.shown = (shot.id, shot.time, pixels)
                 let size = CGSize(width: CVPixelBufferGetWidth(pixels), height: CVPixelBufferGetHeight(pixels))
                 if size != self.pixelSize { self.pixelSize = size }
-                self.surface?.show(pixels)
+                self.surface?.show(pixels, time: shot.time)
             }
             self.decodeNext()
         }
@@ -191,7 +270,7 @@ final class ScreenTimelineState {
     private func clearPicture() {
         wanted = nil
         shown = nil
-        surface?.show(nil)
+        surface?.show(nil, time: 0)
     }
 
     private struct PixelBox: @unchecked Sendable { let pixels: CVPixelBuffer? }
@@ -216,12 +295,58 @@ final class ScreenTimelineState {
     /// The shown shot's file in the index, when it has one.
     func stillOfShown() -> URL? { shot.flatMap { history.still(of: $0) } }
 
+    // MARK: Deleting
+
+    enum DeleteScope: String, Sendable { case shot, session, day }
+
+    /// What a delete would remove: the span, the display (nil: every display), and how many shots.
+    struct Deletion: Sendable {
+        let scope: DeleteScope
+        let from: Double, to: Double
+        let display: UInt32?
+        let shots: Int
+    }
+
+    /// The span a delete around the selected shot covers. One shot is that shot on its display; a
+    /// session (the stretch of work around it, shots no more than five minutes apart) and a day
+    /// go on every display: what was on the other screen then is part of the same work.
+    func deletion(_ scope: DeleteScope, done: @escaping @MainActor @Sendable (Deletion?) -> Void) {
+        guard let shot, let day else { done(nil); return }
+        if scope == .shot { done(Deletion(scope: scope, from: shot.time, to: shot.time, display: shot.display, shots: 1)); return }
+        let history = history
+        Self.queue.async {
+            var found: Deletion?
+            if scope == .session, let s = history.session(around: shot.time) {
+                found = Deletion(scope: scope, from: s.start, to: s.end, display: nil, shots: s.shots)
+            } else if scope == .day, let next = Calendar.current.date(byAdding: .day, value: 1, to: day) {
+                let from = day.timeIntervalSince1970, to = next.timeIntervalSince1970 - 0.001
+                found = Deletion(scope: scope, from: from, to: to, display: nil, shots: history.shots(from: from, to: to).count)
+            }
+            let out = found
+            DispatchQueue.main.async { MainActor.assumeIsolated { done(out) } }
+        }
+    }
+
     // MARK: The perf script
 
     var perfSummary: [String: Any] {
         ["day": day.map { $0.timeIntervalSince1970 } ?? 0, "days": days.count, "shots": shots.count,
+         "display": display ?? 0, "displays": displays.count,
+         "window": window.map { [$0.lowerBound, $0.upperBound] } ?? [],
          "indexed": shots.reduce(0) { $0 + ($1.indexed ? 1 : 0) }, "selected": selected ?? -1,
          "shown": shown?.id ?? "", "time": shot?.time ?? 0, "app": shot?.app ?? "", "title": shot?.title ?? ""]
+    }
+
+    /// `shotdragfile`: write the file a drag of the shown shot would carry, and log what it cost.
+    func perfDragFile() {
+        guard let shown else { omniPerfLog("shot-dragfile nothing shown"); return }
+        let t0 = CACurrentMediaTime()
+        let file = ShotDragFile(shown.pixels, time: shown.time)
+        DispatchQueue.global(qos: .userInitiated).async {
+            let url = file.wait()
+            let bytes = url.flatMap { (try? $0.resourceValues(forKeys: [.fileSizeKey]))?.fileSize } ?? 0
+            omniPerfLog(String(format: "shot-dragfile ms=%.0f bytes=%d path=%@", (CACurrentMediaTime() - t0) * 1000, bytes, url?.path ?? ""))
+        }
     }
 
     /// `shotscrub`: walk `count` shots back from the newest and forward again, each asked for as
@@ -249,10 +374,63 @@ final class ScreenTimelineState {
     }
 }
 
+/// The file a dragged shot carries: a PNG of the whole frame, named as macOS names a screenshot,
+/// in a temporary folder of Omni's.
+///
+/// A REAL FILE, NOT A PROMISE. A promised file is written when it is dropped, and only where the
+/// receiver asks for one: the Finder, Mail and Notes do, a Dock icon, a browser's upload area and
+/// most chat windows take a file that already exists. So the file is written when the button goes
+/// down on the shot, off the main thread, and a drag that starts before it is done waits for it.
+final class ShotDragFile: @unchecked Sendable {
+    private static let folder = FileManager.default.temporaryDirectory.appendingPathComponent("omni-shots", isDirectory: true)
+    private let group = DispatchGroup()
+    /// Written before the group is left, read after a wait on it.
+    private var url: URL?
+
+    private struct Pixels: @unchecked Sendable { let buffer: CVPixelBuffer }
+
+    init(_ pixels: CVPixelBuffer, time: Double) {
+        let held = Pixels(buffer: pixels)
+        group.enter()
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            url = Self.write(held.buffer, time: time)
+            group.leave()
+        }
+    }
+
+    func wait() -> URL? {
+        group.wait()
+        return url
+    }
+
+    private static func write(_ pixels: CVPixelBuffer, time: Double) -> URL? {
+        let fm = FileManager.default
+        try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
+        // A day keeps a file past any drop that still reads it.
+        let old = Date().addingTimeInterval(-86_400)
+        for file in (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.contentModificationDateKey])) ?? [] {
+            if let date = (try? file.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate, date < old {
+                try? fm.removeItem(at: file)
+            }
+        }
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+        let url = folder.appendingPathComponent("Screenshot " + f.string(from: Date(timeIntervalSince1970: time)) + ".png")
+        guard let image = ScreenCodec.cgImage(pixels) else { return nil }
+        let rep = NSBitmapImageRep(cgImage: image)
+        guard let png = rep.representation(using: .png, properties: [:]), (try? png.write(to: url, options: .atomic)) != nil else { return nil }
+        return url
+    }
+}
+
 /// The decoded shot, drawn by a layer straight from the decoder's surface: no copy and no image
-/// conversion per frame.
-final class ShotSurfaceView: NSView {
+/// conversion per frame. Dragged, it leaves as a file.
+final class ShotSurfaceView: NSView, NSDraggingSource {
     private let picture = CALayer()
+    private var pixels: CVPixelBuffer?
+    private var time = 0.0
+    private var pressed: (at: NSPoint, file: ShotDragFile)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -269,7 +447,9 @@ final class ShotSurfaceView: NSView {
         picture.frame = bounds
     }
 
-    func show(_ pixels: CVPixelBuffer?) {
+    func show(_ pixels: CVPixelBuffer?, time: Double) {
+        self.pixels = pixels
+        self.time = time
         guard let pixels else { picture.contents = nil; return }
         if let surface = CVPixelBufferGetIOSurface(pixels)?.takeUnretainedValue() {
             picture.contents = surface
@@ -277,6 +457,32 @@ final class ShotSurfaceView: NSView {
             picture.contents = ScreenCodec.cgImage(pixels)
         }
     }
+
+    // MARK: Dragging the shot out
+
+    override func mouseDown(with event: NSEvent) {
+        guard let pixels else { return }
+        pressed = (event.locationInWindow, ShotDragFile(pixels, time: time))
+    }
+
+    override func mouseUp(with event: NSEvent) { pressed = nil }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let press = pressed else { return }
+        let p = event.locationInWindow
+        guard hypot(p.x - press.at.x, p.y - press.at.y) >= 4 else { return }
+        pressed = nil
+        guard let url = press.file.wait(), let pixels, let image = ScreenCodec.cgImage(pixels) else { return }
+        // A small picture of the shot under the pointer, as the Finder drags an image file.
+        let width = min(bounds.width, 220), height = width * CGFloat(image.height) / CGFloat(max(1, image.width))
+        let at = convert(p, from: nil)
+        let item = NSDraggingItem(pasteboardWriter: url as NSURL)
+        item.setDraggingFrame(NSRect(x: at.x - width / 2, y: at.y - height / 2, width: width, height: height),
+                              contents: NSImage(cgImage: image, size: NSSize(width: width, height: height)))
+        beginDraggingSession(with: [item], event: event, source: self)
+    }
+
+    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation { .copy }
 }
 
 private struct ShotSurface: NSViewRepresentable {
@@ -296,6 +502,7 @@ struct ScreenTimeline: View {
     @State private var state: ScreenTimelineState?
 
     var body: some View {
+        let _ = UIProbe.count("body.ScreenTimeline")
         Group {
             if let state {
                 if state.loaded, state.shots.isEmpty {
@@ -304,7 +511,7 @@ struct ScreenTimeline: View {
                 } else {
                     ShotPane(state: state)
                         .safeAreaInset(edge: .bottom, spacing: 0) { TimelineBar(state: state) }
-                        .background(TimelineKeys(state: state))
+                        .background(TimelineKeys(state: state) { ScreenshotsDelete.confirm(model, state, .shot) })
                 }
             } else {
                 Color.clear
@@ -325,6 +532,19 @@ struct ScreenTimeline: View {
                 state.select(n < 0 ? state.shots.count + n : n)
             case "scrub": state.perfScrub(Int(parts.last ?? "") ?? 60) { omniPerfLog("shotscrub done") }
             case "day": state.stepDay(Int(parts.last ?? "") ?? 0)
+            case "display":
+                let n = Int(parts.last ?? "") ?? 0
+                if state.displays.indices.contains(n) { state.reload(display: state.displays[n]) }
+            case "zoom":
+                if parts.last == "reset" { state.showWholeDay() } else { state.zoomAboutSelection(by: Double(parts.last ?? "") ?? 2) }
+            case "pan": state.pan(by: Double(parts.last ?? "") ?? 0)
+            case "dragfile": state.perfDragFile()
+            case "delete":   // shot | session | day, without the confirmation
+                guard let scope = ScreenTimelineState.DeleteScope(rawValue: parts.last ?? "") else { break }
+                state.deletion(scope) { d in
+                    omniPerfLog("shot-delete asked scope=\(scope.rawValue) shots=\(d?.shots ?? 0)")
+                    if let d { model.deleteScreenshots(from: d.from, to: d.to, display: d.display) }
+                }
             default: break
             }
         }
@@ -336,6 +556,7 @@ private struct ShotPane: View {
     let state: ScreenTimelineState
 
     var body: some View {
+        let _ = UIProbe.count("body.ShotPane")
         ShotSurface(state: state)
             .aspectRatio(state.pixelSize, contentMode: .fit)
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -366,6 +587,14 @@ private struct ShotMenu: View {
                 Label("Show in Finder", systemImage: "folder")
             }
         }
+        Divider()
+        Menu {
+            Button("This Screenshot\u{2026}") { ScreenshotsDelete.confirm(model, state, .shot) }
+            Button("This Session\u{2026}") { ScreenshotsDelete.confirm(model, state, .session) }
+            Button("This Day\u{2026}") { ScreenshotsDelete.confirm(model, state, .day) }
+        } label: {
+            Label("Delete", systemImage: "trash")
+        }
     }
 }
 
@@ -394,6 +623,7 @@ private struct TimelineBar: View {
     let state: ScreenTimelineState
 
     var body: some View {
+        let _ = UIProbe.count("body.TimelineBar")
         GlassGroup {
             VStack(spacing: 6) {
                 HStack(spacing: 10) {
@@ -423,6 +653,7 @@ private struct DayPicker: View {
     private var index: Int? { state.day.flatMap { state.days.firstIndex(of: $0) } }
 
     var body: some View {
+        let _ = UIProbe.count("body.DayPicker")
         HStack(spacing: 2) {
             Button { state.stepDay(-1) } label: { Image(systemName: "chevron.left") }
                 .disabled((index ?? 0) == 0)
@@ -459,6 +690,7 @@ private struct ShotLabel: View {
     let state: ScreenTimelineState
 
     var body: some View {
+        let _ = UIProbe.count("body.ShotLabel")
         if let shot = state.shot {
             HStack(spacing: 8) {
                 Text(ShotCaption.time(shot)).font(.callout.monospacedDigit().weight(.medium))
@@ -476,6 +708,7 @@ private struct ShotCount: View {
     let state: ScreenTimelineState
 
     var body: some View {
+        let _ = UIProbe.count("body.ShotCount")
         if let selected = state.selected {
             Text("\((selected + 1).formatted()) of \(state.shots.count.formatted())")
                 .font(.caption.monospacedDigit())
@@ -486,24 +719,22 @@ private struct ShotCount: View {
 }
 
 /// The day, true to time: a point per shot (the shots the index holds drawn larger), the hours
-/// under them, and the playhead. Drag anywhere on it.
+/// under them, and the playhead. Drag anywhere on it; pinch or scroll up and down to zoom into a
+/// stretch of the day, scroll sideways to move along it.
 private struct TimelineTrack: View {
     let state: ScreenTimelineState
 
-    /// The stretch of the day the track covers: first shot to last, never under ten minutes.
-    private var span: ClosedRange<Double> {
-        guard let first = state.shots.first?.time, let last = state.shots.last?.time else { return 0 ... 1 }
-        let pad = max(0, 600 - (last - first)) / 2
-        return (first - pad) ... (last + pad)
-    }
+    static let inset: CGFloat = 6
 
     var body: some View {
-        let range = span
+        let _ = UIProbe.count("body.TimelineTrack")
+        let range = state.span
+        let zoomed = state.window != nil
         GeometryReader { geo in
-            let inset: CGFloat = 6
+            let inset = Self.inset
             let width = max(1, geo.size.width - inset * 2)
             ZStack(alignment: .topLeading) {
-                TrackPoints(shots: state.shots, span: range, inset: inset).equatable()
+                TrackPoints(shots: state.shots, span: range, day: zoomed ? state.daySpan : nil, inset: inset).equatable()
                 Playhead(state: state, span: range, inset: inset, width: width)
             }
             .contentShape(Rectangle())
@@ -513,6 +744,12 @@ private struct TimelineTrack: View {
             })
         }
         .frame(height: 38)
+        .background(TrackZoom(state: state))
+        .contextMenu {
+            Button("Zoom In") { state.zoomAboutSelection(by: 2) }.keyboardShortcut("=", modifiers: .command)
+            Button("Zoom Out") { state.zoomAboutSelection(by: 0.5) }.keyboardShortcut("-", modifiers: .command).disabled(!zoomed)
+            Button("Show Whole Day") { state.showWholeDay() }.keyboardShortcut("0", modifiers: .command).disabled(!zoomed)
+        }
         .accessibilityElement()
         .accessibilityLabel("Timeline")
         .accessibilityAdjustableAction { direction in
@@ -521,15 +758,65 @@ private struct TimelineTrack: View {
     }
 }
 
+/// Pinch and scroll over the track. A local monitor, as the arrow keys have: the track is drawn
+/// by SwiftUI, which hands a view neither a scroll wheel nor where a pinch is.
+private struct TrackZoom: NSViewRepresentable {
+    let state: ScreenTimelineState
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView(frame: .zero)
+        context.coordinator.install(state, over: view)
+        return view
+    }
+    func updateNSView(_ view: NSView, context: Context) {}
+    static func dismantleNSView(_ view: NSView, coordinator: Coordinator) { coordinator.uninstall() }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    @MainActor final class Coordinator {
+        private var monitor: Any?
+
+        func install(_ state: ScreenTimelineState, over view: NSView) {
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.scrollWheel, .magnify]) { [weak state, weak view] event in
+                // Local monitors run on the main thread, where this closure is isolated.
+                guard let state, let view, event.window === view.window else { return event }
+                let p = view.convert(event.locationInWindow, from: nil)
+                guard view.bounds.contains(p) else { return event }
+                let width = max(1, view.bounds.width - TimelineTrack.inset * 2)
+                let f = Double(min(max((p.x - TimelineTrack.inset) / width, 0), 1))
+                if event.type == .magnify {
+                    state.zoom(by: 1 + Double(event.magnification), around: f)
+                    return nil
+                }
+                // A wheel turns in lines, a trackpad in points.
+                let unit: CGFloat = event.hasPreciseScrollingDeltas ? 1 : 10
+                let dx = event.scrollingDeltaX * unit, dy = event.scrollingDeltaY * unit
+                if abs(dx) > abs(dy) { state.pan(by: Double(-dx / width)) }
+                else if dy != 0 { state.zoom(by: exp(Double(dy) * 0.01), around: f) }
+                return nil
+            }
+        }
+
+        func uninstall() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        }
+    }
+}
+
 /// Drawn once per listing, not per drag: it reads the shots and never the selection.
 private struct TrackPoints: View, Equatable {
     let shots: [ScreenHistory.Shot]
     let span: ClosedRange<Double>
+    /// The whole day when the track is zoomed into part of it: drawn as a bar over the points,
+    /// the part shown marked on it.
+    let day: ClosedRange<Double>?
     let inset: CGFloat
 
     static let rowHeight: CGFloat = 22
 
     var body: some View {
+        let _ = UIProbe.count("body.TrackPoints")
         Canvas { context, size in
             let width = max(1, size.width - inset * 2)
             let length = span.upperBound - span.lowerBound
@@ -538,10 +825,27 @@ private struct TrackPoints: View, Equatable {
             rail.addRoundedRect(in: CGRect(x: inset, y: y - 0.5, width: width, height: 1), cornerSize: CGSize(width: 0.5, height: 0.5))
             context.fill(rail, with: .style(.quaternary))
 
+            if let day {
+                let whole = day.upperBound - day.lowerBound
+                let from = inset + CGFloat((span.lowerBound - day.lowerBound) / whole) * width
+                let shown = max(8, CGFloat(length / whole) * width)
+                var all = Path(), part = Path()
+                all.addRoundedRect(in: CGRect(x: inset, y: 0, width: width, height: 2), cornerSize: CGSize(width: 1, height: 1))
+                part.addRoundedRect(in: CGRect(x: min(from, inset + width - shown), y: 0, width: shown, height: 2), cornerSize: CGSize(width: 1, height: 1))
+                context.fill(all, with: .style(.quaternary))
+                context.fill(part, with: .style(.secondary))
+            }
+
             // One mark per point of width: a day of shots 5 s apart is several to a point.
             let columns = Int(width.rounded(.up)) + 1
             var any = [Bool](repeating: false, count: columns), indexed = [Bool](repeating: false, count: columns)
-            for shot in shots {
+            var first = 0, end = shots.count
+            while first < end {
+                let mid = (first + end) / 2
+                if shots[mid].time < span.lowerBound { first = mid + 1 } else { end = mid }
+            }
+            for shot in shots[first...] {
+                if shot.time > span.upperBound { break }
                 let c = min(columns - 1, max(0, Int(((shot.time - span.lowerBound) / length * Double(width)).rounded())))
                 any[c] = true
                 if shot.indexed { indexed[c] = true }
@@ -556,7 +860,7 @@ private struct TrackPoints: View, Equatable {
             context.fill(marked, with: .style(.secondary))
 
             // The hours, or parts of one on a short day.
-            let step: Double = length <= 1800 ? 300 : length <= 2 * 3600 ? 900 : length <= 8 * 3600 ? 3600 : 2 * 3600
+            let step: Double = length <= 360 ? 60 : length <= 1800 ? 300 : length <= 2 * 3600 ? 900 : length <= 8 * 3600 ? 3600 : 2 * 3600
             let zone = Double(TimeZone.current.secondsFromGMT(for: Date(timeIntervalSince1970: span.lowerBound)))
             var t = ((span.lowerBound + zone) / step).rounded(.up) * step - zone
             var lastLabelEnd = -CGFloat.infinity
@@ -587,7 +891,8 @@ private struct Playhead: View {
     let width: CGFloat
 
     var body: some View {
-        if let shot = state.shot {
+        let _ = UIProbe.count("body.Playhead")
+        if let shot = state.shot, span.contains(shot.time) {
             let x = inset + CGFloat((shot.time - span.lowerBound) / (span.upperBound - span.lowerBound)) * width
             Capsule()
                 .fill(Color.accentColor)
@@ -600,12 +905,14 @@ private struct Playhead: View {
 }
 
 /// Left and right step a shot, with Option to the next one the index holds and with Command to
-/// either end of the day: whichever part of the window has focus, except a text field.
+/// either end of the day; Command with = - 0 zooms the track; Command-Delete deletes the shot:
+/// whichever part of the window has focus, except a text field.
 private struct TimelineKeys: NSViewRepresentable {
     let state: ScreenTimelineState
+    let delete: @MainActor () -> Void
 
     func makeNSView(context: Context) -> NSView {
-        context.coordinator.install(state)
+        context.coordinator.install(state, delete: delete)
         return NSView(frame: .zero)
     }
     func updateNSView(_ view: NSView, context: Context) {}
@@ -615,15 +922,26 @@ private struct TimelineKeys: NSViewRepresentable {
     @MainActor final class Coordinator {
         private var monitor: Any?
 
-        func install(_ state: ScreenTimelineState) {
+        func install(_ state: ScreenTimelineState, delete: @escaping @MainActor () -> Void) {
             guard monitor == nil else { return }
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak state] event in
                 // Local monitors run on the main thread, where this closure is isolated.
-                guard let state, event.keyCode == 123 || event.keyCode == 124,
+                guard let state, [123, 124, 24, 27, 29, 51].contains(event.keyCode),
                       let window = NSApp.keyWindow, window.identifier?.rawValue.hasPrefix("main") ?? false,
                       !(window.firstResponder is NSText) else { return event }
-                let forward = event.keyCode == 124
                 let flags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+                if event.keyCode != 123, event.keyCode != 124 {
+                    // = (with or without Shift, as Zoom In is everywhere), -, 0 and Delete.
+                    guard flags == .command || (event.keyCode == 24 && flags == [.command, .shift]), state.shot != nil else { return event }
+                    switch event.keyCode {
+                    case 24: state.zoomAboutSelection(by: 2)
+                    case 27: state.zoomAboutSelection(by: 0.5)
+                    case 29: state.showWholeDay()
+                    default: delete()
+                    }
+                    return nil
+                }
+                let forward = event.keyCode == 124
                 if flags == .command { state.selectEnd(last: forward) }
                 else if flags == .option { state.stepIndexed(forward: forward) }
                 else if flags.isEmpty { state.step(forward ? 1 : -1) }
@@ -650,6 +968,39 @@ enum ScreenshotsClear {
         alert.addButton(withTitle: "Cancel")
         alert.buttons.first?.hasDestructiveAction = true
         if alert.runModal() == .alertFirstButtonReturn { model.clearScreenshots() }
+    }
+}
+
+/// Confirmation for deleting one shot, the session around it, or its day.
+@MainActor
+enum ScreenshotsDelete {
+    static func confirm(_ model: AppModel, _ state: ScreenTimelineState, _ scope: ScreenTimelineState.DeleteScope) {
+        state.deletion(scope) { deletion in
+            guard let d = deletion, d.shots > 0 else { return }
+            let alert = NSAlert()
+            let clock = Date.FormatStyle(date: .omitted, time: .shortened)
+            let from = Date(timeIntervalSince1970: d.from), to = Date(timeIntervalSince1970: d.to)
+            switch d.scope {
+            case .shot:
+                alert.messageText = "Delete this screenshot?"
+                alert.informativeText = "The screenshot from \(from.formatted(date: .omitted, time: .standard)) will be deleted."
+            case .session:
+                alert.messageText = "Delete this session?"
+                alert.informativeText = d.shots == 1 ? "1 screenshot from \(from.formatted(clock)) will be deleted."
+                    : "\(d.shots.formatted()) screenshots from \(from.formatted(clock)) to \(to.formatted(clock)) will be deleted."
+            case .day:
+                let calendar = Calendar.current
+                let day = calendar.isDateInToday(from) ? "today" : calendar.isDateInYesterday(from) ? "yesterday"
+                    : from.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
+                alert.messageText = "Delete this day?"
+                alert.informativeText = d.shots == 1 ? "1 screenshot from \(day) will be deleted."
+                    : "All \(d.shots.formatted()) screenshots from \(day) will be deleted."
+            }
+            alert.addButton(withTitle: "Delete")
+            alert.addButton(withTitle: "Cancel")
+            alert.buttons.first?.hasDestructiveAction = true
+            if alert.runModal() == .alertFirstButtonReturn { model.deleteScreenshots(from: d.from, to: d.to, display: d.display) }
+        }
     }
 }
 

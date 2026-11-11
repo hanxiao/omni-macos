@@ -219,6 +219,77 @@ final class HeavyCrudTests: XCTestCase {
         }
     }
 
+    /// A listing that a date or a folder narrows is decided a file at a time and reads only the
+    /// passing files' rows (their row windows). It must list what the walk of every row lists: the
+    /// same files, the same row standing for each, in the same order - with files written again
+    /// (their windows widened), files of two kinds, and deleted files in the index.
+    func testListMatchingByFileIsTheRowWalk() throws {
+        let (store, url) = try tempStore()
+        defer { store.close(); try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        var rng = SystemRandomNumberGenerator()
+        var seed = 0
+        func write(_ p: String, _ m: Double) throws {
+            var cs: [IndexedChunk] = []
+            for c in 0 ..< Int.random(in: 1 ... 4, using: &rng) {
+                seed += 1
+                // A PDF's pictured page beside its words: two kinds in one file.
+                let kind = p.hasSuffix(".png") ? "image" : (p.hasSuffix(".pdf") && c % 2 == 1 ? "scan" : "text")
+                cs.append(IndexedChunk(path: p, modified: m, size: 1, kind: kind, chunkIndex: c, snippet: "x",
+                                       embedding: vec(seed), chunkKey: "bf\(seed)"))
+            }
+            try store.replaceMany([(p, cs)])
+        }
+        var dates: [String: Double] = [:]
+        for i in 0 ..< 240 {
+            let p = String(format: "/%@/%03d.%@", ["a", "b", "b/c"][i % 3], i, ["txt", "png", "pdf"][(i / 3) % 3])
+            dates[p] = Double(Int.random(in: 0 ..< 60, using: &rng))
+            try write(p, dates[p]!)
+        }
+        for p in dates.keys.sorted().prefix(40) { dates[p] = Double(Int.random(in: 0 ..< 60, using: &rng)); try write(p, dates[p]!) }
+        let gone = Set(dates.keys.sorted().suffix(30))
+        store.deletePaths(gone)
+        for p in gone { dates[p] = nil }
+        func listed(_ f: SearchFilter, _ k: Int) -> [String] {
+            store.listMatching(filter: f, topK: k).map { "\($0.path)|\($0.kind)|\($0.chunkIndex)" }
+        }
+        var filters: [(String, SearchFilter, (String, Double) -> Bool)] = []
+        var f = SearchFilter(); f.since = 10; f.until = 20
+        filters.append(("a range", f, { _, m in m >= 10 && m < 20 }))
+        f = SearchFilter(); f.since = 55
+        filters.append(("since", f, { _, m in m >= 55 }))
+        f = SearchFilter(); f.until = 3
+        filters.append(("until", f, { _, m in m < 3 }))
+        f = SearchFilter(); f.folderPrefixes = ["/b/c"]
+        filters.append(("a folder", f, { p, _ in p.hasPrefix("/b/c/") }))
+        f = SearchFilter(); f.excludeFolders = ["/a", "/b/c"]; f.since = 5; f.until = 50
+        filters.append(("a range outside two folders", f, { p, m in m >= 5 && m < 50 && !p.hasPrefix("/a/") && !p.hasPrefix("/b/c/") }))
+        f = SearchFilter(); f.since = 100
+        filters.append(("an empty range", f, { _, _ in false }))
+        let before = store.rowWindowUse
+        XCTAssertTrue(before.covering, "the windows are not in use: this would compare the row walk with itself")
+        for (name, filter, passes) in filters {
+            let expected = dates.filter { passes($0.key, $0.value) }
+                .sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }.map(\.key)
+            for k in [1, 5, 400] {
+                let byFile = listed(filter, k)
+                VectorStore.rowWindows = false   // negative control: the walk of every row, restored at once
+                let byRow = listed(filter, k)
+                VectorStore.rowWindows = true
+                XCTAssertEqual(byFile, byRow, "\(name), top \(k)")
+                XCTAssertEqual(byFile.map { String($0.split(separator: "|")[0]) }, Array(expected.prefix(k)), "\(name), top \(k)")
+            }
+            var scans = filter; scans.kinds = ["scan"]
+            let byFile = listed(scans, 400)
+            VectorStore.rowWindows = false
+            let byRow = listed(scans, 400)
+            VectorStore.rowWindows = true
+            XCTAssertEqual(byFile, byRow, "\(name), scans")
+            XCTAssertTrue(byFile.allSatisfy { $0.contains(".pdf|scan|") }, "\(name): a scan row stands for its file")
+        }
+        XCTAssertEqual(store.rowWindowUse.unproven, before.unproven, "a window did not hold its file's rows")
+        XCTAssertEqual(store.rowWindowUse.noWin, before.noWin, "a narrow listing fell back to the row walk")
+    }
+
     /// An index on exact vectors has no coverage, and its tombstones used to be collected by a
     /// compaction inside the very delete that passed the budget - one long hold in the middle of a
     /// bulk delete. They now stay past the budget, every search still skips them, and the stamp

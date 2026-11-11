@@ -14,7 +14,7 @@ import OmniLink
 /// `wait:<seconds>`, `intent:<text>` (the Shortcuts search action's own search, logged). For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
 /// (window size, centered), `front`, `appearance:light|dark`, `ocrview:raw|rendered|split|triple`, `ocrpage:<n>`, `history:<n>`, `sort:<order>`,
-/// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `menu:<title>`, `historybench:<n>`, `seedhistory:<n>[:<m>]`, `note:<text>`, `menustate:<menu>`, `historyfold:<n>`, `sidebarscroll:<top|bottom|f>`, `recents`, `clipboard:on|off`, `screenshots:on|off|clear`, `shotfeed:<dir>[|hoursAgo]`, `shotselect:<n>`, `shotscrub:<n>`, `shotday:<-1|1>`, `powerhold:hot|lowpower|battery|none`, `ocrrun:on|off`, `stall:queue:<path>|flag`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
+/// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `menu:<title>`, `historybench:<n>`, `seedhistory:<n>[:<m>]`, `note:<text>`, `menustate:<menu>`, `historyfold:<n>`, `sidebarscroll:<top|bottom|f>`, `recents`, `clipboard:on|off`, `screenshots:on|off|clear`, `shotfeed:<dir>[|hoursAgo]`, `shotselect:<n>`, `shotscrub:<n>`, `shotday:<-1|1>`, `shotdisplay:<n>`, `shotzoom:<factor|reset>`, `shotpan:<fraction>`, `shotdragfile`, `shotdelete:<shot|session|day>`, `shotexclude:<bundle ids>`, `powerhold:hot|lowpower|battery|none`, `ocrrun:on|off`, `stall:queue:<path>|flag`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
 enum PerfScript {
@@ -370,6 +370,8 @@ enum PerfScript {
                 "screenshotsAccess": model.screenshotsAccess.map { $0 ? "allowed" : "denied" } ?? "unknown",
                 "screenshotsHasShots": model.screenshotsHasShots,
                 "screenshotsRevision": model.screenshotsRevision,
+                "screenshotsExcluded": model.screenshotsExcludedApps,
+                "screenshotsDiskBytes": model.screenshotsDiskBytes ?? -1,
                 "timeline": ScreenTimelineState.current?.perfSummary ?? [:],
                 "folderCounts": model.folderFileCounts,   // the sidebar's per-folder numbers
                 "history": model.searchHistory.prefix(20).map { ["text": $0.displayText, "source": $0.source] },
@@ -431,8 +433,10 @@ enum PerfScript {
         case "rebootstrap": model.retryBootstrap()   // a model switch or a reopen, on the model already in hand
         case "movedb": Task { let r = await model.moveDatabaseDir(to: URL(fileURLWithPath: arg, isDirectory: true)); omniPerfLog("movedb result=\(r ?? "ok")") }
         case "testseam": model.perfSeam(arg)   // see AppModel.perfSeam
-        case "shot":   // the main window, as cacheDisplay draws it (no Screen Recording needed), to <path>
-            if let w = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil }), let frame = w.contentView?.superview,
+        case "shot", "shotsettings":   // the main window (or Settings), as cacheDisplay draws it (no Screen Recording needed), to <path>
+            let settings = step.hasPrefix("shotsettings")
+            if let w = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil && ($0.identifier?.rawValue.hasPrefix("main") ?? false) != settings }),
+               let frame = w.contentView?.superview,
                let rep = frame.bitmapImageRepForCachingDisplay(in: frame.bounds) {
                 frame.cacheDisplay(in: frame.bounds, to: rep)
                 try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: arg))
@@ -466,6 +470,20 @@ enum PerfScript {
             NotificationCenter.default.post(name: .omniPerfShot, object: "scrub:" + arg)
         case "shotday":     // the timeline a day back (-1) or forward (1)
             NotificationCenter.default.post(name: .omniPerfShot, object: "day:" + arg)
+        case "shotdisplay": // the n-th display that has shots in the day
+            NotificationCenter.default.post(name: .omniPerfShot, object: "display:" + arg)
+        case "shotzoom":    // the track zoomed by a factor about the playhead, or reset
+            NotificationCenter.default.post(name: .omniPerfShot, object: "zoom:" + arg)
+        case "shotpan":     // a zoomed track moved by a fraction of its width
+            NotificationCenter.default.post(name: .omniPerfShot, object: "pan:" + arg)
+        case "shotdragfile": // the file a drag of the shown shot carries, written and timed
+            NotificationCenter.default.post(name: .omniPerfShot, object: "dragfile")
+        case "shotdelete":  // shot | session | day around the shown shot, without its confirmation
+            NotificationCenter.default.post(name: .omniPerfShot, object: "delete:" + arg)
+        case "shotdecline": // macOS declining a capture, asked again after <seconds> (ScreenRecorder.declineForScript)
+            model.perfDeclineScreenshots(retryAfter: Double(arg) ?? 300)
+        case "shotexclude": // the apps never recorded: bundle ids, comma separated (empty: none)
+            model.screenshotsExcludedApps = arg.split(separator: ",").map(String.init)
         case "appearance": NSApp.appearance = NSAppearance(named: arg == "dark" ? .darkAqua : .aqua)
         default: omniPerfLog("script: unknown step \(step)")
         }

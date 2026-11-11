@@ -236,6 +236,120 @@ final class EnrichmentTests: XCTestCase {
         XCTAssertEqual(try XCTUnwrap(store.storedChunks(path: film.path)).map { "\($0.kind)|\($0.locator)" }, filmChunks)
     }
 
+    // MARK: - A screenshot read whole before (0.20.0), read again in pieces
+
+    /// An index as 0.20.0 left it - each screenshot read whole, under that reading's keys, done in
+    /// the ledger - becomes, in one enrichment, exactly what indexing the same files today makes:
+    /// the picture not embedded again, its text read in pieces, the keys today's. A copy takes the
+    /// rows of the one done first; a picture that is not a screenshot is not touched; a second
+    /// pass does nothing.
+    func testAScreenshotReadWholeBeforeBecomesWhatIndexingItTodayMakes() throws {
+        final class Counting: Embedder, @unchecked Sendable {
+            let inner = Fake()
+            var dim: Int { inner.dim }
+            var pictures = 0, texts = 0
+            func embedText(_ text: String, as type: OmniInputType) -> [Float] { texts += 1; return inner.embedText(text, as: type) }
+            func embedTextBatch(_ t: [String], as type: OmniInputType) -> [[Float]] { texts += t.count; return inner.embedTextBatch(t, as: type) }
+            func embedImage(_ image: CGImage) -> [Float]? { pictures += 1; return inner.embedImage(image) }
+            func embedImages(_ raws: [OmniVisionPreprocess.RawPatches]) -> [[Float]]? { pictures += raws.count; return inner.embedImages(raws) }
+            func embedVideoFrames(_ frames: [CGImage]) -> [Float]? { inner.embedVideoFrames(frames) }
+            func embedAudio(_ url: URL) -> [Float]? { inner.embedAudio(url) }
+            func embedAudioMel(_ mel: [Float], frames: Int) -> [Float]? { inner.embedAudioMel(mel, frames: frames) }
+            func embedAudioMelBatch(_ mels: [[Float]], frames: [Int]) -> [[Float]]? { inner.embedAudioMelBatch(mels, frames: frames) }
+        }
+        let shot = try screenshot(["Booking confirmed", "Confirmation code: K7Q2LM", "Seat 32A"], name: "Screenshot 2026-11-01 at 10.00.00.png")
+        let twin = root.appendingPathComponent("Screenshot 2026-11-01 at 10.00.00 copy.png")
+        try FileManager.default.copyItem(at: shot, to: twin)
+        let other = try screenshot(["Order #114-3328-9912 has shipped"], name: "Screenshot 2026-11-02 at 09.30.00.png")
+        // Not a screenshot: the same kind of picture, without the mark.
+        let photo = try screenshot(["A sign by the road"], name: "sign.png")
+        XCTAssertEqual(removexattr(photo.path, "com.apple.metadata:kMDItemIsScreenCapture", 0), 0)
+        let paths = [shot.path, twin.path, other.path, photo.path]
+
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let embedder = Counting()
+        // NEGATIVE CONTROL: the reading 0.20.0 had, to build the index an upgrade finds. Restored at once.
+        ScreenText.inPieces = false
+        defer { ScreenText.inPieces = true }
+        pass(Indexer(store: store, embedder: embedder), IndexSettings())
+        ScreenText.inPieces = true
+        let before = Dictionary(uniqueKeysWithValues: try paths.map { ($0, try XCTUnwrap(store.storedChunks(path: $0))) })
+        let digestsBefore = store.contentDigests(paths: paths)
+        for path in [shot.path, twin.path, other.path] {
+            XCTAssertTrue(before[path]?.contains { $0.kind == "text" } == true, "the old index has its text (control)")
+            let d = try XCTUnwrap(digestsBefore[path])
+            XCTAssertEqual(store.enrichLedger.done([EnrichLedger.key(digest: d, path: path)]).count, 1, "done, as 0.20.0 recorded it (control)")
+            XCTAssertTrue(store.enrichLedger.done([EnrichLedger.key(digest: d, path: path, screenshot: true)]).isEmpty)
+        }
+        XCTAssertTrue(store.enrichLedger.backfilled)
+
+        // The same files indexed today, in an index of their own.
+        let freshDir = db.appendingPathComponent("fresh")
+        try FileManager.default.createDirectory(at: freshDir, withIntermediateDirectories: true)
+        let fresh = try VectorStore(dbURL: freshDir.appendingPathComponent("index.sqlite"))
+        defer { fresh.close() }
+        pass(Indexer(store: fresh, embedder: Fake()), IndexSettings())
+        let digestsToday = fresh.contentDigests(paths: paths)
+
+        // The upgrade: the new scope clears "backfilled" at the next launch (EnrichLedger.prepare).
+        store.enrichLedger.backfilled = false
+        let pictures = embedder.pictures
+        pass(Indexer(store: store, embedder: embedder), IndexSettings())
+        XCTAssertEqual(embedder.pictures, pictures, "a picture was embedded again")
+        let digestsAfter = store.contentDigests(paths: paths)
+        func shape(_ rows: [IndexedChunk]?) -> [String] {
+            (rows ?? []).sorted { $0.chunkIndex < $1.chunkIndex }.map { "\($0.kind)|\($0.chunkIndex)|\($0.locator)|\($0.snippet)|\($0.chunkKey)|\($0.embedding)" }
+        }
+        for path in [shot.path, twin.path, other.path] {
+            XCTAssertNotEqual(digestsAfter[path], digestsBefore[path], "still under the old reading's key")
+            XCTAssertEqual(digestsAfter[path], digestsToday[path])
+            XCTAssertEqual(shape(store.storedChunks(path: path)), shape(fresh.storedChunks(path: path)), "not what indexing it today makes")
+            XCTAssertNotEqual(store.storedChunks(path: path)?.first { $0.kind == "image" }?.chunkKey, before[path]?.first { $0.kind == "image" }?.chunkKey)
+            let d = try XCTUnwrap(digestsAfter[path])
+            XCTAssertEqual(store.enrichLedger.done([EnrichLedger.key(digest: d, path: path, screenshot: true)]).count, 1)
+        }
+        XCTAssertEqual(digestsAfter[shot.path], digestsAfter[twin.path], "copies share a content")
+        XCTAssertEqual(digestsAfter[photo.path], digestsBefore[photo.path], "a picture that is not a screenshot was touched")
+        XCTAssertEqual(shape(store.storedChunks(path: photo.path)), shape(before[photo.path]))
+        XCTAssertTrue(store.enrichLedger.backfilled)
+        let found = store.search(embedder.embedText("K7Q2LM", as: .query), topK: 10, textQuery: "K7Q2LM")
+        XCTAssertEqual(Set(found.prefix(2).map(\.path)), [shot.path, twin.path], "the code is found under the new key")
+
+        // Done: asked again, nothing is read or embedded.
+        store.enrichLedger.backfilled = false
+        let texts = embedder.texts
+        let indexer = Indexer(store: store, embedder: embedder)
+        var asked: [String] = []
+        XCTAssertEqual(indexer.enrichMedia(settings: IndexSettings(), onFile: { asked.append($0) }), 0)
+        XCTAssertEqual(asked, [])
+        XCTAssertEqual(embedder.texts, texts)
+        XCTAssertEqual(embedder.pictures, pictures)
+    }
+
+    /// Text the reader no longer finds is taken out with the old reading, not left beside the picture.
+    func testAScreenshotWithNoTextNowLosesTheTextItHad() throws {
+        let shot = try screenshot(["Booking confirmed", "Confirmation code: K7Q2LM"], name: "Screenshot 2026-11-03 at 08.00.00.png")
+        let store = try VectorStore(dbURL: db.appendingPathComponent("index.sqlite"))
+        defer { store.close() }
+        let indexer = Indexer(store: store, embedder: Fake())
+        pass(indexer, IndexSettings())
+        let had = try XCTUnwrap(store.storedChunks(path: shot.path))
+        XCTAssertGreaterThan(had.count, 1, "no text indexed; the test proves nothing")
+        let f = try XCTUnwrap(store.storedFiles(paths: [shot.path])[shot.path])
+        let d = try XCTUnwrap(store.contentDigests(paths: [shot.path])[shot.path])
+        // A key of the stored form, other than the one it has.
+        let old = try XCTUnwrap(had.first { $0.kind == "image" }?.chunkKey)
+        let today = String(old.dropLast()) + (old.hasSuffix("0") ? "1" : "0")
+        indexer.resetCancelled()
+        XCTAssertTrue(indexer.addScreenText(CrawledFile(path: shot.path, modified: f.modified, size: f.size), digest: d, pieces: [],
+                                            settings: IndexSettings(), pictureKey: today))
+        let has = try XCTUnwrap(store.storedChunks(path: shot.path))
+        XCTAssertEqual(has.map(\.kind), ["image"])
+        XCTAssertEqual(has.first?.chunkKey, today)
+        XCTAssertEqual(has.first?.embedding, had.first { $0.kind == "image" }?.embedding)
+    }
+
     // MARK: - Failures are retried
 
     /// `Fake` whose audio can be refused.
