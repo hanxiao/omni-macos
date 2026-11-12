@@ -32,8 +32,8 @@ enum ProfilingService {
         let a = NSAlert()
         a.messageText = "Share your benchmark results?"
         a.informativeText = "Sends chip, memory, macOS version and timings to hanxiao.io/omni. Never files or paths."
-        a.addButton(withTitle: "Share results")
-        a.addButton(withTitle: "Keep local")
+        a.addButton(withTitle: "Share Results")
+        a.addButton(withTitle: "Keep Local")
         let share = a.runModal() == .alertFirstButtonReturn
         OmniPrefs.set(true, forKey: consentKey)       // decision recorded; don't ask again
         OmniPrefs.set(share, forKey: uploadEnabledKey)

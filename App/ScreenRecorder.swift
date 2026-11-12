@@ -3,15 +3,12 @@ import Carbon.HIToolbox
 @preconcurrency import ScreenCaptureKit
 import OmniKit
 
-/// TAKES THE SHOTS (docs/screenshots.md). A shot follows what the user does, not a clock:
+/// TAKES THE SHOTS (docs/screenshots.md). When one is taken is `ScreenCadence`: while the user is
+/// at work, once more when they stop, a few looks after that, and nothing from five minutes after
+/// the last input until the next.
 ///
-/// - While there is input (keys, pointer, scroll) a shot every `interval`.
-/// - When input stops, one more shot, marked settled: what the screen was left showing.
-/// - With no input, a look every 30 s; each look that finds the screen as it was doubles the wait,
-///   to 5 minutes. A screen that moves by itself (a build, a video) keeps the 30 s.
-///
-/// A shot that shows what the last stored one shows is not stored (ScreenHistory.record), so no
-/// input and a still screen writes nothing at all.
+/// A shot that shows what the last stored one shows is not stored (ScreenHistory.record), so a
+/// still screen writes nothing at all.
 ///
 /// One still at a time through ScreenCaptureKit, not a stream: a stream holds the capture path
 /// open and delivers frames whether or not anything moved, and all that is wanted is one frame
@@ -22,9 +19,9 @@ import OmniKit
 /// password field has the keyboard (secure input). Windows an app marks as not shareable are left
 /// out by the system.
 final class ScreenRecorder: @unchecked Sendable {
-    static let interval = 5.0
-    static let firstLook = 30.0
-    static let lastLook = 300.0
+    static let interval = ScreenCadence.interval
+    /// How long after macOS declined a capture it is asked again.
+    static let retry = 300.0
 
     /// macOS lets this process capture the screen. False until the user allows Omni under Privacy &
     /// Security > Screen & System Audio Recording.
@@ -37,9 +34,8 @@ final class ScreenRecorder: @unchecked Sendable {
 
     // Everything below is touched on `queue` only.
     private var timer: DispatchSourceTimer?
-    private var wasActive = false
-    private var lookGap = ScreenRecorder.firstLook
-    private var nextLook = 0.0
+    private var cadence = ScreenCadence()
+    private var reportedAway: Bool?
     private var inFlight = false
     private var targets: [Target]?
     /// Bundle ids never recorded, and the processes they ran as when `targets` was built.
@@ -48,7 +44,7 @@ final class ScreenRecorder: @unchecked Sendable {
     private var reportedAccess: Bool?
     /// macOS answered a capture with "the user declined" while the preflight still says yes: the
     /// grant was taken away while Omni runs. No access, as far as the app shows; asked again at
-    /// `retryAt` (every `lastLook`, not every tick), so a grant given back is found without a restart.
+    /// `retryAt` (every `retry`, not every tick), so a grant given back is found without a restart.
     private var declined = false
     private var retryAt = 0.0
     private var scriptDecline: Double?
@@ -134,7 +130,7 @@ final class ScreenRecorder: @unchecked Sendable {
                 NotificationCenter.default.removeObserver(o)
             }
             observers = []
-            targets = nil; reportedAccess = nil; wasActive = false
+            targets = nil; reportedAccess = nil; reportedAway = nil; cadence.reset()
             history.stop()
         }
     }
@@ -207,9 +203,17 @@ final class ScreenRecorder: @unchecked Sendable {
         }
         guard allowed else { return }
         let now = ProcessInfo.processInfo.systemUptime
+        // Input of this login session, an app's posted events included: macOS keeps one clock for
+        // both (a posted pointer event set this, the hardware clock and powerd's level together).
+        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: Self.anyInput)
+        let away = idle >= ScreenCadence.away
+        if reportedAway != away {
+            reportedAway = away
+            omniPerfLog(String(format: "screen-away %d idle=%.0f", away ? 1 : 0, idle))
+        }
         if declined {
-            guard now >= retryAt, !Self.sessionIsAway, !saverRunning, !IsSecureEventInputEnabled(), !excludedIsInFront else { return }
-            retryAt = now + Self.lastLook
+            guard now >= retryAt, !away, !Self.sessionIsAway, !saverRunning, !IsSecureEventInputEnabled(), !excludedIsInFront else { return }
+            retryAt = now + Self.retry
             inFlight = true
             capture(settled: false) { [self] stored in
                 inFlight = false
@@ -218,34 +222,18 @@ final class ScreenRecorder: @unchecked Sendable {
             }
             return
         }
-        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: Self.anyInput)
-        var settled = false, look = false
-        if idle < Self.interval {
-            wasActive = true
-            lookGap = Self.firstLook
-            nextLook = now + lookGap
-        } else if wasActive {
-            wasActive = false
-            settled = true
-            nextLook = now + lookGap
-        } else if now >= nextLook {
-            look = true
-        } else {
-            return
-        }
+        let step = cadence.step(now: now, idle: idle)
+        guard step != .none else { return }
+        let settled = step == .settled
         // After the cadence, so a pause is not forgotten: it is taken at the first look that may.
         guard !Self.sessionIsAway, !saverRunning, !IsSecureEventInputEnabled(), !excludedIsInFront else {
-            if settled { wasActive = true }
+            if settled { cadence.settledNotTaken() }
             return
         }
         inFlight = true
-        let looked = look
         capture(settled: settled) { [self] stored in
             inFlight = false
-            if looked {
-                lookGap = stored.isEmpty ? min(lookGap * 2, Self.lastLook) : Self.firstLook
-                nextLook = ProcessInfo.processInfo.systemUptime + lookGap
-            }
+            if step == .look { cadence.looked(now: ProcessInfo.processInfo.systemUptime, stored: !stored.isEmpty) }
             guard !stored.isEmpty else { return }
             DispatchQueue.main.async { MainActor.assumeIsolated { self.onStored(stored) } }
         }
@@ -331,7 +319,7 @@ final class ScreenRecorder: @unchecked Sendable {
     }
 
     /// On `queue`. The next tick reports no access; the next try is `retryAfter` from now.
-    private func noteDeclined(retryAfter: Double = ScreenRecorder.lastLook) {
+    private func noteDeclined(retryAfter: Double = ScreenRecorder.retry) {
         declined = true
         retryAt = ProcessInfo.processInfo.systemUptime + retryAfter
         targets = nil

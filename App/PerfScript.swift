@@ -180,7 +180,7 @@ enum PerfScript {
         case "ignorefolder": model.ignoreFolder(URL(fileURLWithPath: arg, isDirectory: true))   // Remove from Omni on a subfolder
         case "sidebardump": NotificationCenter.default.post(name: .omniPerfSidebarSelect, object: "dump")   // log the sidebar's selection
         case "sidebarphotos": NotificationCenter.default.post(name: .omniPerfSidebarSelect, object: "photos:" + arg)   // a click on a Photos row with this key
-        case "photodenied": model.showPhotoDenied = true   // what a denied Photos request raises
+        case "photodenied": model.showPhotoDenied = arg != "off"   // what a denied Photos request raises; off: dismissed
         case "updateprompt": Updater.promptForPerfScript(url: arg)   // the update offer, as a check that found one makes it
         case "sidebarscroll":   // scroll the main window's sidebar: top, bottom, or a fraction 0...1
             if let w = NSApp.windows.first(where: { $0.isVisible && $0.toolbar != nil && $0.title == "Omni" }),
@@ -394,7 +394,7 @@ enum PerfScript {
             if let data = try? JSONSerialization.data(withJSONObject: all) {
                 try? data.write(to: URL(fileURLWithPath: arg), options: .atomic)
             }
-        case "bench":       // Settings > Performance > Run benchmark (returns at once; the run goes on)
+        case "bench":       // Settings > Performance > Run Benchmark (returns at once; the run goes on)
             Task { await model.runPaperBenchmark() }
         case "benchcancel": // the progress sheet's Cancel
             model.cancelPaperRun()

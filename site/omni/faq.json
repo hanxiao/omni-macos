@@ -80,7 +80,7 @@
         },
         {
           "q": "Why do some searches show \"No results above 50%\"?",
-          "a": "Only when Relevance in the filter menu is set to Only Strong Matches: a 50% floor, scaled per file type. Click Show N weaker matches, or set Relevance back to All.",
+          "a": "Only when Relevance in the filter menu is set to Only Strong Matches: a 50% floor, scaled per file type. Click Show N Weaker Matches, or set Relevance back to All.",
           "shortcut": ""
         }
       ]
@@ -130,7 +130,7 @@
         },
         {
           "q": "Can Omni index my Apple Photos library?",
-          "a": "Yes. Choose Add... and pick the Photos library, then index the whole library or selected albums. Photos and videos are indexed; items stored only in iCloud are counted in Settings > Storage as Photos not on this Mac.",
+          "a": "Yes. Choose Add... and pick the Photos library, then index the whole library or selected albums. Photos and videos are indexed; items stored only in iCloud are counted in Settings > Storage as Photos in iCloud only.",
           "shortcut": ""
         },
         {
@@ -330,8 +330,8 @@
           "shortcut": ""
         },
         {
-          "q": "What does Run benchmark do?",
-          "a": "Settings > Performance > Run benchmark generates the same data on every Mac (text, images, audio, video and a 946,568-row index) and reports a table: indexing speed, query latency, search during bulk changes, and what each optimization saves. Your files and index are not touched, indexing pauses during the run and resumes afterwards, and results are shared only if Share results is on.",
+          "q": "What does Run Benchmark do?",
+          "a": "Settings > Performance > Run Benchmark generates the same data on every Mac (text, images, audio, video and a 946,568-row index) and reports a table: indexing speed, query latency, search during bulk changes, and what each optimization saves. Your files and index are not touched, indexing pauses during the run and resumes afterwards, and results are shared only if Share results is on.",
           "shortcut": ""
         },
         {

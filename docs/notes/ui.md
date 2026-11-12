@@ -1876,3 +1876,77 @@ nothing was slower or heavier than 0.19.8. What it found, and what was done:
   shown only where it does something); tag fragments ("mon", "gard") are words the tokenizer splits,
   whose whole form is not a label: five more ways to tell them from words were measured on the
   COCO photos and none holds (roadmap.md, "Image tags").
+
+## Text is the last resort (Han, 2026-11-11)
+
+Han, on the grey line "2 duplicates stacked into the results above" under a result list: the line
+explains what the layout already shows (a stack carries its count on the row). The rule is in
+CLAUDE.md; this is what the review of every hint and helper text removed, so nobody adds them back.
+
+- Results: the stacked-copies line (and `collapsedCount`, `HistoryMode.detail` behind it). A stack
+  is its badge: the count on a card, "3 copies" on a list row.
+- Settings: every section footer that said what the section is for, every tooltip that explained a
+  control. A footer stays only when it is a state ("Indexing paused: memory is low"). Rows renamed
+  so the label and the value say it: "Long files > Logs and data files > First 2 MB / Whole file",
+  "Indexing headroom", "Photos in iCloud only", "Format v4 → v5", the benchmark's "10 to 20 min".
+- Serving: the MCP sheet is its title and the config; the token's placeholder is its state
+  ("Required" / "Not set"); the install button is "Install…", "Installed" or "Replace…" and its
+  tooltip the link's path.
+- Alerts: a title and its buttons. Informative text only when it is a value the title cannot hold
+  (the shot's time, "12 screenshots, 09:10 to 09:42", the missing files' names, the original path).
+- Photos: "No access to Photos" and its two buttons. Screen recording denied: the pane's title and
+  "Open Privacy Settings".
+- Tooltips left: an icon button's name and shortcut, an exact value. None explains.
+- Kept on purpose: first-run text (onboarding, the compute-unit cards, the consent panes of
+  Clipboard and Screenshots), empty states, error facts, the profiling consent alert.
+
+No view gained a dependency (the results footer lost one). Main-thread CPU per scripted step,
+0.20.1 against this build on the same 12-file scratch corpus, back to back: search 199 / 205 ms,
+list 34 / 35, second search 51 / 49, grid 25 / 24, third search 39 / 37.
+
+## The design pass on macOS 27 (Han, 2026-11-11)
+
+Han, with a picture of the "No access to Photos" sheet: is this native enough, why are the buttons
+not central; and go through every surface for the latest guideline (Tahoe, then macOS 27 "Golden
+Gate"), Liquid Glass, and no redraw nobody asked for. Old macOS was not retested: nothing changed
+that is not the system's own control.
+
+- WHAT macOS 27 CHANGES FOR AN APP ALREADY ON LIQUID GLASS (WWDC26 sessions 269 and 289): a hard
+  scroll edge when a title floats in the title bar, the sidebar edge to edge with a semi-bold
+  selection, bordered toolbar items over the sidebar on glass, windows a little less rounded, a
+  system transparency slider. All of it arrives without a line of code, and the 27.2 SDK has no new
+  glass API name. The optional ones (a glass bounce on click, AppKit's concentricity API, toolbar
+  overflow priority) have nothing here to apply to: the controls are the system's.
+- A DIALOG LAID OUT BY HAND AGES; THE SYSTEM'S DOES NOT. The Photos sheet was a VStack: a centred
+  title over trailing buttons, which is no release's alert. It is `.alert` now, and on 27.2 that is
+  a compact panel with the title centred and the two buttons stacked at full width, the default one
+  filled. A yes/no question is an alert; a sheet is for a form (leading title, trailing Cancel and
+  default), which is how every other sheet here was already built.
+- PICTURED ON 27.2, LIGHT AND DARK, AND LEFT AS THEY ARE: the folder browser as grid and list,
+  Recents, Screenshots and Clipboard off, Link a Mac, the progress sheet, all seven Settings panes,
+  Go to Folder (a form sheet: leading title, the field, trailing Cancel and Go) and the update
+  offer (the system's alert, three stacked buttons).
+  The tint on the sidebar's inner edge is the system's glass sampling what is beside it.
+- CORNERS: what hugs a container is concentric already (`DropRing`, `ConcentricRectangle` with a
+  minimum of 8). Thumbnails and cards at `Design.corner` are content, as Finder's are; left.
+- BUTTONS AND MENU ITEMS ARE TITLE CASE, labels and alert titles sentence case (HIG). Ten buttons
+  were not: Run Benchmark, Show Results, Show Samples, Keep in Index, Remove N from Index, Clear
+  Search History, Share Results, Keep Local, Choose Model Folder…, Show N Weaker Matches. The
+  UI tests find the last one case-insensitively now.
+- THE TRANSCRIBE PANE SAID ITS DROP TWICE: "Drop a document to transcribe" over a first row "Drop a
+  PDF or images". The title is the row now; the two rows left are paste and choose.
+
+RENDERS PER STEP, against the 2026-10-26 counts above, same instrument (`Tools/uiprobe/probes.py
+add|remove` inserts and removes the body counters; never commit them), 239-file tree:
+- Idle: no body runs. Typing 18 characters from an empty box: the window once (3 after the October
+  fix, 11 before it), the field 19 times, the empty state 9. Select and arrows: the window never.
+- A place clicked in the sidebar with an empty box: the window once. With a query in the box:
+  twice, and both are real, the scope and then the scoped search's results. Read with a watcher per
+  property the window's body reads (`withObservationTracking`, its `onChange` logging the name):
+  `_printChanges` says only "@dependencies changed" for an `@Observable`.
+- A THUMBNAIL'S BODY RUNS TWICE AND DRAWS ONCE. The picture is state set by `load`, a task, so a
+  tile whose picture the cache already holds runs its body with the type's icon and then with the
+  picture: 120 bodies for 60 tiles. Reading the cache in the body looked like the fix for a frame
+  of icons. There is no such frame: counted with a run-loop observer after Core Animation's commit,
+  the load started 0 commits after the body for 181 of 181 such tiles, while 67 of the 85 tiles that
+  had to be rendered (the control) landed 3 to 23 commits later. The change was reverted.

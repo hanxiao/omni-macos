@@ -205,13 +205,6 @@ enum HistoryMode: String, CaseIterable, Identifiable {
         case .manual: return "Only when I bookmark"
         }
     }
-    var detail: String {
-        switch self {
-        case .auto: return "Saves every search after you stop typing."
-        case .onSubmit: return "Saves searches you submit with Return, and Find Similar."
-        case .manual: return "Saves only bookmarked searches."
-        }
-    }
 }
 
 enum SortOrder: String, CaseIterable, Identifiable {
@@ -3848,7 +3841,7 @@ final class AppModel {
     private(set) var hasListedResults = false
     private(set) var groups: [ResultGroup] = []
     /// Hits not on the list: under the strong-matches floor (`minScore`) or folded as weaker matches
-    /// of this query (`VectorStore.weakFold`). The footer's "Show N weaker matches" brings them back.
+    /// of this query (`VectorStore.weakFold`). The footer's "Show N Weaker Matches" brings them back.
     private(set) var hiddenWeaker: Int = 0
     /// The ones under the floor alone: the button lowers the floor only when it is hiding something.
     private var hiddenByFloor = 0
@@ -3859,9 +3852,6 @@ final class AppModel {
     /// Paths of stacks the user expanded, kept across recomputes so typing does not re-collapse a
     /// stack the user opened. Keyed by representative path.
     var expandedStacks: Set<String> = []
-    /// Files collapsed away into stacks - shown next to the result count so nothing is hidden
-    /// silently.
-    private(set) var collapsedCount: Int = 0
 
     /// The hit for any rendered path, representative or opened copy. Keyboard disclosure needs the
     /// row's chunkCount, and looking that up in `results` alone silently did nothing on a copy.
@@ -3937,9 +3927,6 @@ final class AppModel {
         // sort first by name. Grouping only ever runs over hits that already passed the threshold,
         // so a copy below the cut can never resurrect its stack.
         let collapsed = collapse(above)
-        // Every copy a stack holds beyond the one shown, those outside the result pool too.
-        let stacked = collapsed.reduce(0) { $0 + $1.count - 1 }
-        if collapsedCount != stacked { collapsedCount = stacked }
         var ordered: [ResultGroup]
         // Each order in its own direction; ties keep the relevance order the store produced.
         func text(_ g: ResultGroup) -> String {
@@ -4872,7 +4859,7 @@ final class AppModel {
         suppressFilterEffects = false
         syncBoxFromFilters(reSearch: true)   // drop all qualifiers from the box, then search once
     }
-    /// "Show N weaker matches": unfold this query's weaker matches, and lower the floor if it is
+    /// "Show N Weaker Matches": unfold this query's weaker matches, and lower the floor if it is
     /// hiding some too.
     func showWeakerMatches() {
         showWeakMatches = true

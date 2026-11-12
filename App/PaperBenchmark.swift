@@ -126,8 +126,7 @@ extension AppModel {
         guard !isIndexWorkInFlight, !bulkDeleteInFlight else {
             activeSheet = nil   // take the progress sheet down before the modal that explains why
             paperAlert("Indexing did not stop",
-                       "A file being indexed did not finish within 30 seconds and would slow down the "
-                       + "measurements. Wait for indexing to finish, then try again.")
+                       "A file was still being indexed after 30 seconds.")
             return
         }
 
@@ -291,5 +290,5 @@ private func renderPaperOutcome(result: PaperSuiteResult, engine: OmniEngine, fs
 /// minutes in the app on the M3 Ultra (2026-10-16); v9 measured 11.4 there and 10-11 on the M4 Pro
 /// and the M4. No other Mac has run v10 yet, so the upper end is v9's.
 enum BenchmarkDuration {
-    static let minutesLabel = "10 to 20 minutes, depending on the Mac"
+    static let minutesLabel = "10 to 20 min"
 }

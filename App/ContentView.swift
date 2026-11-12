@@ -408,7 +408,7 @@ struct ContentView: View {
                                prominent: true)
             } else if showsScreenshotsDenied {
                 CenteredStatus(symbol: CenteredStatus.moleSerious, title: "Screen recording is not allowed",
-                               subtitle: "Allow Omni in System Settings > Privacy & Security > Screen & System Audio Recording.",
+                               subtitle: "",
                                action: ("Open Privacy Settings", { AppModel.openScreenRecordingSettings() }),
                                prominent: true)
             } else if showsScreenshots {
@@ -436,7 +436,7 @@ struct ContentView: View {
 
     /// One title for the one action, wherever it is offered.
     static func weakerMatchesTitle(_ n: Int) -> String {
-        "Show \(n.formatted()) weaker \(n == 1 ? "match" : "matches")"
+        "Show \(n.formatted()) Weaker \(n == 1 ? "Match" : "Matches")"
     }
 
     private var showsBrowser: Bool { showsFolderBrowser || showsPhotoBrowser || showsRecents }
@@ -557,20 +557,14 @@ struct ContentView: View {
 ///
 /// ITS OWN VIEW, reading the model in its own body. Built in ContentView's body and handed to the
 /// always-equal ResultsList, it was frozen at the counts of the search that first put the list on
-/// screen: "Show 47 weaker matches" under a search hiding 5 (review 2026-11-02).
+/// screen: "Show 47 Weaker Matches" under a search hiding 5 (review 2026-11-02).
 private struct ResultsFooter: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        // Collapsing is never silent: if the list is shorter than the matches behind it, the
-        // difference is stated here. Not a button - the copies are reachable from their own stack,
-        // and a global "un-collapse" would just restore the noise the feature removes.
-        if model.collapsedCount > 0 {
-            Text("\(model.collapsedCount) duplicate\(model.collapsedCount == 1 ? "" : "s") stacked into the results above")
-                .font(.caption).foregroundStyle(.tertiary)
-                .frame(maxWidth: .infinity)
-                .padding(.top, 8)
-        }
+        // NO LINE FOR THE STACKED COPIES. It read "2 duplicates stacked into the results above":
+        // a sentence on what the stacks already show, each with its own count and its own
+        // disclosure (Han, 2026-11-11).
         if model.hiddenWeaker > 0 {
             // THE SAME BUTTON as the empty state's, same words, same style, same size - it is the
             // same action, so it should not look like two. It was a `.plain` text label, and a
@@ -662,7 +656,6 @@ private struct QualifierBar: View {
             if model.literalQuery {
                 Image(systemName: "quote.opening").foregroundStyle(.secondary).frame(width: 18)
                 Text("Plain query").foregroundStyle(.secondary)
-                Text("- filters ignored").font(.caption).foregroundStyle(.tertiary)
             }
             Spacer(minLength: 8)
             Button { model.toggleLiteralQuery() } label: {
@@ -670,9 +663,6 @@ private struct QualifierBar: View {
                       systemImage: model.literalQuery ? "line.3.horizontal.decrease.circle" : "quote.opening")
             }
             .buttonStyle(.bordered).controlSize(.small)
-            .help(model.literalQuery
-                  ? "Use filters in the query"
-                  : "Ignore filters in the query")
         }
         .font(.callout)
         .padding(.horizontal, 16).padding(.vertical, 6)
@@ -906,8 +896,9 @@ struct SearchWaysPrompt: View {
     /// WAYS IN, not a feature list. This carried three more rows - find in the transcript, copy as
     /// Markdown, save as .md - which are commands on a document that is not open yet. The search
     /// pane's rows are all ways to START a search; these now match.
+    /// The drop is the pane's title ("Drop a PDF or images"), not a row under a title that said
+    /// the same thing in other words.
     static let transcribeWays: [(icon: String, text: String)] = [
-        ("arrow.down.doc", "Drop a PDF or images"),
         // PASTE WAS ALREADY WIRED AND NOWHERE ON SCREEN. `pasteCommand` has handled Cmd-V in OCR
         // mode since the router was split - it even checks OCR before the search test, so a
         // pasted image does not leave the document being read - but this list never said so, and
@@ -954,7 +945,7 @@ struct EngineFailedView: View {
             Text("Omni can't load its model").font(.title)
             HStack {
                 Button("Retry") { model.retryBootstrap() }.buttonStyle(.borderedProminent)
-                Button("Choose model folder\u{2026}") { pickModel() }
+                Button("Choose Model Folder\u{2026}") { pickModel() }
             }
             .controlSize(.large)
             DisclosureGroup("Details") {

@@ -186,8 +186,8 @@ final class FullChaosUITests: XCTestCase {
         app.typeKey("a", modifierFlags: .command)
         app.typeText(pick(queries) + "\r")
         settle(2)
-        // Results below the score floor sit behind "Show N weaker matches".
-        let weaker = window.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Show ' AND label ENDSWITH ' weaker matches'")).firstMatch
+        // Results below the score floor sit behind "Show N Weaker Matches".
+        let weaker = window.buttons.matching(NSPredicate(format: "label BEGINSWITH 'Show ' AND label ENDSWITH[c] ' weaker matches'")).firstMatch
         if find().isEmpty, weaker.exists, weaker.isHittable { weaker.click(); settle(1) }
         let again = find()
         return again.isEmpty ? nil : again

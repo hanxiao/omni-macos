@@ -1196,7 +1196,7 @@ positions and misleads - see coverageMismatchDetailLocked). Snapshot kept at
   (a 929 MB cache, model weights, tokenizers), everything else 0.8 GB. At 1,800 characters a
   chunk that is up to ~8.6M chunks on a 7.6M-chunk index, and hours of embedding.
 - Now .log, .json, .jsonl and .ndjson past 2 MB keep their first 2 MB unless Settings > Content >
-  "Read long logs and data files to the end" is on; prose and code are read to the end as before.
+  Long files > Logs and data files is "Whole file"; prose and code are read to the end as before.
   Their content key hashes what is indexed: the first 2 MB, the pre-0.15.7 key.
 - The meta key `text_streamed_v2` holds the policy last applied (`data=0|1`). While it differs, a
   full pass re-reads every long text file whatever its mtime - to the end or back to 2 MB - from the

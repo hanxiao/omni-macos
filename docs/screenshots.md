@@ -16,8 +16,11 @@ That is the chain an agent follows: query -> a screenshot -> its time -> the fil
   then asks for Screen & System Audio Recording, which only the user can grant.
 - A shot follows input, not a clock (`ScreenRecorder`): one every 5 s while there is input (keys,
   pointer, scroll: `CGEventSource.secondsSinceLastEventType`, no permission needed), one more when
-  input stops (marked settled), then a look at 30 s that doubles to 5 min while the screen stays as
-  it was. A screen that moves by itself (a build, a video) keeps the 30 s.
+  input stops (marked settled), then a look at 30 s that doubles while the screen stays as it was
+  (30, 90, 210 s). A screen that moves by itself (a build, a video) keeps the 30 s.
+- Nothing is taken from 5 minutes after the last input until the next input, whatever the screen
+  does (`ScreenCadence.away`; "Nobody at the Mac"). Something watched hands-off, a film or a
+  meeting, is recorded for those 5 minutes only.
 - No input and a still screen writes nothing: a shot whose signature equals the last stored one is
   not stored (`ScreenHistory.record`).
 - Every stored shot is in the timeline; few are in the index (`ScreenGate`). A shot is indexed
@@ -379,8 +382,61 @@ now (`RemoteFiles.root`).
 
 Thirty days, from the working session: unbroken use is 716 looks and 105 indexed shots an hour,
 9.84 MB of video and 9.5 MB of stills, 19.3 MB an hour: 4.6 GB for 240 hours at 1920 x 1080. The
-session's own mix, pauses included, is 15.0 MB an hour: 3.6 GB. Settings shows the space really
-used.
+session's own mix, pauses included, is 15.0 MB an hour: 3.6 GB. Time away from the Mac costs
+nothing ("Nobody at the Mac"). Settings shows the space really used.
+
+## Nobody at the Mac (2026-11-11)
+
+Han's laptop, at home with an external display that never sleeps, nobody at it for most of the day:
+2,321 shots and 348 MB in 12 hours, about one stored shot a minute through the hours away.
+
+The idle clock was right. The policy recorded: with no input 0.20.1 looked every 30 s, stored the
+look when any tile differed from the last stored shot, and a stored look kept the 30 s. A menu bar
+clock changes the screen every minute, a page that refreshes more often.
+
+IS THERE AN API THAT KNOWS A PERSON IS THERE? No. macOS has no presence sensor an app can read;
+every idle signal is the time since the last input event, read through different doors:
+`CGEventSource.secondsSinceLastEventType` (`.combinedSessionState`, `.hidSystemState`), IOKit's
+`HIDIdleTime`, powerd's `UserIsActive` assertion, and powerd's user-activity level (private:
+`IOPMGetUserActivityLevel`, what `pmset -g useractivity` prints). ActivityWatch (HID idle and the
+lock, away after 3 min) and Chromium (`idle_mac.mm`: the combined session state, the screen saver
+and the lock) use the same clock. Measured on this Mac:
+
+- One synthetic pointer event posted to the session reset all of them together, `.hidSystemState`
+  and `HIDIdleTime` included: none is hardware-only, and an app that posts events is a person to
+  every one of them.
+- powerd's level went from "present, active" (0x01) to "present, passive" (0x06) at idle = 301 s:
+  its timeout is 5 minutes (`kIOPMDefaultUserActivityTimeout`). After 7.6 h without input, with the
+  display held awake, the level still read "present, passive": passive is any app holding the
+  display on, not a person.
+- `IOPMAssertionDeclareUserActivity` from another process put the level back to "active" while the
+  input clocks went on counting: the level is also whatever an app declares.
+
+So the input clock stays (`.combinedSessionState`), and the rule changed: `ScreenCadence.away`,
+300 s after the last input, nothing is taken until there is input again, whatever the screen does.
+A capture macOS declined is not retried while away either. The cost, taken knowingly: a film or a
+meeting watched without touching the Mac is recorded for 5 minutes after the last touch.
+
+The cadence is a value type in OmniKit now (`ScreenCadence`, `ScreenCadenceTests`, 7): a screen
+that changes by itself is looked at 9 times in the 5 minutes and never after, over 12 hours; the
+negative control (idle held under `away`) is 119 looks an hour; the user back is shot at the
+first tick. (In the app the 30 s counts from the look coming back and the tick is 5 s: a look
+every 35 s, 8 in the 5 minutes.)
+
+Both builds beside each other on the real screen, nobody at the Mac, a screen that changes by
+itself, one input event at 0:00 and none after:
+
+| | 0.20.1 | with `away` |
+|---|---|---|
+| stored, first 5 min | 10 | 10 |
+| stored, the next 8 min | 15 | 0 |
+| started with 408 s of no input | a shot at once | nothing (`screen-away 1 idle=408`) |
+
+A look's delta was 0.9-2.6 KB at 1920 x 1080, so the hours away were most of the laptop's shots
+and little of its bytes: the 348 MB is the hours in use, on two displays at their full pixel
+count (a 3840 x 2160 shot measured 2.0x the video and 2.6x the still of a 1920 x 1080 one, and
+1920 x 1080 in unbroken use is 19.3 MB an hour). The laptop's own split is not measured: it is the
+size of its `Screen History` (video) and `Screenshots` (stills) folders.
 
 ## Isolated runs
 
@@ -408,8 +464,9 @@ excluded apps, bytes on disk).
   cut record, segments by hour and launch, stills and their dates, sessions (a gap, a long one,
   several moments at once), retention, clear, a recorder that starts again, a deleted span, the
   whole frame of a still. `ScreenTextTests` (5): the size read, the pieces, a line and a long word
-  across pieces read once. `EnrichmentTests` (8). `OmniCLITests`: an optional bare word. The suite:
-  1080 tests, 6 skipped, 0 failures.
+  across pieces read once. `EnrichmentTests` (8). `OmniCLITests`: an optional bare word.
+  `ScreenCadenceTests` (7): when a shot is taken, and none with nobody at the Mac. The suite:
+  1087 tests, 6 skipped, 0 failures.
 - Linked, two isolated instances paired on one Mac: a query on the asking one returns the other's
   shots in the window, over MCP, the CLI and `--json`, each with its moment; the session line
   names the Mac; the range with no query on the named Mac; `get_linked_file` of a shot, and

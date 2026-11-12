@@ -58,9 +58,7 @@ struct ServingTab: View {
         // made this one tab shorter than its own content and put a scroller inside it, which no
         // other tab has.
         .sheet(isPresented: $showMCPSheet) {
-            AgentConfigSheet(title: "Connect agents over MCP",
-                             subtitle: "For MCP clients with HTTP transport.",
-                             text: mcpConfigText, saveAs: nil)
+            AgentConfigSheet(title: "MCP", subtitle: "", text: mcpConfigText, saveAs: nil)
         }
         .sheet(isPresented: $showSkillSheet) {
             AgentConfigSheet(title: "SKILL.md",
@@ -123,9 +121,11 @@ struct ServingTab: View {
                 // value in this window. Both halves are load-bearing: a FIXED width clipped the
                 // last characters of a real 32-char token, and without the prompt an empty token
                 // left the row as two buttons with nothing between them - a borderless field in a
-                // grouped form is invisible until it has text. "Not set" is also the truth; no
-                // token is needed while the scope is this Mac only.
-                TextField("Bearer token", text: token, prompt: Text("Not set"))
+                // grouped form is invisible until it has text. "Not set" is also the truth while
+                // the scope is this Mac only; the local network needs one, and the prompt says so
+                // where the token goes (it was a footer under the section).
+                TextField("Bearer token", text: token,
+                          prompt: Text(model.serving.scope == .public ? "Required" : "Not set"))
                     .focused($tokenFocused)
                     .onSubmit { commitToken() }
                     .onChange(of: tokenFocused) { _, focused in if !focused { commitToken() } }
@@ -163,15 +163,11 @@ struct ServingTab: View {
                 }
                 Spacer()
                 Button("MCP") { showMCPSheet = true }
-                    .help("Config for MCP clients")
             }
             .buttonStyle(.bordered).controlSize(.small)
             .disabled(!model.serving.enabled)
         } header: {
             Text("Server")
-        } footer: {
-            Text("Local network access requires a token.")
-                .font(.caption).foregroundStyle(.secondary)
         }
     }
 
@@ -187,14 +183,13 @@ struct ServingTab: View {
                     .textSelection(.enabled)
                     .lineLimit(1).truncationMode(.middle)
                 Spacer()
-                Button(cliState == .installed ? "Installed" : "Install\u{2026}") {
+                Button(cliState == .installed ? "Installed" : cliState == .occupied ? "Replace\u{2026}" : "Install\u{2026}") {
                     cliError = CommandLineTool.install() ?? ""
                     cliState = CommandLineTool.state
                 }
                 .disabled(cliState == .installed)
-                .help("Link omni into \((CommandLineTool.linkPath as NSString).deletingLastPathComponent)")
+                .help(CommandLineTool.linkPath)
                 Button("SKILL.md") { showSkillSheet = true }
-                    .help("Skill file for agents")
             }
             .buttonStyle(.bordered).controlSize(.small)
         } header: {
@@ -204,11 +199,9 @@ struct ServingTab: View {
                 if !cliError.isEmpty {
                     Text(cliError).foregroundStyle(.red)
                 } else if case .stale(let other) = cliState {
-                    Text("\(CommandLineTool.linkPath) points to \(other). Install again to use this copy of Omni.")
+                    Text("\(CommandLineTool.linkPath) \u{2192} \(other)")
                 } else if cliState == .occupied {
-                    Text("\(CommandLineTool.linkPath) is another file. Install replaces it.")
-                } else {
-                    Text("Agents run `omni search \"...\"` against this app, with or without the server on.")
+                    Text("\(CommandLineTool.linkPath) is another file")
                 }
             }
             .font(.caption).foregroundStyle(.secondary)
@@ -475,8 +468,10 @@ private struct AgentConfigSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(title).font(.headline)
-            Text(subtitle).font(.subheadline).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if !subtitle.isEmpty {
+                Text(subtitle).font(.subheadline).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
             ScrollView {
                 Text(text)
                     .font(.callout.monospaced())

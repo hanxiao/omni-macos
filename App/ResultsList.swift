@@ -705,7 +705,7 @@ struct ResultRow: View {
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help("Show matching passages (right arrow)")
+                    .help("Matching passages  \u{2192}")
                     .accessibilityLabel(expanded ? "Hide matching passages" : "Show matching passages")
                 } else {
                     Color.clear
@@ -899,7 +899,6 @@ struct PassagesView: View {
                     if inside { hovered = p.id } else if hovered == p.id { hovered = nil }
                     if inside, !path.isEmpty { OpenAtHit.prefetch(path, locator: p.locator, snippet: p.snippet) }
                 }
-                .help(p.locator.isEmpty ? "" : "Double-click to open at \(p.locator)")
             }
             if let passages, passages.isEmpty {
                 Text("No passages").font(.caption).foregroundStyle(.tertiary)

@@ -165,8 +165,7 @@ struct LinkSheet: View {
 
     // The other Mac asked; type what it shows.
     @ViewBuilder private func incoming(_ req: IncomingPairing) -> some View {
-        Text("Link with \u{201C}\(req.name)\u{201D}?").font(.headline)
-        Text("Enter the code shown on \(req.name).").foregroundStyle(.secondary)
+        Text("Enter the code shown on \(req.name)").font(.headline)
         // The boxes show what is typed; the field underneath takes the keys (and a paste), clear
         // so its own caret and text never show. Digits only, six at most.
         CodeBoxes(digits: LinkPairing.normalize(typed), active: codeFocused ? LinkPairing.normalize(typed).count : nil)

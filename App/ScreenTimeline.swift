@@ -962,8 +962,7 @@ private struct TimelineKeys: NSViewRepresentable {
 enum ScreenshotsClear {
     static func confirm(_ model: AppModel) {
         let alert = NSAlert()
-        alert.messageText = "Clear screenshots?"
-        alert.informativeText = "Every screenshot Omni recorded will be deleted."
+        alert.messageText = "Clear all screenshots?"
         alert.addButton(withTitle: "Clear")
         alert.addButton(withTitle: "Cancel")
         alert.buttons.first?.hasDestructiveAction = true
@@ -983,18 +982,17 @@ enum ScreenshotsDelete {
             switch d.scope {
             case .shot:
                 alert.messageText = "Delete this screenshot?"
-                alert.informativeText = "The screenshot from \(from.formatted(date: .omitted, time: .standard)) will be deleted."
+                alert.informativeText = from.formatted(date: .omitted, time: .standard)
             case .session:
                 alert.messageText = "Delete this session?"
-                alert.informativeText = d.shots == 1 ? "1 screenshot from \(from.formatted(clock)) will be deleted."
-                    : "\(d.shots.formatted()) screenshots from \(from.formatted(clock)) to \(to.formatted(clock)) will be deleted."
+                alert.informativeText = d.shots == 1 ? "1 screenshot, \(from.formatted(clock))"
+                    : "\(d.shots.formatted()) screenshots, \(from.formatted(clock)) to \(to.formatted(clock))"
             case .day:
                 let calendar = Calendar.current
-                let day = calendar.isDateInToday(from) ? "today" : calendar.isDateInYesterday(from) ? "yesterday"
+                let day = calendar.isDateInToday(from) ? "Today" : calendar.isDateInYesterday(from) ? "Yesterday"
                     : from.formatted(.dateTime.weekday(.abbreviated).month(.abbreviated).day())
                 alert.messageText = "Delete this day?"
-                alert.informativeText = d.shots == 1 ? "1 screenshot from \(day) will be deleted."
-                    : "All \(d.shots.formatted()) screenshots from \(day) will be deleted."
+                alert.informativeText = "\(day), \(d.shots.formatted()) screenshot\(d.shots == 1 ? "" : "s")"
             }
             alert.addButton(withTitle: "Delete")
             alert.addButton(withTitle: "Cancel")

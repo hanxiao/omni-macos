@@ -24,8 +24,6 @@ struct PaperResultSheet: View {
                 // Only reachable if the report was cleared underneath the sheet. Say so rather than
                 // showing an empty box that looks like a run which measured nothing.
                 Text("No benchmark report").font(.headline)
-                Text("The run produced no report to show.")
-                    .font(.subheadline).foregroundStyle(.secondary)
                 Spacer()
                 HStack { Spacer(); Button("Done") { dismiss() }.keyboardShortcut(.defaultAction) }
             }
@@ -57,7 +55,7 @@ struct PaperResultSheet: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             if warnings.count > shown.count {
-                Text("+\(warnings.count - shown.count) more, listed in the report below")
+                Text("+\(warnings.count - shown.count) more")
                     .font(.caption)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
@@ -151,12 +149,12 @@ struct PaperResultSheet: View {
         // The auto-saved copy, written before this dialog appeared. Stated so that Done, a crash or
         // a closed laptop is never what loses a long run.
         if let url = model.lastPaperReportURL {
-            Text("Also saved to \(url.path)")
+            Text(url.path)
                 .font(.caption).foregroundStyle(.secondary)
                 .textSelection(.enabled)
                 .lineLimit(1).truncationMode(.middle)
         } else {
-            Text("Could not auto-save a copy - use Save or Copy before closing.")
+            Text("Not auto-saved")
                 .font(.caption).foregroundStyle(.orange)
         }
     }

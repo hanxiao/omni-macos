@@ -445,7 +445,7 @@ enum MCPAdapter {
         } else {
             var inlined = 0          // thumbnails emitted so far (capped)
             var cappedSkips = 0      // media hits skipped specifically because the cap was already reached
-            // The app folds these under "Show N weaker matches"; an agent is told the same thing.
+            // The app folds these under "Show N Weaker Matches"; an agent is told the same thing.
             // Judged over the whole pool, so a later page is folded by the same measure as the first.
             let poolWeak = listing ? [] : VectorStore.weakFold(pool.map(\.representative))
             let weaker = reps.indices.map { offset + $0 < poolWeak.count ? poolWeak[offset + $0] : false }

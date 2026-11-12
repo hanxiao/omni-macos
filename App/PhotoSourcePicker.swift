@@ -124,7 +124,7 @@ struct PhotoSourcePicker: View {
 
     private var summary: String {
         if loading { return "Reading your library\u{2026}" }
-        if libraryCovered { return "Your whole library is already indexed." }
+        if libraryCovered { return "Library already indexed" }
         if !model.photoKindsEnabled { return "Images and Videos will be turned on" }
         // Picking the whole library makes every album redundant - the same rule the model applies
         // when the sources are saved, said here so the greyed-out album list is not a mystery.
@@ -161,35 +161,5 @@ struct PhotoSourcePicker: View {
                 .map { PhotoLibrary.Source(id: $0.id, title: $0.title) })
         }
         dismiss()
-    }
-}
-
-/// What to show when Omni cannot read the library. Denial is not recoverable in-app (macOS only
-/// asks once), so the only useful thing to offer is the System Settings pane that can undo it.
-struct PhotoAccessDenied: View {
-    @Environment(\.dismiss) private var dismiss
-    var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: "lock.fill").font(.largeTitle).foregroundStyle(.secondary)
-            Text("Omni doesn't have access to your Photos library").font(.headline)
-            Text("Allow Omni in Privacy & Security \u{203A} Photos.")
-                .font(.callout).foregroundStyle(.secondary)
-                .multilineTextAlignment(.center).fixedSize(horizontal: false, vertical: true)
-            HStack {
-                Spacer()
-                // "Not Now", not "Cancel": nothing is being cancelled - the sheet only explains a
-                // decision macOS already recorded. Trailing-aligned, as every macOS dialog is.
-                Button("Not Now") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("Open System Settings") {
-                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Photos") {
-                        NSWorkspace.shared.open(url)
-                    }
-                    dismiss()
-                }
-                .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(24)
-        .frame(width: 400)
     }
 }

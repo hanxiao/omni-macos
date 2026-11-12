@@ -69,7 +69,7 @@ struct CloudBadge: View {
         HStack(spacing: 0) {
             if cloudOnly {
                 Image(systemName: "icloud.and.arrow.down").font(.caption).foregroundStyle(tint)
-                    .help("Stored in iCloud only")
+                    .help("iCloud only")
             }
         }
         .task(id: "\(path)|\(CloudStatus.shared.epoch)") {

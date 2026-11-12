@@ -334,7 +334,6 @@ private struct ActivityTab: View {
                     Text("Index, then remove download").tag(1)
                     Text("Download and index").tag(2)
                 }
-                .help("For files stored in iCloud only. Index, then remove download: downloads each file, indexes it, then removes the download. Files you keep downloaded are not affected.")
             }
 
             // WITH THE OTHER SOURCES, ahead of the folders. The clipboard is indexed like a folder -
@@ -344,7 +343,6 @@ private struct ActivityTab: View {
             Section("Clipboard") {
                 Toggle("Index clipboard content", isOn: Binding(get: { model.clipboardEnabled },
                                                               set: { model.setClipboardEnabled($0) }))
-                .help("Copied text and images, searchable in Clipboard")
                 if model.clipboardEnabled, ClipboardMonitor.accessDenied {
                     LabeledContent("Pasting from other apps is denied") {
                         Button("Open Privacy Settings") {
@@ -369,7 +367,6 @@ private struct ActivityTab: View {
             Section("Screenshots") {
                 Toggle("Record screenshots", isOn: Binding(get: { model.screenshotsEnabled },
                                                            set: { model.setScreenshotsEnabled($0) }))
-                .help("A screenshot when you use the Mac, searchable in Screenshots")
                 .onAppear { model.refreshScreenshotsDiskUse() }
                 if model.screenshotsEnabled, model.screenshotsAccess == false {
                     LabeledContent("Screen recording is denied") {
@@ -399,9 +396,6 @@ private struct ActivityTab: View {
                 Button("Add App\u{2026}") { addExcludedApps() }
             } header: {
                 Text("Apps left out of screenshots")
-            } footer: {
-                Text("Their windows are not recorded, and no screenshot is taken while one of them is in front.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section("Folders") {
@@ -474,8 +468,8 @@ private struct ActivityTab: View {
             isPresented: Binding(get: { model.pendingDisable != nil }, set: { if !$0 { model.pendingDisable = nil } }),
             presenting: model.pendingDisable
         ) { pd in
-            Button("Remove \(pd.count) from index", role: .destructive) { model.applyKind(pd.kind, on: false, purge: true) }
-            Button("Keep in index") { model.applyKind(pd.kind, on: false, purge: false) }
+            Button("Remove \(pd.count) from Index", role: .destructive) { model.applyKind(pd.kind, on: false, purge: true) }
+            Button("Keep in Index") { model.applyKind(pd.kind, on: false, purge: false) }
             Button("Cancel", role: .cancel) { model.pendingDisable = nil }
         } message: { pd in
             Text("\(pd.count) \(pd.kind.rawValue) \(pd.count == 1 ? "file is" : "files are") already indexed.")
@@ -530,7 +524,6 @@ private struct ExcludedAppRow: View {
             Spacer()
             Button(action: remove) { Image(systemName: "minus.circle") }
                 .buttonStyle(.borderless)
-                .help("Record this app again")
                 .accessibilityLabel("Remove")
         }
     }
@@ -576,14 +569,14 @@ private struct ContentTypesTab: View {
                                             set: { model.minTextChars = Int($0.rounded()) }))
             }
 
-            Section {
-                Toggle("Read long logs and data files to the end", isOn: Binding(get: { model.readLongDataFiles },
-                                                                           set: { model.readLongDataFiles = $0 }))
-            } header: {
-                Text("Long files")
-            } footer: {
-                Text("Text, Markdown, PDFs, documents, web pages and code are always read in full. Logs and JSON files over 2 MB are cut at 2 MB unless this is on.")
-                    .font(.caption).foregroundStyle(.secondary)
+            // A PICKER OF THE TWO LENGTHS, not a switch with a paragraph under it saying what off
+            // cuts and where: the values say it.
+            Section("Long files") {
+                Picker("Logs and data files", selection: Binding(get: { model.readLongDataFiles },
+                                                                 set: { model.readLongDataFiles = $0 })) {
+                    Text("First 2 MB").tag(false)
+                    Text("Whole file").tag(true)
+                }
             }
 
             Section {
@@ -599,9 +592,6 @@ private struct ContentTypesTab: View {
                 }
             } header: {
                 Text("Ignore rules")
-            } footer: {
-                Text(".gitignore syntax, one pattern per line. An .omniignore file inside a folder applies to that folder.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
 
             // The folders' own files, which the rules above do not show. Edited where they live.
@@ -611,10 +601,7 @@ private struct ContentTypesTab: View {
                         FolderPolicyRow(dir: dir, rules: FolderPolicyRow.ruleCount(model.folderPolicies[dir] ?? ""))
                     }
                 } header: {
-                    Text("Rules in folders")
-                } footer: {
-                    Text("These folders have their own .omniignore file with extra rules.")
-                        .font(.caption).foregroundStyle(.secondary)
+                    Text(".omniignore files")
                 }
             }
         }
@@ -668,7 +655,7 @@ private struct ContentTypesTab: View {
                     Text("\(p.removed.formatted()) removed")
                         .foregroundStyle(p.removed > 0 ? .orange : .secondary)
                     if !p.samples.isEmpty {
-                        Button("Show samples") { showSamples = true }
+                        Button("Show Samples") { showSamples = true }
                             .buttonStyle(.link)
                             .popover(isPresented: $showSamples, arrowEdge: .bottom) { samplePopover(p.samples) }
                     }
@@ -679,14 +666,12 @@ private struct ContentTypesTab: View {
                 }
                 Spacer()
                 Button("Import\u{2026}") { importIgnoreFile() }
-                    .help("Load patterns from a file")
                 if model.ignoreHasBackup {
                     Button("Revert") {
                         model.revertIgnore()
                         draft = model.ignoreText
                         basedOn = draft
                     }
-                    .help("Undo the last applied change")
                 }
                 Button("Apply") {
                     previewTask?.cancel()
@@ -840,9 +825,6 @@ private struct PerformanceTab: View {
                 }
             } header: {
                 Text("Model")
-            } footer: {
-                Text("Running the model on the ANE saves energy and doesn't compete with other apps for the GPU.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section {
@@ -858,7 +840,6 @@ private struct PerformanceTab: View {
                     set: { model.groupNearDuplicates = $0 }
                 ))
                 .toggleStyle(.switch)
-                .help("Off: only identical copies stack")
             } header: {
                 Text("Search")
             }
@@ -902,16 +883,13 @@ private struct PerformanceTab: View {
                 }
             } header: {
                 Text("When to index")
-            } footer: {
-                Text("Low Power Mode and a hot Mac pause indexing too. New and changed files are always indexed right away.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
             Section {
                 // What Omni is using first, then the room it may use on top of it.
                 MemoryBreakdown(isVisible: isVisible)
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("Headroom")
+                        Text("Indexing headroom")
                         Spacer()
                         let shown = min(memoryDraft ?? model.memoryHeadroomGB, model.maxHeadroomGB)
                         let isDefault = memoryDraft == nil && model.memoryHeadroomChoiceGB == nil
@@ -927,7 +905,7 @@ private struct PerformanceTab: View {
                             if memoryDragging { memoryDraft = step } else { model.memoryHeadroomGB = step }
                         }
                     ), in: 0 ... headroomCeiling, label: {
-                        Text("Headroom")
+                        Text("Indexing headroom")
                     }, minimumValueLabel: {
                         Text("None").font(.caption).foregroundStyle(.secondary)
                     }, maximumValueLabel: {
@@ -950,26 +928,25 @@ private struct PerformanceTab: View {
             } header: {
                 Text("Memory")
             } footer: {
-                // What the setting is: room on top of what the model and index always take.
-                Text(model.isPaperRunning ? "Locked while the benchmark runs."
-                     : model.memoryPressureActive ? "Paused while memory is low. Resumes automatically."
-                     : (model.modelIndexBytes > 0
-                        ? "Extra memory for indexing, on top of the model and index (\(ByteSize.memory(model.modelIndexBytes))) and a \(ByteSize.memory(omniWorkingFloorBytes)) working buffer. More is faster. With none, indexing still runs, more slowly."
-                        : "Extra memory for indexing, on top of the model, the index and a \(ByteSize.memory(omniWorkingFloorBytes)) working buffer. More is faster. With none, indexing still runs, more slowly."))
-                    .font(.caption).foregroundStyle(.secondary)
+                // A state, when there is one. The paragraph on what headroom is went: the row is
+                // named for what the memory is for, and the bar above it shows the rest.
+                if model.memoryPressureActive {
+                    Text("Indexing paused: memory is low").font(.caption).foregroundStyle(.secondary)
+                }
             }
             Section {
                 LabeledContent("Benchmark this Mac") {
                     HStack(spacing: 8) {
+                        Text(BenchmarkDuration.minutesLabel).foregroundStyle(.secondary)
                         if let r = model.lastPaperReport {
-                            Button("Show results") { model.activeSheet = .paperResult(r.result.runId) }
+                            Button("Show Results") { model.activeSheet = .paperResult(r.result.runId) }
                                 .controlSize(.small)
                                 .disabled(model.isPaperRunning)
                         }
                         // Opens the main window FIRST: the progress sheet - and the only Cancel button
                         // the run has - is presented by ContentView, and the main window is closable
                         // while Settings stays open.
-                        Button("Run benchmark") {
+                        Button("Run Benchmark") {
                             openWindow(id: "main")
                             Task { await model.runPaperBenchmark() }
                         }
@@ -983,9 +960,6 @@ private struct PerformanceTab: View {
                 }
             } header: {
                 Text("Benchmark")
-            } footer: {
-                Text("Measures indexing and search speed on generated test data. Takes \(BenchmarkDuration.minutesLabel). Sharing sends hardware details and timings to hanxiao.io/omni, never your files.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -1007,14 +981,14 @@ private struct MemoryBreakdown: View {
 
     /// Order matters: biggest and most stable first, catch-all last, so the bar doesn't reshuffle
     /// as values move. Grey for the remainder mirrors the free-space slice in System Settings.
-    private var slices: [(name: String, color: Color, bytes: Int, help: String)] {
+    private var slices: [(name: String, color: Color, bytes: Int)] {
         // The folder map is NOT a slice here. It retains tens of MB - a sliver next to Model and
         // Index - so a fifth colour bought a legend row the eye cannot find in the bar. It stays in
         // `Other`, and `sample.viz` still carries the number for the OMNI_MEM_LOG trace.
-        [("Model", .blue, sample.model, "Weights and activations held by MLX"),
-         ("Cache", .teal, sample.cache, "Reusable buffers, freed under memory pressure"),
-         ("Index", .purple, sample.index, "Vectors and row table the search reads"),
-         ("Other", Color(nsColor: .systemGray), sample.other, "App, thumbnails, database cache, frameworks")]
+        [("Model", .blue, sample.model),
+         ("Cache", .teal, sample.cache),
+         ("Index", .purple, sample.index),
+         ("Other", Color(nsColor: .systemGray), sample.other)]
     }
 
     private func fmt(_ bytes: Int) -> String { ByteSize.memory(bytes) }
@@ -1097,7 +1071,6 @@ private struct MemoryBreakdown: View {
                     Spacer(minLength: 4)
                     Text(fmt(s.bytes)).foregroundStyle(.secondary)
                 }
-                .help(s.help)
             }
         }
         .font(.caption)
@@ -1227,23 +1200,20 @@ private struct HistoryTab: View {
     @State private var confirmClear = false
     var body: some View {
         // TWO GROUPS: what the sidebar shows of the index (Recents), and what Omni remembers of
-        // searches. No paragraphs between them - each row's detail is in its tooltip.
+        // searches. No paragraphs between them and no tooltip saying what a row is.
         Form {
             Section("Index") {
                 Picker("Show recent items", selection: Binding(get: { model.recentsLimit },
                                                                set: { model.recentsLimit = $0 })) {
                     ForEach(AppModel.recentsLimits, id: \.self) { Text("\($0)").tag($0) }
                 }
-                .help("Files in Recents, newest indexed first")
             }
             Section("Search") {
                 Picker("Add searches to history", selection: Binding(get: { model.historyMode }, set: { model.historyMode = $0 })) {
                     ForEach(HistoryMode.allCases) { Text($0.title).tag($0) }
                 }
-                .help(model.historyMode.detail)
                 Toggle("Save serving history", isOn: Binding(get: { model.saveServingHistory },
                                                             set: { model.saveServingHistory = $0 }))
-                .help("Searches from agents and scripts")
                 Picker("Keep history for", selection: Binding(get: { model.historyRetentionDays }, set: { model.historyRetentionDays = $0 })) {
                     Text("3 days").tag(3)
                     Text("7 days").tag(7)
@@ -1251,7 +1221,6 @@ private struct HistoryTab: View {
                     Text("1 month").tag(31)
                     Text("Forever").tag(AppModel.keepHistoryForever)
                 }
-                .help("Bookmarks are never removed")
                 // ONE ROW, and the button on the trailing edge. As two rows the Form drew a
                 // separator between the count and the control that acts on it, and left the button
                 // hanging on the leading edge - the only left-aligned button in Settings.
@@ -1263,17 +1232,14 @@ private struct HistoryTab: View {
                     Button("Clear\u{2026}", role: .destructive) { confirmClear = true }
                         .controlSize(.small)
                         .disabled(model.recentHistoryCount == 0)
-                        .help("Bookmarks are kept")
                 }
             }
         }
         .formStyle(.grouped)
         .onReceive(NotificationCenter.default.publisher(for: AppDelegate.dismissSheetsForQuit)) { _ in confirmClear = false }
         .confirmationDialog("Clear all recent searches?", isPresented: $confirmClear) {
-            Button("Clear search history", role: .destructive) { model.clearSearchHistory() }
+            Button("Clear Search History", role: .destructive) { model.clearSearchHistory() }
             Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Bookmarks are kept.")
         }
     }
 }
@@ -1322,9 +1288,8 @@ private struct IndexTab: View {
                 // and that is why #17 went two releases without anyone being able to say how many
                 // photos it was.
                 if model.progress.photosNotLocal > 0 {
-                    LabeledContent("Photos not on this Mac",
+                    LabeledContent("Photos in iCloud only",
                                    value: model.progress.photosNotLocal.formatted())
-                        .help("Stored in iCloud only")
                 }
                 if model.diskUse.isEmpty {
                     LabeledContent("Size", value: ByteSize.file(model.dbSizeBytes))
@@ -1340,18 +1305,14 @@ private struct IndexTab: View {
                         HStack {
                             Text("Optimizing storage")
                             Spacer()
-                            Text("\(Int(Double(m.done) / Double(m.total) * 100))%")
+                            // The backfill phase cannot know what the fold will free, and reports
+                            // 0 rather than a number it would have to take back: no size then.
+                            Text("\(Int(Double(m.done) / Double(m.total) * 100))%"
+                                 + (m.bytesToReclaim > 0 ? " \u{00B7} frees \(ByteSize.file(m.bytesToReclaim))" : ""))
                                 .foregroundStyle(.secondary)
                         }
                         ProgressView(value: Double(m.done), total: Double(m.total))
                             .progressViewStyle(.linear)
-                        // The backfill phase cannot know what the fold will free, and reports 0
-                        // rather than a number it would have to take back. Say nothing then.
-                        if m.bytesToReclaim > 0 {
-                            Text("Frees \(ByteSize.file(m.bytesToReclaim)) when it finishes.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
                     }
                     // Polled while it is on screen: nothing else reports progress once indexing
                     // stops. The row goes when the work is done, and the poll with it.
@@ -1380,12 +1341,10 @@ private struct IndexTab: View {
                     // this pane already uses it.
                     // THE VERSION, AND NOTHING ELSE. It read "v4, upgrading to v5" - a sentence
                     // in a column of values, where every neighbour is a date, a size or a count.
-                    // The number already says which one it is; v5 is current and anything less is
-                    // still on the way, and the tooltip is where that belongs if anywhere.
-                    LabeledContent("Format", value: "v\(model.indexSchemaVersion)")
-                    .help(model.indexSchemaVersion >= VectorStore.currentSchemaVersion
-                          ? "Current"
-                          : "Upgrading to v\(VectorStore.currentSchemaVersion) in the background.")
+                    // An index still on its way to the current format shows both numbers, as values.
+                    LabeledContent("Format", value: model.indexSchemaVersion >= VectorStore.currentSchemaVersion
+                                   ? "v\(model.indexSchemaVersion)"
+                                   : "v\(model.indexSchemaVersion) \u{2192} v\(VectorStore.currentSchemaVersion)")
                 }
                 // Manual row instead of LabeledContent: a long path makes LabeledContent
                 // wrap the value side under the label. The path gets the whole value side
@@ -1405,7 +1364,6 @@ private struct IndexTab: View {
                     HStack(spacing: 8) {
                         Spacer()
                         Button("Change\u{2026}") { pickDatabase() }
-                            .help("Load the index from another folder")
                             // isPaperRunning: the run captured the CURRENT index paths as the ones
                             // its filesystem must refuse to open, and a swap mid-run would move the
                             // index out from under that list.
@@ -1472,9 +1430,6 @@ private struct IndexTab: View {
                 }
             } header: {
                 Text("Model")
-            } footer: {
-                Text("Switching the embedding model rebuilds the index.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
 
         }
@@ -1493,7 +1448,7 @@ private struct IndexTab: View {
         guard missing.isEmpty else {
             let a = NSAlert()
             a.messageText = "That folder doesn't contain a model"
-            a.informativeText = "It is missing \(missing.joined(separator: ", ")). Choose the folder that holds the model's files."
+            a.informativeText = "Missing \(missing.joined(separator: ", "))"
             a.runModal()
             return
         }
@@ -1533,7 +1488,7 @@ private struct IndexTab: View {
             } else {
                 let a = NSAlert()
                 a.messageText = "Index moved"
-                a.informativeText = "The original is still at \(src.path)."
+                a.informativeText = "Original: \(src.path)"
                 a.addButton(withTitle: "OK"); a.addButton(withTitle: "Show Original")
                 if a.runModal() == .alertSecondButtonReturn {
                     NSWorkspace.shared.activateFileViewerSelecting([src])

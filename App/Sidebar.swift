@@ -361,7 +361,18 @@ struct Sidebar: View {
             if let d = pick { $folds.day(d.day, month: d.month).wrappedValue.toggle() }
         }
         .sheet(isPresented: Binding(get: { model.showPhotoPicker }, set: { model.showPhotoPicker = $0 })) { PhotoSourcePicker() }
-        .sheet(isPresented: Binding(get: { model.showPhotoDenied }, set: { model.showPhotoDenied = $0 })) { PhotoAccessDenied() }
+        // The system's alert, not a sheet laid out by hand: macOS places the title and the buttons,
+        // and where they go moves with each release (on 27.2: the title centred, the buttons stacked
+        // at full width; the hand-laid sheet had a centred title over trailing buttons).
+        .alert("No access to Photos", isPresented: Binding(get: { model.showPhotoDenied }, set: { model.showPhotoDenied = $0 })) {
+            Button("Open System Settings") {
+                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Photos") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+            // "Not Now", not "Cancel": nothing is being cancelled, macOS already recorded the decision.
+            Button("Not Now", role: .cancel) {}
+        }
         .onDeleteCommand {
             switch selection {
             case .photos(let key):
@@ -826,14 +837,13 @@ private struct PhotoSourceRow: View {
     let deselect: () -> Void
 
     private var photoHelp: String {
-        if model.isFolderPaused(path: source.key) { return "This source is paused" }
-        if model.userPaused { return "Indexing is paused: File > Resume Indexing" }
+        if model.isFolderPaused(path: source.key) || model.userPaused { return "Paused" }
         if let rp = model.progress.perRoot[source.key], rp.total > 0, rp.done < rp.total {
             return "Indexing \(rp.done.formatted()) / \(rp.total.formatted()) items"
         }
         if model.isPhotoSourceQueued(source) { return "Waiting to be indexed" }
         if RootIndexState.isActive(model, key: source.key) { return "Counting items\u{2026}" }
-        return source.isAll ? "Your whole Apple Photos library" : "Apple Photos album"
+        return source.isAll ? "Apple Photos library" : "Apple Photos album"
     }
 
     var body: some View {
@@ -864,7 +874,6 @@ private struct PhotoSourceRow: View {
                 Text(c.formatted())
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(c == 0 ? .tertiary : .secondary)
-                    .help(c == 0 ? "Nothing indexed from this source yet" : "\(c) item\(c == 1 ? "" : "s") indexed")
             }
         }
         .help(photoHelp)
@@ -932,7 +941,7 @@ private struct ClipboardRow: View {
                     .foregroundStyle(model.clipboardEnabled ? .secondary : .tertiary)
             }
         }
-        .help(model.clipboardEnabled ? "Clipboard history" : "Clipboard history is off")
+        .help(model.clipboardEnabled ? "" : "Off")
         .contextMenu {
             Button { model.enterClipboard() } label: { Label("Open", systemImage: "arrow.up.forward.app") }
             if model.clipboardEnabled || model.clipboardHasClips {
@@ -968,9 +977,9 @@ private struct ScreenshotsRow: View {
     private var key: String { AppModel.screenshotsDirectory.path }
 
     private var help: String {
-        if !model.screenshotsEnabled { return "Screenshots are off" }
-        if model.screenshotsAccess == false { return "Screen recording is denied in System Settings" }
-        return "Screenshots"
+        if !model.screenshotsEnabled { return "Off" }
+        if model.screenshotsAccess == false { return "Screen recording denied" }
+        return ""
     }
 
     var body: some View {
@@ -1122,21 +1131,19 @@ private struct FolderRow: View {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
                 }
                 .buttonStyle(.plain)
-                .help("No permission to read this folder")
+                .help("No permission")
             } else if model.hasIndexedFiles, let c = model.folderFileCounts[url.path] {
                 // Once anything is indexed, show every folder's real count - a
                 // plain "0" is an unambiguous "nothing here yet" rather than blank.
                 Text(c.formatted())
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(c == 0 ? .tertiary : .secondary)
-                    .help(c == 0 ? "No files indexed in this folder yet" : "\(c) file\(c == 1 ? "" : "s") indexed")
             }
         }
         .onHover { hovered = $0 }
         // While this folder indexes, the row tooltip shows live progress;
         // otherwise the full path (useful when the name is truncated).
-        .help(model.isFolderPaused(url) ? "This folder is paused"
-              : model.userPaused ? "Indexing is paused: File > Resume Indexing"
+        .help(model.isFolderPaused(url) || model.userPaused ? "Paused"
               : ((RootIndexState.isActive(model, url) || model.isFolderQueued(url)) && !RootIndexState.isFinished(model, url) ? RootIndexState.indexingHelp(model, url) : url.path))
         // Native source-list management: right-click to act. IDENTICAL to the menu the browser
         // gives a folder - one builder, no list of items kept in step by hand; the root-only
@@ -1298,8 +1305,6 @@ private struct LinkedMacsSection: View {
                         link.unlink(p.id)
                     }
                 }
-            } message: {
-                Text("Neither Mac can search the other until you link them again.")
             }
         }
     }

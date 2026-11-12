@@ -32,7 +32,7 @@ struct OCRView: View {
         Group {
             switch session.phase {
             case .empty:
-                SearchWaysPrompt(title: "Drop a document to transcribe",
+                SearchWaysPrompt(title: "Drop a PDF or images",
                                  symbol: CenteredStatus.moleOCR,
                                  ways: SearchWaysPrompt.transcribeWays,
                                  // Something to click. The rows describe ways in, but an empty
@@ -1436,7 +1436,7 @@ private struct ProgressReadout: View {
                     // The way back to the live end of a document you have scrolled away from.
                     // Without it, following is a door that only locks.
                     ChipButton(symbol: "arrow.down.to.line",
-                               help: "Jump to the page being transcribed") { session.follow() }
+                               help: "Current page") { session.follow() }
                 }
                 if session.isPaused {
                     ChipButton(symbol: "play.fill", help: "Resume transcribing") { session.resume() }

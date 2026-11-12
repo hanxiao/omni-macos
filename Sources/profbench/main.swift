@@ -1,7 +1,7 @@
 import Foundation
 import OmniKit
 
-// Headless equivalent of the App menu's "Run benchmark": the same runProfilingPass, the same
+// Headless equivalent of the App menu's "Run Benchmark": the same runProfilingPass, the same
 // IndexSettings.profiling, the same fixed 300-file dataset, into the same kind of fresh temporary
 // store. Exists as its OWN target so it can be injected into a worktree at any release tag without
 // touching main.swift - whose contents differ between tags and would not compile.

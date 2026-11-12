@@ -424,8 +424,7 @@ private struct ShareItem: View {
         Button { SelectionShare.present(model.selectedURLsOrdered) } label: {
             Label("Share\u{2026}", systemImage: "square.and.arrow.up")
         }
-        // Both states say something true and useful: what it will do, or what is missing.
-        .help(model.menuSelection.count == 0 ? "Select a file to share" : "Share the selection")
+        .help("Share")
         .disabled(model.menuSelection.count == 0)
     }
 }
@@ -450,7 +449,7 @@ private struct ViewModePicker: View {
         // every result set. 38pt a segment is what the live toolbar measures for icon-only ones.
         .frame(width: 2 * 38)
         .fixedSize()
-        .help("Switch between list and gallery")
+        .help("View")
     }
 }
 
@@ -522,7 +521,6 @@ private struct FilterItem: View {
                         // filter or four literal characters, which is quoting, not formatting.
                         Label("As Plain Query", systemImage: "quote.opening")
                     }
-                    .help("Ignore filters in the query")
                 }
             }
             Section("Show") {
