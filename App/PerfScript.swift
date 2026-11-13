@@ -1,6 +1,7 @@
 import AppKit
 import OmniKit
 import OmniLink
+import os
 
 /// A measured script of UI steps, run inside the app: `OMNI_PERF_SCRIPT="browse:/a/b;view:list;sidebar;sidebar"`.
 ///
@@ -130,6 +131,16 @@ enum PerfScript {
                 top.update()
                 let items = top.items.filter { !$0.isSeparatorItem }.map { "\($0.title)=\($0.isEnabled ? "on" : "off")" }
                 omniPerfLog("menustate \(arg): " + items.joined(separator: ", "))
+            }
+        case "menushow":   // a menu bar menu opened over the window for a picture, closed after 4 s: menushow:File
+            if let top = NSApp.mainMenu?.items.first(where: { $0.title == arg })?.submenu,
+               let view = NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil && $0.canBecomeMain })?.contentView {
+                let close = Timer(timeInterval: 4, repeats: false) { _ in
+                    MainActor.assumeIsolated { NSApp.mainMenu?.items.first(where: { $0.title == arg })?.submenu?.cancelTracking() }
+                }
+                RunLoop.main.add(close, forMode: .eventTracking)
+                omniPerfLog("menushow \(arg)")
+                top.popUp(positioning: nil, at: NSPoint(x: 240, y: view.isFlipped ? 60 : view.bounds.maxY - 60), in: view)
             }
         case "share": SelectionShare.present(model.selectedURLsOrdered)   // what File > Share does
         case "cliptest":   // the clipboard history must never record Omni's own file copies
@@ -368,6 +379,7 @@ enum PerfScript {
                 "screenshotsOff": model.showsScreenshotsOff,
                 "screenshotsEnabled": model.screenshotsEnabled,
                 "screenshotsAccess": model.screenshotsAccess.map { $0 ? "allowed" : "denied" } ?? "unknown",
+                "screenshotsFailure": model.screenshotsFailure ?? "",
                 "screenshotsHasShots": model.screenshotsHasShots,
                 "screenshotsRevision": model.screenshotsRevision,
                 "screenshotsExcluded": model.screenshotsExcludedApps,
@@ -480,8 +492,54 @@ enum PerfScript {
             NotificationCenter.default.post(name: .omniPerfShot, object: "dragfile")
         case "shotdelete":  // shot | session | day around the shown shot, without its confirmation
             NotificationCenter.default.post(name: .omniPerfShot, object: "delete:" + arg)
+        case "shotdeleteresult": // the selected results that are shots, deleted without the confirmation
+            model.deleteScreenshots(atPaths: model.selectionOrdered.filter(ResultPath.isShot), confirmed: true)
+        case "shotopen":    // Open on the selected result (a shot: the timeline at it)
+            if let path = model.selection { PhotoActions.open(path) }
+        case "shotcopy":    // Copy on the selection, shots written out as files
+            let t0 = Date()
+            model.copySelectedFiles()
+            omniPerfLog(String(format: "shot-copy main_ms=%.1f", Date().timeIntervalSince(t0) * 1000))
+        case "shotfiles":   // what a drag of the selection writes out as it starts, timed (FileDrag.shotFiles)
+            let paths = model.selectionOrdered
+            let t0 = Date()
+            let files = FileDrag.shotFiles(paths)
+            let first = Date().timeIntervalSince(t0) * 1000
+            let t1 = Date()
+            _ = FileDrag.shotFiles(paths)
+            let bytes = files.values.reduce(0) { $0 + (((try? FileManager.default.attributesOfItem(atPath: $1.path))?[.size] as? Int) ?? 0) }
+            omniPerfLog(String(format: "shot-files shots=%d files=%d bytes=%d first_ms=%.1f again_ms=%.1f", paths.filter(ResultPath.isShot).count,
+                               files.count, bytes, first, Date().timeIntervalSince(t1) * 1000))
+        case "shotpromise": // the selection's promised files written into a folder, as a drop does: shotpromise:<dir>
+            let dir = URL(fileURLWithPath: arg, isDirectory: true)
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let promised = model.selectionOrdered.compactMap { FileDrag.writer(for: $0, shots: [:]) as? NSFilePromiseProvider }
+            let names = promised.map { PhotoPromise.shared.filePromiseProvider($0, fileNameForType: $0.fileType) }
+            let t0 = Date()
+            let left = OSAllocatedUnfairLock(initialState: (count: promised.count, failed: 0))
+            for (provider, name) in zip(promised, names) {
+                nonisolated(unsafe) let provider = provider
+                PhotoPromise.shared.operationQueue(for: provider).addOperation {
+                    PhotoPromise.shared.filePromiseProvider(provider, writePromiseTo: dir.appendingPathComponent(name)) { error in
+                        let done = left.withLock { state in
+                            state.count -= 1; if error != nil { state.failed += 1 }
+                            return state
+                        }
+                        if done.count == 0 {
+                            omniPerfLog(String(format: "shot-promise promised=%d failed=%d ms=%.0f", promised.count, done.failed,
+                                               Date().timeIntervalSince(t0) * 1000))
+                        }
+                    }
+                }
+            }
+            if promised.isEmpty { omniPerfLog("shot-promise promised=0") }
+        case "copies":      // the other running copies, and those a launch would stand down for (the single-instance guard)
+            let copies = AppDelegate.otherCopies()
+            omniPerfLog("copies running=\(copies.running.map(\.processIdentifier)) sharing=\(copies.sharing.map(\.processIdentifier))")
         case "shotdecline": // macOS declining a capture, asked again after <seconds> (ScreenRecorder.declineForScript)
             model.perfDeclineScreenshots(retryAfter: Double(arg) ?? 300)
+        case "shotfail":    // looks failing with <text>, until one works (ScreenRecorder.failForScript)
+            model.perfFailScreenshots(arg)
         case "shotexclude": // the apps never recorded: bundle ids, comma separated (empty: none)
             model.screenshotsExcludedApps = arg.split(separator: ",").map(String.init)
         case "appearance": NSApp.appearance = NSAppearance(named: arg == "dark" ? .darkAqua : .aqua)

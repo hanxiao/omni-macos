@@ -53,14 +53,11 @@ enum ScreenHints {
         return out
     }
 
-    /// The moment of one screenshot file, for a read of it. nil for any other file.
-    static func moment(ofStill path: String) -> Moment? {
-        guard isShot(path),
-              let taken = ((try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date)?.timeIntervalSince1970
-        else { return nil }
-        let session = AppModel.screenHistory.sessions(around: [taken]).first ?? nil
-        let shot = session.map(\.nearest).flatMap { abs($0.time - taken) < 1 ? $0 : nil }
-        return Moment(taken: taken, app: shot?.app ?? "", title: shot?.title ?? "", span: session.map(Span.init))
+    /// The moment of one screenshot, for a read of it. nil for any other path.
+    static func moment(ofShot path: String) -> Moment? {
+        guard isShot(path), let shot = AppModel.screenHistory.shot(atPath: path) else { return nil }
+        let session = AppModel.screenHistory.sessions(around: [shot.time]).first ?? nil
+        return Moment(taken: shot.time, app: shot.app, title: shot.title, span: session.map(Span.init))
     }
 
     /// ISO 8601 to the second with the local offset ("2026-11-10T13:16:27+01:00"): what

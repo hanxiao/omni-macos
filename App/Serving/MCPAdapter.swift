@@ -773,18 +773,20 @@ enum MCPAdapter {
     }
 
     /// An indexed image as a picture an agent can look at: a JPEG, because that is what every
-    /// model that reads images reads (HEIC, which Omni's own screenshots are, only one of them
-    /// does, and Claude Code's file reader refuses it). The file is converted when asked for and
-    /// never stored twice. Runs on the served work queue.
+    /// model that reads images reads (HEIC only one of them does, and Claude Code's file reader
+    /// refuses it). The file is converted when asked for and never stored twice; a screenshot is
+    /// a frame of the screen history's video, taken out when asked for. Runs on the served work queue.
     private static func readPicture(id: Any, path: String, maxEdge: Int?, cli: Bool) -> HTTPResponse {
         let edge = min(max(maxEdge ?? pictureMaxEdge, 256), pictureEdgeLimit)
         var size = imageSize(path: path)
         var image: CGImage?
-        // A screenshot's file is the desktop at a pixel a point; asked for more, the shot itself.
-        if ScreenHints.isShot(path), let s = size, edge > max(s.width, s.height),
-           let whole = AppModel.screenHistory.frame(ofStill: URL(fileURLWithPath: path), maxDimension: edge) {
-            image = whole.image
-            size = (whole.width, whole.height)
+        // A screenshot in the index is the desktop at a pixel a point; asked for more, the frame
+        // as it was recorded.
+        if ScreenHints.isShot(path), let shot = AppModel.screenHistory.shot(atPath: path),
+           let got = AppModel.screenHistory.picture(of: shot, maxDimension: edge) {
+            let held = AppModel.screenHistory.size(of: shot)
+            image = got.image
+            size = held.flatMap { edge > max($0.width, $0.height) ? nil : $0 } ?? (got.width, got.height)
         }
         guard let image = image ?? Self.image(path: path, maxEdge: edge), let data = jpegBase64(image, quality: 0.8) else {
             return toolError(id: id, "read_file failed: the image could not be opened (\(path)).")
@@ -793,7 +795,7 @@ enum MCPAdapter {
         if let size { head += ", \(size.width) x \(size.height) pixels" }
         if size == nil || image.width != size!.width || image.height != size!.height { head += ", shown at \(image.width) x \(image.height)" }
         var shot: [String: Any]?
-        if let moment = ScreenHints.moment(ofStill: path) {
+        if let moment = ScreenHints.moment(ofShot: path) {
             let front = [moment.app, moment.title].filter { !$0.isEmpty }.joined(separator: " - ")
             head += "\nScreenshot taken \(ScreenHints.stamp(moment.taken))" + (front.isEmpty ? "" : ", in front: \(front)")
             if let span = moment.span { head += "\nIt was " + ScreenHints.sessionText(span, cli: cli) }
@@ -871,7 +873,7 @@ enum MCPAdapter {
                 let fresh: String
                 if row["up_to_date"] as? Bool == true { fresh = "up to date" }
                 else if row["exists"] as? Bool == true { fresh = "STALE: file changed on disk since indexing" }
-                else { fresh = "file MISSING on disk" }
+                else { fresh = ScreenHints.isShot(p) ? "no longer in the screen history" : "file MISSING on disk" }
                 line = "\(i + 1). \(p)  indexed (\(kind), \(chunks) chunk\(chunks == 1 ? "" : "s"), \(fresh))"
             } else {
                 // WHY NOT, since the next step differs: a bare "NOT indexed" for a folder or a URL
@@ -885,8 +887,8 @@ enum MCPAdapter {
                         : "NOT indexed: no such photo in the index"
                 }
                 else if !asked.hasPrefix("/") && !asked.hasPrefix("~") { why = "not an absolute file path" }
-                else if !FileManager.default.fileExists(atPath: p, isDirectory: &isDir) { why = "no such file" }
-                else if isDir.boolValue { why = "a folder, not a file: search inside it with search's 'folder', or list_sources for what is indexed" }
+                else if !ScreenShots.isFolder(p), !FileManager.default.fileExists(atPath: p, isDirectory: &isDir) { why = "no such file" }
+                else if isDir.boolValue || ScreenShots.isFolder(p) { why = "a folder, not a file: search inside it with search's 'folder', or list_sources for what is indexed" }
                 else { why = notIndexedWhy(p, snap) }
                 line = "\(i + 1). \(p)  \(why)"
             }
@@ -1199,6 +1201,12 @@ enum MCPAdapter {
         // access stays off - a served response must not trigger an iCloud download.
         if let ref = PhotoLibrary.Ref(path) {
             return PhotoLibrary.image(ref, maxDimension: maxEdge, allowNetwork: false)
+        }
+        // A screenshot is a frame of the screen history: the desktop at a pixel a point, as the
+        // index holds it, no larger than the cap.
+        if let history = ScreenShots.history(holding: path), let shot = history.shot(atPath: path) {
+            let side = history.size(of: shot).map { min(maxEdge, max($0.width, $0.height)) } ?? maxEdge
+            if let got = history.picture(of: shot, maxDimension: side) { return got.image }
         }
         let url = URL(fileURLWithPath: path)
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil) else { return nil }

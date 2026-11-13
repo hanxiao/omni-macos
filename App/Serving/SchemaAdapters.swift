@@ -562,6 +562,12 @@ enum FileStatusAdapter {
                 exists = info != nil
                 diskMtime = info?.modified ?? 0
                 diskSize = info?.size ?? 0
+            } else if ScreenShots.isShotPath(p) {
+                // A shot of the screen history has no file either, and never changes: while the
+                // history holds it, the index holds its one version (ScreenShots.file).
+                exists = !ScreenShots.isGone(p)
+                diskMtime = st.modified
+                diskSize = st.size
             } else {
                 let vals = try? URL(fileURLWithPath: p).resourceValues(
                     forKeys: [.contentModificationDateKey, .fileSizeKey, .isRegularFileKey])

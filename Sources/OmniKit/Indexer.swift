@@ -982,8 +982,9 @@ public final class Indexer: @unchecked Sendable {
     }
 
     /// macOS's screenshot marker (the attribute behind Spotlight's kMDItemIsScreenCapture).
+    /// A shot of the screen history is one by its path: there is no file to carry the marker.
     static func isScreenshot(_ path: String) -> Bool {
-        getxattr(path, "com.apple.metadata:kMDItemIsScreenCapture", nil, 0, 0, 0) > 0
+        ScreenShots.isShotPath(path) || getxattr(path, "com.apple.metadata:kMDItemIsScreenCapture", nil, 0, 0, 0) > 0
     }
 
     /// Start-of-segment timestamp locator: "4:00", "1:20:00".
@@ -1123,6 +1124,13 @@ public final class Indexer: @unchecked Sendable {
         rereadsMissedLock.withLock { rereadsMissed.removeAll() }
         let textsAtStart = textsEmbedded.value
         if !cancelClearedByCaller { resetCancelled() }
+        // THE SCREEN HISTORY IS A ROOT WITH NO FOLDER. Its shots are listed by the history (the third
+        // producer below), never walked, and its path is not one realpath can resolve.
+        var shotSources: [ScreenHistory] = []
+        for r in roots {
+            if let h = ScreenShots.history(root: r.path), !shotSources.contains(where: { $0 === h }) { shotSources.append(h) }
+        }
+        let roots = roots.filter { ScreenShots.history(root: $0.path) == nil }
         var p = IndexProgress()
         // The known-files snapshot is an O(rows) walk of the resident row table that shares no
         // resource with the filesystem crawl below, yet it ran strictly before the crawl. Compute it concurrently
@@ -1131,10 +1139,11 @@ public final class Indexer: @unchecked Sendable {
         // a large existing index. (F6)
         final class KnownBox: @unchecked Sendable { var v: VectorStore.KnownFiles = .empty }
         let knownBox = KnownBox()
-        let knownReady = DispatchSemaphore(value: 0)
+        let knownReady = DispatchGroup()   // two wait on it: the consumer, and the shots' producer
+        knownReady.enter()
         DispatchQueue.global(qos: .utility).async { [store = store] in
             knownBox.v = store.knownFiles()
-            knownReady.signal()
+            knownReady.leave()
         }
         // WHAT THE CRAWL TOUCHED, as digests rather than paths.
         //
@@ -1193,7 +1202,11 @@ public final class Indexer: @unchecked Sendable {
             /// library the user emptied kept its rows forever: they enumerated 0, looked blind, and
             /// were never swept. Their thumbnails then render as type icons, because the assets
             /// they point at no longer exist.
+            /// A screen history still taking in 0.20.2's picture files is one of these too.
             var unreadablePhotoRoots: Set<String> = []
+            /// Every indexed shot the screen histories hold, listed by their producer: what the
+            /// sweep asks instead of the disk for a path with no file behind it.
+            var shots: Set<String> = []
             /// What the file walk could prove, once it has ended: see WalkOutcome. `stopped` is also
             /// set by the Photos producer when it leaves a library part-listed.
             var walk = WalkOutcome()
@@ -1242,7 +1255,8 @@ public final class Indexer: @unchecked Sendable {
         // Photos sources are roots too - the same `perRoot` progress, the same containment test,
         // the same stale sweep. Their keys are not filesystem paths, so they are never realpath'd.
         let photoPaths: [String] = photos.map(\.key)
-        let rootPaths: [String] = filePaths + photoPaths
+        let shotPaths: [String] = shotSources.map(\.root)
+        let rootPaths: [String] = filePaths + photoPaths + shotPaths
         // @Sendable: the producer thread calls this for every file it finds, and it only reads
         // an immutable list of strings.
         let rootOf: @Sendable (String) -> String? = { path in
@@ -1260,7 +1274,7 @@ public final class Indexer: @unchecked Sendable {
         // single stack, so every root's queue fills together and the consumer's round-robin has
         // something from each to take - walking them one at a time meant a paused run indexed the
         // first root and nothing else, which is the starvation the interleaving exists to prevent.
-        feed.producers = photos.isEmpty ? 1 : 2
+        feed.producers = 1 + (photos.isEmpty ? 0 : 1) + (shotSources.isEmpty ? 0 : 1)
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             var counts: [String: Int] = [:]
@@ -1350,6 +1364,55 @@ public final class Indexer: @unchecked Sendable {
                 }
                 feed.lock.lock()
                 for r in photoPaths { feed.totals[r] = counts[r] ?? 0 }
+                feed.walk.stopped = feed.walk.stopped || stopped
+                feed.producers -= 1
+                feed.lock.broadcast()
+                feed.lock.unlock()
+            }
+        }
+
+        // THE THIRD PRODUCER: the screen history, into the same queue. The history lists its indexed
+        // shots (`indexedShots`, from its catalog); one the index already holds comes as the index
+        // holds it (ScreenShots.file), so it reads as unchanged. A history that cannot say yet which
+        // shots are indexed is an unreadable root: blind, its rows kept. One that lists none has none.
+        if !shotSources.isEmpty {
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                guard let self else { return }
+                knownReady.wait()
+                let known = knownBox.v
+                let wanted = settings.enabledKinds.contains(.image)
+                var counts: [String: Int] = [:]
+                var stopped = false
+                for history in shotSources {
+                    if self.isCancelled || feed.isAbandoned { stopped = true; break }
+                    let key = history.root
+                    guard let entries = history.indexedShots() else {
+                        Self.log.info("shots: the history cannot be listed yet; skipping deletion sweep for it")
+                        feed.lock.lock(); feed.unreadablePhotoRoots.insert(key); feed.lock.unlock()
+                        continue
+                    }
+                    // Listed whether or not pictures are indexed: the sweep asks of a row whose
+                    // kind is switched off whether what it points at is still there.
+                    feed.lock.lock(); feed.shots.formUnion(entries.lazy.map(\.path)); feed.lock.unlock()
+                    guard wanted else { continue }
+                    for entry in entries {
+                        if self.isCancelled || feed.isAbandoned { stopped = true; break }
+                        if settings.ignore.isIgnoredIncludingAncestors(entry.path, isDir: false, root: key) { continue }
+                        let f = ScreenShots.file(entry, known: known[entry.path])
+                        feed.lock.lock()
+                        while feed.queued >= queueCap, !self.isCancelled, !feed.abandoned {
+                            feed.lock.wait(until: Date().addingTimeInterval(0.1))
+                        }
+                        feed.pending[key, default: []].append(f)
+                        feed.queued += 1
+                        counts[key, default: 0] += 1
+                        feed.discovered[key] = counts[key]
+                        feed.lock.broadcast()
+                        feed.lock.unlock()
+                    }
+                }
+                feed.lock.lock()
+                for r in shotPaths { feed.totals[r] = counts[r] ?? 0 }
                 feed.walk.stopped = feed.walk.stopped || stopped
                 feed.producers -= 1
                 feed.lock.broadcast()
@@ -2255,7 +2318,7 @@ public final class Indexer: @unchecked Sendable {
             //     that yielded other files. Its files were not found because nobody could look.
             func underPassRoots(_ path: String) -> Bool { rootOf(path) != nil }
             let blindRoots = Self.blindRoots(totals: feed.totals,
-                                             photoRoots: Set(photoPaths),
+                                             photoRoots: Set(photoPaths + shotPaths),
                                              unreadablePhotos: feed.unreadablePhotoRoots)
             func inBlindRoot(_ path: String) -> Bool {
                 blindRoots.contains { path == $0 || path.hasPrefix($0 + "/") }
@@ -2275,8 +2338,13 @@ public final class Indexer: @unchecked Sendable {
             // off with its rows kept is never crawled, so its absence from `seen` proves nothing,
             // but one whose path no longer exists on disk is gone either way and stayed searchable.
             // A Photos asset is not a path, so only the library's own reconcile can remove it.
+            // A shot is not a path on disk either, but the history listed every one it holds.
+            feed.lock.lock()
+            let shotsHeld = feed.shots
+            feed.lock.unlock()
             func goneFromDisk(_ path: String) -> Bool {
-                !PhotoLibrary.isPhotoPath(path) && !FileManager.default.fileExists(atPath: path)
+                if ScreenShots.isShotPath(path) { return !shotsHeld.contains(path) }
+                return !PhotoLibrary.isPhotoPath(path) && !FileManager.default.fileExists(atPath: path)
             }
             // Batch the deletion: one transaction + one in-memory rebuild, not one per path.
             let stale = Set(known.compactMap { (path, sf) -> String? in
@@ -3045,7 +3113,8 @@ public final class Indexer: @unchecked Sendable {
         let text: String
         if ScreenText.inPieces {
             // From the file, at the reader's own size, not from the picture the index embeds.
-            guard let read = ScreenText.recognize(screenshot: file.url) else { return nil }
+            guard let read = ScreenShots.isShotPath(file.path) ? ScreenShots.text(atPath: file.path)
+                    : ScreenText.recognize(screenshot: file.url) else { return nil }
             text = read
         } else {
             guard case .images(let images) = ContentSources.source(for: file).content(file, kind: .image, settings: settings),
@@ -3227,9 +3296,13 @@ public final class Indexer: @unchecked Sendable {
     func enrichOne(_ c: (path: String, kind: String, modified: Double, size: Int, duration: Double), digest: String,
                    settings: IndexSettings) -> Bool {
         let file = CrawledFile(path: c.path, modified: c.modified, size: c.size)
-        var st = stat()
-        guard stat(c.path, &st) == 0, Int(st.st_size) == c.size,
-              abs(Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9 - c.modified) < 0.001 else { return false }
+        if ScreenShots.isShotPath(c.path) {
+            guard case .held = ScreenShots.presence(c.path) else { return false }   // a shot never changes; it is there or not
+        } else {
+            var st = stat()
+            guard stat(c.path, &st) == 0, Int(st.st_size) == c.size,
+                  abs(Double(st.st_mtimespec.tv_sec) + Double(st.st_mtimespec.tv_nsec) / 1e9 - c.modified) < 0.001 else { return false }
+        }
         func write(_ chunks: [IndexedChunk]) -> Bool {
             guard !chunks.isEmpty, !isCancelled else { return false }
             do { try Self.writeWaitingOutLocks { try store.replaceMany([(c.path, chunks)]) }; return true }
@@ -3717,7 +3790,12 @@ public final class Indexer: @unchecked Sendable {
         // ejected or pulled, each path gone with it, and each file and folder lost its rows until the
         // volume came back and a pass embedded them all again. Its files have not been deleted; the
         // root's own rows are already kept, and it reports a root change when it returns.
-        let missing = roots.filter { Darwin.access($0, F_OK) != 0 }
+        // The screen history's root has no folder at all: it is missing while the history cannot
+        // say what it holds, and only then.
+        let missing = roots.compactMap { root -> String? in
+            if let history = ScreenShots.history(root: root) { return history.stillsPending ? history.root : nil }
+            return Darwin.access(root, F_OK) != 0 ? root : nil
+        }
         let gone = missing.isEmpty ? gone : gone.filter { p in !missing.contains { p.hasPrefix($0 + "/") } }
         let absorbing = gone.filter { !protected($0) }
         let topmost = gone.filter { p in
@@ -3763,7 +3841,8 @@ public final class Indexer: @unchecked Sendable {
     public func removeVanished(_ paths: [String], roots: [String], arriving: Set<String> = []) -> Int {
         let names = arrivalLock.withLock { arrivalNames }.union(arriving)
         let gone = Set(paths.filter {
-            !names.contains(($0 as NSString).lastPathComponent) && Darwin.access($0, F_OK) != 0   // may be back already
+            if ScreenShots.isShotPath($0) { return ScreenShots.isGone($0) }
+            return !names.contains(($0 as NSString).lastPathComponent) && Darwin.access($0, F_OK) != 0   // may be back already
         })
         guard !gone.isEmpty else { return 0 }
         let (files, folders) = classifyVanished(gone, known: { self.store.storedFiles(paths: $0) }, roots: roots)
@@ -3820,8 +3899,18 @@ public final class Indexer: @unchecked Sendable {
         func rootOf(_ p: String) -> String? {
             roots.filter { p == $0 || p.hasPrefix($0 + "/") }.max { $0.count < $1.count }
         }
+        var shots = Set<String>()
         for path in Set(paths) {
             if isCancelled { break }
+            // A shot of the screen history has no file to stat: the history answers (ScreenShots).
+            if ScreenShots.isShotPath(path) {
+                switch ScreenShots.presence(path) {
+                case .held(let entry): files.append(ScreenShots.file(entry, known: nil)); shots.insert(path)
+                case .gone: deletedTop.insert(path)
+                case .unknown: break
+                }
+                continue
+            }
             var st = stat()
             guard stat(path, &st) == 0 else { deletedTop.insert(path); continue }
             // THE OLD SIDE OF A CASE-ONLY RENAME STILL STATS. APFS is case-insensitive, so after
@@ -3857,6 +3946,13 @@ public final class Indexer: @unchecked Sendable {
         files = files.filter { seenPaths.insert($0.path).inserted }
         var lookup = seenPaths; lookup.formUnion(deletedTop)
         let known = store.storedFiles(paths: lookup)
+        // A shot the index holds is the version it holds (ScreenShots.file).
+        if !shots.isEmpty {
+            files = files.map { f in
+                guard shots.contains(f.path), let k = known[f.path] else { return f }
+                return CrawledFile(path: f.path, modified: k.modified, size: k.size)
+            }
+        }
         // (The crawl above has been adding to it; `update`s do not overlap, so nothing else has.)
         arrivalLock.withLock {
             for f in files { arrivalNames.insert((f.path as NSString).lastPathComponent) }
@@ -3911,7 +4007,7 @@ public final class Indexer: @unchecked Sendable {
             // Ancestor-aware: an explicit file event for `.../.build/x/y.json` must honor the
             // dirOnly rule on `.build/` - the crawl prunes at the directory, this path never sees it.
             if kind == nil || settings.ignore.isIgnoredIncludingAncestors(path, isDir: false, root: rootOf(path))
-                || rootOf(path).map({ !gate.admitsEventPath(path, isDir: false, size: crawled.size, root: $0) }) == true {
+                || !shots.contains(path) && rootOf(path).map({ !gate.admitsEventPath(path, isDir: false, size: crawled.size, root: $0) }) == true {
                 if known[path] != nil { toDelete.insert(path) }   // now unsupported/excluded -> remove
                 continue
             }
@@ -3932,7 +4028,7 @@ public final class Indexer: @unchecked Sendable {
             // it) and do NOT delete any existing entry (a remotely-modified evicted file keeps its
             // old vectors - stale beats invisible; relying on the embed stage's empty result instead
             // would hit the chunks.isEmpty branch below and DROP the file from the index).
-            if settings.skipDataless, FileExtractor.isDataless(path) { continue }
+            if settings.skipDataless, !shots.contains(path), FileExtractor.isDataless(path) { continue }
             work.append(crawled)
         }
         // Decode through the same bounded concurrent pipeline as a full pass (PDF raster, mel STFT,

@@ -3,6 +3,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 import OmniKit
 import OmniLink
+import os
 
 /// Dragging files OUT of Omni, Finder-style: from a result row or cell, or a browser row, to Finder,
 /// Mail, an editor or any other app, which then does what it does with dropped files.
@@ -20,6 +21,10 @@ import OmniLink
 ///   the search area or the sidebar. That accidental drop is why rows used to be non-draggable.
 /// - PHOTOS ASSETS have no file until one is exported, so they go as file promises and are written
 ///   out only when dropped, which is what Photos itself does.
+/// - A SHOT OF THE SCREEN HISTORY goes as a real file, written out as the drag starts: a Dock icon,
+///   a browser's upload area and most chat windows take an existing file and not a promise
+///   (ShotDragFile, for the timeline's own drag). Up to as many as the history reads at once; a
+///   larger selection's shots go as promises (shotFiles; docs/screenshots.md, "A shot as a file").
 /// - NOT THE CLIPBOARD: a drag travels on the system's drag pasteboard, which the clipboard history
 ///   never reads, so dragging can never record a clip.
 @MainActor
@@ -36,8 +41,9 @@ final class FileDrag: NSObject, @preconcurrency NSDraggingSource {
               let window = event.window, let view = window.contentView else { return }
         let origin = view.convert(event.locationInWindow, from: nil)
         let side: CGFloat = 64
+        let shots = shotFiles(paths)
         let items: [NSDraggingItem] = paths.enumerated().map { i, path in
-            let item = NSDraggingItem(pasteboardWriter: writer(for: path))
+            let item = NSDraggingItem(pasteboardWriter: writer(for: path, shots: shots))
             // Fanned a few points per item, capped: the session then piles them under the pointer.
             let step = CGFloat(min(i, 4)) * 4
             item.setDraggingFrame(NSRect(x: origin.x - side / 2 + step, y: origin.y - side / 2 - step,
@@ -51,14 +57,31 @@ final class FileDrag: NSObject, @preconcurrency NSDraggingSource {
         session.animatesToStartingPositionsOnCancelOrFail = true
     }
 
-    private static func writer(for path: String) -> NSPasteboardWriting {
-        // A Photos asset and a linked Mac's file go as promises, written out only when dropped.
+    /// THE SHOTS OF A DRAG, WRITTEN OUT AS IT STARTS. Writing one is a decode and an encode on the
+    /// thread the drag starts on, so the hold must not grow with the selection: as many shots as the
+    /// history reads at once are written together, in about the time of one, and a drag of more
+    /// carries its shots as promises, written where they are dropped, as Photos assets are. Fifteen
+    /// written one after another held the drag 845 ms (docs/screenshots.md, "A shot as a file").
+    static func shotFiles(_ paths: [String]) -> [String: URL] {
+        let shots = paths.filter(ResultPath.isShot)
+        guard !shots.isEmpty, shots.count <= ScreenHistory.readerCount else { return [:] }
+        let written = OSAllocatedUnfairLock(initialState: [String: URL]())
+        DispatchQueue.concurrentPerform(iterations: shots.count) { i in
+            if let url = ShotActions.file(shots[i]) { written.withLock { $0[shots[i]] = url } }
+        }
+        return written.withLock { $0 }
+    }
+
+    static func writer(for path: String, shots: [String: URL]) -> NSPasteboardWriting {
+        if let file = shots[path] { return file as NSURL }
+        // A Photos asset, a linked Mac's file and a shot not written out go as promises, written
+        // only when dropped.
         guard ResultPath.isVirtual(path) else { return URL(fileURLWithPath: path) as NSURL }
-        let remote = RemotePath.isRemote(path)
-        // A Photos path percent-encodes its name; a linked Mac's path is the file's own name.
-        let name = remote ? (path as NSString).lastPathComponent
+        // A Photos path percent-encodes its name; a linked Mac's path and a shot's end in the name.
+        let named = RemotePath.isRemote(path) || ResultPath.isShot(path)
+        let name = named ? (path as NSString).lastPathComponent
             : (path as NSString).lastPathComponent.removingPercentEncoding ?? (path as NSString).lastPathComponent
-        let type = UTType(filenameExtension: (name as NSString).pathExtension) ?? (remote ? .data : .image)
+        let type = UTType(filenameExtension: (name as NSString).pathExtension) ?? (named ? .data : .image)
         let provider = NSFilePromiseProvider(fileType: type.identifier, delegate: PhotoPromise.shared)
         provider.userInfo = PhotoPromise.Request(path: path, name: name)
         return provider
@@ -88,7 +111,7 @@ final class FileDrag: NSObject, @preconcurrency NSDraggingSource {
     }
 }
 
-/// Writes a Photos asset's original where a promise was dropped.
+/// Writes a promised file where it was dropped: a Photos asset's original, a linked Mac's file, a shot.
 final class PhotoPromise: NSObject, NSFilePromiseProviderDelegate, @unchecked Sendable {
     static let shared = PhotoPromise()
     struct Request { let path: String; let name: String }

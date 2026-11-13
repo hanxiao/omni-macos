@@ -151,15 +151,19 @@ enum SearchArgs {
         // must never produce. Say which path missed instead. Existence is the decisive half and
         // costs one stat; a real folder that simply is not a source still returns empty, and the
         // index-state lines already in the response explain that case.
+        // The screenshots' folder is not on disk: the shots are frames of the video, and their paths
+        // are under the folder 0.20.2 kept its files in. A scope an agent has used goes on working.
+        let notAFile = "'folder' must be a folder, not a file (got \"\(expanded)\"). "
+            + "To search inside specific files, use search_inline."
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: expanded, isDirectory: &isDir) else {
+            let shots = normalizeStorePath(expanded)
+            if ScreenShots.isFolder(shots) { return (shots, nil) }
+            if ScreenShots.isShotPath(shots) { return (nil, notAFile) }
             return (nil, "no such folder: \"\(expanded)\". Check the path, or omit 'folder' to "
                        + "search everywhere. list_sources reports the folders Omni indexes.")
         }
-        guard isDir.boolValue else {
-            return (nil, "'folder' must be a folder, not a file (got \"\(expanded)\"). "
-                       + "To search inside specific files, use search_inline.")
-        }
+        guard isDir.boolValue else { return (nil, notAFile) }
         return (normalizeStorePath(expanded), nil)
     }
 

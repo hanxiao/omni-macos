@@ -317,7 +317,26 @@ enum ShotBench {
                           let read = ScreenText.fitted(image, long: ScreenText.readSide(width: image.width, height: image.height, dpi: 72 * Double(scale))) else { return nil }
                     return (read, true, 0)
                 }),
-            ]
+            ] + [(Float(0.7), true), (0.7, false), (0.8, true), (0.8, false)].map { quality, key in
+                // The frame as the history gives it back: through the video codec, a key frame or
+                // the frame after a different screen (the largest delta there is), read as the
+                // frame itself is. What a history with no stills would read. Bytes: the frame's.
+                (String(format: "video q%.1f %@, in pieces", quality, key ? "key" : "delta"), { shot in
+                    guard let encoder = ScreenFrameEncoder(width: renderer.width, height: renderer.height, quality: quality, keyInterval: 30) else { return nil }
+                    let decoder = ScreenFrameDecoder()
+                    var frame: ScreenFrameEncoder.Frame?
+                    if key {
+                        frame = encoder.encode(shot, forceKey: true)
+                    } else {
+                        guard let other = shots.first(where: { $0 !== shot }), let first = encoder.encode(other, forceKey: true),
+                              decoder.decode(first.data, parameterSets: first.parameterSets) != nil else { return nil }
+                        frame = encoder.encode(shot)
+                    }
+                    guard let frame, let back = decoder.decode(frame.data, parameterSets: frame.parameterSets), let image = ScreenCodec.cgImage(back),
+                          let read = ScreenText.fitted(image, long: ScreenText.readSide(width: image.width, height: image.height, dpi: 72 * Double(scale))) else { return nil }
+                    return (read, true, frame.data.count)
+                })
+            }
             for (arm, make) in arms {
                 var words = 0, lines = 0, time = 0.0, bytes = 0, pieces = 0, side = 0
                 for (k, shot) in shots.enumerated() {
@@ -357,7 +376,6 @@ enum ShotBench {
         let root = URL(fileURLWithPath: dir)
         let segments = root.appendingPathComponent("history"), stills = root.appendingPathComponent("stills")
         try? FileManager.default.createDirectory(at: segments, withIntermediateDirectories: true)
-        try? FileManager.default.createDirectory(at: stills, withIntermediateDirectories: true)
         let pixels = ScreenCodec.makePixelBuffer(width: 320, height: 200)!
         let day0 = Calendar.current.startOfDay(for: Date()).timeIntervalSince1970 - Double(days) * 86_400 + 9 * 3600
         let perDay = 8 * 3600 / 5
@@ -677,7 +695,189 @@ enum ShotBench {
         }
     }
 
+    /// shotbench frameembed <model> <source> <prose> <photo>: the vector of a screenshot's still
+    /// (HEIC at a pixel a point, as the index has it today) against the vector of the same screen
+    /// taken back out of the video (a key frame, and the frame after a different screen), scaled to
+    /// the still's size. Beside them the frame with no codec at all, and how far the next editor
+    /// screen (70 points scrolled) is from this one: what a cosine between two different screens is.
+    static func frameEmbed(_ args: [String]) async throws {
+        guard args.count >= 4 else { print("usage: shotbench frameembed <model> <source> <prose> <photo>"); return }
+        let engine = try await OmniEngine(modelDir: URL(fileURLWithPath: args[0]), keepVision: true, keepAudio: false)
+        let source = (try? String(contentsOfFile: args[1], encoding: .utf8)) ?? ""
+        let prose = (try? String(contentsOfFile: args[2], encoding: .utf8)) ?? ""
+        let photo = CGImageSourceCreateWithURL(URL(fileURLWithPath: args[3]) as CFURL, nil).flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) }
+        func cos(_ x: [Float]?, _ y: [Float]?) -> Float? {
+            guard let x, let y, x.count == y.count, !x.isEmpty else { return nil }
+            let dot = zip(x, y).reduce(Float(0)) { $0 + $1.0 * $1.1 }
+            return dot / (x.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot() * y.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot())
+        }
+        func line(_ name: String, _ values: [Float?]) -> String {
+            let v = values.compactMap { $0 }
+            guard !v.isEmpty else { return "    \(name): none" }
+            return String(format: "    %@: min %.4f  mean %.4f  (%d of %d)", name.padding(toLength: 34, withPad: " ", startingAt: 0),
+                          v.min()!, v.reduce(0, +) / Float(v.count), v.count, values.count)
+        }
+        let desktops: [(String, Int, Int, Int)] = [("1512x982 @2x", 1512, 982, 2), ("1920x1080 @1x", 1920, 1080, 1),
+                                                  ("2560x1440 @2x", 2560, 1440, 2), ("3840x2160 @1x", 3840, 2160, 1)]
+        for (name, w, h, scale) in desktops where args.count < 5 || args[4] == name {
+            let renderer = Renderer(scale: scale, points: (w, h), source: source, prose: prose, photo: photo)
+            var states: [State] = []
+            for top in [0, 70, 140, 210] { var s = State(); s.typed = min(renderer.source.count, 40_000); s.top = top; states.append(s) }
+            let editors = states.count
+            for y in [0.0, 700.0] { var s = State(); s.app = 1; s.scrollY = y; states.append(s) }
+            let shots = states.map { renderer.render($0) }
+            let side = ScreenHistory.stillSide(width: renderer.width, height: renderer.height, scale: Double(scale))
+            /// The frame as the history gives it back, at the still's size.
+            func video(_ shot: CVPixelBuffer, quality: Float, key: Bool) -> CGImage? {
+                guard let encoder = ScreenFrameEncoder(width: renderer.width, height: renderer.height, quality: quality, keyInterval: 30) else { return nil }
+                let decoder = ScreenFrameDecoder()
+                var frame: ScreenFrameEncoder.Frame?
+                if key {
+                    frame = encoder.encode(shot, forceKey: true)
+                } else {
+                    guard let other = shots.first(where: { $0 !== shot }), let first = encoder.encode(other, forceKey: true),
+                          decoder.decode(first.data, parameterSets: first.parameterSets) != nil else { return nil }
+                    frame = encoder.encode(shot)
+                }
+                guard let frame, let back = decoder.decode(frame.data, parameterSets: frame.parameterSets) else { return nil }
+                return scaled(back, maxDimension: side)
+            }
+            var stills: [[Float]?] = [], plain: [[Float]?] = []
+            var arms: [(String, [[Float]?])] = [("video q0.7 key", []), ("video q0.7 delta", []), ("video q0.8 key", []), ("video q0.8 delta", [])]
+            for shot in shots {
+                let image = scaled(shot, maxDimension: side)
+                plain.append(image.flatMap { engine.embedImage($0) })
+                let file = image.map { still($0, type: .heic, quality: ScreenHistory.stillQuality) }
+                let back = file.flatMap { CGImageSourceCreateWithData($0 as CFData, nil) }.flatMap { CGImageSourceCreateImageAtIndex($0, 0, nil) }
+                stills.append(back.flatMap { engine.embedImage($0) })
+                for (k, (quality, key)) in [(Float(0.7), true), (0.7, false), (0.8, true), (0.8, false)].enumerated() {
+                    arms[k].1.append(video(shot, quality: quality, key: key).flatMap { engine.embedImage($0) })
+                }
+            }
+            print("\(name)  \(renderer.width)x\(renderer.height) px, embedded at \(side) on the long side, \(shots.count) screens")
+            print(line("still (HEIC) vs no codec", zip(stills, plain).map { cos($0, $1) }))
+            for (arm, vectors) in arms {
+                print(line("\(arm) vs still", zip(vectors, stills).map { cos($0, $1) }))
+                print(line("\(arm) vs no codec", zip(vectors, plain).map { cos($0, $1) }))
+            }
+            print(line("next editor screen vs this (still)", (1 ..< editors).map { cos(stills[$0], stills[$0 - 1]) }))
+        }
+    }
+
+    /// The update that takes 0.20.2's picture files into the video, on a history as 0.20.2 left it
+    /// (a CLONE): `shotbench migrate <Screen History> <Screenshots> [--kill-after n]`. With
+    /// --kill-after the process is SIGKILLed after its n-th write, as a crash or a power cut
+    /// would end it; run it again, or open the app on it, and `shotbench state` says what is there.
+    static func migrate(_ args: [String]) {
+        guard args.count >= 2 else { print("usage: shotbench migrate <Screen History> <Screenshots> [--kill-after n]"); return }
+        let kill = args.firstIndex(of: "--kill-after").flatMap { $0 + 1 < args.count ? Int(args[$0 + 1]) : nil }
+        let history = ScreenHistory(history: URL(fileURLWithPath: args[0]), stills: URL(fileURLWithPath: args[1]))
+        var steps: [String: Int] = [:], n = 0
+        let t = Date()
+        let result = history.migrateStills { step in
+            steps[step, default: 0] += 1
+            n += 1
+            if n == kill {
+                print("killed after step \(n) (\(step))")
+                fflush(stdout)
+                Darwin.kill(getpid(), SIGKILL)
+            }
+        }
+        print(String(format: "migrate: %@  %.1f ms  steps %d %@", "\(result)", ms(t), n, "\(steps.sorted { $0.key < $1.key })"))
+    }
+
+    /// What a history holds, in one line to hold two of them against each other:
+    /// `shotbench state <Screen History> <Screenshots> [--decode] [--cold]`. The digest is over
+    /// every indexed shot's path, time and size in the video; --decode takes each one's picture
+    /// out of its frame and adds its size; --cold drops the catalog first and times the walk of
+    /// the video against the read of the catalog it leaves.
+    static func state(_ args: [String]) {
+        guard args.count >= 2 else { print("usage: shotbench state <Screen History> <Screenshots> [--decode] [--cold]"); return }
+        let folder = URL(fileURLWithPath: args[0])
+        if args.contains("--cold") { try? FileManager.default.removeItem(at: folder.appendingPathComponent("shots.catalog")) }
+        func open() -> ScreenHistory { ScreenHistory(history: folder, stills: URL(fileURLWithPath: args[1])) }
+        var history = open()
+        let segments = ((try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []).filter { $0.hasSuffix("." + ScreenHistory.segmentExtension) }.count
+        let t0 = Date()
+        let all = history.shots(from: 0, to: 4e9)
+        let walk = ms(t0)
+        let t1 = Date()
+        guard let indexed = history.indexedShots() else {
+            print("state: pending=true segments=\(segments) shots=\(all.count) flagged=\(all.filter(\.indexed).count)")
+            return
+        }
+        let first = ms(t1)
+        history = open()
+        let t2 = Date()
+        let again = history.indexedShots() ?? []
+        let second = ms(t2)
+        var digest: UInt64 = 0xcbf2_9ce4_8422_2325
+        func mix(_ s: String) { for b in s.utf8 { digest = (digest ^ UInt64(b)) &* 0x100_0000_01b3 } }
+        for e in indexed.sorted(by: { $0.path < $1.path }) { mix("\(e.path)|\(Int((e.time * 1000).rounded()))|\(e.bytes)\n") }
+        var decoded = 0, failed = 0, decodeMs = 0.0
+        if args.contains("--decode") {
+            let t = Date()
+            for e in indexed {
+                guard let shot = history.shot(atPath: e.path), history.path(of: shot) == e.path,
+                      let picture = history.picture(of: shot) else { failed += 1; continue }
+                decoded += 1
+                mix("\(picture.width)x\(picture.height)\n")
+            }
+            decodeMs = ms(t)
+        }
+        print(String(format: "state: pending=false segments=%d shots=%d indexed=%d same_again=%@ digest=%016llx list_shots_ms=%.1f indexed_first_ms=%.1f indexed_reopened_ms=%.1f",
+                     segments, all.count, indexed.count, "\(again.map(\.path) == indexed.map(\.path))", digest, walk, first, second)
+              + (args.contains("--decode") ? String(format: " decoded=%d failed=%d decode_ms=%.0f", decoded, failed, decodeMs) : ""))
+    }
+
+    /// A page of results that are shots, as the window draws it: `shotbench thumbs <Screen History>
+    /// <Screenshots> [count] [side]`. Each shot's picture at a tile's size, first one after the
+    /// other in the order the index lists them, then spread over the days (every one a jump to
+    /// another segment), then four at once as the window asks (Thumbnail.decodeGate).
+    static func thumbs(_ args: [String]) {
+        guard args.count >= 2 else { print("usage: shotbench thumbs <Screen History> <Screenshots> [count] [side]"); return }
+        let count = args.count > 2 ? Int(args[2]) ?? 40 : 40, side = args.count > 3 ? Int(args[3]) ?? 256 : 256
+        let history = ScreenHistory(history: URL(fileURLWithPath: args[0]), stills: URL(fileURLWithPath: args[1]))
+        guard let indexed = history.indexedShots(), !indexed.isEmpty else { print("thumbs: no indexed shots (or files pending)"); return }
+        let near = Array(indexed.suffix(count))
+        let spread = stride(from: 0, to: indexed.count, by: max(1, indexed.count / count)).prefix(count).map { indexed[$0] }
+        func one(_ e: ScreenHistory.Entry) -> Double {
+            let t = Date()
+            guard let shot = history.shot(atPath: e.path) else { return -1 }
+            var long = side
+            if let size = history.size(of: shot) {
+                let short = max(1, min(size.width, size.height))
+                long = min(max(size.width, size.height), Int((Double(side) * Double(max(size.width, size.height)) / Double(short)).rounded(.up)))
+            }
+            return history.picture(of: shot, maxDimension: long) == nil ? -1 : ms(t)
+        }
+        func report(_ name: String, _ entries: [ScreenHistory.Entry], width: Int) {
+            let t = Date()
+            let slots = UnsafeMutablePointer<Double>.allocate(capacity: entries.count)
+            defer { slots.deallocate() }
+            nonisolated(unsafe) let out = slots      // each iteration writes its own slot
+            if width == 1 { for (i, e) in entries.enumerated() { out[i] = one(e) } } else {
+                let gate = DispatchSemaphore(value: width)
+                DispatchQueue.concurrentPerform(iterations: entries.count) { i in
+                    gate.wait(); out[i] = one(entries[i]); gate.signal()
+                }
+            }
+            let each = (0 ..< entries.count).map { out[$0] }
+            let wall = ms(t), failed = each.filter { $0 < 0 }.count
+            let sorted = each.filter { $0 >= 0 }.sorted()
+            print(String(format: "thumbs %@ n=%d width=%d wall=%.0f ms  each p50=%.1f p90=%.1f max=%.1f ms  failed=%d", name, entries.count, width, wall,
+                         sorted.isEmpty ? 0 : sorted[sorted.count / 2], sorted.isEmpty ? 0 : sorted[min(sorted.count - 1, sorted.count * 9 / 10)], sorted.last ?? 0, failed))
+        }
+        report("newest", near, width: 1)
+        report("spread", spread, width: 1)
+        report("newest", near, width: 4)
+        report("spread", spread, width: 4)
+    }
+
     static func run(_ args: [String]) {
+        if args.first == "migrate" { migrate(Array(args.dropFirst())); return }
+        if args.first == "state" { state(Array(args.dropFirst())); return }
+        if args.first == "thumbs" { thumbs(Array(args.dropFirst())); return }
         if args.first == "reference" { reference(Array(args.dropFirst())); return }
         if args.first == "neighbour" { neighbour(Array(args.dropFirst())); return }
         if args.first == "hints" { hints(Array(args.dropFirst())); return }

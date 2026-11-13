@@ -515,18 +515,26 @@ struct ResultsList<Footer: View>: View {
                 Button { model.requestTags(Array(model.selectedPaths)) } label: { Label("Generate Tags", systemImage: "tag") }
             }
             Divider()
-            Button { model.revealSelected() } label: { Label("Show in Finder", systemImage: "folder") }
+            Button { model.revealSelected() } label: { Label(PhotoActions.revealTitle(paths: model.selectionOrdered), systemImage: "folder") }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             Button { model.copySelectedPaths() } label: { Label("Copy \(count) Paths", systemImage: "doc.on.doc") }
                 .keyboardShortcut("c", modifiers: [.command, .option])
             // Native macOS share picker (AirDrop, Mail, Messages, ...) over the whole selection.
-            ShareLink(items: model.selectedURLsOrdered) { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
+            // A shot of the screen history has no file for a ShareLink to hold: the picker, which
+            // writes them out when it opens.
+            if model.selectedPaths.contains(where: ResultPath.isShot) {
+                Button { SelectionShare.present(model.selectedURLsOrdered) } label: { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
+            } else {
+                ShareLink(items: model.selectedURLsOrdered) { Label("Share\u{2026}", systemImage: "square.and.arrow.up") }
+            }
             Divider()
             Button { model.selectAllResults() } label: { Label("Select All", systemImage: "checkmark.circle") }
                 .keyboardShortcut("a", modifiers: .command)
             Divider()
-            Button(role: .destructive) { model.moveSelectedToTrash() } label: { Label("Move \(count) Items to Trash", systemImage: "trash") }
-                .keyboardShortcut(.delete, modifiers: .command)
+            if model.menuSelection.removal != .none {
+                Button(role: .destructive) { model.moveSelectedToTrash() } label: { Label(model.menuSelection.removalTitle, systemImage: "trash") }
+                    .keyboardShortcut(.delete, modifiers: .command)
+            }
         } else {
             // Stack actions, above the per-file ones. Everything else in this menu acts on the
             // REPRESENTATIVE only - a collapsed stack is one file as far as opening, previewing and

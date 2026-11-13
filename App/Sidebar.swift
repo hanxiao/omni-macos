@@ -979,7 +979,7 @@ private struct ScreenshotsRow: View {
     private var help: String {
         if !model.screenshotsEnabled { return "Off" }
         if model.screenshotsAccess == false { return "Screen recording denied" }
-        return ""
+        return model.screenshotsFailure ?? ""
     }
 
     var body: some View {
@@ -1004,6 +1004,9 @@ private struct ScreenshotsRow: View {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
                 }
                 .buttonStyle(.plain)
+            } else if model.screenshotsEnabled, model.screenshotsFailure != nil {
+                // On, allowed, and nothing is being stored: the same badge, its reason the tooltip.
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.yellow)
             }
         }
         .help(help)
@@ -1017,11 +1020,6 @@ private struct ScreenshotsRow: View {
             Divider()
             Toggle(isOn: Binding(get: { model.screenshotsEnabled }, set: { model.setScreenshotsEnabled($0) })) {
                 Label("Record Screenshots", systemImage: "camera.viewfinder")
-            }
-            if model.screenshotsFolderExists {
-                Button { NSWorkspace.shared.activateFileViewerSelecting([AppModel.screenshotsDirectory]) } label: {
-                    Label("Show in Finder", systemImage: "folder")
-                }
             }
             if model.screenshotsHasShots {
                 Divider()

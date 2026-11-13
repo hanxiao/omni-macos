@@ -1,5 +1,4 @@
 import AppKit
-import Carbon.HIToolbox
 @preconcurrency import ScreenCaptureKit
 import OmniKit
 
@@ -15,9 +14,21 @@ import OmniKit
 /// every few seconds. Omni's own windows are left out of the shot: a search made in Omni would
 /// otherwise be found again by the picture of its own results.
 ///
-/// NOT TAKEN: while the screen is locked or its saver runs, while a display sleeps, and while a
-/// password field has the keyboard (secure input). Windows an app marks as not shareable are left
-/// out by the system.
+/// NOT TAKEN: while the screen is locked or its saver runs, and while a display sleeps. Windows an
+/// app marks as not shareable are left out by the system.
+///
+/// SECURE INPUT DOES NOT STOP A SHOT. Through 0.20.2 `IsSecureEventInputEnabled()` did, as "a password
+/// field has the keyboard". It is one flag for the whole login session, true while ANY process holds
+/// it, in front or not (measured: a helper with no window held it for 2 s and every process read
+/// true): a terminal's Secure Keyboard Entry, a password manager, an authorization dialog left open
+/// behind other windows. Recording then stopped for as long as that lasted and nothing said so; a
+/// laptop stopped at the shot that shows an installer about to ask for a password and took nothing
+/// for the next seven hours, through a toggle and an update. And it kept nothing out of a shot: a
+/// password field draws bullets.
+///
+/// A LOOK THAT FAILS IS TOLD. No access is `onAccess`; anything else that keeps a shot from being
+/// stored (no answer from the system, no frame, the video not written) is `onFailure` from the
+/// second look in a row, and gone at the first that works.
 final class ScreenRecorder: @unchecked Sendable {
     static let interval = ScreenCadence.interval
     /// How long after macOS declined a capture it is asked again.
@@ -31,12 +42,19 @@ final class ScreenRecorder: @unchecked Sendable {
     private let queue = DispatchQueue(label: "omni.screen", qos: .utility)
     private let onStored: @MainActor @Sendable ([ScreenHistory.Recorded]) -> Void
     private let onAccess: @MainActor @Sendable (Bool) -> Void
+    private let onFailure: @MainActor @Sendable (String?) -> Void
 
     // Everything below is touched on `queue` only.
     private var timer: DispatchSourceTimer?
     private var cadence = ScreenCadence()
     private var reportedAway: Bool?
     private var inFlight = false
+    /// When the look in flight began, and which look it is: one the system never answers is given
+    /// up after `patience`, and what it sends back later belongs to no look.
+    private var inFlightSince = 0.0
+    private var look = 0
+    static let patience = 30.0
+    private var health = ScreenLookHealth()
     private var targets: [Target]?
     /// Bundle ids never recorded, and the processes they ran as when `targets` was built.
     private var excluded: Set<String>
@@ -48,6 +66,7 @@ final class ScreenRecorder: @unchecked Sendable {
     private var declined = false
     private var retryAt = 0.0
     private var scriptDecline: Double?
+    private var scriptFailure: String?
     private var saverRunning = false
     private var observers: [NSObjectProtocol] = []
 
@@ -65,12 +84,15 @@ final class ScreenRecorder: @unchecked Sendable {
         let width: Int, height: Int
     }
 
-    /// Both callbacks run on the main actor: `onStored` after a look stored at least one shot,
-    /// `onAccess` when what macOS allows is first known and whenever it changes.
+    /// The callbacks run on the main actor: `onStored` after a look stored at least one shot,
+    /// `onAccess` when what macOS allows is first known and whenever it changes, `onFailure` with
+    /// why looks are storing nothing, and with nil when one works again.
     init(history: ScreenHistory, excluded: Set<String> = [],
          onStored: @escaping @MainActor @Sendable ([ScreenHistory.Recorded]) -> Void,
-         onAccess: @escaping @MainActor @Sendable (Bool) -> Void) {
+         onAccess: @escaping @MainActor @Sendable (Bool) -> Void,
+         onFailure: @escaping @MainActor @Sendable (String?) -> Void) {
         self.history = history; self.excluded = excluded; self.onStored = onStored; self.onAccess = onAccess
+        self.onFailure = onFailure
     }
 
     /// The apps never recorded, by bundle id. Their windows are left out of every shot (the system
@@ -131,6 +153,7 @@ final class ScreenRecorder: @unchecked Sendable {
             }
             observers = []
             targets = nil; reportedAccess = nil; reportedAway = nil; cadence.reset()
+            look += 1; inFlight = false; health.reset()
             history.stop()
         }
     }
@@ -166,7 +189,7 @@ final class ScreenRecorder: @unchecked Sendable {
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     if !out.isEmpty { self.onStored(out) }
-                    done(out.count, out.filter { $0.still != nil }.count)
+                    done(out.count, out.filter { $0.path != nil }.count)
                 }
             }
         }
@@ -192,8 +215,13 @@ final class ScreenRecorder: @unchecked Sendable {
     private static let anyInput = CGEventType(rawValue: ~0)!
 
     private func tick() {
-        guard !inFlight else { return }
+        if inFlight {
+            guard ProcessInfo.processInfo.systemUptime - inFlightSince >= Self.patience else { return }
+            look += 1; inFlight = false; targets = nil
+            ended(failure: "macOS did not answer.")
+        }
         if let after = scriptDecline { scriptDecline = nil; noteDeclined(retryAfter: after) }
+        if let text = scriptFailure { scriptFailure = nil; ended(failure: text); ended(failure: text) }
         let allowed = Self.hasAccess
         let access = allowed && !declined
         if reportedAccess != access {
@@ -212,11 +240,9 @@ final class ScreenRecorder: @unchecked Sendable {
             omniPerfLog(String(format: "screen-away %d idle=%.0f", away ? 1 : 0, idle))
         }
         if declined {
-            guard now >= retryAt, !away, !Self.sessionIsAway, !saverRunning, !IsSecureEventInputEnabled(), !excludedIsInFront else { return }
+            guard now >= retryAt, !away, !Self.sessionIsAway, !saverRunning, !excludedIsInFront else { return }
             retryAt = now + Self.retry
-            inFlight = true
             capture(settled: false) { [self] stored in
-                inFlight = false
                 guard !stored.isEmpty else { return }
                 DispatchQueue.main.async { MainActor.assumeIsolated { self.onStored(stored) } }
             }
@@ -226,13 +252,11 @@ final class ScreenRecorder: @unchecked Sendable {
         guard step != .none else { return }
         let settled = step == .settled
         // After the cadence, so a pause is not forgotten: it is taken at the first look that may.
-        guard !Self.sessionIsAway, !saverRunning, !IsSecureEventInputEnabled(), !excludedIsInFront else {
+        guard !Self.sessionIsAway, !saverRunning, !excludedIsInFront else {
             if settled { cadence.settledNotTaken() }
             return
         }
-        inFlight = true
         capture(settled: settled) { [self] stored in
-            inFlight = false
             if step == .look { cadence.looked(now: ProcessInfo.processInfo.systemUptime, stored: !stored.isEmpty) }
             guard !stored.isEmpty else { return }
             DispatchQueue.main.async { MainActor.assumeIsolated { self.onStored(stored) } }
@@ -257,16 +281,38 @@ final class ScreenRecorder: @unchecked Sendable {
     private final class Look: @unchecked Sendable {
         var left: Int
         var stored: [ScreenHistory.Recorded] = []
+        /// A display gave a frame that was stored or showed what the last one shows.
+        var worked = false
+        var failure: String?
         init(left: Int) { self.left = left }
     }
 
-    /// `done` runs on `queue` with the shots stored.
+    /// On `queue`: a look came back. A failure is told from the second in a row (ScreenLookHealth).
+    private func ended(failure: String?) {
+        if let failure { omniPerfLog("screen-look failed n=\(health.failed + 1): \(failure)") }
+        guard let tell = health.ended(failure: failure) else { return }
+        omniPerfLog("screen-recording \(tell.map { "failing: " + $0 } ?? "working")")
+        DispatchQueue.main.async { MainActor.assumeIsolated { self.onFailure(tell) } }
+    }
+
+    /// `done` runs on `queue` with the shots stored, unless the look was given up meanwhile.
     private func capture(settled: Bool, done: @escaping @Sendable ([ScreenHistory.Recorded]) -> Void) {
         let running = runningExcluded()
         if running != excludedPids { targets = nil }
-        withTargets { [self] targets in
+        inFlight = true
+        inFlightSince = ProcessInfo.processInfo.systemUptime
+        look += 1
+        let mine = look
+        withTargets { [self] found in
+            guard mine == look else { return }
+            guard let targets = found.targets else {
+                inFlight = false
+                // Declined is no access, which `onAccess` tells.
+                if !declined { ended(failure: found.failure ?? "macOS listed no displays.") }
+                done([]); return
+            }
             let awake = targets.filter { CGDisplayIsAsleep($0.display) == 0 }
-            guard !awake.isEmpty else { done([]); return }
+            guard !awake.isEmpty else { inFlight = false; done([]); return }
             let front = Self.frontWindows(awake.map(\.display), skipping: excludedPids)
             let pending = Look(left: awake.count)
             for target in awake {
@@ -280,7 +326,15 @@ final class ScreenRecorder: @unchecked Sendable {
                 SCScreenshotManager.captureSampleBuffer(contentFilter: target.filter, configuration: config) { [self] sample, error in
                     let frame = Handed(sample), failure = error.map { "\($0)" }, refused = Self.isDeclined(error)
                     queue.async { [self] in
-                        defer { pending.left -= 1; if pending.left == 0 { done(pending.stored) } }
+                        guard mine == look else { return }
+                        defer {
+                            pending.left -= 1
+                            if pending.left == 0 {
+                                inFlight = false
+                                if pending.worked { ended(failure: nil) } else if let f = pending.failure, !declined { ended(failure: f) }
+                                done(pending.stored)
+                            }
+                        }
                         // Turned off while this shot was being taken: it is not kept. On the first real
                         // session a look and Turn Off fell within 50 ms of each other, and the shot was
                         // recorded into a history already closed (docs/screenshots.md, "A real session").
@@ -292,6 +346,7 @@ final class ScreenRecorder: @unchecked Sendable {
                             // A display that went away, or a grant withdrawn: look them up again.
                             self.targets = nil
                             if refused { noteDeclined() }
+                            pending.failure = error.map { $0.localizedDescription } ?? "macOS returned no frame."
                             omniPerfLog("screen-shot failed display=\(target.display) error=\(failure ?? "no frame")")
                             return
                         }
@@ -302,9 +357,10 @@ final class ScreenRecorder: @unchecked Sendable {
                         let r = history.record(pixels, time: Date().timeIntervalSince1970, display: target.display,
                                                app: who?.app ?? "", title: who?.title ?? "", settled: settled, scale: target.scale)
                         if let r { pending.stored.append(r) }
+                        if r == nil, let why = history.lastFailure { pending.failure = why } else { pending.worked = true }
                         if let captured, let t1 {
                             omniPerfLog(String(format: "screen-shot display=%u stored=%d indexed=%d settled=%d novelty=%.3f bytes=%d capture_ms=%.0f record_ms=%.0f",
-                                               target.display, r == nil ? 0 : 1, r?.still == nil ? 0 : 1, settled ? 1 : 0,
+                                               target.display, r == nil ? 0 : 1, r?.path == nil ? 0 : 1, settled ? 1 : 0,
                                                r?.novelty ?? 0, r?.bytes ?? 0, captured, Date().timeIntervalSince(t1) * 1000))
                         }
                     }
@@ -332,16 +388,28 @@ final class ScreenRecorder: @unchecked Sendable {
         queue.async { [self] in scriptDecline = retryAfter }
     }
 
+    /// `shotfail:<text>` (perf script): as though looks were failing with `text`. The next look
+    /// that works clears it, as it clears a real one.
+    func failForScript(_ text: String) {
+        queue.async { [self] in scriptFailure = text }
+    }
+
+    private struct Found: @unchecked Sendable {
+        var targets: [Target]?
+        var failure: String?
+    }
+
     /// The displays and what to leave out of them, looked up once and kept until a display changes.
-    private func withTargets(_ body: @escaping @Sendable ([Target]) -> Void) {
-        if let targets { body(targets); return }
+    private func withTargets(_ body: @escaping @Sendable (Found) -> Void) {
+        if let targets { body(Found(targets: targets)); return }
         SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: true) { [self] content, error in
             let handed = Handed(content), failure = error.map { "\($0)" }, refused = Self.isDeclined(error)
+            let said = error?.localizedDescription
             queue.async { [self] in
                 guard let content = handed.value else {
                     omniPerfLog("screen-shot no content: \(failure ?? "")")
                     if refused { noteDeclined() }
-                    body([]); return
+                    body(Found(failure: said)); return
                 }
                 let out = content.applications.filter { $0.processID == getpid() || excluded.contains($0.bundleIdentifier) }
                 // The processes this filter leaves out, not the ones running: an excluded app the
@@ -356,7 +424,7 @@ final class ScreenRecorder: @unchecked Sendable {
                                   height: Int((filter.contentRect.height * scale).rounded()) & ~1)
                 }
                 targets = made
-                body(made)
+                body(Found(targets: made))
             }
         }
     }

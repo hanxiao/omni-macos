@@ -1,10 +1,13 @@
 # Screenshots (2026-11-10)
 
-Omni takes a shot of the desktop while the Mac is in use, keeps every shot as video, and writes
-the few worth finding again as picture files into a folder the index already crawls. Search,
-filters, thumbnails, Quick Look, Find Similar, MCP, CLI and REST are the existing pipeline,
-unchanged: a shot in the index is a screenshot file like any other (`Indexer.isScreenshot`, a
-picture embedding plus `ScreenText`). No schema change, no migration, no new model, no new package.
+Omni takes a shot of the desktop while the Mac is in use and keeps every shot as a frame of a
+video, and as nothing else. The few worth finding again are in the index under a path that spells
+their moment; no file is behind that path, and the frame is taken out of the video when a search,
+a thumbnail or an agent asks for it (0.20.3, "Video only"; through 0.20.2 each indexed shot was
+also a picture file). Search, filters, thumbnails, Quick Look, Find Similar, MCP, CLI and REST are
+the existing pipeline: a shot rides it through a content source as a Photos asset does
+(`ScreenContentSource`), a picture embedding plus `ScreenText`. No schema change, no new model, no
+new package.
 
 The one thing served surfaces add is time: a screenshot result says when it was taken and what the
 stretch of work around it was, and `search` lists the files changed in a time range with no query.
@@ -26,13 +29,22 @@ That is the chain an agent follows: query -> a screenshot -> its time -> the fil
 - Every stored shot is in the timeline; few are in the index (`ScreenGate`). A shot is indexed
   when at least 10% of its tiles both changed and show something, against the nearest of the last
   8 indexed shots; a settled shot at 0.5%. A flat screen is never indexed.
-- Not taken: screen locked, another user at the console, screen saver, display asleep, a password
-  field holding the keyboard (secure input). Omni's own windows are left out of the shot (a search
-  in Omni would otherwise be found by the picture of its own results). The pointer is not drawn.
-  Windows an app marks as not shareable are left out by the system.
+- Not taken: screen locked, another user at the console, screen saver, display asleep. Omni's own
+  windows are left out of the shot (a search in Omni would otherwise be found by the picture of its
+  own results). The pointer is not drawn. Windows an app marks as not shareable are left out by the
+  system. Secure input does NOT hold a shot back (it did through 0.20.2: "The recorder that stopped
+  and said nothing").
+- A look that fails is told: "Not recording" with the reason in Settings and a badge on the sidebar
+  row, from the second failed look in a row, gone at the first that works (`ScreenLookHealth`).
 - Retention 30 days by default; 7 / 30 / 90 days / forever in Settings, with the space used
-  (video and stills). Clear is on the sidebar row's context menu.
-- Apps left out (Settings > Files, "Apps left out of screenshots"): their windows are not in a
+  (the video). Clear is on the sidebar row's context menu.
+- Video only (Han, 2026-11-12): "the datetime serves as a pointer. only at search time ... retrieve
+  the pointer, use the pointer to retrieve the frame and return". No folder of pictures to browse in
+  the Finder; a shot becomes a file only when something that takes nothing else asks (a drag, a
+  copy, Share, Quick Look, a linked Mac's fetch). "Reveal" opens the timeline at that moment. The
+  update deletes 0.20.2's picture files. The video stays as it was: HEVC quality 0.7, a key frame
+  every 30 shots.
+- Apps left out (Settings > Files > Screenshots, "Excluded apps", the group's last row): their windows are not in a
   shot, and no shot is taken while one of them is in front.
 - Served to this Mac's agents (MCP, CLI, REST, Shortcuts) as the user's files are, and to Linked
   Macs as the rest of the index is (Han, 2026-11-10; the first build kept them back with the
@@ -43,17 +55,23 @@ That is the chain an agent follows: query -> a screenshot -> its time -> the fil
 1. `Sources/OmniKit/ScreenChange.swift`: `ScreenSignature` (green channel on a grid about 960
    wide, tiles of 16 x 16 samples, which tiles show something) and `ScreenGate`.
 2. `Sources/OmniKit/ScreenCodec.swift`: VideoToolbox HEVC on the hardware encoder, quality 0.7, a
-   key frame every 30 shots, no frame reordering; the decoder; the still writer.
-3. `Sources/OmniKit/ScreenHistory.swift`: two folders beside the index.
+   key frame every 30 shots, no frame reordering; the decoder; the HEIC writer a shot leaves the
+   app through.
+3. `Sources/OmniKit/ScreenHistory.swift`: one folder beside the index.
    `Application Support/Omni/Screen History` holds the segments (`<start>-<display>.omniscreen`,
    one per display per hour or 720 shots, a new one at every launch): records appended one at a
    time, each with its time, the app in front, its window's title and the HEVC frame. Never
    crawled. A record cut short by a kill is the last thing in its file and a reader stops at it:
-   nothing to repair. The frame table is read from the segments; there is no second file.
-   `Application Support/Omni/Screenshots` is the crawl root: an indexed shot is also written there
-   as `2026-11-10/2026-11-10 13.16.27 Editor - source.swift.heic`, a pixel a point of the display
-   (`ScreenHistory.stillSide`; 0.20.0 wrote at most 1568 wide, which a desktop wider than that
-   could not be read from: "The reader"), dated at the shot and marked `kMDItemIsScreenCapture`.
+   nothing to repair. An indexed shot is a flag in its record and a path in the index,
+   `<Application Support/Omni/Screenshots>/2026-11-10/2026-11-10 13.16.27 Editor - source.swift.heic`:
+   the path 0.20.2's picture file had, spelled from the segment's offset from UTC (its header)
+   and the record (time, app, title, and which of the names of one second is its own), with no
+   file and no folder behind it. The index reads the frame at a pixel a point of the display
+   (`ScreenHistory.stillSide`, kept in the header; 0.20.0 read at most 1568 wide, which a desktop
+   wider than that could not be read from: "The reader"). `shots.catalog` beside the segments
+   lists the indexed shots, so a pass does not walk the video ("Video only").
+   `Sources/OmniKit/ScreenShots.swift`: the registry the indexer finds a history by, and
+   `ScreenContentSource`, which answers for a shot what a file system answers for a file.
 4. `App/ScreenRecorder.swift`: one `SCScreenshotManager` still per look and display (not a stream:
    a stream delivers frames whether or not anything moved), on its own queue.
 5. `App/ScreenTimeline.swift`: the Screenshots place. One day on a track true to time, a point a
@@ -69,12 +87,14 @@ That is the chain an agent follows: query -> a screenshot -> its time -> the fil
    of the whole frame, a real file written when the button goes down (a promised file is taken by
    the Finder and Mail, not by a browser's upload area or a chat window). Delete (the shot's
    menu; Command-Delete for the one shown) removes this screenshot, this session or this day after a
-   confirmation that names the count: the stills first, then the frames (`ScreenHistory.delete`:
+   confirmation that names the count: the frames, then their rows (`ScreenHistory.delete`:
    the frames after a deleted one, up to the next key frame, are encoded again from a new key
    frame, the segment written beside itself and renamed over).
 6. `App/Serving/ScreenHints.swift`: what a served screenshot result says (below).
-7. AppModel: the folder joins `crawlRoots` when it exists, outside `addedFolders`, exempt from the
-   ignore rules as the clipboard's is.
+7. AppModel: the history's root joins `crawlRoots` while there is a history, outside
+   `addedFolders`; a pass takes its files from the history and not from a crawl
+   (`Indexer`, `shotSources`). `App/ShotActions.swift`: a shot as a file, for what takes nothing
+   else.
 
 ## Served: a time, a stretch of work, and the files changed then
 
@@ -435,8 +455,223 @@ itself, one input event at 0:00 and none after:
 A look's delta was 0.9-2.6 KB at 1920 x 1080, so the hours away were most of the laptop's shots
 and little of its bytes: the 348 MB is the hours in use, on two displays at their full pixel
 count (a 3840 x 2160 shot measured 2.0x the video and 2.6x the still of a 1920 x 1080 one, and
-1920 x 1080 in unbroken use is 19.3 MB an hour). The laptop's own split is not measured: it is the
-size of its `Screen History` (video) and `Screenshots` (stills) folders.
+1920 x 1080 in unbroken use is 19.3 MB an hour). The laptop's own split is not measured: it was
+the size of its `Screen History` (video) and `Screenshots` (stills) folders, and from 0.20.3 there
+is only the first.
+
+## The recorder that stopped and said nothing (2026-11-12)
+
+Han's laptop, 0.20.1: the last shot is 22:01:33 on 2026-11-11, of a password prompt. The next
+morning, on 0.20.2, the timeline was still on that day, and turning recording off and on stored
+nothing. Settings showed no "no access" row. Turning recording on forgets the last stored frame
+and the gate, so the first look after it is stored whatever the screen shows: something stopped
+every look before it was taken, or every look failed, and neither had a place in the UI. The
+laptop was not in reach; the cause below is inferred from what the build could do, not read off it.
+
+SECURE INPUT IS ONE FLAG FOR THE WHOLE LOGIN SESSION. `IsSecureEventInputEnabled()` is true in
+every process while any process holds it, and a process that never lets go (a prompt left open, an
+app that crashed holding it) holds it until it exits. Through 0.20.2 the recorder took no shot
+while it was true. A helper with no window held it for 2 s and then for 22 s on this Mac: every
+process read true, and the session's `kCGSSessionSecureInputPID` named the app in front both times
+(35778, then the isolated Omni), never the helper: who holds it cannot be asked, so "only while the
+holder is in front" cannot be built. The stop is REMOVED: a password field draws dots, in the shot
+as on the screen, and an app to keep out is an excluded app. With the 22 s hold and input every
+2 s, this build stored 4 looks.
+
+EVERY OTHER WAY A LOOK FAILS IS TOLD. Before, a capture error, a missing frame, an encoder that
+would not start and a write that failed were perf-log lines; an unanswered `SCShareableContent`
+or capture call left `inFlight` set and every later tick returned at its first line, for good.
+Now:
+
+- A look ends as worked or failed with a reason (macOS's own error text, or "macOS listed no
+  displays.", "macOS returned no frame.", "The frame could not be read.", "The video could not be
+  started.", "The frame could not be encoded."). `ScreenHistory.lastFailure` tells a screen that
+  did not change from a shot that could not be stored. A look that fails on one display and works
+  on another is a look that worked.
+- `ScreenLookHealth`: told from the second failed look in a row, once a reason; taken back by the
+  first look that works. One failed look is not told (a display that went to sleep under the call).
+- A look macOS has not answered in 30 s is given up ("macOS did not answer."), its late callbacks
+  dropped by number (`look`), the display list asked for again.
+- A segment whose frame could not be encoded or written is closed, so the next shot starts a new
+  one with a new encoder and a key frame.
+- Shown: Settings > Files > Screenshots, a row "Not recording" with the reason, and a yellow
+  triangle on the sidebar row (its tooltip the reason). Turning recording off clears it.
+
+Through the app, isolated (`-omni.screenshots.capture YES`, the real screen, to scratch):
+`shotfail:<text>` fails two looks at the next tick: `screen-look failed n=1`, `n=2`,
+`screen-recording failing: ...`, the row and the badge, `dumpui` `screenshotsFailure`; the next
+real look stored a shot and logged `screen-recording working`, row and badge gone; failing again
+and turned off, the failure is cleared. Renders per step (counter build): entering the failing
+state 1 `ScreenshotsRow` and 1 of the Settings tab, 20 s in it 0, turning off 1 and 1. This Mac had
+seen no input for 9 hours, so the real looks were started with pointer events posted at the
+pointer's own place (4, then 7, 2 s apart); nothing was clicked or moved.
+
+A failure that is not scripted: the run's history folder made read-only with recording off, then
+on. Three real looks could not be stored (`stored=0`, "The video could not be started."), told at
+the second; the folder writable again, the next look stored a shot and took it back. A capture
+call failing inside macOS could not be produced on demand; it ends at the same `ended(failure:)`.
+
+## The frame out of the video against the still (measured 2026-11-12)
+
+Han, 2026-11-12: keep the video only, the time as the pointer, the frame taken back out when a
+search finds it. Measured before anything is built: is the frame the history gives back as good a
+picture for the index as the still? Nothing below is in the app.
+
+Read (`shotbench stillsize`, arms "video q0.7|q0.8 key|delta": the frame encoded as a key frame, or
+as the frame after a different screen, decoded and read in pieces as the still is; words read of 4
+editor frames):
+
+| desktop | still | no codec | q0.7 key | q0.7 delta | q0.8 key | q0.8 delta |
+|---|---|---|---|---|---|---|
+| 1512 x 982 @2x | 98.4% | 98.0% | 97.6% | 97.7% | 98.0% | 97.8% |
+| 1920 x 1080 @1x | 97.4% | 96.7% | 97.0% | 97.4% | 97.7% | 97.3% |
+| 1920 x 1080 @2x | 98.0% | 97.9% | 97.7% | 97.9% | 97.5% | 97.7% |
+| 2560 x 1440 @1x | 97.2% | 96.8% | 97.4% | 97.3% | 97.6% | 97.3% |
+| 2560 x 1440 @2x | 98.0% | 97.6% | 97.6% | 97.8% | 97.7% | 97.7% |
+| 3008 x 1692 @2x | 97.6% | 97.4% | 97.2% | 97.8% | 97.6% | 97.7% |
+| 3840 x 2160 @1x | 96.9% | 96.6% | 96.8% | 96.8% | 96.8% | 96.8% |
+
+Within 0.8 points of the still everywhere. Of exact lines the q0.7 delta frame read as many or
+more on six desktops of seven (3840 x 2160: 73.6% against 74.8%), the key frame on five. q0.8
+reads nothing q0.7 does not.
+
+Embedded (`shotbench frameembed <model> <source> <prose> <photo>`: cosine of the frame's vector,
+scaled to the still's size, to the still's; 6 screens a desktop; min / mean):
+
+| desktop | model | q0.7 key | q0.7 delta | still to no codec | next screen |
+|---|---|---|---|---|---|
+| 1512 x 982 @2x | Nano | 0.991 / 0.997 | 0.996 / 0.998 | 0.989 / 0.996 | 0.670 / 0.692 |
+| 1920 x 1080 @1x | Nano | 0.992 / 0.997 | 0.994 / 0.997 | 0.978 / 0.993 | 0.663 / 0.698 |
+| 2560 x 1440 @2x | Nano | 0.980 / 0.994 | 0.980 / 0.995 | 0.985 / 0.995 | 0.682 / 0.741 |
+| 3840 x 2160 @1x | Nano | 0.978 / 0.988 | 0.975 / 0.986 | 0.987 / 0.991 | 0.719 / 0.770 |
+| 1512 x 982 @2x | Small | 0.987 / 0.993 | 0.989 / 0.993 | 0.985 / 0.991 | 0.726 / 0.750 |
+| 1920 x 1080 @1x | Small | 0.979 / 0.991 | 0.982 / 0.993 | 0.966 / 0.984 | 0.780 / 0.788 |
+| 2560 x 1440 @2x | Small | 0.988 / 0.992 | 0.986 / 0.992 | 0.983 / 0.990 | 0.690 / 0.751 |
+| 3840 x 2160 @1x | Small | 0.976 / 0.984 | 0.972 / 0.982 | 0.969 / 0.985 | 0.799 / 0.823 |
+
+The frame is as far from the still as the still is from the picture before any codec, and an
+editor scrolled by 70 points is at 0.66-0.82: the same picture to the model. What the stills
+cost: the 150-shot session's 47 stills are 5.30 MB beside 3.05 MB of video (63% of its bytes).
+
+## Video only (0.20.3)
+
+Han, 2026-11-12, after the measurement above: keep the video and nothing else. Built so that no
+row of the index changes.
+
+- THE PATH IS SPELLED FROM THE SEGMENT. Through 0.20.2 an indexed shot was a flag in its record and
+  a picture file, and the index held the file's path. The path is still that one. A segment's
+  header carries the offset from UTC its names are spelled at and the side its pictures are read
+  at (the reserved word at byte 20: Int16 minutes, UInt16 side; a side of 0 is a segment 0.20.2
+  wrote and nobody has taken in yet); a record's flags carry which of the names of one second is
+  its own (bits 2-4, with 0x20 for "has one"). Indexed is having a name. The writer starts a new
+  segment when the offset or the display's scale changes. A path back to its shot: the name's
+  date and time as a wall clock, the segments within 15 hours of it, each one's offset, and the
+  shot whose spelled path is the same bytes.
+- A CONTENT SOURCE, NOT A FILE (`ScreenContentSource`, as a Photos asset): size, picture, content
+  key and "is it still there" are answered by the history. A shot the pass already holds is
+  unchanged by definition and keeps its row's date and size. The content key is the shot (time
+  and display), not the picture: two shots are never the same frame, the recorder stores a screen
+  once. A test feed that repeats frames is therefore new work where 0.20.2 deduplicated it; a
+  comparison of writes feeds frames neither index has seen.
+- THE UPDATE (`ScreenHistory.migrateStills`), automatic, silent, at launch on a utility queue
+  (`AppModel.takeInScreenshotFiles`), and again before the first shot is written if it had failed
+  (retried every 60 s). While 0.20.2's folder exists the root is blind: `indexedShots()` is nil,
+  the pass leaves every shot's row alone. Per segment, the header first (offset and side read from
+  one of its own files: dated at its shot to the millisecond, named in local time, the difference
+  is the offset; the picture's long side, if the frame fitted to it is the file's size exactly),
+  then each flagged shot takes the number of the file dated at it. A file whose date was lost is
+  found by its plain name in a second pass, after every dated file has its shot. A shot whose file
+  cannot be told from another's takes a name no file had and is read again from its frame; a shot
+  whose file is gone is flagged as any other, and its row leaves at the next pass. When every
+  segment is done the folder is renamed to `Screen History/stills.removed` and deleted. The index
+  is never written.
+- KILLED ANYWHERE, IT ENDS THE SAME. A header is written before the flags read by it, a flag is
+  one byte in place, a numbered shot is not looked at again, every file is there until every flag
+  is on disk, the folder leaves in one rename, and a leftover `stills.removed` is deleted by the
+  next launch.
+
+Measured (M3 Ultra, release, `shotbench migrate | state`; the digest is every segment's header,
+every shot's flags and path, and what is left on disk):
+
+| history | picture files | update | steps | killed after step |
+|---|---|---|---|---|
+| the fed test index, through the app | 82 | 23-24 ms | | |
+| one day, 5,760 shots | 1,920 | 153.7 ms | 1,930 | 1, 4, 9, 700, 1928, 1929, 1930 |
+| thirty days, 172,800 shots, 240 segments | 57,600 (748 MB beside 171 MB of video) | 4,193 ms | 57,842 | 1, 100, 240, 241, 30000, 57840, 57841, 57842 |
+
+Every killed run, run again, ends at the unkilled digest (9093b3989a82b118 one day,
+b4f99c5bf76c290c thirty). The reruns of thirty days take 3.2-3.9 s; killed after 57841 (the
+rename), the rerun only finishes the delete, 2.45 s; after 57842, 0.2 ms. After it every frame
+the index holds decodes: 57,600 of 57,600, 0 failed, 101 s for all of them.
+
+Through the app, on clones of one index 0.20.2 built from fed shots (321 files, 82 of them shots,
+settled, and again with its text backlog unfinished), unkilled and SIGKILLed during the update,
+the pass after it and the text backlog: the same state digest (742822a042c82a03) and the same
+served answers as 0.20.2 on that index, compared as sets where scores tie (notes/testing.md).
+Back to back, three interleaved rounds:
+
+| | 0.20.2 | 0.20.3, first open | 0.20.3, opened again |
+|---|---|---|---|
+| launch ready | 818-826 ms | 801-830 ms | 808-822 ms |
+| 48 served searches, wall | 2,975-3,004 ms | 2,977-2,995 ms | 3,117-3,146 ms (353 files by then) |
+| the served work in them, p50 | 4 ms | 4 ms | 5 ms |
+| 150 new frames stored | 4.02-4.18 s | | 2.73-2.75 s |
+| their 32 indexed shots all searchable | 13.20-13.26 s | | 6.57-6.64 s |
+| embedding in that | 3.91-3.92 s | | 3.84-3.89 s |
+
+A stored shot costs less because the HEIC is no longer written beside the frame, and a shot is
+searchable sooner because it is handed to the indexer as it is stored (0.20.2 waited for the
+watcher to see the file).
+
+## The list of indexed shots
+
+A pass asks which shots the index is to hold. With no folder to list, the answer is a few bytes
+in every record of every segment. `shots.catalog` beside the segments keeps each closed
+segment's answer with the segment's size and date; a segment that differs, or is new, is walked
+again; the open segments are always walked. The catalog is never the authority: deleted or cut
+short, the next pass writes it again from the video (ScreenHistoryTests).
+
+| history | walked cold | walked warm | from the catalog | catalog |
+|---|---|---|---|---|
+| one day, 1,920 indexed | 6.8 ms | 4.5 ms | 1.1 ms | |
+| thirty days, 57,600 indexed | 164 ms | 107-113 ms | 23-26 ms | 3.8 MB |
+
+## A shot as a file
+
+Nothing in Omni needs one: a thumbnail, the timeline, `read_file` and a linked Mac's thumbnail
+are cut from the frame. Quick Look, Share, Copy, a drag, Open With and a linked Mac's fetch take
+a file, so the frame is written out then (`ShotActions.file`, `ScreenHistory.export`): the HEIC
+0.20.2 kept, same name, dated at the shot, marked as a screen capture, in a folder of this launch
+under the temporary directory (a later launch deletes the folders of launches that have ended).
+
+- One shot: 54.7-64.9 ms the first time (105 KB at 1920 x 1080), 0.2 ms after. A linked Mac's
+  fetch of it 42.5 ms, its thumbnail (456 x 257 JPEG, 17 KB) 122.9 ms. The timeline's own drag is
+  the whole frame as a PNG: 75 ms, 421 KB. A scrub step p50 23.1 ms, p90 48.3.
+- READERS. One decoder walking from the key frame served every read through 0.20.2's timeline; a
+  grid of results asks for four thumbnails at once (`Thumbnail.decodeGate`). The history keeps up
+  to four readers (`readerCount`), each with its decoder, open segment and last decoded frame,
+  and drops to one at rest. 40 thumbnails at 256, three interleaved rounds: p50 10.9-12.5 ms from
+  the video against 17.2-19.6 ms from 0.20.2's files; wall 259-319 ms four at a time against
+  318-396 ms.
+- A READ BESIDE A DELETE. A delete rewrites a segment beside itself and renames it over. A reader
+  holds the table it read the offsets from (`tableChanges`), checks each record's head on disk
+  before its payload, and a shot from before the delete answers nil instead of another shot's
+  frame. Three tests, each failing with its check taken out.
+- A DRAG OF MANY. The file is written as the drag starts, on the thread the drag starts on
+  (a browser's upload area and a chat window take an existing file, not a promise). Fifteen
+  selected shots held it 845 ms, one after another. Up to four are now written together (83.9 ms
+  for four against 54.7 ms for one); a larger selection's shots go as promises, written where
+  they are dropped as Photos assets are: nothing at the start, fifteen written in 217 ms
+  (`FileDrag.shotFiles`, steps `shotfiles` and `shotpromise:<dir>`).
+- Delete (a shot, a session, a day): the frames 200 ms, their rows 3 ms. A shot's size in a
+  listing is its frame's bytes in the video.
+- IN THE MENUS a shot is "Show in Screenshots" (the timeline at that moment; Open goes there too)
+  and "Delete…" (confirmed, not undoable); a file is "Show in Finder" and "Move to Trash". A
+  selection of both moves its files to the Trash and names their count; the shots stay. Read
+  off the File menu through the app (`menustate:File`): one shot, and 4 to 29 of them,
+  "Show in Screenshots" and "Delete…"; 25 files with 20 shots, "Show in Finder", "Copy 45 Paths"
+  and "Move 25 Items to Trash" (it read 45 before the count was the files'); one file with one
+  shot, "Move to Trash", which moved the file, opened no confirmation and left the shot selected.
 
 ## Isolated runs
 
@@ -455,18 +690,32 @@ takes. Other steps: `screenshots:on|off|clear`, `shotselect:<n>`, `shotscrub:<n>
 `shotday:<-1|1>`, `shotdisplay:<n>`, `shotzoom:<factor|reset>`, `shotpan:<fraction>`,
 `shotdragfile`, `shotdelete:<shot|session|day>` and `shotexclude:<bundle ids>` (both without their
 confirmation), `shotdecline:<seconds>` (macOS declining a capture, asked again after that long),
+`shotfail:<text>` (two looks failing with that reason), `shotcopy` and `shotopen` (the selected
+shot copied, opened), `shotfiles` (the files a drag of the selection writes as it starts, timed
+twice), `shotpromise:<dir>` (its promised files written into a folder, as a drop does),
+`menustate:<menu>` and `menushow:<menu>` (a menu bar menu's items as text, and open for a picture),
 `sidebarselect:-3`; `dumpui:<path>` carries the feature's state (on, access, the
-excluded apps, bytes on disk).
+excluded apps, bytes on disk, the failure told).
 
 ## Verification
 
-- Unit (`ScreenHistoryTests`, 23): signature and gate, codec round trip, the record format and a
-  cut record, segments by hour and launch, stills and their dates, sessions (a gap, a long one,
-  several moments at once), retention, clear, a recorder that starts again, a deleted span, the
-  whole frame of a still. `ScreenTextTests` (5): the size read, the pieces, a line and a long word
-  across pieces read once. `EnrichmentTests` (8). `OmniCLITests`: an optional bare word.
-  `ScreenCadenceTests` (7): when a shot is taken, and none with nobody at the Mac. The suite:
-  1087 tests, 6 skipped, 0 failures.
+- Unit (`ScreenHistoryTests`, 38): signature and gate, codec round trip, the record format and a
+  cut record, segments by hour and launch, a shot's path and the way back from it, the update
+  from 0.20.2's files (dates lost, a file gone, two displays in one second, a clock change, killed
+  at every step), the catalog (believed when whole; damaged, cut short or gone, written again
+  from the video; a segment gone), readers beside a delete,
+  sessions (a gap, a long one, several moments at once), retention, clear, a recorder that starts
+  again, a deleted span, a history that cannot write as a failure (an unchanged screen is not).
+  `ScreenShotsTests` (11): a shot through the indexer with no file, a new shot indexed by its
+  path alone, a deleted shot's rows gone by each of the three ways, a cleared history, Images
+  off, a forced reading that keeps the words, an index built from 0.20.2's files the same index
+  after the update, no row removed while the files wait, shots given new paths read again from
+  their frames. `FileFactsTests` (3) and
+  `FileKindTests` (2): notes/index.md, "A file's facts".
+  `ScreenTextTests` (5): the size read, the pieces, a line and a long word across pieces read once.
+  `EnrichmentTests` (8). `OmniCLITests`: an optional bare word. `ScreenCadenceTests` (11): when a
+  shot is taken, none with nobody at the Mac, and a failing look told once from the second in a
+  row. The suite: 1122 tests, 6 skipped, 0 failures.
 - Linked, two isolated instances paired on one Mac: a query on the asking one returns the other's
   shots in the window, over MCP, the CLI and `--json`, each with its moment; the session line
   names the Mac; the range with no query on the named Mac; `get_linked_file` of a shot, and
@@ -483,6 +732,14 @@ excluded apps, bytes on disk).
   window shown to Han.
 - Isolated, through the app: consent screen, Turn On, feed, timeline in light and dark, scrub, a
   search scoped to Screenshots, Settings, Clear (files, rows and the sidebar count gone).
+- 0.20.3, through a renamed copy of the final build: the update on an index 0.20.2 built, unkilled
+  and killed ("Video only"); search, thumbnails and the timeline over shots with no file behind
+  them; the File menu and a row's menu by selection (none, a file, two files, a shot, two shots,
+  files with shots: notes/ui.md, "Titles by selection"), Trash on a file beside a shot, the delete
+  alert; a drag of one, four and fifteen shots; and a linked Mac asking about a shot that is no
+  file on the answering Mac: `similar` 120 hits, 31 of them shots, 10.6 ms; `thumb` a JPEG of
+  18,985 bytes, 110.6 ms; `fetch` the HEIC, 96,881 bytes, 51.8 ms. Renders per step counted
+  against 0.20.2, the same line for line.
 - Served, on the isolated port and socket: a query that finds a shot (time, session line), the
   range with no query (the two files dated inside it; a file dated after it and the shots left
   out), the folder named (shots listed), neither (the error), an empty range, REST both forms,

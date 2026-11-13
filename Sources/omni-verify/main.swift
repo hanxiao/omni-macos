@@ -4328,6 +4328,7 @@ if args.count >= 4 && args[1] == "soundcost" {
 
 // What the screen history costs as video against one picture at a time: see ShotBench.
 if args.count >= 2 && args[1] == "shotbench" {
+    if args.count >= 3, args[2] == "frameembed" { try await ShotBench.frameEmbed(Array(args[3...])); exit(0) }
     ShotBench.run(Array(args[2...]))
     exit(0)
 }

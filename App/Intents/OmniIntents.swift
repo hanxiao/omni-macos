@@ -33,7 +33,8 @@ struct OmniFileEntity: AppEntity {
         self.passage = passage
         self.kind = kind
         self.location = location
-        url = URL(fileURLWithPath: path)
+        // A shot of the screen has no file of its own: the frame, written out, is the one handed on.
+        url = ResultPath.isShot(path) ? ShotActions.file(path) ?? URL(fileURLWithPath: path) : URL(fileURLWithPath: path)
     }
 
     var displayRepresentation: DisplayRepresentation {
@@ -51,7 +52,7 @@ struct OmniFileQuery: EntityStringQuery {
     }
 
     func entities(for identifiers: [String]) async throws -> [OmniFileEntity] {
-        identifiers.filter { FileManager.default.fileExists(atPath: $0) }.map { OmniFileEntity(path: $0) }
+        identifiers.filter { ShotActions.exists($0) }.map { OmniFileEntity(path: $0) }
     }
 
     func suggestedEntities() async throws -> [OmniFileEntity] { [] }

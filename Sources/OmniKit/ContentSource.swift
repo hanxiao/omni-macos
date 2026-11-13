@@ -102,7 +102,7 @@ extension ContentSource {
 
 /// The original channel: anything with a real filesystem path.
 struct FileContentSource: ContentSource {
-    static func claims(_ file: CrawledFile) -> Bool { !file.isPhoto }
+    static func claims(_ file: CrawledFile) -> Bool { !file.isPhoto && !ScreenShots.isShotPath(file.path) }
 
     func probe(_ file: CrawledFile, settings: IndexSettings) -> SourceProbe? {
         // A dataless (cloud-evicted) file: reading its body would implicitly DOWNLOAD it, so under
@@ -262,6 +262,7 @@ enum ContentSources {
         if PhotosContentSource.claims(file), let ref = PhotoLibrary.Ref(file.path) {
             return PhotosContentSource(ref: ref)
         }
+        if let history = ScreenShots.history(holding: file.path) { return ScreenContentSource(history: history) }
         return FileContentSource()
     }
 }

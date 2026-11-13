@@ -1950,3 +1950,63 @@ add|remove` inserts and removes the body counters; never commit them), 239-file 
   of icons. There is no such frame: counted with a run-loop observer after Core Animation's commit,
   the load started 0 commits after the body for 181 of 181 such tiles, while 67 of the 85 tiles that
   had to be rendered (the control) landed 3 to 23 commits later. The change was reverted.
+
+## Titles by selection: the File menu and a row's menu (2026-11-12)
+
+0.20.3 stores a shot of the screen only as a frame of the history's video (docs/screenshots.md,
+"Video only"), so a selected shot is no file: Finder cannot show it and the Trash cannot hold it.
+The File menu and a row's menu said "Show in Finder" and "Move to Trash" over it all the same.
+
+- THE TITLES ARE FIELDS OF `AppModel.MenuSelection`, the stored snapshot the menu bar reads, written
+  only when it differs: `reveal` (`PhotoActions.revealTitle(paths:)`: Finder when any of the
+  selection is a file on this Mac, else where the first item is shown), `removal` (`.trash` when
+  any is a file, `.delete` when shots are all there is to remove, `.none` for a Photos asset or a
+  linked Mac's file) and `trashCount` (the files among them). `removalTitle` is spelled from those.
+  Read through a renamed copy with `menustate:File`:
+
+  | selection | reveal | paths | removal |
+  |---|---|---|---|
+  | none | Show in Finder (off) | Copy Path (off) | Move to Trash (off) |
+  | one file | Show in Finder | Copy Path | Move to Trash |
+  | two files | Show in Finder | Copy 2 Paths | Move 2 Items to Trash |
+  | one shot | Show in Screenshots | Copy Path | Delete... |
+  | 2 to 29 shots | Show in Screenshots | Copy N Paths | Delete... |
+  | 25 files and 20 shots | Show in Finder | Copy 45 Paths | Move 25 Items to Trash |
+  | one file and one shot | Show in Finder | Copy 2 Paths | Move to Trash |
+
+  (The menu spells the last column's delete with an ellipsis character.)
+- A COUNT IN A TITLE IS THE COUNT OF WHAT THE ITEM TOUCHES. The mixed selection first read "Move 45
+  Items to Trash" (`pathsCount`) over an action that moves 25: `trashCount` is its own field.
+  `moveToTrash` leaves a shot alone beside files, as it leaves a Photos asset: one file and one
+  shot selected, "Move to Trash" moved the file, opened no confirmation, and the shot stayed and
+  became the selection (index 271 to 270 files).
+- SHOTS ALONE ARE DELETED, ONCE CONFIRMED: an alert, "Delete this screenshot?" (or the count), the
+  shot's date and time as its one line, Cancel and Delete. Nothing else in it. The row's menu drops
+  the item when `removal` is `.none`.
+- SHARE OVER A SHOT IS THE PICKER, NOT A ShareLink. A ShareLink holds the URLs when the menu is
+  built, and a shot has none until it is written out (`ShotActions.file`); the row's menu uses the
+  File menu's `SelectionShare.present`, which writes them when it opens, whenever a shot is selected.
+- THE SNAPSHOT STARTS AT WHAT AN EMPTY SELECTION READS. `removal` started at `.trash` and an empty
+  selection computes `.none`, so the first refresh of a launch (the first search's results) was a
+  change with nothing selected: the menu bar's body once more, and the toolbar's Share item with it.
+  Counted, 0.20.2 against the new build, counters in both (`Tools/uiprobe/probes.py add`), the same
+  script interleaved (search, list, select 1, select 2, down, shift-down, resign, Select All, grid,
+  select 3, a second search). Before the fix the first search read `OmniCommands=2 ShareItem=1`
+  against 0.20.2's `OmniCommands=1`, in three runs of three; with the start at `.none`, four runs
+  (new, old, new, old) are the same line for line:
+
+  | step | bodies |
+  |---|---|
+  | first search | BrowseMode 3, OmniCommands 1, BookmarkItem 1, FilterItem 1, QuerySuggestions 1, RawQueryWatcher 1, SearchField 1, SortViewItem 1, ViewModePicker 1 |
+  | select 1, select 2 | OmniCommands 1, ShareItem 1 |
+  | down, shift-down, list, select 3 | none |
+  | resign | QuerySuggestions 1 |
+  | Select All | OmniCommands 1, ShareItem 1, OmniApp 1, QuerySuggestions 1, and the sidebar's history row (SidebarTint 2, DayRow 1, HistoryRowLabel 1, HistorySections 1, SidebarRow 1) |
+  | grid | OmniCommands 1, ViewModePicker 1 |
+  | second search | OmniCommands 1, ShareItem 1, NavPill 1, NavTitleItem 1, QuerySuggestions 1, RawQueryWatcher 1, SearchField 1 |
+
+  Select All's `OmniApp=1` is 0.20.2's too. These runs drew no rows (the screen was idle and the
+  window behind others; `front` did not change it): the counts are the menu bar's and the toolbar's,
+  which is what changed. One earlier run of 0.20.2 did draw rows (ResultRow, Thumbnail) and compares
+  with nothing here: counts are compared within one regime.
+

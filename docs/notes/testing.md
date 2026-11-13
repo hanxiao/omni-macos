@@ -792,3 +792,88 @@ From checking an agent's first-run review (ui.md, "A first-run review, checked c
   draws, but the main queue cannot drain, so a search's `MainActor.run` sat until the wait ended -
   results 2-4 s after a 12 ms store search, read as a slow first query. Hangwatch stays silent (the
   main thread is not blocked). Wait outside the app, and poll a quick read instead.
+
+## The test instance that stood the installed app down, and comparing answers across builds (2026-11-12)
+
+Found while proving the 0.20.3 update (docs/screenshots.md, "Video only").
+- AN ISOLATED RUN UNDER THE REAL BUNDLE ID STOOD THE INSTALLED APP DOWN. The single-instance guard
+  stood a launch down for ANY running process with its bundle id. An isolated build of the tree
+  (`-omni.dbDir`, its own index) was running when the installed app relaunched after an update: it
+  activated the test instance and quit, and the user's Omni stayed closed. The guard now stands down
+  only for a copy on the same index (`AppDelegate.otherCopies().sharing`: a running copy without
+  `-omni.dbDir` among its arguments, `AppModel.isIsolatedRun(pid:)`). Controls, on a renamed copy,
+  with a stand-in process of the same bundle id (perf-script step `copies` logs both lists): none
+  running `running=[] sharing=[]`; the stand-in `running=[pid] sharing=[pid]`; the stand-in started
+  with `-omni.dbDir /x` `running=[pid] sharing=[]`.
+- EVERY ISOLATED RUN IS A RENAMED COPY all the same (`Scripts/chaos-app.sh <built app> <new dest>`,
+  `io.hanxiao.omni.chaos`), not only the UI suites: an installed app older than this fix still stands
+  down for the real id, and Launch Services, TCC and the screenshot filter all go by bundle id. The
+  copy's executable is still `Omni`, so `pgrep -x Omni` lists it; tell instances apart by pid.
+- A RUN DIRECTORY OPENED AGAIN REPLAYS ITS STEPS. `OMNI_PERF_SCRIPT=listen:<dir>` runs every step
+  file in the directory from 0, so a cloned or reopened run fed its shots a second time. Move the
+  steps folder aside before the second launch.
+- AN INDEX CLONE IS OPENED AT THE PATH IT WAS BUILT AT. Rows hold absolute paths; a clone opened
+  elsewhere has every file missing and a pass that removes them.
+- THE SAME SEARCH CAN ANSWER DIFFERENTLY IN TWO LAUNCHES OF ONE BUILD. The served passage step
+  spends 30 ms per answer at a rate it measures itself (`charsPerMs`, a moving average per
+  process), so how many results get a recovered passage depends on what that process had timed
+  before. Compare round n of one launch to round n of the other, and when one answer of twelve
+  differs, look for the passage lines before the index.
+- FED SHOTS LEAVE A TEXT BACKLOG. 150 fed frames index in seconds and their screen text is read for
+  about a minute after; answers taken inside that minute differ run to run by which shots have
+  words yet. Wait for `enrichment:` and a quiet log.
+- A KILL TRIAL ENDS IN THE SAME ANSWERS, NOT ONLY THE SAME FILES. The state digest (`shotbench
+  state`) was equal after every kill while a served answer was not: the kill had only changed how
+  the index was opened, and the two ways of opening disagreed (index.md, "A file's facts"). Diff the
+  answers of a killed run against the unkilled one, every time.
+- WHAT DIFFERS BETWEEN TWO RIGHT RUNS. `status.json`'s `indexed_at`; one text file's snippet window
+  (the passage budget above); and results with the SAME score, which come in row write order:
+  three shots of one repeated fed frame, score 0.25153881311416626 each, changed places after a
+  kill inside the text backlog had their rows written in another order. Compare such answers as
+  sets with their fields.
+- THE STATE DIGEST CARRIES EACH SHOT'S PATH, so two runs compare only at one path: every trial is
+  cloned to the same directory and the one before it moved aside.
+- A FRESH INDEX ASKS WHERE OMNI RUNS, and the choice covers the content pane: the timeline is never
+  built, `shotopen` logs `shot-show found=true` and every timeline step after it logs nothing.
+  Start a scripted run on a new index with `-omni.computeUnit gpu -omni.computeChoicePending NO`.
+- A `quit` STEP PRINTS TIMEOUT. The app is gone before it can acknowledge the step; check the pid.
+- TEST FRAMES THAT DIFFER ONLY IN A LINE OF TYPING ARE THE SAME FRAME TO A TEST. Two of them differ
+  by a mean of about 0.2 a pixel, under the 4 a decoded frame may differ from its source by; a test
+  that must tell which frame came back uses a different page per look (mean difference over 12).
+- A DEBUG BUILD DOES NOT GENERATE DAYS OF HISTORY. The thirty-day history of the scale trial took
+  1,992 s in release, by 0.20.2's own code (a worktree of the tag); the debug test binary is many
+  times slower at the encoder's software side.
+- ONE FED FOLDER IS ONE SESSION (its frames are 5 s apart): `shotdelete:session` removes all of it.
+  Feed a second folder hours back (`shotfeed:<dir>|60`) for a second session or day.
+- A WRITE COMPARISON FEEDS FRAMES NEITHER INDEX HAS SEEN. 0.20.2 keys a shot's content by its
+  picture, 0.20.3 by its time and display: the same folder fed a second time is `dedup=10` in the
+  old arm and new work in the new one. The frames are made new by a crop of a few pixels and a
+  rescale.
+- `wait:<n>` AS A LISTENED STEP STALLS THE SCRIPT (no later step ran; the instance was stopped by
+  pid). Pause in the shell, between two calls that each wait for their `.done`.
+- THE MENU BAR FOLLOWS THE SELECTION A TURN LATER. `menustate:File` in the same step file as
+  `select:<n>` read the menu of no selection (Open off). Select, pause, then read.
+- A BACKGROUND BUILD'S STATUS IS ITS LAST COMMAND'S. `build ...; echo "exit=$?" >> log` reported
+  0 over a failed build (exit 65), and the renamed copy made next was the build before. End the
+  command with `exit $rc` and read the log's `error:` lines before copying the app.
+- A MENU IS PICTURED OPEN BY `menushow:<menu>` (popped up over the window, closed after 4 s) and
+  `screencapture -l` of the menu's own window, which is on another layer than the app's windows.
+- `menu:<title>` GOES TO THE FIRST RESPONDER. After a `search:` step that is the search field:
+  `menu:Select All` selected the field's text (the menu still read one path) and `menu:Move to
+  Trash` was the editor's delete-to-line-start. Send `resign` first.
+- `select:<n>` COUNTS THE LIST AS DISPLAYED, which is not the order of `dumpui`'s `results`: a
+  trash test picked row 40 by the dump and moved another file than the one intended. Read the
+  selection back (`dumpui`) before the step that acts on it, and act only on generated files.
+- A HOSTING VIEW IS FLIPPED. `menushow` popped the menu at `bounds.maxY - 60`, the window's bottom,
+  and the picture was cut off; the step asks `isFlipped`.
+- AN ALERT IS ITS OWN WINDOW (layer 8), not a sheet of the main one: `winall <pid>` lists it, and
+  `screencapture -l` takes it by its id. With one open, a scripted run is stopped by pid.
+- A PLAIN BUILD PRINTS NO `counts[...]`. The body counters are inserted for a count
+  (`Tools/uiprobe/probes.py add`, build, renamed copy, `remove`), in BOTH trees when two builds are
+  compared (the old one in a worktree of its tag); the product left in `.build/xcode-rel` is then
+  the counted build, so the release build is made again before anything is copied from it.
+- COUNTS COMPARE WITHIN ONE REGIME. A window whose rows are not drawn (idle screen, window behind
+  others) counts only the menu bar and the toolbar; one that draws them adds ResultRow and
+  Thumbnail by the dozen. `wait:6` at launch read FolderRow 4 or 5 between runs of one build.
+- `pgrep -x Omni` CAN LIST A PID THAT `ps` DOES NOT HAVE, for a moment after an instance quits
+  (5366, twice). Name the instances by `ps -p <pid> -o lstart,command` before concluding one is left.

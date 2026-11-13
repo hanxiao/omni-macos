@@ -151,21 +151,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// EXEMPT WHEN `-omni.dbDir` IS SET. That argument means the caller brought its own index -
     /// every UI-test suite passes it - and two instances on two indexes contend over nothing. The
     /// guard exists to stop two copies fighting over ONE index, not to stop two copies existing.
+    /// BOTH WAYS: a running copy that was started with it is no survivor either
+    /// (`AppModel.isIsolatedRun(pid:)`), or a normal launch stands down for a test instance.
     ///
     /// Runs in `applicationWillFinishLaunching`, before the store is opened, so the redundant
     /// process exits without ever touching the index.
+    /// The other running copies of this app, and those of them on this copy's index: the ones a
+    /// launch stands down for. Also what the perf-script step `copies` logs.
+    static func otherCopies() -> (running: [NSRunningApplication], sharing: [NSRunningApplication]) {
+        guard let id = Bundle.main.bundleIdentifier else { return ([], []) }
+        let mine = ProcessInfo.processInfo.processIdentifier
+        let running = NSRunningApplication.runningApplications(withBundleIdentifier: id)
+            .filter { $0.processIdentifier != mine && !$0.isTerminated }
+        return (running, running.filter { !AppModel.isIsolatedRun(pid: $0.processIdentifier) })
+    }
+
     func applicationWillFinishLaunching(_ notification: Notification) {
         omniPerfLog("launch will-finish-launching model-built=\(AppModel.shared != nil)")
         Self.letQuitEndSheets()
         // The ARGUMENT domain, for the same reason as AppModel.isolatedByLaunchArgument: reading
         // the key itself meant a user who moved their index in Settings lost the single-instance
         // guard too, so two copies could fight over the one index it is here to protect.
-        guard !AppModel.isolatedByLaunchArgument,
-              let id = Bundle.main.bundleIdentifier else { return }
-        let mine = ProcessInfo.processInfo.processIdentifier
-        let others = NSRunningApplication.runningApplications(withBundleIdentifier: id)
-            .filter { $0.processIdentifier != mine && !$0.isTerminated }
-        guard let survivor = others.first else { return }
+        guard !AppModel.isolatedByLaunchArgument, let survivor = Self.otherCopies().sharing.first else { return }
         DistributedNotificationCenter.default().postNotificationName(
             Self.reopenNotification, object: nil, deliverImmediately: true)
         survivor.activate()
@@ -493,7 +500,7 @@ private struct OmniCommands: Commands {
             Button("Quick Look") { model.toggleQuickLook() }
                 .keyboardShortcut("y", modifiers: .command)
                 .disabled(!sel.hasSelection || multi || model.ocrMode)
-            Button("Show in Finder") { model.revealSelected() }
+            Button(sel.reveal) { model.revealSelected() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
                 .disabled(!sel.hasSelection)
             // The menu bar owns these shortcuts too: keyboard equivalents declared only
@@ -514,7 +521,7 @@ private struct OmniCommands: Commands {
                 .disabled(!sel.hasSelection)
             // Move to Trash (reversible). Cmd-Delete is routed: in a text field it stays the
             // editor's delete-to-line-start, so typing in the search box can never trash files.
-            Button(multi ? "Move \(sel.pathsCount) Items to Trash" : "Move to Trash") { moveToTrashCommand() }
+            Button(sel.removalTitle) { moveToTrashCommand() }
                 .keyboardShortcut(.delete, modifiers: .command)
                 .disabled(!sel.hasSelection || model.ocrMode)
             Divider()

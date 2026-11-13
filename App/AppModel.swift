@@ -872,9 +872,12 @@ final class AppModel {
             hasSelection: selection != nil,
             count: next.count,
             pathsCount: selectedPaths.count,
+            trashCount: selectedPaths.reduce(0) { $0 + (ResultPath.isVirtual($1) ? 0 : 1) },
             transcribable: Transcribe.candidates(next).count,
             taggable: selectionIsTaggable,
-            enclosingFolder: selection.flatMap { ResultPath.isVirtual($0) ? nil : ($0 as NSString).deletingLastPathComponent })
+            enclosingFolder: selection.flatMap { ResultPath.isVirtual($0) ? nil : ($0 as NSString).deletingLastPathComponent },
+            reveal: PhotoActions.revealTitle(paths: next),
+            removal: next.contains { !ResultPath.isVirtual($0) } ? .trash : (next.contains(where: ResultPath.isShot) ? .delete : .none))
         if menu != menuSelection { menuSelection = menu }
     }
 
@@ -888,13 +891,27 @@ final class AppModel {
         var hasSelection = false
         /// The selection in result order (falls back to the active item), as Share and Open count it.
         var count = 0
-        /// `selectedPaths.count`: what "Copy N Paths" and "Move N Items to Trash" name.
+        /// `selectedPaths.count`: what "Copy N Paths" names.
         var pathsCount = 0
+        /// The files among them, which "Move N Items to Trash" names: what goes to the Trash.
+        var trashCount = 0
         var transcribable = 0
         var taggable = false
         /// The active item's folder, nil for a Photos asset. Whether it can be ignored also depends
         /// on the roots, which `canIgnoreFolder` reads when the menu is built.
         var enclosingFolder: String?
+        /// "Show in Finder", or where a selection that is no file on this Mac is shown.
+        var reveal = "Show in Finder"
+        /// What Command-Delete does to the selection: its files go to the Trash, and nothing else
+        /// of it is touched; shots alone, which are no files, are deleted once confirmed; a Photos
+        /// asset or a linked Mac's file, nothing.
+        enum Removal { case trash, delete, none }
+        /// The start is what an empty selection reads, as every field's is: a start of its own was
+        /// a change at the first search, the menu bar's body once more (ui.md, "Titles by selection").
+        var removal = Removal.none
+        var removalTitle: String {
+            removal == .delete ? "Delete\u{2026}" : (trashCount > 1 ? "Move \(trashCount) Items to Trash" : "Move to Trash")
+        }
     }
     private(set) var menuSelection = MenuSelection()
 
@@ -911,7 +928,8 @@ final class AppModel {
     func findSimilarSelected() { if let p = selection { searchBySimilar(to: p) } }
 
     /// Search by a result, whichever kind it is. A Photos asset has to be written out first - the
-    /// query path embeds a FILE - so this is async; a plain file runs straight through.
+    /// query path embeds a FILE - so this is async; a plain file runs straight through, and so does
+    /// a shot of the screen history, by its path: the search takes the vector the index holds.
     func searchBySimilar(to path: String) {
         if RemotePath.isRemote(path) { searchBySimilarRemote(path); return }
         if !PhotoLibrary.isPhotoPath(path) {
@@ -928,11 +946,11 @@ final class AppModel {
         }
     }
 
-    /// Quick Look a result. Photos assets are exported to a temp file first (Quick Look needs a
-    /// real file), which is why this is not just a `previewURL` write.
+    /// Quick Look a result. A Photos asset or a shot of the screen history is written to a temp
+    /// file first (Quick Look needs a real file), which is why this is not just a `previewURL` write.
     func showPreview(path: String) {
         if RemotePath.isRemote(path) { previewRemote(path); return }
-        if !PhotoLibrary.isPhotoPath(path) {
+        if !PhotoLibrary.isPhotoPath(path), !ResultPath.isShot(path) {
             let url = URL(fileURLWithPath: path)
             showPreview(url)
             // At the page or moment that matched, once the panel has the file (Moment).
@@ -978,8 +996,15 @@ final class AppModel {
     func moveToTrash(_ paths: [String]) {
         // A Photos asset is not a file Omni may move: deleting it means deleting it from the
         // library (and from every synced device). That belongs in Photos.app, not here.
+        // A shot of the screen history is no file either, and is Omni's own: deleted, once
+        // confirmed, when shots are all that is selected. Beside files it is left where it is, as
+        // a Photos asset is: "Move 3 Items to Trash" moves three files and deletes nothing.
+        let shots = paths.filter(ResultPath.isShot)
         let paths = paths.filter { !ResultPath.isVirtual($0) }   // nor a linked Mac's file
-        guard !paths.isEmpty else { return }
+        guard !paths.isEmpty else {
+            if !shots.isEmpty { deleteScreenshots(atPaths: shots) }
+            return
+        }
         let set = Set(paths)
         NSWorkspace.shared.recycle(paths.map { URL(fileURLWithPath: $0) }, completionHandler: nil)
         rawResults.removeAll { set.contains($0.path) }
@@ -1025,8 +1050,21 @@ final class AppModel {
     func copySelectedFiles() {
         let paths = selectionOrdered
         guard !paths.isEmpty else { return }
-        let files = paths.filter { !ResultPath.isVirtual($0) }.map { URL(fileURLWithPath: $0) }
-        OmniPasteboard.copyFiles(files, text: paths.joined(separator: "\n"))
+        let text = paths.joined(separator: "\n")
+        let shots = paths.filter(ResultPath.isShot)
+        guard !shots.isEmpty else {
+            OmniPasteboard.copyFiles(paths.filter { !ResultPath.isVirtual($0) }.map { URL(fileURLWithPath: $0) }, text: text)
+            return
+        }
+        // A shot is copied as the picture file it is written out to; off the main thread.
+        Task { @MainActor in
+            let files = await Task.detached(priority: .userInitiated) {
+                paths.compactMap { p in
+                    ResultPath.isShot(p) ? ShotActions.file(p) : ResultPath.isVirtual(p) ? nil : URL(fileURLWithPath: p)
+                }
+            }.value
+            OmniPasteboard.copyFiles(files, text: text)
+        }
     }
 
     /// Make `path` the sole selection - a plain click or an arrow-key move.
@@ -1268,14 +1306,20 @@ final class AppModel {
     /// The Clipboard row was clicked while there is nothing to show: capture off and no clips.
     var showsClipboardOff = false
 
-    /// The folders the indexer crawls and the watcher follows: the user's, plus the clipboard
-    /// history and the screenshots.
+    /// The roots of a pass: the folders the watcher follows, and the screenshots, which no folder
+    /// holds (the indexer asks the screen history for them: ScreenShots).
     /// `roots` stays the user's folders alone, which is what the sidebar, Settings, the Go menu
     /// and the served root check list.
     var crawlRoots: [URL] {
+        var all = watchedRoots
+        if screenshotsRootExists { all.append(Self.screenshotsDirectory) }
+        return all
+    }
+
+    /// The folders the indexer crawls and the watcher follows: the user's, plus the clipboard history.
+    private var watchedRoots: [URL] {
         var all = roots
         if clipboardFolderExists { all.append(Self.clipboardDirectory) }
-        if screenshotsFolderExists { all.append(Self.screenshotsDirectory) }
         return all
     }
 
@@ -1427,12 +1471,20 @@ final class AppModel {
         return support.appendingPathComponent("Omni/" + name, isDirectory: true)
     }
 
-    /// The shots worth finding again, as picture files: a crawl root, like the clipboard's folder.
-    nonisolated static let screenshotsDirectory = ownFolder("Screenshots")
     /// Every shot, as video. Omni's own data: never crawled.
     nonisolated static let screenHistoryDirectory = ownFolder("Screen History")
-    /// One for the process: the recorder writes it, the timeline and the served surfaces read it.
-    nonisolated static let screenHistory = ScreenHistory(history: screenHistoryDirectory, stills: screenshotsDirectory)
+    /// One for the process: the recorder writes it, the indexer, the timeline and the served
+    /// surfaces read it. Known to the indexer from its first use (ScreenShots), which is before any
+    /// pass can name its root.
+    nonisolated static let screenHistory: ScreenHistory = {
+        let history = ScreenHistory(history: screenHistoryDirectory, stills: ownFolder("Screenshots"))
+        ScreenShots.add(history)
+        return history
+    }()
+    /// THE ROOT THE INDEXED SHOTS ARE UNDER, each at the path its picture file had until 0.20.2
+    /// (`<root>/<day>/<day time> <App> - <Title>.heic`). No folder is there: a shot's picture is
+    /// its frame in the screen history, and becomes a file only when it is dragged out or exported.
+    nonisolated static let screenshotsDirectory = URL(fileURLWithPath: screenHistory.root, isDirectory: true)
 
     /// What no linked Mac is given: the clipboard history, which no served surface returns. The
     /// screenshots are served like the user's files, to this Mac's agents and to linked Macs (Han,
@@ -1491,21 +1543,25 @@ final class AppModel {
         screenshotsExcludedApps.append(id)
     }
 
-    /// Bytes the screen history and its indexed files take. STORED: finding out walks two folders
+    /// Bytes the screen history takes. STORED: finding out walks a folder
     /// (`refreshScreenshotsDiskUse`, asked for by Settings and after anything that deletes).
     private(set) var screenshotsDiskBytes: Int?
 
     func refreshScreenshotsDiskUse() {
         let history = Self.screenHistory
         Task.detached(priority: .utility) {
-            let use = history.diskUse()
-            let bytes = use.history + use.stills
+            let bytes = history.diskUse()
             await MainActor.run { if self.screenshotsDiskBytes != bytes { self.screenshotsDiskBytes = bytes } }
         }
     }
 
-    /// Crawled while it exists, on or off, so a shot deleted by retention or in the Finder leaves the index.
-    private(set) var screenshotsFolderExists = FileManager.default.fileExists(atPath: AppModel.screenshotsDirectory.path)
+    /// A root of every pass while there is a screen history, recording on or off, so a shot that
+    /// retention took leaves the index. STORED: finding out asks the disk.
+    private(set) var screenshotsRootExists = AppModel.screenHistoryOnDisk()
+
+    private nonisolated static func screenHistoryOnDisk() -> Bool {
+        FileManager.default.fileExists(atPath: screenHistoryDirectory.path) || screenHistory.stillsPending
+    }
 
     /// The Screenshots row was clicked while there is nothing to show: recording off and no shots.
     var showsScreenshotsOff = false
@@ -1513,14 +1569,19 @@ final class AppModel {
     /// What macOS allows, as the recorder last found it. nil until it has looked.
     private(set) var screenshotsAccess: Bool?
 
+    /// Why recording is on, allowed, and storing nothing: what the recorder was last told by the
+    /// system or the disk, two looks in a row. nil while it works.
+    private(set) var screenshotsFailure: String?
+
     /// The history holds at least one shot. STORED: finding out lists a folder.
     private(set) var screenshotsHasShots = false
 
     /// Moves when the history changes (a shot stored, retention, Clear). The timeline reloads on it.
     private(set) var screenshotsRevision = 0
 
-    /// Launch: resume recording if it is on, and apply retention.
+    /// Launch: take in what 0.20.2 left, resume recording if it is on, and apply retention.
     func startScreenshots() {
+        takeInScreenshotFiles()
         if screenshotsEnabled { startScreenRecorder() }
         pruneScreenshots()
         refreshScreenshotsHasShots()
@@ -1537,20 +1598,19 @@ final class AppModel {
         screenshotsEnabled = on
         if !isIsolatedRun { OmniPrefs.set(on, forKey: "omni.screenshots.enabled") }
         if on {
-            for dir in [Self.screenshotsDirectory, Self.screenHistoryDirectory] {
-                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            }
+            try? FileManager.default.createDirectory(at: Self.screenHistoryDirectory, withIntermediateDirectories: true)
             // macOS asks the user once, in its own dialog. From an isolated run only when its
             // arguments let it record the real screen. Off the main thread: the call asks a system
             // service.
             if Self.screenshotsMayCapture { DispatchQueue.global(qos: .userInitiated).async { _ = CGRequestScreenCaptureAccess() } }
             startScreenRecorder()
-            refreshScreenshotsFolder()
+            refreshScreenshotsRoot()
             if showsScreenshotsOff { showsScreenshotsOff = false }
         } else {
             screenRecorder?.stop()
             screenRecorder = nil
             screenshotsAccess = nil
+            if screenshotsFailure != nil { screenshotsFailure = nil }
         }
     }
 
@@ -1560,11 +1620,18 @@ final class AppModel {
                        onAccess: { [weak self] allowed in
                            guard let self, self.screenshotsAccess != allowed else { return }
                            self.screenshotsAccess = allowed
+                       },
+                       onFailure: { [weak self] failure in
+                           guard let self, self.screenshotsEnabled, self.screenshotsFailure != failure else { return }
+                           self.screenshotsFailure = failure
                        })
     }
 
     /// `shotdecline:<seconds>` (perf script).
     func perfDeclineScreenshots(retryAfter: Double) { screenRecorder?.declineForScript(retryAfter: retryAfter) }
+
+    /// `shotfail:<text>` (perf script).
+    func perfFailScreenshots(_ text: String) { screenRecorder?.failForScript(text) }
 
     private func startScreenRecorder() {
         guard screenRecorder == nil else { return }
@@ -1573,19 +1640,59 @@ final class AppModel {
         screenRecorder = r
     }
 
+    /// Shots were stored. The ones to index go to the indexer by their paths, through the queue a
+    /// changed file's path takes: no folder is watched for them.
     private func screenshotsStored(_ stored: [ScreenHistory.Recorded]) {
         if !screenshotsHasShots { screenshotsHasShots = true }
         screenshotsRevision += 1
-        if stored.contains(where: { $0.still != nil }) { refreshScreenshotsFolder() }
+        let paths = stored.compactMap(\.path)
+        guard !paths.isEmpty else { return }
+        refreshScreenshotsRoot()
+        handleFSChange(paths)
     }
 
-    /// The folder appeared or went away: the watcher and the next pass follow it.
-    private func refreshScreenshotsFolder() {
-        let exists = FileManager.default.fileExists(atPath: Self.screenshotsDirectory.path)
-        guard exists != screenshotsFolderExists else { return }
-        screenshotsFolderExists = exists
+    /// The screen history appeared or went away: the passes' roots follow it.
+    private func refreshScreenshotsRoot() {
+        let exists = Self.screenHistoryOnDisk()
+        guard exists != screenshotsRootExists else { return }
+        screenshotsRootExists = exists
         restartWatcher()
-        if exists { requestIndexPass() }
+    }
+
+    @ObservationIgnored private var takingInScreenshotFiles = false
+    private static let screenshotFilesQueue = DispatchQueue(label: "omni.screenshots.files", qos: .utility)
+
+    /// THE UPDATE FROM 0.20.2, which kept a picture file beside the video for every indexed shot:
+    /// each shot takes its file's path as its own and the files are deleted (ScreenHistory.
+    /// migrateStills). At every launch, files or none, since a launch killed after the folder was
+    /// set aside has only that to finish. Until it is done no pass removes a shot's row; a pass
+    /// that starts meanwhile asks again here, and one follows when it is done, for the shots whose
+    /// files were gone.
+    private func takeInScreenshotFiles() {
+        guard !takingInScreenshotFiles else { return }
+        takingInScreenshotFiles = true
+        let history = Self.screenHistory
+        Self.screenshotFilesQueue.async {
+            let t0 = Date()
+            let result = history.migrateStills()
+            let line: String? = switch result {
+            case .none: nil
+            case .done(let kept, let dropped): String(format: "shot-files taken in kept=%d dropped=%d ms=%.0f", kept, dropped, Date().timeIntervalSince(t0) * 1000)
+            case .failed(let why): "shot-files not taken in: \(why)"
+            }
+            if let line { omniPerfLog(line); Self.rootLog.info("\(line, privacy: .public)") }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    self.takingInScreenshotFiles = false
+                    self.refreshScreenshotsRoot()
+                    if case .done = result {
+                        self.refreshScreenshotsHasShots()
+                        if self.screenshotsDiskBytes != nil { self.refreshScreenshotsDiskUse() }
+                        self.requestIndexPass()
+                    }
+                }
+            }
+        }
     }
 
     private func refreshScreenshotsHasShots() {
@@ -1599,18 +1706,27 @@ final class AppModel {
     private func pruneScreenshots() {
         let days = screenshotsRetentionDays, history = Self.screenHistory
         guard days > 0 else { return }
+        let store = self.store
         Task.detached(priority: .utility) {
-            guard history.prune(olderThan: Date().timeIntervalSince1970 - Double(days) * 86_400) > 0 else { return }
+            guard let paths = history.prune(olderThan: Date().timeIntervalSince1970 - Double(days) * 86_400) else { return }
+            // The rows by path through the sliced delete, as a deleted span's go.
+            if !paths.isEmpty { store?.deletePaths(Set(paths)) }
+            omniPerfLog("shot-prune paths=\(paths.count)")
             await MainActor.run {
                 self.screenshotsRevision += 1
                 self.refreshScreenshotsHasShots()
+                self.refreshScreenshotsRoot()
                 if self.screenshotsDiskBytes != nil { self.refreshScreenshotsDiskUse() }
+                if let store, self.store === store, !paths.isEmpty {
+                    self.refreshIndexStats(store)
+                    self.refreshSearchAfterBackgroundChange()
+                }
             }
         }
     }
 
-    /// Delete every shot: the history, the files written for the index, and their rows, in order
-    /// on one task, as Clear does for the clipboard.
+    /// Delete every shot: the history and the rows of the indexed ones, in order on one task, as
+    /// Clear does for the clipboard.
     func clearScreenshots() {
         let dir = Self.screenshotsDirectory, history = Self.screenHistory
         let store = self.store
@@ -1620,6 +1736,7 @@ final class AppModel {
             store?.deleteUnderFolder(dir.path)
             await MainActor.run {
                 self.screenshotsRevision += 1
+                self.refreshScreenshotsRoot()
                 if self.screenshotsDiskBytes != nil { self.refreshScreenshotsDiskUse() }
                 if let store, self.store === store {
                     self.refreshIndexStats(store)
@@ -1629,25 +1746,59 @@ final class AppModel {
         }
     }
 
-    /// Delete the shots of a span, on one display or (nil) on all: the history and the files
-    /// written for the index first, then those files' rows, in order on one task. The rows go by
-    /// path through the sliced delete (`deletePaths`), as a file moved to the Trash does; the
-    /// watcher's pass over the same paths afterwards finds nothing left to do.
+    /// Delete the shots of a span, on one display or (nil) on all: the history first, then the
+    /// rows of the indexed ones, in order on one task. The rows go by path through the sliced
+    /// delete (`deletePaths`), as a file moved to the Trash does.
     func deleteScreenshots(from: Double, to: Double, display: UInt32?) {
+        deleteScreenshots([(from, to, display)])
+    }
+
+    /// Delete the shots behind results, asked for from a result's menu or with Command-Delete.
+    /// Nothing brings a shot back, so it asks first, as the timeline's Delete does.
+    /// `confirmed`: the perf script's, which has nobody to answer.
+    func deleteScreenshots(atPaths paths: [String], confirmed: Bool = false) {
+        let history = Self.screenHistory
+        Task { @MainActor in
+            let shots = await Task.detached(priority: .userInitiated) { paths.compactMap { history.shot(atPath: $0) } }.value
+            guard let first = shots.first else { return }
+            let alert = NSAlert()
+            if shots.count == 1 {
+                alert.messageText = "Delete this screenshot?"
+                alert.informativeText = Date(timeIntervalSince1970: first.time).formatted(date: .abbreviated, time: .standard)
+            } else {
+                alert.messageText = "Delete \(shots.count.formatted()) screenshots?"
+            }
+            alert.addButton(withTitle: "Delete")
+            alert.addButton(withTitle: "Cancel")
+            alert.buttons.first?.hasDestructiveAction = true
+            guard confirmed || alert.runModal() == .alertFirstButtonReturn else { return }
+            let gone = Set(paths)
+            selectedPaths.subtract(gone)
+            if let s = selection, gone.contains(s) { selection = selectedPaths.first }
+            if let a = selectionAnchor, gone.contains(a) { selectionAnchor = nil }
+            deleteScreenshots(shots.map { ($0.time, $0.time, $0.display) })
+        }
+    }
+
+    private func deleteScreenshots(_ spans: [(from: Double, to: Double, display: UInt32?)]) {
         let history = Self.screenHistory, store = self.store
         Task.detached(priority: .userInitiated) {
             let t0 = Date()
-            let deleted = history.delete(from: from, to: to, display: display)
+            var deleted = (shots: 0, paths: [String](), lost: 0)
+            for span in spans {
+                let d = history.delete(from: span.from, to: span.to, display: span.display)
+                deleted = (deleted.shots + d.shots, deleted.paths + d.paths, deleted.lost + d.lost)
+            }
             let t1 = Date()
-            if !deleted.stills.isEmpty { store?.deletePaths(Set(deleted.stills.map(\.path))) }
-            omniPerfLog(String(format: "shot-delete shots=%d stills=%d lost=%d history_ms=%.0f rows_ms=%.0f", deleted.shots,
-                               deleted.stills.count, deleted.lost, t1.timeIntervalSince(t0) * 1000, Date().timeIntervalSince(t1) * 1000))
-            guard deleted.shots > 0 || !deleted.stills.isEmpty else { return }
+            if !deleted.paths.isEmpty { store?.deletePaths(Set(deleted.paths)) }
+            omniPerfLog(String(format: "shot-delete shots=%d paths=%d lost=%d history_ms=%.0f rows_ms=%.0f", deleted.shots,
+                               deleted.paths.count, deleted.lost, t1.timeIntervalSince(t0) * 1000, Date().timeIntervalSince(t1) * 1000))
+            guard deleted.shots > 0 || !deleted.paths.isEmpty else { return }
             await MainActor.run {
                 self.screenshotsRevision += 1
                 self.refreshScreenshotsHasShots()
                 if self.screenshotsDiskBytes != nil { self.refreshScreenshotsDiskUse() }
-                if let store, self.store === store, !deleted.stills.isEmpty {
+                if let store, self.store === store, !deleted.paths.isEmpty {
                     self.refreshIndexStats(store)
                     self.refreshSearchAfterBackgroundChange()
                 }
@@ -1668,14 +1819,37 @@ final class AppModel {
         if !(screenshotsEnabled || screenshotsHasShots) { showsScreenshotsOff = true }
     }
 
+    /// The shot the timeline is to open at, held until the timeline takes it.
+    @ObservationIgnored private var screenshotTarget: ScreenHistory.Shot?
+    /// Moves when a target is set: a timeline already on screen goes there.
+    private(set) var screenshotTargetTick = 0
+
+    func takeScreenshotTarget() -> ScreenHistory.Shot? {
+        defer { screenshotTarget = nil }
+        return screenshotTarget
+    }
+
+    /// Open or Reveal on a shot's result: the timeline at that moment. A shot has no file for
+    /// another app to open or for Finder to show. The lookup may read a segment's table, so it is
+    /// off the main thread.
+    func showScreenshot(_ path: String) {
+        let history = Self.screenHistory
+        Task { @MainActor in
+            let shot = await Task.detached(priority: .userInitiated) { history.shot(atPath: path) }.value
+            screenshotTarget = shot
+            clearSearch()
+            enterScreenshots()
+            if shot != nil { screenshotTargetTick &+= 1 }
+            omniPerfLog("shot-show found=\(shot != nil) path=\((path as NSString).lastPathComponent.prefix(19))")
+        }
+    }
+
     /// Record a prepared session instead of the screen (the `shotfeed` script step): PNG frames in
     /// name order, 5 s apart, the first `hoursAgo` back from now. `<n>[!] <App> - <Title>.png`; a
     /// "!" after the number marks the shot the user stopped on.
     func feedScreenshots(from dir: URL, hoursAgo: Double) {
-        for d in [Self.screenshotsDirectory, Self.screenHistoryDirectory] {
-            try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
-        }
-        refreshScreenshotsFolder()
+        try? FileManager.default.createDirectory(at: Self.screenHistoryDirectory, withIntermediateDirectories: true)
+        refreshScreenshotsRoot()
         let recorder = screenRecorder ?? makeScreenRecorder()
         recorder.feed(dir, start: Date().timeIntervalSince1970 - hoursAgo * 3600) { stored, indexed in
             omniPerfLog("shotfeed stored=\(stored) indexed=\(indexed)")
@@ -3378,7 +3552,7 @@ final class AppModel {
     /// it couldn't run (e.g. a file query whose file is gone) so the caller can drop the selection.
     @discardableResult
     func runHistoryQuery(_ item: HistoryItem) -> Bool {
-        if item.isFile, let path = item.filePath, !FileManager.default.fileExists(atPath: path) {
+        if item.isFile, let path = item.filePath, !ShotActions.exists(path) {
             queryError = "\((path as NSString).lastPathComponent) no longer exists."
             return false   // keep current results; don't blow them away (caller clears the selection)
         }
@@ -5947,7 +6121,7 @@ final class AppModel {
             // Off the main thread: it lists the shared temporary directory, which measured 2.7 s of
             // main-thread block at 50k entries - the stall every launch showed right after ready.
             // It skips this session's own export folder, so running alongside the session is safe.
-            Task.detached(priority: .utility) { PhotoLibrary.cleanExportScratch() }
+            Task.detached(priority: .utility) { PhotoLibrary.cleanExportScratch(); ShotActions.cleanScratch() }
             startPhotoLibraryObserver()
             // Reclaim space left by a previously-emptied or heavily-pruned index. compact()
             // self-skips unless a large fraction of the file is free, so a healthy index is
@@ -6513,6 +6687,33 @@ final class AppModel {
         return !((args["omni.dbDir"] as? String)?.isEmpty ?? true)
     }
     private var isIsolatedRun: Bool { Self.isolatedByLaunchArgument }
+
+    /// Whether another process was started on an index of its own (`-omni.dbDir` among its
+    /// arguments, read from the kernel). The single-instance guard asks: such a run shares nothing
+    /// with this one, and a launch that stood down for it left the Mac with no Omni at all
+    /// (2026-11-12: the relaunch after an update quit for a test instance, which then went away).
+    /// False when the arguments cannot be read.
+    nonisolated static func isIsolatedRun(pid: pid_t) -> Bool {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = 0
+        guard sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return false }
+        var bytes = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &bytes, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return false }
+        let argc = Int(bytes.withUnsafeBytes { $0.loadUnaligned(as: Int32.self) })
+        // The executable's path, zero padding, then argc strings; the environment after them is not read.
+        var at = MemoryLayout<Int32>.size
+        while at < size, bytes[at] != 0 { at += 1 }
+        while at < size, bytes[at] == 0 { at += 1 }
+        var args: [String] = []
+        while at < size, args.count < argc {
+            var end = at
+            while end < size, bytes[end] != 0 { end += 1 }
+            args.append(String(decoding: bytes[at ..< end], as: UTF8.self))
+            at = end + 1
+        }
+        guard let i = args.firstIndex(of: "-omni.dbDir"), i + 1 < args.count else { return false }
+        return !args[i + 1].isEmpty
+    }
     /// Whether UI state (sidebar folds, history) may be written back: never from a test or an
     /// isolated run, which read the user's state and must not change it.
     static var persistsUIState: Bool { !ephemeralUIState && !isolatedByLaunchArgument }
@@ -7504,7 +7705,8 @@ final class AppModel {
         // isResolving compared that token against the still-present typed text, and a later,
         // successful retry of the SAME file settled onto the token already there - read as a
         // refresh, not a new query, so it kept the old selection and recorded no history stop.
-        if !FileManager.default.isReadableFile(atPath: url.path) {
+        // A shot of the screen history is its path: the search takes the vector the index holds.
+        if !FileManager.default.isReadableFile(atPath: url.path), !(ResultPath.isShot(url.path) && ShotActions.exists(url.path)) {
             queryError = FileManager.default.fileExists(atPath: url.path)
                 ? "\(url.lastPathComponent) can't be read (permission denied)."
                 : "\(url.lastPathComponent) no longer exists."
@@ -8045,8 +8247,10 @@ final class AppModel {
                         Double(DispatchTime.now().uptimeNanoseconds - tVec) / 1e6,
                         stored == nil ? "miss" : "stored").utf8))
                 }
+                // A shot the index holds no vector of: its frame, written out.
+                let file = stored == nil && cachedVec == nil && ResultPath.isShot(url.path) ? ShotActions.file(url.path) ?? url : url
                 let vec = stored ?? cachedVec
-                    ?? engine.embedFileQuery(url, asDocument: similar, maxImageDimension: maxImg, maxVideoFrames: maxVid)
+                    ?? engine.embedFileQuery(file, asDocument: similar, maxImageDimension: maxImg, maxVideoFrames: maxVid)
                 if Task.isCancelled { return }   // superseded while embedding: don't run the store scan
                 // Run the vector search OFF the main actor (matches the text path); doing it inside
                 // MainActor.run stalled the UI per file query, especially on a large index.
@@ -8336,7 +8540,10 @@ final class AppModel {
         // Every change to the crawled folders passes through here.
         recompileIgnoreForRoots()
         watcher?.stop(); watcher = nil
-        guard engine != nil, !crawlRoots.isEmpty else { return }
+        // The screenshots are a root with no folder: nothing to watch, their paths come from the
+        // recorder (screenshotsStored).
+        let watched = watchedRoots
+        guard engine != nil, !watched.isEmpty else { return }
         let since = eventCheckpoint.flatMap { UInt64($0) }
         // Omni's own files - the index, its WAL, the tag cache, OCR transcripts - are never
         // indexed, and a write to them under a watched folder was an event like any other. Real
@@ -8345,8 +8552,8 @@ final class AppModel {
             realpath(p, nil).map { r in defer { free(r) }; return String(cString: r) } ?? p
         }
         let own = Self.ownDataPaths().map(real)
-        let ownExceptions = [real(Self.clipboardDirectory.path), real(Self.screenshotsDirectory.path)]
-        let w = FSWatcher(paths: crawlRoots.map { $0.path }, since: since) { [weak self] paths, flags in
+        let ownExceptions = [real(Self.clipboardDirectory.path)]
+        let w = FSWatcher(paths: watched.map { $0.path }, since: since) { [weak self] paths, flags in
             let renamed = flags.renamed, rescan = flags.rescan
             // Sorted into present and gone HERE, on the watcher's queue: a drag-in reports
             // thousands of paths and the main thread should not stat them.
@@ -8652,6 +8859,9 @@ final class AppModel {
         guard !neuralEngineHoldsText else { indexingPausedForANE = true; return }
         guard powerHold == nil else { indexingPausedForPower = true; return }
         guard !indexWritesBlocked, let indexer, let store, indexState != .indexing else { return }
+        // 0.20.2's picture files not taken in yet (a launch that could not): asked again, and this
+        // pass leaves the shots' rows as they are.
+        if Self.screenHistory.stillsPending { takeInScreenshotFiles() }
         // !isPaperRunning: same reason as catchUpPendingRoots - the suite owns the engine and the
         // levers for the duration. REMEMBERED, not dropped: a Reindex/Update/Resume that arrives
         // during a benchmark run (the menu item and the Settings buttons stay live) would otherwise
@@ -9047,10 +9257,11 @@ final class AppModel {
         // browser, Recents and the map offer Generate Tags too, and with no search there are no
         // results to look it up in - every path was dropped and the item did nothing.
         // Never a Photos asset: update() re-embeds files by path, and an asset has no file, so it
-        // read as deleted and its rows were dropped.
+        // read as deleted and its rows were dropped. A shot of the screen history has no file
+        // either, and update() knows its path (ScreenShots.presence).
         let byPath = Dictionary(rawResults.map { ($0.path, $0.kind) }, uniquingKeysWith: { a, _ in a })
         let mediaPaths = paths.filter { p in
-            !ResultPath.isVirtual(p) && retagAllowed(p)
+            (!ResultPath.isVirtual(p) || ResultPath.isShot(p)) && retagAllowed(p)
                 && media.contains(byPath[p] ?? FileExtractor.kind(forExtension: (p as NSString).pathExtension)?.rawValue ?? "")
         }
         guard !mediaPaths.isEmpty else { return }
@@ -9087,7 +9298,7 @@ final class AppModel {
         let media: Set<String> = [FileKind.image.rawValue, FileKind.scan.rawValue, FileKind.video.rawValue]
         var added = false
         for h in hits where media.contains(h.kind)
-            && !ResultPath.isVirtual(h.path)   // see requestTags
+            && (!ResultPath.isVirtual(h.path) || ResultPath.isShot(h.path))   // see requestTags
             && pendingRetag.count < Self.retagQueueCap
             && !retagSeen.contains(h.path)
             && OmniTagger.nameDerivedSnippet(h.snippet, path: h.path) {

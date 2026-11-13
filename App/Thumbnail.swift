@@ -153,6 +153,19 @@ struct Thumbnail: View {
             return cg
         }
 
+        // A shot of the screen history has no file either: its frame out of the video, the short
+        // side covering the tile as a picture file's does. A path the history does not answer for
+        // (0.20.2's files, until they are taken in) is read as the file below.
+        if let history = ScreenShots.history(holding: path) {
+            let cg = await Self.decodeBounded { () -> CGImage? in
+                guard let shot = history.shot(atPath: path) else { return nil }
+                let long = history.size(of: shot).map { coverPixels(maxPixel, width: $0.width, height: $0.height) } ?? maxPixel
+                return history.picture(of: shot, maxDimension: long)?.image
+            }
+            if Task.isCancelled { return nil }
+            if let cg { return cg }
+        }
+
         let url = URL(fileURLWithPath: path)
         let ext = (path as NSString).pathExtension.lowercased()
 

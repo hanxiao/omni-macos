@@ -147,6 +147,17 @@ final class ScreenTimelineState {
         }
     }
 
+    /// Open at a shot: its day, its display, the playhead on it.
+    func go(to target: ScreenHistory.Shot) {
+        generation += 1
+        let generation = generation
+        let day = Calendar.current.startOfDay(for: Date(timeIntervalSince1970: target.time))
+        Self.list(history, day: day, display: target.display) { [weak self] listing in
+            guard let self, self.generation == generation else { return }
+            self.apply(listing, keep: target)
+        }
+    }
+
     private nonisolated static func list(_ history: ScreenHistory, day: Date?, display: UInt32?,
                                          done: @escaping @MainActor @Sendable (Listing) -> Void) {
         queue.async {
@@ -292,8 +303,8 @@ final class ScreenTimelineState {
         if let png = rep.representation(using: .png, properties: [:]) { OmniPasteboard.copyImage(png: png) }
     }
 
-    /// The shown shot's file in the index, when it has one.
-    func stillOfShown() -> URL? { shot.flatMap { history.still(of: $0) } }
+    /// Where the index holds the shown shot, when it does.
+    func pathOfShown() -> String? { shot.flatMap { history.path(of: $0) } }
 
     // MARK: Deleting
 
@@ -520,9 +531,12 @@ struct ScreenTimeline: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
             if state == nil { state = ScreenTimelineState(history: AppModel.screenHistory) }
-            state?.reload()
+            if let shot = model.takeScreenshotTarget() { state?.go(to: shot) } else { state?.reload() }
         }
         .onChange(of: model.screenshotsRevision) { _, _ in state?.reload() }
+        .onChange(of: model.screenshotTargetTick) { _, _ in
+            if let shot = model.takeScreenshotTarget() { state?.go(to: shot) }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .omniPerfShot)) { note in
             guard let state, let text = note.object as? String else { return }
             let parts = text.split(separator: ":", maxSplits: 1).map(String.init)
@@ -580,11 +594,8 @@ private struct ShotMenu: View {
     var body: some View {
         Button { state.copyShown() } label: { Label("Copy", systemImage: "doc.on.doc") }
         if state.shot?.indexed == true {
-            Button { if let url = state.stillOfShown() { model.searchBySimilar(to: url.path) } } label: {
+            Button { if let path = state.pathOfShown() { model.searchBySimilar(to: path) } } label: {
                 Label("Find Similar", systemImage: "sparkle.magnifyingglass")
-            }
-            Button { if let url = state.stillOfShown() { NSWorkspace.shared.activateFileViewerSelecting([url]) } } label: {
-                Label("Show in Finder", systemImage: "folder")
             }
         }
         Divider()

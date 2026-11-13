@@ -94,4 +94,40 @@ final class ScreenCadenceTests: XCTestCase {
         XCTAssertEqual(cadence.step(now: 120, idle: 120), .none)
         XCTAssertEqual(cadence.step(now: 125, idle: 125), .look)
     }
+
+    // MARK: Looks that store nothing
+
+    /// A recorder that could not store looked exactly like one facing a still screen: nothing in
+    /// the timeline and nothing said (0.20.2 on a laptop, seven hours).
+    func testOneFailedLookIsNotToldAndTheSecondIs() {
+        var health = ScreenLookHealth()
+        XCTAssertNil(health.ended(failure: "no frame"))
+        XCTAssertEqual(health.ended(failure: "no frame"), .some("no frame"))
+        XCTAssertEqual(health.told, "no frame")
+    }
+
+    func testAFailureIsToldOncePerReason() {
+        var health = ScreenLookHealth()
+        _ = health.ended(failure: "no frame"); _ = health.ended(failure: "no frame")
+        XCTAssertNil(health.ended(failure: "no frame"))
+        XCTAssertEqual(health.ended(failure: "disk full"), .some("disk full"))
+    }
+
+    func testALookThatWorksTakesTheFailureBack() {
+        var health = ScreenLookHealth()
+        _ = health.ended(failure: "no frame"); _ = health.ended(failure: "no frame")
+        let tell = health.ended(failure: nil)
+        XCTAssertNotNil(tell)
+        XCTAssertNil(tell!)
+        XCTAssertNil(health.told)
+        // And nothing to say when it was working all along.
+        XCTAssertNil(health.ended(failure: nil))
+    }
+
+    func testAWorkingLookBetweenTwoFailuresKeepsThemFromBeingTold() {
+        var health = ScreenLookHealth()
+        XCTAssertNil(health.ended(failure: "no frame"))
+        XCTAssertNil(health.ended(failure: nil))
+        XCTAssertNil(health.ended(failure: "no frame"))
+    }
 }

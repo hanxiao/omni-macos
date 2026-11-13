@@ -200,7 +200,8 @@ struct FileMenuItems<Passages: View>: View {
         // synced device - Photos.app's decision to offer, not Omni's.
         let ignorable = model.canIgnoreEnclosingFolder(ofPath: path)
         let trashable = !ResultPath.isVirtual(path)
-        if ignorable || trashable || trashAll != nil {
+        let shot = ResultPath.isShot(path)
+        if ignorable || trashable || shot || trashAll != nil {
             Divider()
         }
         if ignorable {
@@ -211,6 +212,12 @@ struct FileMenuItems<Passages: View>: View {
         if trashable {
             Button(role: .destructive) { model.moveToTrash([path]) } label: {
                 Label("Move to Trash", systemImage: "trash")
+            }
+            .keyboardShortcut(.delete, modifiers: .command)
+        }
+        if shot {
+            Button(role: .destructive) { model.deleteScreenshots(atPaths: [path]) } label: {
+                Label("Delete\u{2026}", systemImage: "trash")
             }
             .keyboardShortcut(.delete, modifiers: .command)
         }
@@ -427,6 +434,17 @@ enum SelectionShare {
             let content = window.contentLayoutRect
             anchor = NSRect(x: content.maxX - 60, y: content.maxY - 2, width: 2, height: 2)
         }
-        NSSharingServicePicker(items: urls).show(relativeTo: anchor, of: frame, preferredEdge: .minY)
+        // A shot of the screen history is shared as the picture file it is written out to.
+        guard urls.contains(where: { ResultPath.isShot($0.path) }) else {
+            NSSharingServicePicker(items: urls).show(relativeTo: anchor, of: frame, preferredEdge: .minY)
+            return
+        }
+        Task { @MainActor in
+            let files = await Task.detached(priority: .userInitiated) {
+                urls.compactMap { ResultPath.isShot($0.path) ? ShotActions.file($0.path) : $0 }
+            }.value
+            guard !files.isEmpty, frame.window != nil else { return }
+            NSSharingServicePicker(items: files).show(relativeTo: anchor, of: frame, preferredEdge: .minY)
+        }
     }
 }

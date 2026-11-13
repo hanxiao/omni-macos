@@ -19,11 +19,16 @@ import OmniLink
 ///
 /// A LINKED MAC'S FILE (`omni-link://`, docs/notes/link.md) is the third kind: Open, Quick Look,
 /// Share and drag fetch a read-only copy over the link (RemoteFiles); Reveal has nowhere to go.
+///
+/// A SHOT OF THE SCREEN HISTORY is the fourth: a frame of its video under a path with no file
+/// (docs/screenshots.md). Open and Reveal go to the timeline at that moment; Quick Look, Share and
+/// drag take the frame written out as a picture file (ShotActions).
 enum PhotoActions {
     /// Open a result: Photos.app for an asset, the default app for a file.
     @MainActor static func open(_ path: String) {
         if RemotePath.isRemote(path) { AppModel.shared?.openRemote(path); return }
         if let ref = PhotoLibrary.Ref(path) { PhotoLibrary.openInPhotos(ref); return }
+        if ResultPath.isShot(path) { AppModel.shared?.showScreenshot(path); return }
         NSWorkspace.shared.openAsync(URL(fileURLWithPath: path))
     }
 
@@ -31,6 +36,7 @@ enum PhotoActions {
     static func reveal(_ path: String) {
         if RemotePath.isRemote(path) { NSSound.beep(); return }   // it is on another Mac
         if let ref = PhotoLibrary.Ref(path) { PhotoLibrary.openInPhotos(ref); return }
+        if ResultPath.isShot(path) { Task { @MainActor in AppModel.shared?.showScreenshot(path) }; return }
         NSWorkspace.shared.revealAsync(URL(fileURLWithPath: path))
     }
 
@@ -45,7 +51,14 @@ enum PhotoActions {
 
     /// The menu wording for `path` - "Show in Photos" reads as a lie for a file, and vice versa.
     static func revealTitle(_ path: String) -> String {
-        PhotoLibrary.isPhotoPath(path) ? "Show in Photos" : "Show in Finder"
+        if PhotoLibrary.isPhotoPath(path) { return "Show in Photos" }
+        return ResultPath.isShot(path) ? "Show in Screenshots" : "Show in Finder"
+    }
+
+    /// The wording for a selection: where `reveal(paths:)` takes it. Finder when any of it is a file.
+    static func revealTitle(paths: [String]) -> String {
+        guard let first = paths.first, paths.allSatisfy(ResultPath.isVirtual) else { return "Show in Finder" }
+        return revealTitle(first)
     }
 
     /// A real file for a result, exporting a Photos asset if it has to. NEVER call this on the main
@@ -53,6 +66,7 @@ enum PhotoActions {
     nonisolated static func materialize(_ path: String) -> URL? {
         if RemotePath.isRemote(path) { return RemoteFiles.shared.fetchBlocking(path) }
         if let ref = PhotoLibrary.Ref(path) { return PhotoLibrary.exportedFile(ref) }
+        if ResultPath.isShot(path) { return ShotActions.file(path) }
         let url = URL(fileURLWithPath: path)
         return FileManager.default.fileExists(atPath: path) ? url : nil
     }
@@ -60,7 +74,7 @@ enum PhotoActions {
     /// Same, off the main actor, for the UI paths that need a file (Quick Look, Share, find-similar).
     static func materialized(_ path: String) async -> URL? {
         if RemotePath.isRemote(path) { return try? await RemoteFiles.shared.fetch(path) }
-        if !PhotoLibrary.isPhotoPath(path) {
+        if !PhotoLibrary.isPhotoPath(path), !ResultPath.isShot(path) {
             return FileManager.default.fileExists(atPath: path) ? URL(fileURLWithPath: path) : nil
         }
         return await Task.detached(priority: .userInitiated) { materialize(path) }.value
@@ -70,6 +84,7 @@ enum PhotoActions {
     /// (home-relative) for a file.
     @MainActor static func location(_ path: String, sources: [PhotoLibrary.Source]) -> String {
         if RemotePath.isRemote(path) { return LinkController.shared.location(path) }
+        if ResultPath.isShot(path) { return "Screenshots" }
         guard let ref = PhotoLibrary.Ref(path) else {
             let dir = (path as NSString).deletingLastPathComponent
             let home = FileManager.default.homeDirectoryForCurrentUser.path

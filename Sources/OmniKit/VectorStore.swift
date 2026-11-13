@@ -888,10 +888,16 @@ public final class VectorStore: @unchecked Sendable {
 
     /// The facts that belong to a FILE, stored once per file id, lockstep with `idPath`.
     ///
-    /// Every live row of a file carries the same values - they come from the file's `files` row, and
-    /// replace() drops a file's old rows before it appends the new - so storing them per file loses
-    /// nothing a reader can see. The last write wins, which is the newest; a tombstoned row reads its
-    /// file's current values, and a tombstoned row is unreachable by every reader by construction.
+    /// THEY ARE THE FILE'S FIRST ROW'S, which is what its `files` row holds (upsertFileLocked writes
+    /// it from the first chunk) and the same rule as the kind a file is (`countedKind`). A file's
+    /// rows do not all carry the same values: a screenshot is a picture row with its size and text
+    /// rows with none, a video its frames and then a soundtrack. The last row used to win here, so
+    /// a screenshot lost its size in memory when its words were written, the row file kept the
+    /// zeros, and an open from the database gave the size back: one file answered a search with or
+    /// without its size by how the index had last been opened (found by killing the 0.20.3 update;
+    /// index.md, "A file's facts"). replace() drops a file's old rows before it appends the new, so
+    /// the first row written is the newest. A tombstoned row reads its file's current values, and
+    /// is unreachable by every reader by construction.
     struct FileMeta {
         var modified: Double = 0
         var size: Int64 = 0
@@ -910,13 +916,14 @@ public final class VectorStore: @unchecked Sendable {
     /// `internPath` (the only append) and rebuilt at the same sites that rebuild `idPath`.
     private var fileMeta: [FileMeta] = []
 
-    /// Record a file's metadata. A LIVE row always writes (last write wins, which is the newest);
-    /// a tombstone writes only if no live row of the file has, so a file whose live rows sit
-    /// behind its dead ones in load order still ends up describing the live version.
-    @inline(__always) private func setFileMetaLocked(_ fid: Int32, _ m: FileMeta, live: Bool) {
+    /// Record a file's metadata from one of its rows: only while the file has no live row counted,
+    /// so its first live row decides (FileMeta) and every later one is passed over. A tombstone
+    /// counts for nothing, so a file whose live rows sit behind its dead ones in load order still
+    /// ends up describing the live version. Call it BEFORE the row is counted (appendRowMetaLocked).
+    @inline(__always) private func setFileMetaLocked(_ fid: Int32, _ m: FileMeta) {
         let f = Int(fid)
         guard f >= 0, f < fileMeta.count else { return }
-        if live || fileChunkCount[f] == 0 {
+        if fileChunkCount[f] == 0 || Self.lastRowFactsForTest {
             // The date filter's GPU table keeps one entry per file and is rebuilt only when the file
             // count moves: a file indexed again kept its old time there (modifiedGPULocked).
             fileMeta[f] = m
@@ -926,10 +933,9 @@ public final class VectorStore: @unchecked Sendable {
     /// Build a Row for `path`, interning it and its kind, and record the file's metadata. The one
     /// constructor the load and append paths share, so the Row and `fileMeta` cannot disagree.
     @inline(__always) private func newRowLocked(path: String, kind: String, chunkIndex: Int,
-                                                meta: FileMeta, slot: Int32 = -1, chunkID: Int64 = 0,
-                                                live: Bool = true) -> Row {
+                                                meta: FileMeta, slot: Int32 = -1, chunkID: Int64 = 0) -> Row {
         let fid = internPath(path)
-        setFileMetaLocked(fid, meta, live: live)
+        setFileMetaLocked(fid, meta)
         return Row(fid: fid, kc: internKind(kind), chunkIndex: chunkIndex, slot: slot, chunkID: chunkID)
     }
 
@@ -1959,6 +1965,7 @@ public final class VectorStore: @unchecked Sendable {
     private var extFileCounts: [String: Int] = [:]     // ext  -> file count (keys = the extensions present)
     private func resetAggregatesLocked() {
         liveFiles = 0; kindFileCounts.removeAll(keepingCapacity: true); extFileCounts.removeAll(keepingCapacity: true)
+        countedKind.removeAll(keepingCapacity: true)
         dropFolderCountsLocked()
     }
 
@@ -2030,6 +2037,19 @@ public final class VectorStore: @unchecked Sendable {
     /// aggregates. Empty otherwise.
     private var firstKindCode: [UInt8] = []
 
+    /// THE KIND A FILE IS, per file id: the kind of its first row, which is what `files.kind` holds
+    /// and what `liveFileIDs` reads. A screenshot is a picture with text rows after it, a video has
+    /// its soundtrack's, a PDF its pictured pages: the file is counted, purged and swept as what it
+    /// was indexed as, whichever of its rows comes or goes last. Written at a file's first live row
+    /// (0 -> 1), read at its last (1 -> 0) and by `knownFiles`; valid for every file with live rows.
+    ///
+    /// The count was added under the first row's kind and taken away under the LAST REMOVED row's:
+    /// every deleted screenshot with text left "image" one too many and "text" one too few until
+    /// the next launch, and `knownFiles` named it by the greatest kind name over its rows, "text",
+    /// so a pass with Images switched off and their rows kept read it as a text file the walk had
+    /// not found, and removed it.
+    private var countedKind: [UInt8] = []
+
     /// The per-file aggregates `fileChunkInc` keeps, computed in ONE pass after a bulk load that
     /// deferred them - the same counts, file by file. Doing it per row cost a path-table copy and
     /// an extension lookup for each of 2.7M files inside the row loop.
@@ -2049,15 +2069,18 @@ public final class VectorStore: @unchecked Sendable {
         liveFiles += live
         for (k, n) in kinds.enumerated() where n > 0 { kindFileCounts[idKind[k], default: 0] += n }
         for (e, n) in exts { extFileCounts[e, default: 0] += n }
+        countedKind = firstKindCode
         firstKindCode = []
     }
 
-    @inline(__always) private func fileChunkInc(_ fid: Int32, _ kind: String) {
+    @inline(__always) private func fileChunkInc(_ fid: Int32, _ kind: String, _ kc: UInt8) {
         invalidateTagFilterCacheLocked()   // any row change can add/remove a tag match
         if fileChunkCount[Int(fid)] == 0 {
             liveFiles += 1
             noteLiveFlipLocked(fid)
             kindFileCounts[kind, default: 0] += 1
+            if countedKind.count <= Int(fid) { countedKind.append(contentsOf: repeatElement(0, count: Int(fid) + 1 - countedKind.count)) }
+            countedKind[Int(fid)] = kc
             let e = filePaths.lowercasedExtension(Int(fid)); if !e.isEmpty { extFileCounts[e, default: 0] += 1 }
         }
         fileChunkCount[Int(fid)] += 1
@@ -2070,6 +2093,8 @@ public final class VectorStore: @unchecked Sendable {
         if n == 0 {
             liveFiles -= 1
             noteLiveFlipLocked(fid)
+            // Under the kind it was counted under, not this row's (countedKind).
+            let kind = Int(fid) < countedKind.count && Int(countedKind[Int(fid)]) < idKind.count ? idKind[Int(countedKind[Int(fid)])] : kind
             if let c = kindFileCounts[kind] { if c <= 1 { kindFileCounts[kind] = nil } else { kindFileCounts[kind] = c - 1 } }
             let e = filePaths.lowercasedExtension(Int(fid)); if !e.isEmpty, let c = extFileCounts[e] { if c <= 1 { extFileCounts[e] = nil } else { extFileCounts[e] = c - 1 } }
             // The file has no live rows left, so its window can be forgotten - and MUST be, or a
@@ -2101,7 +2126,7 @@ public final class VectorStore: @unchecked Sendable {
             if fileChunkCount[Int(fid)] == 0 { firstKindCode[Int(fid)] = kc }
             fileChunkCount[Int(fid)] += 1
         } else {
-            fileChunkInc(fid, kind)
+            fileChunkInc(fid, kind, kc)
         }
         if fileRowLo[Int(fid)] > Int32(i) { fileRowLo[Int(fid)] = Int32(i) }
         if fileRowHi[Int(fid)] < Int32(i) + 1 { fileRowHi[Int(fid)] = Int32(i) + 1 }
@@ -4214,7 +4239,7 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     /// Resident ids of the files with live rows that `match` accepts, read on the queue: the file
-    /// id and the kind of its first live row. No path String per file unless `match` builds one.
+    /// id and the kind the file is (`countedKind`). No path String per file unless `match` builds one.
     private func liveFileIDs(_ match: (Int, String) -> Bool) -> [(id: Int32, hash: Int)] {
         queue.sync {
             guard dbOpen(), dim > 0 else { return [] }
@@ -4226,7 +4251,7 @@ public final class VectorStore: @unchecked Sendable {
                 guard f < seen.count, !seen[f], fileChunkCount[f] > 0 else { continue }
                 if hasDead, deadRows.contains(Int32(i)) { continue }
                 seen[f] = true
-                if f < filePaths.count, match(f, idKind[Int(rows[i].kc)]) { out.append((Int32(f), filePaths.hashOf(f))) }
+                if f < filePaths.count, match(f, idKind[Int(f < countedKind.count ? countedKind[f] : rows[i].kc)]) { out.append((Int32(f), filePaths.hashOf(f))) }
             }
             return out
         }
@@ -4348,8 +4373,8 @@ public final class VectorStore: @unchecked Sendable {
     /// index (skipped at load) report as unindexed and re-embed - self-healing where the SQL form
     /// kept them stale forever.
     ///
-    /// Per file: the newest modified time, the largest size and the greatest kind name over its
-    /// LIVE rows. Tombstones are filtered rather than collected - compaction MOVES vectors, and a
+    /// Per file: the newest modified time and the largest size over its LIVE rows, and the kind
+    /// the file is (`countedKind`). Tombstones are filtered rather than collected - compaction MOVES vectors, and a
     /// row whose blob has been cleared cannot move without that blob coming back first, so a cold
     /// reader must not be able to trigger one.
     public func knownFiles() -> KnownFiles {
@@ -4368,8 +4393,7 @@ public final class VectorStore: @unchecked Sendable {
                 let r = rows[i], m = metaOf(r)
                 if m.modified > modified[f] { modified[f] = m.modified }
                 if m.size > size[f] { size[f] = m.size }
-                let k = Int16(r.kc)
-                if kindIndex[f] < 0 || idKind[Int(k)] > idKind[Int(kindIndex[f])] { kindIndex[f] = k }
+                if kindIndex[f] < 0 { kindIndex[f] = Int16(f < countedKind.count ? countedKind[f] : r.kc) }
             }
             var known = 0
             for f in 0 ..< n where kindIndex[f] >= 0 { known += 1 }
@@ -9339,6 +9363,9 @@ public final class VectorStore: @unchecked Sendable {
     /// only visible in a debug print - which is how a sharing index came to pay the full scan on
     /// every launch with 539 tests passing.
     public private(set) var adoptedRowSidecar = false
+    /// How many files' facts the last open took from the database over the row file's
+    /// (fileFactsToCorrectLocked); nil when the row file said they were right, or none was adopted.
+    public private(set) var fileFactsCorrected: Int?
     /// Whether this open seated its rows from `chunks.slot` rather than from their rank. The
     /// by-slot path is correct everywhere but does not use the row sidecar, so it is the slow one -
     /// which makes "did we take it, and did we need to" a thing tests have to be able to ask.
@@ -9718,6 +9745,10 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// It does NOT suppress READING the split, because a fixture that has one must still open.
     nonisolated(unsafe) public static var legacyWriteForTest = false
+    /// A FILE'S FACTS AS EVERY BUILD BEFORE 0.20.3 KEPT THEM: its last row's, and a row file that
+    /// does not say whose they are. The negative control of FileFactsTests, and how it makes the
+    /// row file an older build left for the open that has to correct it.
+    nonisolated(unsafe) public static var lastRowFactsForTest = false
     /// HAS THE ONE-WAY TRANSLATION ALREADY RUN. Its only job, and it cannot be inferred: a
     /// staged blob's `chunk_id` is just an integer, and the v4 row space and the content space
     /// are both dense, so "does this id exist in `chunk`" is true of most v4 ids too.
@@ -10014,6 +10045,11 @@ public final class VectorStore: @unchecked Sendable {
         /// every session after it. The split's 3.77M reclaimed positions would simply never
         /// arrive, with nothing failing anywhere.
         var contentIDs: Bool?
+        /// WHOSE FACTS THE RECORDS CARRY for a file: true, its first row's, which is what the
+        /// database holds. A row file written before 0.20.3 has no such key and carries the last
+        /// row's (FileMeta); the open that adopts one takes those files' facts from the database,
+        /// once, and the next stamp writes the key (fileFactsToCorrectLocked).
+        var firstRowFacts: Bool?
     }
     /// Fixed-width per-row record; see stampRowSidecarLocked for the field layout.
     ///
@@ -11992,7 +12028,7 @@ public final class VectorStore: @unchecked Sendable {
     /// reader can reach it and no file counts it.
     private func appendHoleRowLocked(slot: Int32) {
         let i = rows.count
-        rows.append(newRowLocked(path: "", kind: "", chunkIndex: 0, meta: FileMeta(), slot: slot, live: false))
+        rows.append(newRowLocked(path: "", kind: "", chunkIndex: 0, meta: FileMeta(), slot: slot))
         appendDeadRowMetaLocked(rows[rows.count - 1].fid, kindCode: rows[rows.count - 1].kc, slot: slot)
         markDeadLocked(Int32(i))
         deadIdxCache = nil
@@ -13293,7 +13329,8 @@ public final class VectorStore: @unchecked Sendable {
             recordBytes: records.count,
             pathOffBytes: paths.offsets.count, pathBlobBytes: paths.blob.count,
             kindOffBytes: kinds.offsets.count, kindBlobBytes: kinds.blob.count,
-            deadCount: deadRows.count, vecRows: vecUnits, contentIDs: residentIDsAreContents)
+            deadCount: deadRows.count, vecRows: vecUnits, contentIDs: residentIDsAreContents,
+            firstRowFacts: Self.lastRowFactsForTest ? nil : true)
         lastStampedGen = mutationGen
         let url = rowSidecarURL
         let tmp = url.deletingLastPathComponent().appendingPathComponent(url.lastPathComponent + ".tmp")
@@ -13347,6 +13384,7 @@ public final class VectorStore: @unchecked Sendable {
     private func tryAdoptRowSidecarLocked() -> Bool {
         let tAdopt = Date()
         adoptedRowSidecar = false
+        fileFactsCorrected = nil
         guard Self.rowSidecarEnabled else { return false }
         let fm = FileManager.default
         try? fm.removeItem(at: rowSidecarURL.deletingLastPathComponent()
@@ -13526,6 +13564,18 @@ public final class VectorStore: @unchecked Sendable {
         omniPerfLog(String(format: "store adopt validated %.0fms", -tAdopt.timeIntervalSinceNow * 1000))
         reportLoadProgress(0.77)   // files read + validated; the row rebuild below is the rest
 
+        // Read before anything is committed, so that what cannot be proven is still a rejection.
+        var factsToCorrect: [Int32: FileMeta] = [:]
+        if header.firstRowFacts != true, !Self.lastRowFactsForTest {
+            let t0 = Date()
+            guard let found = fileFactsToCorrectLocked(records: records, recSize: recSize, rowCount: header.rowCount,
+                                                       paths: pathTable) else { return reject("file facts") }
+            factsToCorrect = found
+            fileFactsCorrected = found.count
+            omniPerfLog(String(format: "store file facts from the database: corrected=%d files=%d ms=%.0f",
+                               found.count, pathTable.count, -t0.timeIntervalSinceNow * 1000))
+        }
+
         // Commit: rebuild the derived structures exactly as loadIntoMemory would have.
         dim = header.dim
         filePaths = pathTable
@@ -13566,8 +13616,7 @@ public final class VectorStore: @unchecked Sendable {
                         size: Int(raw.loadUnaligned(fromByteOffset: o + 32, as: Int64.self)),
                         width: Int(raw.loadUnaligned(fromByteOffset: o + 8, as: Int32.self)),
                         height: Int(raw.loadUnaligned(fromByteOffset: o + 12, as: Int32.self)),
-                        duration: raw.loadUnaligned(fromByteOffset: o + 24, as: Double.self)),
-                        live: !isDead)
+                        duration: raw.loadUnaligned(fromByteOffset: o + 24, as: Double.self)))
                     rows.append(Row(fid: fid, kc: kc,
                                     chunkIndex: Int(raw.loadUnaligned(fromByteOffset: o + 4, as: Int32.self)),
                                     slot: slot, chunkID: cid))
@@ -13584,14 +13633,104 @@ public final class VectorStore: @unchecked Sendable {
         }
         settleAggregatesLocked()
         deadIdxCache = nil
+        for (fid, facts) in factsToCorrect where Int(fid) < fileMeta.count {
+            fileMeta[Int(fid)].width = facts.width
+            fileMeta[Int(fid)].height = facts.height
+            fileMeta[Int(fid)].duration = facts.duration
+        }
         omniPerfLog(String(format: "store adopt rows built %.0fms", -tAdopt.timeIntervalSinceNow * 1000))
-        lastStampedGen = mutationGen
+        // A row file that did not say whose facts it carries is written again, corrected or found
+        // right, so that the database is asked once and not at every open.
+        lastStampedGen = header.firstRowFacts == true ? mutationGen : -1
         invalidateBase()
         reportLoadProgress(1)
         residentIDsAreContents = header.contentIDs ?? false
         adoptedRowSidecar = true
         if Self.searchTiming { print("[search] ADOPT row sidecar rows=\(header.rowCount) files=\(filePaths.count)") }
         return true
+    }
+
+    /// THE FILES WHOSE FACTS IN A ROW FILE ARE NOT THE DATABASE'S, each with what the database
+    /// holds: the size and length of a file are its first row's (FileMeta), and a row file written
+    /// before 0.20.3 carries its last row's - a screenshot with its words read has no size there.
+    ///
+    /// Proven or refused, never guessed: nil rejects the row file, and the open reads the database,
+    /// which is always right. Every file the database gives a size or a length is found among the
+    /// row file's live files by its path; one that is not, and has rows, is the refusal. A file the
+    /// row file gives a size and the database did not is asked for by its path, and missing is the
+    /// refusal too. Reads only; nothing here is committed.
+    ///
+    /// One scan of the files with a size or a length (the pictures, recordings and films: 587,000
+    /// of the bench index's 2.68M files), at the first open after the update and never again.
+    private func fileFactsToCorrectLocked(records: Data, recSize: Int, rowCount: Int,
+                                          paths: PathTable) -> [Int32: FileMeta]? {
+        let n = paths.count
+        var live = [Bool](repeating: false, count: n)
+        var held = [FileMeta](repeating: FileMeta(), count: n)
+        records.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            for i in 0 ..< rowCount {
+                let o = i * recSize
+                let fid = Int(raw.loadUnaligned(fromByteOffset: o, as: Int32.self))
+                guard fid >= 0, fid < n, !live[fid],
+                      raw.loadUnaligned(fromByteOffset: o + 41, as: UInt8.self) == 0 else { continue }
+                live[fid] = true
+                held[fid].width = raw.loadUnaligned(fromByteOffset: o + 8, as: Int32.self)
+                held[fid].height = raw.loadUnaligned(fromByteOffset: o + 12, as: Int32.self)
+                held[fid].duration = raw.loadUnaligned(fromByteOffset: o + 24, as: Double.self)
+            }
+        }
+        var scan: OpaquePointer?, hasRows: OpaquePointer?, byPath: OpaquePointer?
+        defer { sqlite3_finalize(scan); sqlite3_finalize(hasRows); sqlite3_finalize(byPath) }
+        guard sqlite3_prepare_v2(db, """
+                SELECT \(StoreSchema.pathExpr), f.width, f.height, f.duration, f.id
+                  FROM files f JOIN dirs d ON d.id = f.dir_id
+                 WHERE f.width != 0 OR f.height != 0 OR f.duration != 0;
+                """, -1, &scan, nil) == SQLITE_OK,
+              sqlite3_prepare_v2(db, "SELECT 1 FROM \(rowTableLocked) WHERE file_id = ? LIMIT 1;",
+                                 -1, &hasRows, nil) == SQLITE_OK,
+              sqlite3_prepare_v2(db, """
+                SELECT f.width, f.height, f.duration FROM files f JOIN dirs d ON d.id = f.dir_id
+                 WHERE d.path = ? AND f.name = ?;
+                """, -1, &byPath, nil) == SQLITE_OK
+        else { return nil }
+        var out: [Int32: FileMeta] = [:]
+        var matched = [Bool](repeating: false, count: n)
+        func differs(_ a: FileMeta, _ b: FileMeta) -> Bool {
+            a.width != b.width || a.height != b.height || a.duration != b.duration
+        }
+        while true {
+            let rc = sqlite3_step(scan)
+            if rc == SQLITE_DONE { break }
+            guard rc == SQLITE_ROW, let text = sqlite3_column_text(scan, 0) else { return nil }
+            let truth = FileMeta(width: Int(sqlite3_column_int(scan, 1)), height: Int(sqlite3_column_int(scan, 2)),
+                                 duration: sqlite3_column_double(scan, 3))
+            if let id = paths.id(String(cString: text)).map(Int.init), id < n, live[id], !matched[id] {
+                matched[id] = true
+                if differs(held[id], truth) { out[Int32(id)] = truth }
+                continue
+            }
+            // Not one of the row file's live files. A file row that no row hangs from is nothing
+            // a search can return; one with rows is a file this cannot place.
+            sqlite3_reset(hasRows)
+            sqlite3_bind_int64(hasRows, 1, sqlite3_column_int64(scan, 4))
+            switch sqlite3_step(hasRows) {
+            case SQLITE_DONE: continue
+            default: return nil
+            }
+        }
+        // A size or a length the database did not give: a later row's (a PDF's pictured page, a
+        // deck's slide), where the file's first row is its words.
+        for id in 0 ..< n where live[id] && !matched[id] && differs(held[id], FileMeta()) {
+            let (dir, name) = StoreSchema.splitPath(paths[id])
+            sqlite3_reset(byPath)
+            sqlite3_bind_text(byPath, 1, dir, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(byPath, 2, name, -1, SQLITE_TRANSIENT)
+            guard sqlite3_step(byPath) == SQLITE_ROW else { return nil }
+            let truth = FileMeta(width: Int(sqlite3_column_int(byPath, 0)), height: Int(sqlite3_column_int(byPath, 1)),
+                                 duration: sqlite3_column_double(byPath, 2))
+            if differs(held[id], truth) { out[Int32(id)] = truth }
+        }
+        return out
     }
 
     /// Group-quantize flat16 rows [range) in SLABS: converting through one full bf16 MLXArray

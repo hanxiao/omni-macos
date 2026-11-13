@@ -60,7 +60,7 @@ public struct ScreenCadence: Sendable {
         return now >= nextLook ? .look : .none
     }
 
-    /// The settled shot could not be taken (the screen locked, a password field): it is still owed.
+    /// The settled shot could not be taken (the screen locked, an excluded app in front): it is still owed.
     public mutating func settledNotTaken() { wasActive = true }
 
     /// A look came back, with or without a shot stored.
@@ -71,4 +71,32 @@ public struct ScreenCadence: Sendable {
 
     /// Recording stopped.
     public mutating func reset() { self = ScreenCadence() }
+}
+
+/// Whether looks are storing anything. One look that fails is a display that went to sleep under
+/// it or a grant being read again: the recorder builds its targets anew and nothing is said. Two in
+/// a row are told, once per reason, and the first look that works takes it back.
+public struct ScreenLookHealth: Sendable {
+    public private(set) var failed = 0
+    public private(set) var told: String?
+
+    public init() {}
+
+    /// A look ended, with why it stored nothing or nil when it worked (stored, or the screen showed
+    /// what the last shot shows). Returns what to tell when that changes: a reason, or `.some(nil)`
+    /// for "working again"; nil when there is nothing new to tell.
+    public mutating func ended(failure: String?) -> String?? {
+        guard let failure else {
+            failed = 0
+            guard told != nil else { return nil }
+            told = nil
+            return .some(nil)
+        }
+        failed += 1
+        guard failed >= 2, told != failure else { return nil }
+        told = failure
+        return .some(failure)
+    }
+
+    public mutating func reset() { failed = 0; told = nil }
 }

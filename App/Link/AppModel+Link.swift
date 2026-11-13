@@ -300,9 +300,12 @@ extension LinkServed {
     }
 }
 
-/// "Is this result a file on this Mac?" in one place: a Photos asset and a linked Mac's file are not.
+/// "Is this result a file on this Mac?" in one place: a Photos asset, a linked Mac's file and a
+/// shot of the screen history are not.
 enum ResultPath {
     static func isRemote(_ p: String) -> Bool { RemotePath.isRemote(p) }
-    /// Not a file on this Mac's disk: a Photos asset or a linked Mac's file.
-    static func isVirtual(_ p: String) -> Bool { PhotoLibrary.isPhotoPath(p) || RemotePath.isRemote(p) }
+    /// A shot of the screen history: a frame of its video, with a path in the index and no file.
+    static func isShot(_ p: String) -> Bool { ScreenShots.isShotPath(p) }
+    /// Not a file on this Mac's disk: a Photos asset, a linked Mac's file or a shot.
+    static func isVirtual(_ p: String) -> Bool { PhotoLibrary.isPhotoPath(p) || RemotePath.isRemote(p) || isShot(p) }
 }

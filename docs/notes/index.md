@@ -3677,3 +3677,53 @@ The second round, after the first was called done:
   characters; width 10 7/10, 0.0087); `--probe-qmm` shows the known MLX 0.31.3 M=2/3 bug untransposed
   only. In the app, interleaved with the 26.6 app: 44.7 / 45.3 s against 45.0 / 45.2 s for the long scan,
   first page 12.3 s in both.
+
+## A file's facts (2026-11-12, found by killing the 0.20.3 update)
+
+A file has rows of several kinds: a screenshot is a picture row with its size and text rows with
+none, a video its frames and then a soundtrack, a PDF text and then scans. Two things the store
+keeps once per file were taken from whichever row came last.
+
+- ITS SIZE AND DURATION. The database's `files` row is written from the file's FIRST chunk. In
+  memory `fileMeta[fid]` was written by every row, so the last won: a screenshot's text rows (0 x 0)
+  zeroed its size, the row file (`index.sqlite.rows`) was stamped from memory with the zeros, and an
+  open that rebuilt from the database gave the size back. One file answered a search with or
+  without `width`/`height` by how its index had last been opened. Found when a SIGKILL 3 s into the
+  screen-text backlog and a reopen answered with dimensions where the unkilled run had none; the
+  killed one was right.
+  First row wins now (`setFileMetaLocked`: only while the file has no live row counted; replace()
+  drops a file's rows before it appends, so the first row written is the newest). The row file
+  carries `firstRowFacts`; one without the key was written under the old rule, so adoption reads the
+  five facts of every file from `files` (`fileFactsToCorrectLocked`: one ordered walk, rejected as
+  "file facts" if the database and the row file disagree on which files exist; a `files` row with no
+  chunk is passed over), applies what differs and asks for the row file once more
+  (`lastStampedGen = -1`). Killed before that write, the next open corrects again and answers the
+  same (FileFactsTests).
+- ITS KIND. A file is counted (the filter menu, `knownFiles`) under its first row's kind. The count
+  was taken away under the LAST REMOVED row's kind: every deleted screenshot left "image" one too
+  many and "text" one too few until the next launch, and `knownFiles` named a screenshot "text", so
+  a pass with Images switched off and their rows kept read it as a text file the walk had not found
+  and removed it. `countedKind` keeps the kind each file was counted under (FileKindTests).
+- THE TESTS HAD NOT BEEN OPENING A ROW FILE. A row file is written only when the vectors are in
+  their own file (a store written once is not: `row-stamp SKIPPED: persistent false`) and adopted
+  only at a vector width the scan's quantizer takes (64; at 8 the header is rejected). FileKindTests'
+  "opened from the row file" had been an open from the database. Both classes now use 64-wide
+  vectors, write a file a second time, and assert `adoptedRowSidecar`.
+- THROUGH THE APP, on clones of a settled index 0.20.2 wrote (321 files, 82 of them shots): the
+  first open by this build logs `store file facts from the database: corrected=78 files=321 ms=0`,
+  the second open logs nothing, and launch is ready in 801-830 ms either way (0.20.2: 818-826 ms).
+- COST, on the 9,729,693-row, 2,677,260-file bench clone, 0.20.2's tools against this tree's,
+  interleaved, release: adoption of the older row file 1,670 / 1,705 / 1,668 ms before and 2,139 /
+  2,113 / 2,075 ms with the one-time read of `files` (444 / 450 / 437 ms of it; corrected=0, no
+  file there has a later row with other facts); a row file written by this tree 1,959 / 1,980 ms
+  against 0.20.2's 1,982 / 2,081 ms on the same settled clone. The four search digests are 0.20.2's
+  in every open (134b9ff183fd2f29, a5d92396d17c86a6, 45701c093aaaafe4, ca10cc003e695e91), p50 4.1-4.2
+  ms in both. `mutbench --crud` on fresh clones of the settled index, 0 relocation slices in every
+  run, audits clean:
+
+  | op | 0.20.2 | this tree |
+  |---|---|---|
+  | update 5,000 files | 25.30 s (42.40 s the first run of the session, a cold cache) | 25.21, 25.40 s |
+  | update, search p50 / p99 | 11.8 / 365 ms | 13.2 / 369, 13.5 / 343 ms |
+  | delpaths 100,000 files | 87.80, 90.79 s | 86.27, 87.17 s |
+  | delpaths, search p50 / p99 | 9.0 / 322, 9.9 / 315 ms | 8.8 / 345, 9.5 / 309 ms |

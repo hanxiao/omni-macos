@@ -276,7 +276,7 @@
         },
         {
           "q": "What is left out of screenshots?",
-          "a": "Omni's own windows, the pointer, and the apps you add under Settings > Files > Screenshots: their windows are not recorded, and no screenshot is taken while one of them is in front. Nothing is taken while the screen is locked, the screen saver runs, the display sleeps, or a password field has the keyboard.",
+          "a": "Omni's own windows, the pointer, and the apps you add under Settings > Files > Screenshots: their windows are not recorded, and no screenshot is taken while one of them is in front. Nothing is taken while the screen is locked, the screen saver runs or the display sleeps. A password field shows dots, and so does its screenshot; add a password manager to the excluded apps to keep its windows out.",
           "shortcut": ""
         },
         {
@@ -286,7 +286,7 @@
         },
         {
           "q": "How much disk do screenshots use?",
-          "a": "Shots are stored as video, so a shot where little changed costs a few kilobytes; the ones added to the index are also kept as picture files. Settings > Files > Screenshots shows the space in use and how long shots are kept: 7, 30 (the default) or 90 days, or forever.",
+          "a": "Shots are stored as video and nothing else, so a shot where little changed costs a few kilobytes. Settings > Files > Screenshots shows the space in use and how long shots are kept: 7, 30 (the default) or 90 days, or forever.",
           "shortcut": ""
         },
         {

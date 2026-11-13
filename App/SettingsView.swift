@@ -374,6 +374,11 @@ private struct ActivityTab: View {
                             .controlSize(.small)
                     }
                     .foregroundStyle(.secondary)
+                } else if model.screenshotsEnabled, let failure = model.screenshotsFailure {
+                    LabeledContent("Not recording") {
+                        Text(failure).lineLimit(2).multilineTextAlignment(.trailing).help(failure)
+                    }
+                    .foregroundStyle(.secondary)
                 }
                 Picker("Keep screenshots for", selection: Binding(get: { model.screenshotsRetentionDays },
                                                                   set: { model.screenshotsRetentionDays = $0 })) {
@@ -385,17 +390,14 @@ private struct ActivityTab: View {
                 if let bytes = model.screenshotsDiskBytes {
                     LabeledContent("Space used") { Text(ByteSize.file(Int64(bytes))).monospacedDigit() }
                 }
-            }
-
-            Section {
+                LabeledContent("Excluded apps") {
+                    Button("Add App\u{2026}") { addExcludedApps() }.controlSize(.small)
+                }
                 ForEach(model.screenshotsExcludedApps, id: \.self) { id in
                     ExcludedAppRow(bundleID: id) {
                         model.screenshotsExcludedApps.removeAll { $0 == id }
                     }
                 }
-                Button("Add App\u{2026}") { addExcludedApps() }
-            } header: {
-                Text("Apps left out of screenshots")
             }
 
             Section("Folders") {
