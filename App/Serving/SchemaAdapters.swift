@@ -444,10 +444,21 @@ enum SearchAdapter {
     static func textPassages(_ reps: [SearchHit], query: String, vector: [Float]?, width: Int, backend: any ServingBackend) -> [Passage?] {
         let textual = reps.indices.filter { reps[$0].fileKind == FileKind.text.rawValue }
         var out = [Passage?](repeating: nil, count: reps.count)
-        guard width > 0, !textual.isEmpty else { return out }
-        let found = backend.passages(for: textual.map { (reps[$0].path, reps[$0].chunkIndex, reps[$0].locator) },
-                                     query: query, vector: vector, width: width)
-        for (j, i) in textual.enumerated() { out[i] = found[j] }
+        guard width > 0 else { return out }
+        if !textual.isEmpty {
+            let found = backend.passages(for: textual.map { (reps[$0].path, reps[$0].chunkIndex, reps[$0].locator) },
+                                         query: query, vector: vector, width: width)
+            for (j, i) in textual.enumerated() { out[i] = found[j] }
+        }
+        // A PICTURE THAT WON BY ITS PICTURE showed its tags ("instagram, tweeted, nueva"), which say
+        // nothing of why it matched. A picture with text (a screenshot) shows its text chunk that
+        // best fits the query instead; one with none keeps its tags.
+        if let vector {
+            for i in reps.indices where reps[i].fileKind == FileKind.image.rawValue && reps[i].kind == FileKind.image.rawValue {
+                guard let c = backend.textChunk(of: reps[i].path, vector: vector, besides: reps[i].chunkIndex) else { continue }
+                out[i] = Passage(text: String(c.snippet.prefix(width)), opensChunk: true, locator: c.locator.isEmpty ? nil : c.locator)
+            }
+        }
         return out
     }
 

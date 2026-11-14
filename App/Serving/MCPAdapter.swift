@@ -45,6 +45,12 @@ enum MCPAdapter {
     /// Hard cap on inlined thumbnails per response, so an all-images search can't flood the
     /// client's context with base64. Image hits past this are still returned as links/text.
     private static let maxInlineImages = 10
+    /// A listing counts the screenshots it left out up to this many.
+    static let shotsLeftOutCap = 1000
+    static func shotsLeftOutLine(_ n: Int) -> String {
+        let count = n >= shotsLeftOutCap ? "\(shotsLeftOutCap.formatted())+" : n.formatted()
+        return "\(count) screenshot\(n == 1 ? " was" : "s were") taken then, left out of the listing: folder omni://screenshots lists them."
+    }
     /// Longest edge of the picture `read_file` returns unless asked otherwise: the size a vision
     /// model takes whole, and the size of a screenshot's indexed still. Up to `pictureEdgeLimit`
     /// on request (a screenshot then comes from the history, as the display showed it).
@@ -62,7 +68,7 @@ enum MCPAdapter {
 
     /// What `initialize` tells a client about the whole server. Also the body of SKILL.md
     /// (AgentSkill), so it is written for an agent reading it cold.
-    static let instructions = "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `read_file` reads an indexed file's text by page, line or offset, including formats you cannot open, and returns an indexed image as a picture to look at; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, the passage that matched and media metadata; a search ends with how many more there are (`offset` pages) and where the top matches are.\n\nIf the user has Omni record screenshots, what was on their screen is found like any picture. A screenshot result is an omni:// link, not a file: read_file returns its picture. It gives the time it was taken, and under the results the stretch of work around it: when it ran and which apps and windows were in front. To find what they were working on then, call `search` with that range as `modified_after` and `modified_before` and no query: it lists the files last modified in it, newest first. A linked Mac's screenshots are found the same way, and their line names the Mac to pass as `macs` for the files changed on it.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. Linked Macs (other Macs running Omni that this one is linked with) are searched too, and their results are listed under each Mac's name: get_linked_file copies one here to read. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
+    static let instructions = "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `read_file` reads an indexed file's text by page, line or offset, including formats you cannot open, and returns an indexed image as a picture to look at; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, the passage that matched and media metadata; a search ends with how many more there are (`offset` pages) and where the top matches are.\n\nIf the user has Omni record screenshots, what was on their screen is found like any picture. A screenshot result is an omni:// link (its digits are the time in UTC), not a file: read_file returns its picture, and region zooms into part of it at full resolution. Read what is on it from the picture; its snippet is text Omni read for search and can drop characters. It gives the time it was taken, and under the results the stretch of work around it: when it ran and which apps and windows were in front. To find what they were working on then, call `search` with that range as `modified_after` and `modified_before` and no query: it lists the files last modified in it, newest first. A linked Mac's screenshots are found the same way, and their line names the Mac to pass as `macs` for the files changed on it.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. Linked Macs (other Macs running Omni that this one is linked with) are searched too, and their results are listed under each Mac's name: get_linked_file copies one here to read. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
 
     /// Every tool, as `tools/list` returns them - and as the `omni` command line and SKILL.md
     /// present them. The source tools are only advertised once the app has wired the control:
@@ -387,14 +393,17 @@ enum MCPAdapter {
         // same ranking. A page is a slice of it - a second call with offset=10 runs the same search
         // and returns the next ten, and no ranking is held between calls.
         let poolSize = min(max(k + offset, Self.summaryPool), 190)
-        let (hits, pool, groups, passages, screen, tQueued, tRan) = await ServedWork.run {
-            () -> ([SearchHit], [ResultGroup], [ResultGroup], [Passage?], [String: ScreenHints.Moment], Date, Date) in
+        let (hits, pool, groups, passages, screen, shotsLeftOut, tQueued, tRan) = await ServedWork.run {
+            () -> ([SearchHit], [ResultGroup], [ResultGroup], [Passage?], [String: ScreenHints.Moment], Int, Date, Date) in
             let tQueued = Date()
             if listing {
                 let hits = backend.list(filter: filter, topK: poolSize)
                 let pool = backend.groupedResults(hits, enabled: false, limit: poolSize)
                 let groups = offset < pool.count ? Array(pool[offset ..< min(pool.count, offset + k)]) : []
-                return (hits, pool, groups, groups.map { _ in nil }, ScreenHints.moments(groups.map(\.representative)), tQueued, Date())
+                // The screenshots taken then, which a listing leaves out: an empty answer over a stretch
+                // with 29 of them read as "nothing happened" (an agent's review of 0.20.4).
+                let leftOut = backend.shotsLeftOut(filter: filter, cap: Self.shotsLeftOutCap)
+                return (hits, pool, groups, groups.map { _ in nil }, ScreenHints.moments(groups.map(\.representative)), leftOut, tQueued, Date())
             }
             let (hits, vector) = backend.searchReturningVector(query, topK: group ? min(poolSize * 3, 300) : poolSize, filter: filter, surface: surface)
             var pool = backend.groupedResults(hits, enabled: group, limit: poolSize)
@@ -406,7 +415,7 @@ enum MCPAdapter {
             let passages = SearchAdapter.textPassages(groups.map(\.representative), query: query, vector: vector, width: width, backend: backend)
             // A screenshot Omni took: when, and the stretch of work around it.
             let screen = ScreenHints.moments(groups.map(\.representative))
-            return (hits, pool, groups, passages, screen, tQueued, Date())
+            return (hits, pool, groups, passages, screen, 0, tQueued, Date())
         }
         let reps = groups.map(\.representative)
         let dupesByPath = Dictionary(uniqueKeysWithValues: groups.map { ($0.representative.path, $0) })
@@ -437,6 +446,7 @@ enum MCPAdapter {
         if hits.isEmpty {
             // Say WHICH kind of nothing this is, so the agent's next move is right.
             var text = listing ? "No indexed file was last modified in that range." : "No results for \"\(query)\"."
+            if shotsLeftOut > 0 { text += " " + Self.shotsLeftOutLine(shotsLeftOut) }
             if let snap {
                 if snap.sources.isEmpty {
                     text += " Omni has no sources yet, so nothing is searchable"
@@ -511,6 +521,7 @@ enum MCPAdapter {
             } else if let line = poolSummary(pool, offset: offset, shown: reps.count, pageSize: topK, roots: roots) {
                 content.append(["type": "text", "text": line])
             }
+            if shotsLeftOut > 0 { content.append(["type": "text", "text": Self.shotsLeftOutLine(shotsLeftOut)]) }
         }
 
         // Linked Macs, after this Mac's results: each under its name, its paths on that Mac.
@@ -522,13 +533,24 @@ enum MCPAdapter {
         // stretch of work are asked of the Mac the work was on (a linked screenshot's line names it).
         if !listing || named?.isEmpty == false, named?.isEmpty != true, let search = sources?.linkedSearch {
             let floor = listing ? 0 : filter.minScore ?? EngineServingBackend.minScore
+            // Offline Macs and Macs with nothing to add, one line each, not one line a Mac under every
+            // answer (an agent's review of 0.20.4).
+            var offline: [String] = [], empty: [String] = []
+            defer {
+                if !offline.isEmpty { content.append(diagnostic("Offline: \(offline.joined(separator: ", ")).")) }
+                if !empty.isEmpty {
+                    content.append(diagnostic((listing ? "No indexed file was last modified in that range on: " : "No results for \"\(query)\" on: ")
+                                              + empty.joined(separator: ", ") + "."))
+                }
+            }
             for a in await search(query, filter, topK, named ?? ["all"], named != nil) {
                 let hits = Array(a.hits.filter { floor <= 0 || Double($0.score) / $0.lift >= VectorStore.relevanceFloor($0, base: floor) }.prefix(topK))
-                if let note = a.note {
+                if a.note == "offline" {
+                    offline.append(a.mac)
+                } else if let note = a.note {
                     content.append(diagnostic("On \(a.mac): \(note.hasSuffix(".") ? note : note + ".")"))
                 } else if hits.isEmpty {
-                    content.append(diagnostic(listing ? "On \(a.mac): no indexed file was last modified in that range."
-                                                      : "On \(a.mac): no results for \"\(query)\"."))
+                    empty.append(a.mac)
                 } else {
                     // THE WAY TO THE FILE GOES WITH THE PATHS. An agent given paths on another Mac and
                     // nothing else concluded it could only read the snippets: the tool's name was in
@@ -699,7 +721,14 @@ enum MCPAdapter {
         }
         if found.scans > 0 { summary += " \(found.scans) scanned PDF\(found.scans == 1 ? " was" : "s were") not searched: its text is OCR (ocr reads it)." }
         if !found.partial.isEmpty { summary += " Searched only partly (very long): \(found.partial.prefix(3).joined(separator: ", "))." }
-        if found.filesInScope == 0 { summary = "No indexed files in those paths." }
+        if found.filesInScope == 0 { summary = found.shots > 0 ? "" : "No indexed files in those paths." }
+        if found.shots > 0 {
+            // Not "does not occur": not looked at. A screenshot is found by search (by meaning, and an
+            // exact code or name) and read on its picture.
+            summary += (summary.isEmpty ? "" : " ") + "\(found.shots) screenshot\(found.shots == 1 ? " was" : "s were") not searched: Omni keeps no text of a screenshot to match."
+                + (cli ? " omni search finds one by what was on screen; omni read_file <omni:// link> shows it."
+                       : " search finds one by what was on screen; read_file with its omni:// link shows it.")
+        }
         content.append(diagnostic(summary))
         return answer(id: id, content, cli: cli) {
             ["query": phrase, "exact": true, "total": found.total, "files_searched": found.filesSearched,
@@ -714,7 +743,7 @@ enum MCPAdapter {
         [
             "name": "read_file",
             "title": "Read an indexed file",
-            "description": "The text Omni read from an indexed text, code, PDF, Word, Pages, RTF, Keynote, PowerPoint, Excel or Numbers file, a stretch at a time (pages, lines, or characters; a slide or a sheet is a page): for reading past a search result in formats you may not open yourself. An indexed IMAGE comes back as a picture to look at, a JPEG whatever the file is (HEIC, a screenshot Omni took, a photo in Apple Photos); a screenshot also says when it was taken and what was in front. Reads a copy get_linked_file made too. Audio and video have nothing to read; scans: use ocr.",
+            "description": "The text Omni read from an indexed text, code, PDF, Word, Pages, RTF, Keynote, PowerPoint, Excel or Numbers file, a stretch at a time (pages, lines, or characters; a slide or a sheet is a page): for reading past a search result in formats you may not open yourself. An indexed IMAGE comes back as a picture to look at, a JPEG whatever the file is (HEIC, a screenshot Omni took, a photo in Apple Photos); a screenshot also says when it was taken and what was in front. Read what is on a screenshot from its picture, with region to zoom into small text; the text search shows of it was read for finding and can drop or merge characters. Reads a copy get_linked_file made too. Audio and video have nothing to read; scans: use ocr.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
@@ -723,6 +752,8 @@ enum MCPAdapter {
                     "line": ["type": "integer", "minimum": 1, "description": "Text and code: first line (default 1). A workbook: first row of the sheet `page` names (a hit's \"Stock A508:D518\" is row 508)."],
                     "offset": ["type": "integer", "minimum": 0, "description": "First character, for documents (default 0)."],
                     "max_edge": ["type": "integer", "minimum": 256, "maximum": pictureEdgeLimit, "description": "An image: the longest edge of the picture, in pixels (default \(pictureMaxEdge)). Ask for more to read small text; a screenshot goes up to the display's own size."],
+                    "region": ["type": "array", "items": ["type": "number"], "minItems": 4, "maxItems": 4,
+                               "description": "An image: [left, top, right, bottom] of the part to see, in the picture's pixels or as fractions (0-1), cut at full resolution. For small text."],
                     "max_chars": ["type": "integer", "minimum": 100, "maximum": 20000, "description": "Default 4000."]
                 ] as [String: Any],
                 "required": ["path"]
@@ -752,7 +783,8 @@ enum MCPAdapter {
             return toolError(id: id, "read_file failed: \(path) is not in Omni's index. read_file reads only indexed files; file_status says which are.")
         }
         if photo || FileExtractor.kind(forExtension: (path as NSString).pathExtension.lowercased()) == .image {
-            return readPicture(id: id, path: path, maxEdge: args["max_edge"] as? Int, cli: cli)
+            return readPicture(id: id, path: path, maxEdge: args["max_edge"] as? Int,
+                               region: (args["region"] as? [Any])?.compactMap { ($0 as? NSNumber)?.doubleValue }, cli: cli)
         }
         let maxChars = (args["max_chars"] as? Int) ?? 4000
         let outcome = TextSlice.read(path: path, page: args["page"] as? Int, line: args["line"] as? Int,
@@ -789,26 +821,53 @@ enum MCPAdapter {
     /// model that reads images reads (HEIC only one of them does, and Claude Code's file reader
     /// refuses it). The file is converted when asked for and never stored twice; a screenshot is
     /// a frame of the screen history's video, taken out when asked for. Runs on the served work queue.
-    private static func readPicture(id: Any, path: String, maxEdge: Int?, cli: Bool) -> HTTPResponse {
+    private static func readPicture(id: Any, path: String, maxEdge: Int?, region raw: [Double]?, cli: Bool) -> HTTPResponse {
         let edge = min(max(maxEdge ?? pictureMaxEdge, 256), pictureEdgeLimit)
-        var size = imageSize(path: path)
-        var image: CGImage?
-        // A screenshot in the index is the desktop at a pixel a point; asked for more, the frame
-        // as it was recorded.
-        if ScreenHints.isShot(path), let shot = AppModel.screenHistory.shot(atPath: path),
-           let got = AppModel.screenHistory.picture(of: shot, maxDimension: edge) {
-            let held = AppModel.screenHistory.size(of: shot)
-            image = got.image
-            size = held.flatMap { edge > max($0.width, $0.height) ? nil : $0 } ?? (got.width, got.height)
-        }
         // A screenshot is named by its link: its path has no file behind it.
         let shown = ScreenShots.served(path)
-        guard let image = image ?? Self.image(path: path, maxEdge: edge), let data = jpegBase64(image, quality: 0.8) else {
+        // A REGION IS CUT FROM THE SOURCE: the whole picture at full resolution, then the part, so
+        // small text comes back with every pixel the recording or the file has (a 1920 frame shown
+        // at 1568 has lost a fifth of them). Without one, the picture at the edge it is shown at.
+        var size = imageSize(path: path)
+        var image: CGImage?
+        if ScreenHints.isShot(path), let shot = AppModel.screenHistory.shot(atPath: path),
+           let got = AppModel.screenHistory.picture(of: shot, maxDimension: raw == nil ? edge : 1 << 16) {
+            image = got.image
+            size = (got.width, got.height)      // the frame as it was recorded: what a region counts in
+        }
+        let sourceEdge = raw == nil ? edge : size.map { max($0.width, $0.height) } ?? pictureEdgeLimit
+        guard var image = image ?? Self.image(path: path, maxEdge: sourceEdge) else {
+            return toolError(id: id, "read_file failed: the image could not be opened (\(shown)).")
+        }
+        var cut: [Int]?
+        if let raw {
+            let whole = size ?? (image.width, image.height)
+            guard raw.count == 4, raw.allSatisfy(\.isFinite) else {
+                return toolError(id: id, "read_file: 'region' takes four numbers, [left, top, right, bottom], in the picture's pixels or as fractions of it (0-1).")
+            }
+            let (w, h) = (Double(whole.width), Double(whole.height))
+            let r = raw.allSatisfy { $0 >= 0 && $0 <= 1 } ? [raw[0] * w, raw[1] * h, raw[2] * w, raw[3] * h] : raw
+            let x0 = max(0, min(r[0], r[2])), x1 = min(w, max(r[0], r[2]))
+            let y0 = max(0, min(r[1], r[3])), y1 = min(h, max(r[1], r[3]))
+            guard x1 - x0 >= 8, y1 - y0 >= 8 else {
+                return toolError(id: id, "read_file: 'region' is outside the picture (\(whole.width) x \(whole.height) pixels) or under 8 pixels across.")
+            }
+            let sx = Double(image.width) / w, sy = Double(image.height) / h
+            let rect = CGRect(x: x0 * sx, y: y0 * sy, width: (x1 - x0) * sx, height: (y1 - y0) * sy).integral
+            guard let part = image.cropping(to: rect) else {
+                return toolError(id: id, "read_file failed: the region could not be cut (\(shown)).")
+            }
+            image = Self.fitted(part, maxEdge: edge)
+            cut = [Int(x0.rounded()), Int(y0.rounded()), Int(x1.rounded()), Int(y1.rounded())]
+        }
+        guard let data = jpegBase64(image, quality: 0.8) else {
             return toolError(id: id, "read_file failed: the image could not be opened (\(shown)).")
         }
         var head = "\(shown): image"
         if let size { head += ", \(size.width) x \(size.height) pixels" }
-        if size == nil || image.width != size!.width || image.height != size!.height { head += ", shown at \(image.width) x \(image.height)" }
+        if let cut { head += ", region \(cut[0]),\(cut[1]) to \(cut[2]),\(cut[3])" }
+        let full = cut == nil && size.map { image.width == $0.width && image.height == $0.height } == true
+        if !full || cut != nil { head += ", shown at \(image.width) x \(image.height)" }
         var shot: [String: Any]?
         if let moment = ScreenHints.moment(ofShot: path) {
             let front = [moment.app, moment.title].filter { !$0.isEmpty }.joined(separator: " - ")
@@ -821,9 +880,23 @@ enum MCPAdapter {
         return answer(id: id, [cli ? diagnostic(head) : ["type": "text", "text": head], picture], cli: cli) {
             var out: [String: Any] = ["path": shown, "kind": "image", "shown_width": image.width, "shown_height": image.height]
             if let size { out["width"] = size.width; out["height"] = size.height }
+            if let cut { out["region"] = cut }
             if let shot { out["screenshot"] = shot }
             return out
         }
+    }
+
+    /// A picture no longer than `maxEdge` on its long side; never enlarged.
+    private static func fitted(_ image: CGImage, maxEdge: Int) -> CGImage {
+        let longest = max(image.width, image.height)
+        guard longest > maxEdge, let space = CGColorSpace(name: CGColorSpace.sRGB) else { return image }
+        let k = Double(maxEdge) / Double(longest)
+        let w = max(1, Int((Double(image.width) * k).rounded())), h = max(1, Int((Double(image.height) * k).rounded()))
+        guard let cg = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                 bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue) else { return image }
+        cg.interpolationQuality = .high
+        cg.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return cg.makeImage() ?? image
     }
 
     /// An image file's pixel size as it is shown (its orientation applied). nil for a Photos asset
@@ -1067,7 +1140,7 @@ enum MCPAdapter {
         [
             "name": "ocr",
             "title": "Transcribe a scanned document or image to Markdown",
-            "description": "Read the text of a scanned PDF, a photographed page or a screenshot on this Mac with Omni's on-device OCR model, as Markdown: tables as HTML, formulas as LaTeX, headers and footers dropped. Use it when a file's text is not otherwise readable - a PDF with no text layer, or an image of a document. Give an absolute path inside the user's indexed folders. At most \(OCRServing.maxPagesMCP) pages per call, the first \(OCRServing.maxPagesMCP) by default; the reply says which pages remain, so call again with `pages` for the next ones. Pages Omni has transcribed before come back instantly. A page takes a few seconds on the GPU, and the first call loads the model.",
+            "description": "Read the text of a scanned PDF or a photographed page on this Mac with Omni's on-device OCR model, as Markdown: tables as HTML, formulas as LaTeX, headers and footers dropped. Use it when a file's text is not otherwise readable - a PDF with no text layer, or an image of a document. A screenshot Omni took is read better from its picture (read_file, with region for small text): OCR can drop or merge repeated characters and miss a block. Give an absolute path inside the user's indexed folders. At most \(OCRServing.maxPagesMCP) pages per call, the first \(OCRServing.maxPagesMCP) by default; the reply says which pages remain, so call again with `pages` for the next ones. Pages Omni has transcribed before come back instantly. A page takes a few seconds on the GPU, and the first call loads the model.",
             "inputSchema": [
                 "type": "object",
                 "properties": [

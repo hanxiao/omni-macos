@@ -64,6 +64,11 @@ protocol ServingBackend: Sendable {
     /// The files a filter keeps, newest first, with no query: what a search answers when it is
     /// given a time range alone. Nothing is embedded, and it is not recorded as a search.
     func list(filter: SearchFilter, topK: Int) -> [SearchHit]
+    /// How many screenshots Omni took in the filter's range that `list` left out (it lists them only
+    /// when their folder is named), up to `cap`.
+    func shotsLeftOut(filter: SearchFilter, cap: Int) -> Int
+    /// The best of a file's other chunks for the query: a picture's text, when its picture won.
+    func textChunk(of path: String, vector: [Float], besides chunk: Int) -> ChunkHit?
     /// For each hit, the part of its chunk that matches `query`, at most `width` characters: the
     /// whole chunk when it fits, else its best window (PassageWindow). nil where there is no text to
     /// recover (media, a file changed since it was indexed) - the caller shows the stored snippet.
@@ -167,6 +172,20 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
 
     func list(filter: SearchFilter, topK: Int) -> [SearchHit] { Self.list(store, filter: filter, topK: topK) }
 
+    func shotsLeftOut(filter: SearchFilter, cap: Int) -> Int {
+        let shots = AppModel.screenshotsDirectory.path
+        guard !filter.folderPrefixes.contains(where: { $0 == shots || $0.hasPrefix(shots + "/") }) else { return 0 }
+        var f = filter
+        f.folderPrefix = shots
+        f.excludeFolders.removeAll { $0 == shots }
+        return store.listMatching(filter: f, topK: cap).count
+    }
+
+    func textChunk(of path: String, vector: [Float], besides chunk: Int) -> ChunkHit? {
+        // A picture's text rows are located "Text" (Indexer.extraChunks); its picture rows are not.
+        store.rankChunks(vector, path: path).first { $0.chunkIndex != chunk && $0.locator == "Text" && !$0.snippet.isEmpty }
+    }
+
     /// The files last modified in the filter's range. One for this Mac's surfaces and for a linked
     /// Mac that asks (LinkResponder).
     static func list(_ store: VectorStore, filter: SearchFilter, topK: Int) -> [SearchHit] {
@@ -211,7 +230,10 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
     static let maxPhraseFiles = 400
 
     func findPhrase(_ phrase: String, paths: [String], keep: Int) -> PhraseHits {
-        let files = store.indexedFiles(under: paths).sorted()
+        // A screenshot Omni took keeps no text to read the phrase in (its words are indexed for
+        // search, a few lines a chunk): counted and named, never counted against the cap.
+        let all = store.indexedFiles(under: paths).sorted()
+        let files = all.filter { !ScreenShots.isShotPath($0) }
         let settings = passageRecovery?.currentSettings ?? IndexSettings()
         let searched = Array(files.prefix(Self.maxPhraseFiles))
         // By file, in parallel (each opens its own document); merged in path order.
@@ -221,6 +243,7 @@ struct EngineServingBackend: ServingBackend, @unchecked Sendable {
             (found.baseAddress! + i).initialize(to: TextSlice.find(phrase, path: searched[i], keep: keep, settings: settings))
         }
         var out = PhraseHits(filesInScope: files.count)
+        out.shots = all.count - files.count
         for i in searched.indices {
             switch found[i] {
             case .matches(let ms, let total, let partial):
@@ -328,6 +351,8 @@ struct PhraseHits {
     var filesInScope = 0
     /// Scanned PDFs: their text is OCR, not something the index read from the file.
     var scans = 0
+    /// Screenshots Omni took in scope, not searched.
+    var shots = 0
     var skipped = 0
     /// Files searched only as far as `TextSlice.find`'s byte limit.
     var partial: [String] = []

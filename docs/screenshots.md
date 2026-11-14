@@ -728,6 +728,51 @@ of spaces. Han, 2026-11-13: a link, dense, no punctuation.
   (`expandedPath`). (4) Omni's own copies went to the general pasteboard in an isolated run too:
   with `-omni.clipboard.pasteboard <name>` they go to the named one (`OmniPasteboard.pasteboard`).
 
+## Read with the agent's own eyes (0.20.5)
+
+Han, 2026-11-14, after another agent's review of 0.20.4: an agent fetches the frame and reads it
+with its own vision. The screen text Omni reads (Vision, `ScreenText`) stays in the index as a way
+to FIND a shot; it is not what an agent should read a shot by, and jina-ocr is no part of the
+feature (the `ocr` tool is for scanned documents). The review read handles off a screen and found
+the text dropping and merging exactly the characters they are made of (repeated `_` and `.`), and
+once missing a block; its own vision on the picture read them.
+
+- A REGION. `read_file` takes `region: [left, top, right, bottom]`, in the picture's pixels or as
+  fractions of it, cut from the source at full resolution and shown no larger than `max_edge`: the
+  frame as it was recorded, a file at its own size. The answer names the region
+  (`1920 x 1080 pixels, region 0,0 to 640,120, shown at 640 x 120`) and a shot's size is now always
+  its recorded frame's, the space a region counts in. Each of the review's zooms had been: read the
+  picture, take the client's resized copy, crop it in Python, read the crop; about 25 of them. Ten region reads
+  of a shot take 296-305 ms against 504-538 ms for ten whole reads (a smaller JPEG). Omni never
+  enlarged a shot; the review's 2730 x 1536 "upscale" was its client's resize.
+- THE WORDS SAY SO. read_file's description: read a screenshot from its picture, region for small
+  text; the text search shows of it was read for finding and can drop or merge characters. The
+  server instructions add that the link's digits are UTC. `ocr` no longer lists screenshots: a
+  screenshot is read better from its picture. The once-per-answer line names region.
+- A PICTURE'S SNIPPET IS ITS TEXT. A shot (any picture with text) that won by its picture showed its
+  tags ("folders, selects, browsing"), which say nothing of what was on screen. It shows its text
+  chunk that best fits the query now (`ServingBackend.textChunk`, rows located "Text"); a picture
+  with no text keeps its tags. The same search on 0.20.4 and now: three of four results went from
+  tags to the screen's words, same order, same scores.
+- EXACT PHRASE SAYS WHAT IT DID NOT LOOK AT. `search_inline` with `exact` counted every shot as
+  unreadable media and answered "does not occur in the text of 0 indexed files", which reads as
+  "not there"; a folder of 1,244 shots hit the 400-file cap and searched none. The index keeps a
+  shot's text only as 220-character snippets beside its vectors, not the text itself, so there is
+  nothing to match a phrase in; storing it would be a change of the store's layout, for text the
+  agent should not be reading by. Shots are counted apart now and never against the cap: "32
+  screenshots were not searched: Omni keeps no text of a screenshot to match. search finds one by
+  what was on screen; read_file with its omni:// link shows it."
+- A LISTING SAYS WHAT IT LEFT OUT. A time range with no query leaves screenshots out unless
+  `folder` names them; over a stretch with 32 shots and no other change it answered "No indexed
+  file was last modified in that range", read by the review as "the frames have no time". Now:
+  "32 screenshots were taken then, left out of the listing: folder omni://screenshots lists them"
+  (counted up to 1,000), on an empty answer and under a full one.
+- LINKED MACS IN ONE LINE. A Mac offline or with nothing to add said so in a line each under every
+  answer; now "Offline: Studio, Air." and one line for the empty ones.
+- Not done: the screen text under `read_file`'s picture (it would point agents back at it).
+- Speed, 20 served searches, three interleaved rounds against 0.20.4: 692-771 ms against
+  734-799 ms with shots in the answer, 461-509 against 494-536 without.
+
 ## Isolated runs
 
 An isolated run (`-omni.dbDir`) reads `-omni.screenshots.enabled` from its arguments only and
@@ -771,7 +816,7 @@ excluded apps, bytes on disk, the failure told).
   `ScreenTextTests` (5): the size read, the pieces, a line and a long word across pieces read once.
   `EnrichmentTests` (8). `OmniCLITests`: an optional bare word. `ScreenCadenceTests` (11): when a
   shot is taken, none with nobody at the Mac, and a failing look told once from the second in a
-  row. The suite: 1123 tests, 6 skipped, 0 failures (`LinkNodeTests.testRemotePath` covers the join of a path with a scheme).
+  row. The suite: 1123 tests, 6 skipped, 0 failures (again on 0.20.5) (`LinkNodeTests.testRemotePath` covers the join of a path with a scheme).
 - Linked, two isolated instances paired on one Mac: a query on the asking one returns the other's
   shots in the window, over MCP, the CLI and `--json`, each with its moment; the session line
   names the Mac; the range with no query on the named Mac; `get_linked_file` of a shot, and

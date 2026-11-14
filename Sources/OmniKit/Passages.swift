@@ -373,6 +373,9 @@ public struct Passage: Sendable, Equatable {
     /// Where the text is: for a PDF, the page it starts on ("Page 238"), else nil (the hit's own
     /// locator stands).
     public var locator: String? = nil
+    public init(text: String, opensChunk: Bool, locator: String? = nil) {
+        self.text = text; self.opensChunk = opensChunk; self.locator = locator
+    }
 }
 
 /// What recovering a stored chunk's text needs of it: its KEY (the digest of its exact text and its

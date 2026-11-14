@@ -73,8 +73,8 @@ enum ScreenHints {
             return cli ? "A screenshot on \(mac) is no file: omni get_linked_file <omni:// link> --mac \"\(mac)\" copies it here."
                        : "A screenshot on \(mac) is no file: get_linked_file with its omni:// link and mac \"\(mac)\" copies it here."
         }
-        return cli ? "A screenshot is no file: omni read_file <omni:// link> saves it as a JPEG and prints the path."
-                   : "A screenshot is no file: read_file with its omni:// link returns it as a JPEG."
+        return cli ? "A screenshot is no file: omni read_file <omni:// link> saves its picture as a JPEG and prints the path (--region to zoom in)."
+                   : "A screenshot is no file: read_file with its omni:// link returns its picture (region zooms in)."
     }
 
     /// ISO 8601 to the second with the local offset ("2026-11-10T13:16:27+01:00"): what
