@@ -20,6 +20,9 @@ enum ScreenHints {
         /// The stretch of work around it. nil when the history around the shot is gone (cleared, or
         /// pruned ahead of the index).
         var span: Span?
+        /// What a served answer names the shot by (`ScreenHistory.link(of:)`). nil from a Mac older
+        /// than 0.20.4, whose answers name a shot by its path.
+        var link: String?
     }
 
     struct Span: Codable, Sendable {
@@ -48,7 +51,8 @@ enum ScreenHints {
         for (h, session) in zip(shots, AppModel.screenHistory.sessions(around: shots.map(\.modified))) {
             // The file is dated at its shot; the shot within a second of it is the same one.
             let shot = session.map(\.nearest).flatMap { abs($0.time - h.modified) < 1 ? $0 : nil }
-            out[h.path] = Moment(taken: h.modified, app: shot?.app ?? "", title: shot?.title ?? "", span: session.map(Span.init))
+            out[h.path] = Moment(taken: h.modified, app: shot?.app ?? "", title: shot?.title ?? "", span: session.map(Span.init),
+                                 link: AppModel.screenHistory.link(forPath: h.path))
         }
         return out
     }
@@ -57,7 +61,20 @@ enum ScreenHints {
     static func moment(ofShot path: String) -> Moment? {
         guard isShot(path), let shot = AppModel.screenHistory.shot(atPath: path) else { return nil }
         let session = AppModel.screenHistory.sessions(around: [shot.time]).first ?? nil
-        return Moment(taken: shot.time, app: shot.app, title: shot.title, span: session.map(Span.init))
+        return Moment(taken: shot.time, app: shot.app, title: shot.title, span: session.map(Span.init),
+                      link: AppModel.screenHistory.link(of: shot))
+    }
+
+    /// Said once under results that hold a screenshot, not on every row: its omni:// link names a
+    /// frame of the screen history's video, and an agent that opens it with its own reader finds
+    /// nothing. On the command line read_file saves the picture as a JPEG and prints where.
+    static func notAFile(cli: Bool, mac: String? = nil) -> String {
+        if let mac {
+            return cli ? "A screenshot on \(mac) is no file: omni get_linked_file <omni:// link> --mac \"\(mac)\" copies it here."
+                       : "A screenshot on \(mac) is no file: get_linked_file with its omni:// link and mac \"\(mac)\" copies it here."
+        }
+        return cli ? "A screenshot is no file: omni read_file <omni:// link> saves it as a JPEG and prints the path."
+                   : "A screenshot is no file: read_file with its omni:// link returns it as a JPEG."
     }
 
     /// ISO 8601 to the second with the local offset ("2026-11-10T13:16:27+01:00"): what

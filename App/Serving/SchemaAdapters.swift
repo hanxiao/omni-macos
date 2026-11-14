@@ -58,10 +58,12 @@ func mimeType(forPath path: String) -> String? {
 /// symlinks, so neither does this.
 ///
 /// A "<scheme>://" path (a Photos asset or source, photos://...) is not a filesystem path and is
-/// returned as given: split on "/" it came back as "/photos:/all", which matched nothing.
+/// returned as given: split on "/" it came back as "/photos:/all", which matched nothing. A
+/// screenshot's link (omni://screenshots/...) is read back to the path the index holds for it, and
+/// is returned as given when no shot is at that moment.
 func normalizeStorePath(_ raw: String) -> String {
-    if let r = raw.range(of: "://"), !raw[..<r.lowerBound].isEmpty,
-       raw[..<r.lowerBound].allSatisfy({ $0.isLetter }) { return raw }
+    if ScreenShots.isLink(raw) { return ScreenShots.path(forLink: raw) ?? raw }
+    if isSchemePath(raw) { return raw }
     let expanded = (raw as NSString).expandingTildeInPath
     var parts: [String] = []
     for comp in expanded.split(separator: "/") {
@@ -70,6 +72,18 @@ func normalizeStorePath(_ raw: String) -> String {
         parts.append(String(comp))
     }
     return "/" + parts.joined(separator: "/")
+}
+
+/// "photos://...", "omni://screenshots/...": a name with a scheme, not a file's path.
+func isSchemePath(_ raw: String) -> Bool {
+    guard let r = raw.range(of: "://") else { return false }
+    return !raw[..<r.lowerBound].isEmpty && raw[..<r.lowerBound].allSatisfy { $0.isLetter }
+}
+
+/// `~` expanded, and a name with a scheme left as it is: NSString's expansion reads
+/// "omni://screenshots/x" as a path and collapses it to "omni:/screenshots/x".
+func expandedPath(_ raw: String) -> String {
+    isSchemePath(raw) ? raw : (raw as NSString).expandingTildeInPath
 }
 
 // MARK: - Query or document
@@ -454,7 +468,7 @@ enum SearchAdapter {
             let hit = g.representative
             let passage = i < passages.count ? passages[i] : nil
             var row: [String: Any] = [
-                "path": hit.path,
+                "path": screen[hit.path]?.link ?? hit.path,
                 "score": Double(max(0, min(1, hit.score))),
                 "snippet": passage?.text ?? hit.snippet,
                 "kind": hit.fileKind,
@@ -473,7 +487,8 @@ enum SearchAdapter {
             if hit.height > 0 { row["height"] = hit.height }
             if hit.duration > 0 { row["duration"] = hit.duration }
             if hit.size > 0 { row["bytes"] = hit.size }
-            if let mime = mimeType(forPath: hit.path) { row["mime_type"] = mime }
+            // A screenshot is no HEIC file: read_file hands it over as a JPEG.
+            if let mime = screen[hit.path] != nil ? "image/jpeg" : mimeType(forPath: hit.path) { row["mime_type"] = mime }
             if let ck = contentKeys[hit.path], ck.modified == hit.modified { row["content_key"] = ck.key }
             if weaker[i] { row["weaker"] = true }
             if !scored { row.removeValue(forKey: "score") }
@@ -529,7 +544,7 @@ enum FileStatusAdapter {
     /// read as rooted ("docs/CLI.md" as "/docs/CLI.md") it came back "not indexed".
     static func relativePath(_ paths: [String]) -> String? {
         guard let p = paths.first(where: {
-            let t = ($0.trimmingCharacters(in: .whitespaces) as NSString).expandingTildeInPath
+            let t = expandedPath($0.trimmingCharacters(in: .whitespaces))
             return !t.hasPrefix("/") && !t.contains("://")
         }) else { return nil }
         return "'paths' takes absolute paths (got \"\(p)\")"
@@ -545,7 +560,7 @@ enum FileStatusAdapter {
                 // Not indexed: report only that, with NO disk probe. Stat-ing arbitrary paths
                 // would let any (LAN-token) caller test the existence of files far outside the
                 // indexed roots; this endpoint reports index coverage, nothing more.
-                return ["path": p, "indexed": false]
+                return ["path": ScreenShots.served(p), "indexed": false]
             }
             // Freshness: same attribute source as the crawler (FileCrawler.swift) -
             // contentModificationDate + fileSize via resourceValues - so double-for-double
@@ -576,7 +591,7 @@ enum FileStatusAdapter {
                 diskSize = vals?.fileSize ?? 0
             }
             var row: [String: Any] = [
-                "path": p,
+                "path": ScreenShots.served(p),
                 "indexed": true,
                 // False when the indexed file has since been deleted (or replaced by a non-file).
                 "exists": exists,
@@ -641,6 +656,9 @@ enum IndexedRoots {
 }
 
 func pathIsInIndexedRoot(_ path: String) -> Bool {
+    // A screenshot Omni took is under a folder that is on no disk since 0.20.3 (the frames are in
+    // the screen history's video), so neither the roots nor realpath can find it.
+    if ScreenShots.isShotPath(path) { return ScreenShots.history(holding: path)?.shot(atPath: path) != nil }
     let roots = IndexedRoots.current.map(normalizeStorePath)
     func inside(_ p: String, _ roots: [String]) -> Bool {
         roots.contains { root in p == root || p.hasPrefix(root.hasSuffix("/") ? root : root + "/") }
@@ -662,6 +680,11 @@ func pathIsInIndexedRoot(_ path: String) -> Bool {
 /// Accepts a filesystem path (root-gated by the caller) or inline bytes as base64 / a data: URI.
 private func decodeRequestImage(path: String?, base64: String?) -> CGImage? {
     var source: CGImageSource?
+    // A screenshot Omni took has no file: its frame, out of the screen history's video.
+    if let path, ScreenShots.isShotPath(path) {
+        guard let history = ScreenShots.history(holding: path), let shot = history.shot(atPath: path) else { return nil }
+        return history.picture(of: shot, maxDimension: tagMaxImageDimension)?.image
+    }
     if let path {
         source = CGImageSourceCreateWithURL(URL(fileURLWithPath: path) as CFURL, nil)
     } else if var b64 = base64 {
@@ -717,11 +740,11 @@ enum FileTagsAdapter {
             // file (never tagged, by design) from a path Omni has never seen. No disk probe here
             // either, for the same reason FileStatusAdapter refuses one.
             guard let t = tags[p] else {
-                guard let st = status[p] else { return ["path": p, "indexed": false, "tags": []] }
-                return ["path": p, "indexed": true, "kind": st.kind, "taggable": false, "tags": []]
+                guard let st = status[p] else { return ["path": ScreenShots.served(p), "indexed": false, "tags": []] }
+                return ["path": ScreenShots.served(p), "indexed": true, "kind": st.kind, "taggable": false, "tags": []]
             }
             return [
-                "path": p,
+                "path": ScreenShots.served(p),
                 "indexed": true,
                 "kind": status[p]?.kind ?? "",
                 "taggable": true,
@@ -802,14 +825,14 @@ enum TagAdapter {
         for p in paths {
             let np = normalizeStorePath(p)
             guard pathIsInIndexedRoot(np) else {
-                return badRequest("'\(np)' is outside the indexed folders; pass the image inline as 'image' instead")
+                return badRequest("'\(ScreenShots.served(np))' is outside the indexed folders; pass the image inline as 'image' instead")
             }
             guard let cg = decodeRequestImage(path: np, base64: nil) else {
-                return badRequest("could not decode an image at '\(np)'")
+                return badRequest("could not decode an image at '\(ScreenShots.served(np))'")
             }
             raws.append(OmniVisionPreprocess.preprocessRaw(cg))
             crops.append(cutCrops(cg))
-            labels.append(np)
+            labels.append(ScreenShots.served(np))
         }
         for (i, b64) in images.enumerated() {
             guard let cg = decodeRequestImage(path: nil, base64: b64) else {
@@ -847,11 +870,11 @@ enum TagAdapter {
         for raw in paths {
             let p = normalizeStorePath(raw)
             guard pathIsInIndexedRoot(p) else {
-                rows[p] = ["path": p, "tags": [], "error": "outside the indexed folders"]
+                rows[p] = ["path": ScreenShots.served(p), "tags": [], "error": "outside the indexed folders"]
                 continue
             }
             guard let cg = decodeRequestImage(path: p, base64: nil) else {
-                rows[p] = ["path": p, "tags": [], "error": "not a decodable image"]
+                rows[p] = ["path": ScreenShots.served(p), "tags": [], "error": "not a decodable image"]
                 continue
             }
             raws.append(OmniVisionPreprocess.preprocessRaw(cg))
@@ -863,10 +886,10 @@ enum TagAdapter {
         if !raws.isEmpty {
             guard let tagged = backend.tagImages(raws, crops: crops, topK: topK) else { return nil }
             for (i, p) in ok.enumerated() where i < tagged.count {
-                rows[p] = ["path": p, "tags": tagged[i], "taggable": true, "recomputed": true]
+                rows[p] = ["path": ScreenShots.served(p), "tags": tagged[i], "taggable": true, "recomputed": true]
             }
         }
-        return paths.map { rows[normalizeStorePath($0)] ?? ["path": normalizeStorePath($0), "tags": []] }
+        return paths.map { rows[normalizeStorePath($0)] ?? ["path": ScreenShots.served(normalizeStorePath($0)), "tags": []] }
     }
 }
 

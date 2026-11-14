@@ -134,3 +134,19 @@ B killed, frozen and unplugged against the feature off; B's own search latency w
   Checked on two linked instances, both grants, MCP over HTTP and the CLI.
 - The sidebar folds each Mac like a History day (chevron on hover, kept while folded, state in
   SidebarFolds under "mac:<id>"); no disclosure triangle, which would indent every row.
+
+## A path that is no file, and a screenshot's link (2026-11-13)
+
+- `RemotePath.make` ran the other Mac's path straight onto its id, which holds only for a path that
+  starts with "/". A Photos asset there (`photos://...`) made `omni-link://<id>photos://...`, and
+  `parse` read the id back as "<id>photos:" (LinkNodeTests.testRemotePath, failing on the old join
+  with exactly that). A path with a scheme is joined with a slash now and read back without it; a
+  folder named like a scheme (`/Users/x/a://b`) is still a path. Not run through two apps with a
+  Photos library: an isolated run is given no Photos source.
+- A screenshot travels as before, by its path, for the asking Mac's window; the reply's moment adds
+  its link (`ScreenHints.Moment.link`), which that Mac's agents are given instead. The answering
+  Mac reads a link back to the path in `similar`, `passages`, `thumb` and `fetch`
+  (`LinkResponder.local`), and a fetch asked for by link names the copy by it, with no spaces
+  (docs/screenshots.md, "A shot as a link"). Checked with linktool and with two linked renamed
+  copies, the asker's agent through `omni`.
+

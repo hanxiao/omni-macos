@@ -673,6 +673,61 @@ under the temporary directory (a later launch deletes the folders of launches th
   and "Move 25 Items to Trash" (it read 45 before the count was the files'); one file with one
   shot, "Move to Trash", which moved the file, opened no confirmation and left the shot selected.
 
+## A shot as a link (0.20.4)
+
+0.20.3 kept a shot only as a frame of the video, and served it by the path 0.20.2's still had:
+`.../Screenshots/2026-11-12/2026-11-12 12.01.23 Browser - Field notes.heic`. Nothing is at that
+path, so an agent that opened it with its own reader got "file not found", and the name is full
+of spaces. Han, 2026-11-13: a link, dense, no punctuation.
+
+- THE LINK. `omni://screenshots/20261112200123`: the shot's second in UTC as fourteen digits
+  (local time repeats in the hour the clocks go back), and `/<display>` only when another
+  indexed shot shares that second (`ScreenHistory.link(of:)`). One display takes at most one shot
+  in 5 s (`ScreenCadence.interval`), so the second and the display name one shot; a link with no
+  display that two shots share reads to neither. The row's `taken` stays in local time with its
+  offset, and the app and window in its `screenshot` object. The index is unchanged: its rows keep
+  the paths, and the link is spelled at the served surfaces only, so there is no migration.
+- WHERE. MCP and the CLI (search, search_inline, read_file, file_status, tag_image), REST rows, a
+  linked Mac's answers (`ScreenHints.Moment.link` beside the path its window uses; a Mac older
+  than 0.20.4 sends none, and its shots keep their paths), the pool summary's group
+  (`omni://screenshots 21`), and the app's Copy Path and the text Command-C puts beside the files.
+  Back in, every path argument reads a link to the shot's path (`normalizeStorePath`,
+  `LinkResponder.local`); `omni://screenshots` is the folder, for `folder`, `folders`,
+  `exclude_folders` and `search_inline`. A link no shot answers says so: "no screenshot at
+  omni://screenshots/... in Omni's screen history".
+- SAID ONCE. Under results that hold a shot, one line: "A screenshot is no file: read_file with its
+  omni:// link returns it as a JPEG." (on a linked Mac's results, get_linked_file with the link; the
+  CLI's names `omni read_file`). Not a field on every row: the per-row resource links were 2,079
+  bytes of a 9,656-byte answer and were cut for that (index.md). The search and read_file
+  descriptions and the server instructions say the same.
+- NOT EVERY PICTURE ON THE COMMAND LINE. The plan was a `picture:` file under each shot in every
+  CLI search. Measured, 20 searches each, three interleaved rounds against 0.20.3 on the fed test
+  index: with ten shots in the answer 6,211-6,576 ms against 665-727 ms, about 285 ms a search
+  for ten decodes and JPEGs nobody had asked for; with no shot in it 396-462 against 400-461 ms.
+  Dropped: `omni read_file <link>` writes the one picture an agent wants (`$TMPDIR/omni-pictures`,
+  per user, cleared at boot; never `/private/tmp`, which every account on the Mac can list), and
+  `--include_images` still writes all. With the link and no pictures, 652-792 ms against
+  724-831 ms for 0.20.3, and 405-527 against 483-494 for a search with no shot.
+- AT SCALE. On a copy of the thirty-day history, updated (57,600 indexed shots, digest
+  b4f99c5bf76c290c): 57,600 links, 57,600 distinct, every one read back to its own path, 0.025 ms
+  a link p50 (0.052 p99) and 0.023 ms back (`shotbench state --links`).
+- A LINKED MAC'S SHOT. Asked for by its link, the copy `get_linked_file` makes is named by it
+  (`20261112200143.heic`); asked for by its path, as the window does, by the path's name. Through
+  two linked renamed copies: the asking Mac's search lists `omni://screenshots/...` under the
+  other's name, `get_linked_file` copies the 125,084-byte HEIC, and `read_file` reads the copy.
+- FOUND ON THE WAY, FIXED. (1) A linked Mac's path that is no file (a Photos asset,
+  `photos://...`, or a link) was run straight onto the peer's id, `omni-link://abcphotos://...`,
+  and the id could not be read back ("abcphotos:"): it is joined with a slash now (`RemotePath`,
+  link.md). (2) `tag_image` with `recompute` on a shot said "outside the indexed folders": the
+  check looked for the Screenshots folder on disk, which 0.20.3 removed, and past it there was no
+  file to decode. A shot the history holds is inside now, and tagging takes its frame (through a
+  renamed copy: stored and recomputed tags for a link). `ocr` on a shot had the same check and
+  reads the shot's written-out file now (`ShotActions.file`); not run through the app, which
+  would load the OCR model. (3) NSString's `expandingTildeInPath` reads `omni://screenshots/x` as a path and
+  collapses it to `omni:/screenshots/x`; served paths are expanded only when they have no scheme
+  (`expandedPath`). (4) Omni's own copies went to the general pasteboard in an isolated run too:
+  with `-omni.clipboard.pasteboard <name>` they go to the named one (`OmniPasteboard.pasteboard`).
+
 ## Isolated runs
 
 An isolated run (`-omni.dbDir`) reads `-omni.screenshots.enabled` from its arguments only and
@@ -694,12 +749,13 @@ confirmation), `shotdecline:<seconds>` (macOS declining a capture, asked again a
 shot copied, opened), `shotfiles` (the files a drag of the selection writes as it starts, timed
 twice), `shotpromise:<dir>` (its promised files written into a folder, as a drop does),
 `menustate:<menu>` and `menushow:<menu>` (a menu bar menu's items as text, and open for a picture),
-`sidebarselect:-3`; `dumpui:<path>` carries the feature's state (on, access, the
+`copypath` and `pasteboard` (Copy Path, and what is on the run's named pasteboard,
+`-omni.clipboard.pasteboard <name>`), `sidebarselect:-3`; `dumpui:<path>` carries the feature's state (on, access, the
 excluded apps, bytes on disk, the failure told).
 
 ## Verification
 
-- Unit (`ScreenHistoryTests`, 38): signature and gate, codec round trip, the record format and a
+- Unit (`ScreenHistoryTests`, 39): signature and gate, a shot as a link (UTC, two displays, a deleted neighbour, malformed links), codec round trip, the record format and a
   cut record, segments by hour and launch, a shot's path and the way back from it, the update
   from 0.20.2's files (dates lost, a file gone, two displays in one second, a clock change, killed
   at every step), the catalog (believed when whole; damaged, cut short or gone, written again
@@ -715,7 +771,7 @@ excluded apps, bytes on disk, the failure told).
   `ScreenTextTests` (5): the size read, the pieces, a line and a long word across pieces read once.
   `EnrichmentTests` (8). `OmniCLITests`: an optional bare word. `ScreenCadenceTests` (11): when a
   shot is taken, none with nobody at the Mac, and a failing look told once from the second in a
-  row. The suite: 1122 tests, 6 skipped, 0 failures.
+  row. The suite: 1123 tests, 6 skipped, 0 failures (`LinkNodeTests.testRemotePath` covers the join of a path with a scheme).
 - Linked, two isolated instances paired on one Mac: a query on the asking one returns the other's
   shots in the window, over MCP, the CLI and `--json`, each with its moment; the session line
   names the Mac; the range with no query on the named Mac; `get_linked_file` of a shot, and

@@ -170,7 +170,7 @@ struct FileMenuItems<Passages: View>: View {
             }
             .keyboardShortcut("r", modifiers: [.command, .shift])
             Button {
-                OmniPasteboard.copy(path)
+                OmniPasteboard.copy(ScreenShots.served(path))
             } label: { Label("Copy Path", systemImage: "doc.on.doc") }
             // Opt-Cmd-C, matching the File menu, because that is the chord that actually fires. A
             // chord declared inside a context menu never fires on macOS, so this label is decoration -

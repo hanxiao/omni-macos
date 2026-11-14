@@ -1031,7 +1031,8 @@ final class AppModel {
         let ordered = results.filter { selectedPaths.contains($0.path) }.map { $0.path }
         let paths = ordered.isEmpty ? (selection.map { [$0] } ?? []) : ordered
         guard !paths.isEmpty else { return }
-        OmniPasteboard.copy(paths.joined(separator: "\n"))
+        // A shot by its link, which an agent pasted it gives to read_file: its path is no file.
+        OmniPasteboard.copy(paths.map(ScreenShots.served).joined(separator: "\n"))
     }
 
     // MARK: - Result selection (single + multi)
@@ -1050,7 +1051,7 @@ final class AppModel {
     func copySelectedFiles() {
         let paths = selectionOrdered
         guard !paths.isEmpty else { return }
-        let text = paths.joined(separator: "\n")
+        let text = paths.map(ScreenShots.served).joined(separator: "\n")
         let shots = paths.filter(ResultPath.isShot)
         guard !shots.isEmpty else {
             OmniPasteboard.copyFiles(paths.filter { !ResultPath.isVirtual($0) }.map { URL(fileURLWithPath: $0) }, text: text)

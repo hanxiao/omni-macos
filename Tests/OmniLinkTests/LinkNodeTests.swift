@@ -497,6 +497,14 @@ final class LinkNodeTests: XCTestCase, @unchecked Sendable {
         XCTAssertTrue(RemotePath.isRemote(p))
         XCTAssertEqual(RemotePath.parse(p)?.peer, "abc")
         XCTAssertEqual(RemotePath.parse(p)?.path, "/Users/x/Doc é.pdf")
+        // A Photos asset and a screenshot's link are not files' paths: the id is still found.
+        for other in ["photos://asset/ABC-123/L0/001", "omni://screenshots/20270115080000/2"] {
+            let r = RemotePath.make(peer: "abc", path: other)
+            XCTAssertEqual(RemotePath.parse(r)?.peer, "abc", r)
+            XCTAssertEqual(RemotePath.parse(r)?.path, other, r)
+        }
+        // A folder whose name looks like a scheme is still a path.
+        XCTAssertEqual(RemotePath.parse(RemotePath.make(peer: "abc", path: "/Users/x/a://b"))?.path, "/Users/x/a://b")
         XCTAssertEqual((p as NSString).lastPathComponent, "Doc é.pdf")
         XCTAssertEqual((p as NSString).pathExtension, "pdf")
         XCTAssertNil(RemotePath.parse("/Users/x"))

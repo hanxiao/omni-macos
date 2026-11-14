@@ -57,6 +57,26 @@ public enum ScreenShots {
     }
 
     /// Has the history let go of the shot this path names?
+    /// A served name for a path: a shot's link (`ScreenHistory.link(of:)`), any other path as it
+    /// is. A shot the history no longer holds keeps its path.
+    public static func served(_ path: String) -> String {
+        if history(root: path) != nil { return ScreenHistory.linkScheme }
+        guard let history = history(holding: path) else { return path }
+        return history.link(forPath: path) ?? path
+    }
+
+    /// Is this a shot's link, or the bare scheme that names the screenshots' folder?
+    public static func isLink(_ s: String) -> Bool {
+        s == ScreenHistory.linkScheme || s.hasPrefix(ScreenHistory.linkScheme + "/")
+    }
+
+    /// The path the index holds for a link, nil when no registered history holds that shot.
+    public static func path(forLink link: String) -> String? {
+        let histories = state.withLock { $0.map(\.history) }
+        for h in histories { if let p = h.path(forLink: link) { return p } }
+        return nil
+    }
+
     public static func isGone(_ path: String) -> Bool {
         if case .gone = presence(path) { return true }
         return false

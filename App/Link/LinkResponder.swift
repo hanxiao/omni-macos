@@ -163,7 +163,7 @@ final class LinkResponder: LinkService, @unchecked Sendable {
 
     private func similar(_ req: LinkWire.PathRequest) async throws -> LinkMessage {
         let (_, store, _) = try backend()
-        let path = req.path
+        let path = Self.local(req.path)
         let (hits, vec): ([SearchHit], [Float]?) = try await offPool {
             try self.servable(path, store)
             guard let v = store.fileVector(path) else { return ([], nil) }
@@ -176,7 +176,7 @@ final class LinkResponder: LinkService, @unchecked Sendable {
 
     private func passages(_ req: LinkWire.PathRequest) async throws -> LinkMessage {
         let (engine, store, _) = try backend()
-        let path = req.path
+        let path = Self.local(req.path)
         let found: [ChunkHit] = try await offPool {
             try self.servable(path, store)
             let vec: [Float]
@@ -192,10 +192,10 @@ final class LinkResponder: LinkService, @unchecked Sendable {
 
     private func thumb(_ req: LinkWire.PathRequest) async throws -> LinkMessage {
         let (_, store, _) = try backend()
-        let path = req.path
+        let path = Self.local(req.path)
         try await offPool { try self.servable(path, store) }
         let px = max(32, min(req.px ?? 256, 1024))
-        guard let cg = await Thumbnail.render(path: req.path, maxPixel: px, side: CGFloat(px) / 2, scale: 2),
+        guard let cg = await Thumbnail.render(path: path, maxPixel: px, side: CGFloat(px) / 2, scale: 2),
               let jpeg = Self.jpeg(cg) else { return LinkMessage() }
         return LinkMessage(body: Data(), blob: jpeg)
     }
@@ -206,14 +206,18 @@ final class LinkResponder: LinkService, @unchecked Sendable {
 
     private func fetch(_ req: LinkWire.PathRequest) async throws -> LinkMessage {
         let (_, store, _) = try backend()
-        let path = req.path
+        let path = Self.local(req.path)
+        // Asked for by its link (an agent's get_linked_file), a shot's copy is named by the link,
+        // with no spaces; asked for by its path (the other Mac's window), as its path is.
+        let linkName = ScreenShots.isLink(req.path)
+            ? req.path.dropFirst(ScreenHistory.linkScheme.count + 1).replacingOccurrences(of: "/", with: "-") + ".heic" : nil
         return try await offPool {
             try self.servable(path, store)
             guard let url = PhotoActions.materialize(path) else { throw LinkError.refused("The file is gone.") }
             let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
             let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
             let modified = (attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
-            let info = LinkWire.FileInfo(size: size, modified: modified, name: url.lastPathComponent)
+            let info = LinkWire.FileInfo(size: size, modified: modified, name: linkName ?? url.lastPathComponent)
             let offset = max(0, req.offset ?? 0)
             let length = max(0, min(req.length ?? Self.maxSlice, Self.maxSlice))
             guard length > 0, offset < size else { return try .json(info) }
@@ -257,6 +261,12 @@ final class LinkResponder: LinkService, @unchecked Sendable {
     }
 
     // MARK: - Helpers
+
+    /// The path the index holds for what the other Mac asked about: a screenshot's link (an agent
+    /// there copied it from a search answer) read back to its shot; anything else as it came.
+    static func local(_ asked: String) -> String {
+        ScreenShots.isLink(asked) ? ScreenShots.path(forLink: asked) ?? asked : asked
+    }
 
     /// Throws unless `path` is a file this Mac's index holds, outside the clipboard history. It
     /// reads the store, so it runs on the served work queue, not on the pool thread of the

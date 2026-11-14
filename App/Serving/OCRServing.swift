@@ -82,11 +82,15 @@ enum OCRServing {
                 : "list_sources shows which folders those are, and add_source adds one (Omni then indexes it)"
             return .failure(.badInput("'\(path)' is outside the indexed folders; \(fix)"))
         }
-        let url = URL(fileURLWithPath: path)
-        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
-            return .failure(.badInput("cannot read '\(path)'"))
+        // A screenshot Omni took is a frame of the screen history: written out as the picture file
+        // a drag would carry (ShotActions.file), named in the answer by its link.
+        let shot = ScreenShots.isShotPath(path)
+        let label = shot ? ScreenShots.served(path) : path
+        guard let url = shot ? ShotActions.file(path) : URL(fileURLWithPath: path),
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
+            return .failure(.badInput("cannot read '\(label)'"))
         }
-        return open(data: data, url: url, label: path)
+        return open(data: data, url: url, label: label)
     }
 
     /// Inline bytes: a `data:` URI or bare base64.

@@ -787,7 +787,7 @@ enum ShotBench {
     }
 
     /// What a history holds, in one line to hold two of them against each other:
-    /// `shotbench state <Screen History> <Screenshots> [--decode] [--cold]`. The digest is over
+    /// `shotbench state <Screen History> <Screenshots> [--decode] [--cold] [--links]`. The digest is over
     /// every indexed shot's path, time and size in the video; --decode takes each one's picture
     /// out of its frame and adds its size; --cold drops the catalog first and times the walk of
     /// the video against the read of the catalog it leaves.
@@ -825,9 +825,27 @@ enum ShotBench {
             }
             decodeMs = ms(t)
         }
+        // --links: every indexed shot's link, and the path it reads back to (A shot as a link).
+        var linkLine = ""
+        if args.contains("--links") {
+            var links = Set<String>(), wrong = 0, missing = 0, displayed = 0, toLink: [Double] = [], back: [Double] = []
+            for e in indexed {
+                let a = Date()
+                guard let link = history.link(forPath: e.path) else { missing += 1; continue }
+                toLink.append(ms(a))
+                let b = Date()
+                if history.path(forLink: link) != e.path { wrong += 1 }
+                back.append(ms(b))
+                links.insert(link)
+                if link.dropFirst(ScreenHistory.linkScheme.count + 1).contains("/") { displayed += 1 }
+            }
+            func p(_ v: [Double], _ q: Double) -> Double { v.isEmpty ? 0 : v.sorted()[min(v.count - 1, Int(Double(v.count) * q))] }
+            linkLine = String(format: " links=%d unique=%d with_display=%d missing=%d wrong=%d to_link_p50_ms=%.3f p99=%.3f back_p50_ms=%.3f p99=%.3f",
+                              indexed.count - missing, links.count, displayed, missing, wrong, p(toLink, 0.5), p(toLink, 0.99), p(back, 0.5), p(back, 0.99))
+        }
         print(String(format: "state: pending=false segments=%d shots=%d indexed=%d same_again=%@ digest=%016llx list_shots_ms=%.1f indexed_first_ms=%.1f indexed_reopened_ms=%.1f",
                      segments, all.count, indexed.count, "\(again.map(\.path) == indexed.map(\.path))", digest, walk, first, second)
-              + (args.contains("--decode") ? String(format: " decoded=%d failed=%d decode_ms=%.0f", decoded, failed, decodeMs) : ""))
+              + (args.contains("--decode") ? String(format: " decoded=%d failed=%d decode_ms=%.0f", decoded, failed, decodeMs) : "") + linkLine)
     }
 
     /// A page of results that are shots, as the window draws it: `shotbench thumbs <Screen History>

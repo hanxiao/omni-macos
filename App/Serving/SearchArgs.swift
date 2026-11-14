@@ -73,9 +73,9 @@ enum SearchArgs {
         if let raw = a["exclude_folders"] {
             guard let folders = raw as? [String] else { return (filter, "'exclude_folders' must be a list of absolute folder paths") }
             for f in folders {
-                let t = (f.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
+                let t = expandedPath(f.trimmingCharacters(in: .whitespacesAndNewlines))
                 guard !t.isEmpty else { continue }
-                guard t.hasPrefix("/") else { return (filter, "'exclude_folders' takes absolute paths (got \"\(f)\")") }
+                guard t.hasPrefix("/") || ScreenShots.isLink(t) else { return (filter, "'exclude_folders' takes absolute paths (got \"\(f)\")") }
                 let v = normalizeStorePath(t)
                 if !filter.excludeFolders.contains(v) { filter.excludeFolders.append(v) }
             }
@@ -141,6 +141,12 @@ enum SearchArgs {
     static func normalizedFolder(_ raw: String) -> (value: String?, error: String?) {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return (nil, nil) }
+        // omni://screenshots: the screenshots Omni took, a folder that is on no disk.
+        if ScreenShots.isLink(trimmed) {
+            let folder = normalizeStorePath(trimmed)
+            return ScreenShots.isFolder(folder) ? (folder, nil)
+                : (nil, "'folder' must be a folder: \"\(trimmed)\" is one screenshot. Use omni://screenshots for all of them.")
+        }
         let expanded = (trimmed as NSString).expandingTildeInPath
         guard expanded.hasPrefix("/") else {
             return (nil, "'folder' must be an absolute path (got \"\(trimmed)\"). "

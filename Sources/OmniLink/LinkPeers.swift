@@ -139,7 +139,11 @@ public enum RemotePath {
 
     public static func isRemote(_ path: String) -> Bool { path.hasPrefix(scheme) }
 
-    public static func make(peer: String, path: String) -> String { scheme + peer + path }
+    /// A path that is not a file's ("photos://...", "omni://screenshots/...") is joined with a
+    /// slash: run straight onto the id, the id's end could not be found again ("abcphotos:").
+    public static func make(peer: String, path: String) -> String {
+        scheme + peer + (path.hasPrefix("/") ? path : "/" + path)
+    }
 
     /// (peer id, path on that Mac), or nil for anything else.
     public static func parse(_ s: String) -> (peer: String, path: String)? {
@@ -148,7 +152,12 @@ public enum RemotePath {
         guard let slash = rest.firstIndex(of: "/") else { return nil }
         let peer = String(rest[..<slash])
         guard !peer.isEmpty else { return nil }
-        return (peer, String(rest[slash...]))
+        let path = rest[slash...]
+        let tail = path.dropFirst()
+        if let r = tail.range(of: "://"), !tail[..<r.lowerBound].isEmpty, tail[..<r.lowerBound].allSatisfy(\.isLetter) {
+            return (peer, String(tail))
+        }
+        return (peer, String(path))
     }
 
     public static func peer(of s: String) -> String? { parse(s)?.peer }

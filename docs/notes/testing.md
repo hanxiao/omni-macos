@@ -877,3 +877,15 @@ Found while proving the 0.20.3 update (docs/screenshots.md, "Video only").
   Thumbnail by the dozen. `wait:6` at launch read FolderRow 4 or 5 between runs of one build.
 - `pgrep -x Omni` CAN LIST A PID THAT `ps` DOES NOT HAVE, for a moment after an instance quits
   (5366, twice). Name the instances by `ps -p <pid> -o lstart,command` before concluding one is left.
+- A COPY IN A TEST RUN WENT TO THE USER'S CLIPBOARD. `OmniPasteboard` wrote the general
+  pasteboard whatever the run, so the `shotcopy` steps of the 0.20.3 proof replaced what the user
+  had copied (with test files; nothing of theirs was read). With `-omni.clipboard.pasteboard <name>`
+  every copy Omni makes goes to that pasteboard, and the `pasteboard` step logs what is on it
+  (it refuses the general one). `copypath` is Copy Path on the selection.
+- A SCHEME IN A PATH ARGUMENT. NSString's `expandingTildeInPath` collapses `omni://screenshots/x`
+  to `omni:/screenshots/x`, which then reads as the relative path "/omni:/...". Expand only what
+  has no scheme (`expandedPath`).
+- TWO LINKED COPIES ON ONE MAC: `$S`-style launcher with its own serving port, socket and link
+  port per instance, linked by `linktool seed <asker's link dir> <answerer's link dir> 127.0.0.1
+  <answerer's link port>` with both quit. The asker then sees the answerer under the name it
+  advertises (`-omni.link.name`), not the "app" the seed wrote.

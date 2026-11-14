@@ -292,6 +292,59 @@ final class ScreenHistoryTests: XCTestCase {
         XCTAssertEqual(reopened.shot(atPath: try XCTUnwrap(samoa.path))?.time, t0 + 5)
     }
 
+    /// A served answer names a shot by a link (docs/screenshots.md, "A shot as a link"): its second
+    /// in UTC, whatever clock the Mac is on, and its display only when another shot shares the
+    /// second. Each link reads back to its own shot, and a deleted neighbour leaves the display's
+    /// link pointing where it did.
+    func testAShotIsServedAsALinkToItsSecondInUTC() throws {
+        let system = NSTimeZone.default
+        defer { NSTimeZone.default = system }
+        NSTimeZone.default = try XCTUnwrap(TimeZone(identifier: "Asia/Tokyo"))
+        let a = try XCTUnwrap(history.record(frame(page: 1), time: t0 + 0.25, display: 1, app: "Xcode", title: "a.swift", settled: false))
+        let aPath = try XCTUnwrap(a.path)
+        // 1,800,000,000 s is 2027-01-15 08:00:00 UTC (17:00 in Tokyo, the clock the name is on).
+        XCTAssertEqual(history.link(of: a.shot), "omni://screenshots/20270115080000")
+        XCTAssertEqual(history.link(forPath: aPath), "omni://screenshots/20270115080000")
+        XCTAssertEqual(history.shot(atLink: "omni://screenshots/20270115080000"), a.shot)
+        XCTAssertEqual(history.path(forLink: "omni://screenshots/20270115080000"), aPath)
+        XCTAssertEqual(history.path(forLink: "omni://screenshots"), history.root, "the bare scheme is the folder")
+
+        // A second display in the same second: both links name their display, the bare one neither.
+        let b = try XCTUnwrap(history.record(frame(page: 2), time: t0 + 0.6, display: 2, app: "Safari", title: "News", settled: false))
+        let bPath = try XCTUnwrap(b.path)
+        XCTAssertEqual(history.link(of: a.shot), "omni://screenshots/20270115080000/1")
+        XCTAssertEqual(history.link(of: b.shot), "omni://screenshots/20270115080000/2")
+        XCTAssertEqual(history.path(forLink: "omni://screenshots/20270115080000/1"), aPath)
+        XCTAssertEqual(history.path(forLink: "omni://screenshots/20270115080000/2"), bPath)
+        XCTAssertNil(history.shot(atLink: "omni://screenshots/20270115080000"), "two shots at that second: the bare link is neither")
+
+        // A shot not in the index has no link; nor does anything malformed or empty.
+        let typing = try XCTUnwrap(history.record(frame(page: 1, typed: 6), time: t0 + 5, display: 1, app: "Xcode", title: "a.swift", settled: false))
+        XCTAssertNil(typing.path)
+        XCTAssertNil(history.link(of: typing.shot))
+        for bad in ["omni://screenshots/2027011508000", "omni://screenshots/202701150800000", "omni://screenshots/2027O115080000",
+                    "omni://screenshots/20270115080001", "omni://screenshots/20270115080000/3", "omni://screenshots/20270115080000/x",
+                    "omni://screenshots/20270115080000/1/2", "omni://other/20270115080000", "/20270115080000"] {
+            XCTAssertNil(history.shot(atLink: bad), bad)
+            XCTAssertNil(history.path(forLink: bad), bad)
+        }
+
+        // On another clock, and reopened, the same links.
+        history.stop()
+        NSTimeZone.default = try XCTUnwrap(TimeZone(identifier: "America/Los_Angeles"))
+        let reopened = open()
+        XCTAssertEqual(reopened.link(forPath: aPath), "omni://screenshots/20270115080000/1")
+        XCTAssertEqual(reopened.path(forLink: "omni://screenshots/20270115080000/2"), bPath)
+
+        // The first display's shot deleted: the second's shot is the only one at that second now, its
+        // display's link still reads to it, and the deleted one's reads to nothing.
+        _ = reopened.delete(from: t0, to: t0 + 0.5, display: 1)
+        XCTAssertNil(reopened.path(forLink: "omni://screenshots/20270115080000/1"))
+        XCTAssertEqual(reopened.path(forLink: "omni://screenshots/20270115080000/2"), bPath)
+        XCTAssertEqual(reopened.link(forPath: bPath), "omni://screenshots/20270115080000")
+        XCTAssertEqual(reopened.path(forLink: "omni://screenshots/20270115080000"), bPath)
+    }
+
     /// A shot that leaves the app is the file 0.20.2 kept for every indexed shot.
     func testAShotLeavesAsAScreenCaptureFileDatedAtTheShot() throws {
         let big = frame(page: 1, width: 2560, height: 1440)

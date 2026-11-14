@@ -68,8 +68,9 @@ From "CLI is All Agents Need", reviewed 2026-10-07:
   Omni's own screenshots are, so `read_file` on an indexed image answers with a JPEG whatever the
   file is (`--max_edge` for more pixels; a screenshot up to the display's own size, from the
   history), and `omni` saves each picture a command returns under `$TMPDIR/omni-pictures`, named by
-  its content, and prints the path where the picture was: `omni read_file shot.heic` prints one
-  path, `omni search ... --include_images` a `picture:` line under each result that has one, and
+  its content, and prints the path where the picture was: `omni read_file
+  omni://screenshots/20261112200123` (a screenshot is a link, not a file: docs/screenshots.md,
+  "A shot as a link") prints one path, `omni search ... --include_images` a `picture:` line under each result that has one, and
   `--json` adds `pictures` (each the file and its picture). Saved by `omni`, not by the app, so it
   is on the disk of whoever ran the command; pictures older than a day are removed. The server
   names the file of each image block in `_meta` `io.hanxiao.omni/picture`, on CLI calls only. REST

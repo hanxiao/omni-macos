@@ -36,13 +36,7 @@ final class ClipboardMonitor {
     /// The pasteboard read: the system's, or for an isolated run a named one a harness writes
     /// (`-omni.clipboard.pasteboard <name>`, launch argument only), so a measured instance never
     /// reads what the user copies.
-    static let pasteboard: NSPasteboard = {
-        let args = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
-        if let name = args["omni.clipboard.pasteboard"] as? String, !name.isEmpty {
-            return NSPasteboard(name: .init(name))
-        }
-        return .general
-    }()
+    static var pasteboard: NSPasteboard { OmniPasteboard.pasteboard }
 
     func start() {
         guard timer == nil else { return }
@@ -135,11 +129,22 @@ final class ClipboardMonitor {
 /// does not record Omni's own output. `concealed` also sets the nspasteboard.org concealed type,
 /// which other clipboard managers honour too: the serving token is a credential.
 enum OmniPasteboard {
+    /// The system's pasteboard, or for an isolated run the named one it was given
+    /// (`-omni.clipboard.pasteboard <name>`, launch argument only): what the clipboard history
+    /// reads and what Omni's own copies go to, so a measured instance neither reads nor replaces
+    /// what the user copied.
+    nonisolated(unsafe) static let pasteboard: NSPasteboard = {
+        let args = UserDefaults.standard.volatileDomain(forName: UserDefaults.argumentDomain)
+        if let name = args["omni.clipboard.pasteboard"] as? String, !name.isEmpty {
+            return NSPasteboard(name: .init(name))
+        }
+        return .general
+    }()
     static let ownType = NSPasteboard.PasteboardType(ClipboardHistory.ownType)
     static let concealedType = NSPasteboard.PasteboardType("org.nspasteboard.ConcealedType")
 
     static func copy(_ string: String, concealed: Bool = false) {
-        let pb = NSPasteboard.general
+        let pb = pasteboard
         pb.clearContents()
         pb.declareTypes([.string, ownType] + (concealed ? [concealedType] : []), owner: nil)
         pb.setString(string, forType: .string)
@@ -149,7 +154,7 @@ enum OmniPasteboard {
 
     /// A picture Omni made (a shot from the screen history), as PNG.
     static func copyImage(png: Data) {
-        let pb = NSPasteboard.general
+        let pb = pasteboard
         pb.clearContents()
         pb.declareTypes([.png, ownType], owner: nil)
         pb.setData(png, forType: .png)
@@ -162,7 +167,7 @@ enum OmniPasteboard {
     /// that, Omni copying a result would land the copy in the Clipboard folder, where it is indexed,
     /// found, and copied again. `pb` is a parameter so that guard can be checked on a private
     /// pasteboard instead of the user's clipboard.
-    static func copyFiles(_ files: [URL], text: String, to pb: NSPasteboard = .general) {
+    static func copyFiles(_ files: [URL], text: String, to pb: NSPasteboard = pasteboard) {
         guard !files.isEmpty else { copy(text); return }
         pb.clearContents()
         let items = files.enumerated().map { i, url -> NSPasteboardItem in

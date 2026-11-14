@@ -62,7 +62,7 @@ enum MCPAdapter {
 
     /// What `initialize` tells a client about the whole server. Also the body of SKILL.md
     /// (AgentSkill), so it is written for an agent reading it cold.
-    static let instructions = "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `read_file` reads an indexed file's text by page, line or offset, including formats you cannot open, and returns an indexed image as a picture to look at; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, the passage that matched and media metadata; a search ends with how many more there are (`offset` pages) and where the top matches are.\n\nIf the user has Omni record screenshots, what was on their screen is found like any picture. A screenshot result gives the time it was taken, and under the results the stretch of work around it: when it ran and which apps and windows were in front. To find what they were working on then, call `search` with that range as `modified_after` and `modified_before` and no query: it lists the files last modified in it, newest first. A linked Mac's screenshots are found the same way, and their line names the Mac to pass as `macs` for the files changed on it.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. Linked Macs (other Macs running Omni that this one is linked with) are searched too, and their results are listed under each Mac's name: get_linked_file copies one here to read. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
+    static let instructions = "Search the user's local files by meaning. Files of every kind - text, code, PDFs, images, audio, video - share one embedding space, so describe the CONTENT you want in natural language (any language). `search` finds files across the whole index; `search_inline` ranks the best passages WITHIN a specific set of files or folders you already know; `read_file` reads an indexed file's text by page, line or offset, including formats you cannot open, and returns an indexed image as a picture to look at; `file_status` reports whether given files are indexed and whether the index is still fresh for them. `ocr` transcribes a scanned PDF or an image to Markdown, page by page. Results are file paths with scores, the passage that matched and media metadata; a search ends with how many more there are (`offset` pages) and where the top matches are.\n\nIf the user has Omni record screenshots, what was on their screen is found like any picture. A screenshot result is an omni:// link, not a file: read_file returns its picture. It gives the time it was taken, and under the results the stretch of work around it: when it ran and which apps and windows were in front. To find what they were working on then, call `search` with that range as `modified_after` and `modified_before` and no query: it lists the files last modified in it, newest first. A linked Mac's screenshots are found the same way, and their line names the Mac to pass as `macs` for the files changed on it.\n\nOmni only finds what it has indexed. If a search comes back empty for something the user says is on their Mac, check `list_sources` before concluding the file is not there - the folder may simply not be a source yet. Linked Macs (other Macs running Omni that this one is linked with) are searched too, and their results are listed under each Mac's name: get_linked_file copies one here to read. `add_source` adds a folder (or the Apple Photos library, whole or by album) and indexing starts immediately; `pause_source` stops work on one without losing what it already indexed; `remove_source` drops it and its rows. These change what the user sees in the app, so treat add and especially remove as actions to take on request rather than on your own initiative."
 
     /// Every tool, as `tools/list` returns them - and as the `omni` command line and SKILL.md
     /// present them. The source tools are only advertised once the app has wired the control:
@@ -137,6 +137,8 @@ enum MCPAdapter {
         // enough that the line costs a few tokens, not a few hundred.
         func label(_ path: String) -> String {
             if PhotoLibrary.isPhotoPath(path) { return "Photos" }
+            // A shot is named by its link above, so its folder by the scheme an agent scopes with.
+            if ScreenShots.isShotPath(path) { return ScreenHistory.linkScheme }
             let dir = (path as NSString).deletingLastPathComponent
             guard let root = roots.filter({ dir == $0 || dir.hasPrefix($0 + "/") }).max(by: { $0.count < $1.count }) else {
                 return (dir as NSString).lastPathComponent
@@ -264,7 +266,7 @@ enum MCPAdapter {
                     ],
                     "folder": [
                         "type": "string",
-                        "description": "Restrict to files under this absolute folder path."
+                        "description": "Restrict to files under this absolute folder path; omni://screenshots for the screenshots Omni took."
                     ],
                     "folders": [
                         "type": "array",
@@ -474,18 +476,21 @@ enum MCPAdapter {
                 meta += ", " + (listing || screen[h.path] != nil ? ScreenHints.stamp(h.modified) : Self.shortDate(h.modified))
                 if weaker[i] { meta += ", weaker match" }
                 // A listing ranks nothing, so it has no score to show.
-                var text = "\(offset + i + 1). \(h.path)  (\(h.fileKind)\(listing ? "" : ", \(score)%")\(loc)\(meta))"
+                var text = "\(offset + i + 1). \(screen[h.path]?.link ?? h.path)  (\(h.fileKind)\(listing ? "" : ", \(score)%")\(loc)\(meta))"
                 if maxSnippet > 0 {
                     let snippet = oneLine(passages[i]?.text ?? h.snippet)
                     if !snippet.isEmpty { text += "\n   \(String(snippet.prefix(maxSnippet)))" }
                 }
                 content.append(["type": "text", "text": text])
                 let isMedia = h.fileKind == FileKind.image.rawValue || h.fileKind == FileKind.scan.rawValue
+                // Not every screenshot's picture on the command line as well: ten of them cost 285 ms a
+                // search (34 ms without), for pictures an agent mostly never opens. read_file of the
+                // link gives the one it wants (docs/screenshots.md, "A shot as a link").
                 if includeImages && isMedia {
                     if inlined >= maxInlineImages {
                         cappedSkips += 1                         // genuinely skipped by the cap
                     } else if let b64 = thumbnailBase64(for: h) {
-                        content.append(["type": "image", "data": b64, "mimeType": "image/jpeg", pictureMark: h.path])
+                        content.append(["type": "image", "data": b64, "mimeType": "image/jpeg", pictureMark: screen[h.path]?.link ?? h.path])
                         inlined += 1
                     }
                     // else: a decode failure (missing/corrupt file) - the text block still carries the
@@ -499,6 +504,7 @@ enum MCPAdapter {
             for line in ScreenHints.sessionLines(reps, screen, offset: offset, cli: cli) {
                 content.append(["type": "text", "text": line])
             }
+            if reps.contains(where: { screen[$0.path]?.link != nil }) { content.append(["type": "text", "text": ScreenHints.notAFile(cli: cli)]) }
             if reps.isEmpty {
                 content.append(diagnostic(listing ? "No files past \(pool.count) in that range: offset \(offset) is beyond the end."
                                                   : "No results past \(pool.count) for \"\(query)\": offset \(offset) is beyond the end."))
@@ -536,7 +542,7 @@ enum MCPAdapter {
                         let loc = h.locator.isEmpty ? "" : ", \(h.locator)"
                         // To the second where the time is the point, as for this Mac's results.
                         let when = listing || a.shots[h.path] != nil ? ScreenHints.stamp(h.modified) : Self.shortDate(h.modified)
-                        var text = "\(i + 1). \(h.path)  (\(h.fileKind)\(listing ? "" : ", \(score)%")\(loc), \(when))"
+                        var text = "\(i + 1). \(a.shots[h.path]?.link ?? h.path)  (\(h.fileKind)\(listing ? "" : ", \(score)%")\(loc), \(when))"
                         if maxSnippet > 0 {
                             let snippet = h.snippet.replacingOccurrences(of: "\n", with: " ")
                             if !snippet.isEmpty { text += "\n   \(String(snippet.prefix(maxSnippet)))" }
@@ -547,9 +553,12 @@ enum MCPAdapter {
                     for line in ScreenHints.sessionLines(hits, a.shots, offset: 0, cli: cli, mac: a.mac) {
                         content.append(["type": "text", "text": line])
                     }
+                    if a.canOpen, hits.contains(where: { a.shots[$0.path]?.link != nil }) {
+                        content.append(["type": "text", "text": ScreenHints.notAFile(cli: cli, mac: a.mac)])
+                    }
                 }
                 linked.append(["mac": a.mac, "note": a.note ?? NSNull(), "canOpen": a.canOpen, "results": hits.map { h -> [String: Any] in
-                    var row: [String: Any] = ["path": h.path, "kind": h.fileKind, "snippet": h.snippet,
+                    var row: [String: Any] = ["path": a.shots[h.path]?.link ?? h.path, "kind": h.fileKind, "snippet": h.snippet,
                                               "locator": h.locator, "modified": h.modified, "size": h.size]
                     if !listing { row["score"] = Double(max(0, min(1, h.score))) }
                     if let moment = a.shots[h.path] { row["screenshot"] = ScreenHints.row(moment) }
@@ -619,7 +628,8 @@ enum MCPAdapter {
                 "isError": true
             ])
         }
-        let paths = (args["paths"] as? [String])?.filter { !$0.isEmpty } ?? []
+        // A screenshot's link (or omni://screenshots) read back to what the index holds.
+        let paths = (args["paths"] as? [String])?.filter { !$0.isEmpty }.map { ScreenShots.isLink($0) ? normalizeStorePath($0) : $0 } ?? []
         guard !paths.isEmpty else {
             return result(id: id, [
                 "content": [["type": "text", "text": "search_inline failed: 'paths' must be a non-empty array of absolute file or folder paths"]],
@@ -651,7 +661,7 @@ enum MCPAdapter {
             for (i, h) in hits.enumerated() {
                 let score = Int((max(0, min(1, h.score)) * 100).rounded())
                 let loc = h.locator.isEmpty ? "" : ", \(h.locator)"
-                var text = "\(i + 1). \(h.path)  (\(h.kind), chunk \(h.chunkIndex), \(score)%\(loc))"
+                var text = "\(i + 1). \(ScreenShots.served(h.path))  (\(h.kind), chunk \(h.chunkIndex), \(score)%\(loc))"
                 if maxSnippet > 0 {
                     let snippet = oneLine(h.snippet)
                     if !snippet.isEmpty { text += "\n   \(String(snippet.prefix(maxSnippet)))" }
@@ -661,7 +671,7 @@ enum MCPAdapter {
         }
         return answer(id: id, content, cli: cli) {
             ["query": query, "results": hits.map { h -> [String: Any] in
-                ["path": h.path, "kind": h.kind, "chunk_index": h.chunkIndex,
+                ["path": ScreenShots.served(h.path), "kind": h.kind, "chunk_index": h.chunkIndex,
                  "score": Double(max(0, min(1, h.score))), "snippet": h.snippet, "locator": h.locator]
             }]
         }
@@ -678,7 +688,7 @@ enum MCPAdapter {
         let found = backend.findPhrase(phrase, paths: paths, keep: keep)
         var content: [[String: Any]] = []
         for (i, p) in found.places.enumerated() {
-            content.append(["type": "text", "text": "\(i + 1). \(p.path)  (\(p.locator))\n   \(p.context)"])
+            content.append(["type": "text", "text": "\(i + 1). \(ScreenShots.served(p.path))  (\(p.locator))\n   \(p.context)"])
         }
         var summary = found.total == 0
             ? "\"\(phrase)\" does not occur in the text of \(found.filesSearched) indexed file\(found.filesSearched == 1 ? "" : "s") in those paths."
@@ -694,7 +704,7 @@ enum MCPAdapter {
         return answer(id: id, content, cli: cli) {
             ["query": phrase, "exact": true, "total": found.total, "files_searched": found.filesSearched,
              "files_with_matches": found.filesWithMatches,
-             "matches": found.places.map { ["path": $0.path, "locator": $0.locator, "context": $0.context] }]
+             "matches": found.places.map { ["path": ScreenShots.served($0.path), "locator": $0.locator, "context": $0.context] }]
         }
     }
 
@@ -708,7 +718,7 @@ enum MCPAdapter {
             "inputSchema": [
                 "type": "object",
                 "properties": [
-                    "path": ["type": "string", "description": "Absolute path of a file Omni has indexed, as search listed it."],
+                    "path": ["type": "string", "description": "Absolute path of a file Omni has indexed, or a screenshot's omni:// link, as search listed it."],
                     "page": ["type": "integer", "minimum": 1, "description": "PDF, deck or workbook: first page, slide or sheet (default 1)."],
                     "line": ["type": "integer", "minimum": 1, "description": "Text and code: first line (default 1). A workbook: first row of the sheet `page` names (a hit's \"Stock A508:D518\" is row 508)."],
                     "offset": ["type": "integer", "minimum": 0, "description": "First character, for documents (default 0)."],
@@ -729,11 +739,14 @@ enum MCPAdapter {
         }
         let typed = raw.trimmingCharacters(in: .whitespaces)
         let photo = PhotoLibrary.Ref(typed) != nil
-        let path = photo ? typed : normalizeStorePath((typed as NSString).expandingTildeInPath)
+        let path = photo ? typed : normalizeStorePath(expandedPath(typed))
         let clip = AppModel.clipboardDirectory.path
         // A copy get_linked_file made is read like the file it is a copy of: the Mac it came from
         // served it from its own index.
         let linkedCopy = path.hasPrefix(RemoteFiles.shared.root.path + "/")
+        if ScreenShots.isLink(path) {
+            return toolError(id: id, "read_file failed: no screenshot at \(path) in Omni's screen history (deleted, or older than Settings > Screenshots keeps).")
+        }
         guard photo || path.hasPrefix("/"), path != clip, !path.hasPrefix(clip + "/"),
               linkedCopy && FileManager.default.fileExists(atPath: path) || backend.fileStatus(paths: [path])[path] != nil else {
             return toolError(id: id, "read_file failed: \(path) is not in Omni's index. read_file reads only indexed files; file_status says which are.")
@@ -788,10 +801,12 @@ enum MCPAdapter {
             image = got.image
             size = held.flatMap { edge > max($0.width, $0.height) ? nil : $0 } ?? (got.width, got.height)
         }
+        // A screenshot is named by its link: its path has no file behind it.
+        let shown = ScreenShots.served(path)
         guard let image = image ?? Self.image(path: path, maxEdge: edge), let data = jpegBase64(image, quality: 0.8) else {
-            return toolError(id: id, "read_file failed: the image could not be opened (\(path)).")
+            return toolError(id: id, "read_file failed: the image could not be opened (\(shown)).")
         }
-        var head = "\(path): image"
+        var head = "\(shown): image"
         if let size { head += ", \(size.width) x \(size.height) pixels" }
         if size == nil || image.width != size!.width || image.height != size!.height { head += ", shown at \(image.width) x \(image.height)" }
         var shot: [String: Any]?
@@ -802,9 +817,9 @@ enum MCPAdapter {
             shot = ScreenHints.row(moment)
         }
         var picture: [String: Any] = ["type": "image", "data": data, "mimeType": "image/jpeg"]
-        picture[pictureMark] = path
+        picture[pictureMark] = shown
         return answer(id: id, [cli ? diagnostic(head) : ["type": "text", "text": head], picture], cli: cli) {
-            var out: [String: Any] = ["path": path, "kind": "image", "shown_width": image.width, "shown_height": image.height]
+            var out: [String: Any] = ["path": shown, "kind": "image", "shown_width": image.width, "shown_height": image.height]
             if let size { out["width"] = size.width; out["height"] = size.height }
             if let shot { out["screenshot"] = shot }
             return out
@@ -886,6 +901,8 @@ enum MCPAdapter {
                         ? "a Photos source, not a file: search covers it, and list_sources says how many photos it holds"
                         : "NOT indexed: no such photo in the index"
                 }
+                else if p == ScreenHistory.linkScheme { why = "the screenshots Omni took, not a file: search inside them with search's 'folder'" }
+                else if ScreenShots.isLink(p) { why = "no screenshot at that moment in Omni's screen history" }
                 else if !asked.hasPrefix("/") && !asked.hasPrefix("~") { why = "not an absolute file path" }
                 else if !ScreenShots.isFolder(p), !FileManager.default.fileExists(atPath: p, isDirectory: &isDir) { why = "no such file" }
                 else if isDir.boolValue || ScreenShots.isFolder(p) { why = "a folder, not a file: search inside it with search's 'folder', or list_sources for what is indexed" }
@@ -1477,7 +1494,7 @@ enum MCPAdapter {
                 "type": "object",
                 "properties": [
                     "mac": ["type": "string", "description": "The linked Mac's name, as search listed it."],
-                    "path": ["type": "string", "description": "The file's path on that Mac, as search listed it."],
+                    "path": ["type": "string", "description": "The file's path on that Mac (or a screenshot's omni:// link), as search listed it."],
                 ] as [String: Any],
                 "required": ["path", "mac"],   // path first: the command line takes it bare
             ] as [String: Any],

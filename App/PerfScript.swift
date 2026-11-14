@@ -15,7 +15,7 @@ import os
 /// `wait:<seconds>`, `intent:<text>` (the Shortcuts search action's own search, logged). For recording the intro video: `type:<text>` (a key at a time, searching at
 /// each word), `similar:<path>`, `select:<result index>`, `map:<folder>`, `frame:<w>x<h>`
 /// (window size, centered), `front`, `appearance:light|dark`, `ocrview:raw|rendered|split|triple`, `ocrpage:<n>`, `history:<n>`, `sort:<order>`,
-/// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `menu:<title>`, `historybench:<n>`, `seedhistory:<n>[:<m>]`, `note:<text>`, `menustate:<menu>`, `historyfold:<n>`, `sidebarscroll:<top|bottom|f>`, `recents`, `clipboard:on|off`, `screenshots:on|off|clear`, `shotfeed:<dir>[|hoursAgo]`, `shotselect:<n>`, `shotscrub:<n>`, `shotday:<-1|1>`, `shotdisplay:<n>`, `shotzoom:<factor|reset>`, `shotpan:<fraction>`, `shotdragfile`, `shotdelete:<shot|session|day>`, `shotexclude:<bundle ids>`, `powerhold:hot|lowpower|battery|none`, `ocrrun:on|off`, `stall:queue:<path>|flag`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
+/// `bsort:<name|column rawValue>`, `settings:<tab>`, `kind:<kind>:<on|off>[:keep|purge]`, `set:<name>=<value>`, `sidebarselect:<n>`, `sidebarhistory:<n>`, `dumpui:<path>`, `menu:<title>`, `historybench:<n>`, `seedhistory:<n>[:<m>]`, `note:<text>`, `menustate:<menu>`, `copypath`, `pasteboard`, `historyfold:<n>`, `sidebarscroll:<top|bottom|f>`, `recents`, `clipboard:on|off`, `screenshots:on|off|clear`, `shotfeed:<dir>[|hoursAgo]`, `shotselect:<n>`, `shotscrub:<n>`, `shotday:<-1|1>`, `shotdisplay:<n>`, `shotzoom:<factor|reset>`, `shotpan:<fraction>`, `shotdragfile`, `shotdelete:<shot|session|day>`, `shotexclude:<bundle ids>`, `powerhold:hot|lowpower|battery|none`, `ocrrun:on|off`, `stall:queue:<path>|flag`. Each step is followed by `OMNI_PERF_SCRIPT_SETTLE` seconds (default 2) before its
 /// CPU is read, so what it set in motion is counted too. `repeat:<n>` before a step repeats it.
 @MainActor
 enum PerfScript {
@@ -496,6 +496,13 @@ enum PerfScript {
             model.deleteScreenshots(atPaths: model.selectionOrdered.filter(ResultPath.isShot), confirmed: true)
         case "shotopen":    // Open on the selected result (a shot: the timeline at it)
             if let path = model.selection { PhotoActions.open(path) }
+        case "copypath":    // Copy Path on the selection
+            model.copySelectedPaths()
+        case "pasteboard":  // what Omni's copies left on the run's named pasteboard; never the user's
+            let pb = OmniPasteboard.pasteboard
+            guard pb != NSPasteboard.general else { omniPerfLog("pasteboard refused: no -omni.clipboard.pasteboard"); break }
+            let text = (pb.string(forType: .string) ?? "").replacingOccurrences(of: "\n", with: " | ")
+            omniPerfLog("pasteboard files=\(pb.pasteboardItems?.filter { $0.string(forType: .fileURL) != nil }.count ?? 0) text=\(text)")
         case "shotcopy":    // Copy on the selection, shots written out as files
             let t0 = Date()
             model.copySelectedFiles()

@@ -840,6 +840,62 @@ public final class ScreenHistory: @unchecked Sendable {
         return nil
     }
 
+    // MARK: - A shot as a link
+
+    /// What a served answer names a shot by (docs/screenshots.md, "A shot as a link"). The path
+    /// the index holds has no file behind it and spaces in it, so an agent that opens it with its
+    /// own reader finds nothing; a link says it is Omni's to read. Its second in UTC as fourteen
+    /// digits (local time repeats when the clocks go back), and `/<display>` when another indexed
+    /// shot shares that second.
+    public static let linkScheme = "omni://screenshots"
+
+    public func link(of shot: Shot) -> String? {
+        guard shot.number > 0 else { return nil }
+        let second = Self.second(shot.time)
+        let wall = Self.wallClock(second)
+        let digits = String((wall.day + wall.time).filter(\.isNumber))
+        let shared = indexedFrames(atSecond: second).contains { $0.shot.id != shot.id }
+        return Self.linkScheme + "/" + digits + (shared ? "/\(shot.display)" : "")
+    }
+
+    /// The link of the shot a path names, while the history holds it.
+    public func link(forPath path: String) -> String? { shot(atPath: path).flatMap(link(of:)) }
+
+    /// The shot a link names. nil when no indexed shot is at that second, or when more than one is
+    /// and the link names no display.
+    public func shot(atLink link: String) -> Shot? {
+        guard link.hasPrefix(Self.linkScheme + "/") else { return nil }
+        let parts = link.dropFirst(Self.linkScheme.count + 1).split(separator: "/", omittingEmptySubsequences: false)
+        guard (1 ... 2).contains(parts.count), let second = Self.linkSeconds(parts[0]) else { return nil }
+        var display: UInt32?
+        if parts.count == 2 { guard let d = UInt32(parts[1]) else { return nil }; display = d }
+        let found = indexedFrames(atSecond: second).filter { display == nil || $0.shot.display == display }
+        return found.count == 1 ? found[0].shot : nil
+    }
+
+    /// The path the index holds for the shot a link names; the root for the bare scheme.
+    public func path(forLink link: String) -> String? {
+        if link == Self.linkScheme || link == Self.linkScheme + "/" { return root }
+        return shot(atLink: link).flatMap(path(of:))
+    }
+
+    /// "20261112200123": the seconds since 1970 it spells in UTC.
+    private static func linkSeconds(_ digits: Substring) -> Int? {
+        let u = Array(digits.utf8)
+        guard u.count == 14, u.allSatisfy({ $0 >= 48 && $0 <= 57 }) else { return nil }
+        let d = String(digits)
+        func at(_ i: Int, _ n: Int) -> String { String(d.dropFirst(i).prefix(n)) }
+        return wallSeconds(at(0, 4) + "-" + at(4, 2) + "-" + at(6, 2) + " " + at(8, 2) + "." + at(10, 2) + "." + at(12, 2))
+    }
+
+    /// The indexed shots of one second, on every display: the segments that could hold it.
+    private func indexedFrames(atSecond second: Int) -> [Frame] {
+        let t = Double(second)
+        return refs().filter { $0.start <= t + 1 && $0.start >= t - Self.maxSegmentSeconds - 1 }
+            .flatMap { frames(of: $0.name) }
+            .filter { $0.shot.number > 0 && Self.second($0.shot.time) == second }
+    }
+
     /// The size the index reads a shot at: the desktop at a pixel a point (`stillSide`).
     public func size(of shot: Shot) -> (width: Int, height: Int)? {
         guard let info = info(of: shot.segment), info.side > 0, info.width > 0, info.height > 0 else { return nil }
