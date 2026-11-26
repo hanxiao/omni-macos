@@ -308,4 +308,21 @@ enum ResultPath {
     static func isShot(_ p: String) -> Bool { ScreenShots.isShotPath(p) }
     /// Not a file on this Mac's disk: a Photos asset, a linked Mac's file or a shot.
     static func isVirtual(_ p: String) -> Bool { PhotoLibrary.isPhotoPath(p) || RemotePath.isRemote(p) || isShot(p) }
+
+    /// What a result row calls a path: its file name, and for a shot its moment and window
+    /// ("00:12:34 Home X"; the date before it when not today). A shot's path is the name 0.20.2's
+    /// HEIC had, which no file carries now; cut in the middle, four shots of one window read the
+    /// same and the time that tells them apart was what went. `modified` is the shot's time.
+    /// Lexical, as ResultRow.fileName must be: read from row bodies.
+    static func name(_ p: String, modified: Double) -> String {
+        let file = (p as NSString).lastPathComponent
+        guard isShot(p), file.utf8.count > 20 else { return file }
+        var subject = String((file as NSString).deletingPathExtension.dropFirst(20))   // "2026-11-16 00.12.34 "
+        if let dash = subject.range(of: " - ") { subject = String(subject[dash.upperBound...]) }
+        let date = Date(timeIntervalSince1970: modified)
+        let when = Calendar.current.isDateInToday(date) ? date.formatted(shotTime) : date.formatted(shotDayTime)
+        return subject.isEmpty ? when : when + "  " + subject
+    }
+    private static let shotTime = Date.FormatStyle().hour().minute().second()
+    private static let shotDayTime = Date.FormatStyle().month(.abbreviated).day().hour().minute().second()
 }

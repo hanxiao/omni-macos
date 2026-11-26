@@ -11,8 +11,9 @@ import OmniKit
 ///
 /// One still at a time through ScreenCaptureKit, not a stream: a stream holds the capture path
 /// open and delivers frames whether or not anything moved, and all that is wanted is one frame
-/// every few seconds. Omni's own windows are left out of the shot: a search made in Omni would
-/// otherwise be found again by the picture of its own results.
+/// every few seconds. Omni is an excluded app from the start (AppModel.screenshotsExcludedApps):
+/// its windows are left out of the shot and none is taken while it is in front, or a search made in
+/// Omni would be found again by the picture of its own results.
 ///
 /// NOT TAKEN: while the screen is locked or its saver runs, and while a display sleeps. Windows an
 /// app marks as not shareable are left out by the system.
@@ -411,10 +412,10 @@ final class ScreenRecorder: @unchecked Sendable {
                     if refused { noteDeclined() }
                     body(Found(failure: said)); return
                 }
-                let out = content.applications.filter { $0.processID == getpid() || excluded.contains($0.bundleIdentifier) }
+                let out = content.applications.filter { excluded.contains($0.bundleIdentifier) }
                 // The processes this filter leaves out, not the ones running: an excluded app the
                 // content does not list yet is not in the filter, and the next look builds it again.
-                excludedPids = Set(out.map(\.processID)).subtracting([getpid()])
+                excludedPids = Set(out.map(\.processID))
                 if !excluded.isEmpty { omniPerfLog("screen-targets displays=\(content.displays.count) left_out=\(excludedPids.count)") }
                 let made = content.displays.map { display -> Target in
                     let filter = SCContentFilter(display: display, excludingApplications: out, exceptingWindows: [])
@@ -429,14 +430,13 @@ final class ScreenRecorder: @unchecked Sendable {
         }
     }
 
-    /// The app and window in front on each display: the topmost ordinary window that is not Omni's
-    /// and not an app left out of the shot.
+    /// The app and window in front on each display: the topmost ordinary window of an app not left
+    /// out of the shot.
     private static func frontWindows(_ displays: [CGDirectDisplayID], skipping: Set<pid_t>) -> [CGDirectDisplayID: (app: String, title: String)] {
         guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[CFString: Any]] else { return [:] }
-        let own = getpid()
         var out: [CGDirectDisplayID: (app: String, title: String)] = [:]
         for w in list {
-            guard (w[kCGWindowLayer] as? Int) == 0, let pid = w[kCGWindowOwnerPID] as? pid_t, pid != own, !skipping.contains(pid),
+            guard (w[kCGWindowLayer] as? Int) == 0, let pid = w[kCGWindowOwnerPID] as? pid_t, !skipping.contains(pid),
                   (w[kCGWindowAlpha] as? Double ?? 1) > 0,
                   let b = w[kCGWindowBounds] as? [String: CGFloat],
                   let width = b["Width"], let height = b["Height"], width >= 64, height >= 64,

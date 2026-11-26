@@ -3168,6 +3168,11 @@ pictures inside Word, Pages and Keynote files (rows existing indexes hold: a mig
   the image kind, as a scan does. A hit on a slide's picture shows as the document, at "Slide 3".
   Not drawn: a deck Quick Look has no preview for (python-pptx decks with speaker notes: "TCMessage
   Exception"), which is indexed by its words. A workbook's preview draws a chart as an empty box.
+  A 2X SCREEN DREW EVERY SLIDE AT TWICE THE SIZE ASKED (fixed in 0.20.6): `snapshotWidth` is in
+  points and the picture comes back at the window's backing scale, so 800 came back 1600 and the
+  indexer's 1568 as 2880 x 2160 on any Retina screen. Found when OfficeDocumentTests failed once
+  this Mac's display ran at 2x (2026-11-25); the measurements above were taken at 1x. The width is
+  divided by the window's scale now: 800 x 600 and 1440 x 1080 for a 720 x 540-point slide.
 - THE EVAL: bed `eval-bed-2` (/Volumes/han2tb/omni-eval-2): three decks (one German), four workbooks
   (a guest list with one name among 37 rows, a car loan, a 700-row inventory with one needle row, a
   rainfall chart) and two Numbers documents, from `Tools/eval/office.py` (committed in

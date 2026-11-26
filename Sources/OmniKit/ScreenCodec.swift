@@ -182,8 +182,10 @@ private final class Handoff<Value>: @unchecked Sendable {
 }
 
 public enum ScreenCodec {
-    /// Measured on generated desktop sessions (omni-verify shotbench; docs/screenshots.md).
-    public static let quality: Float = 0.7
+    /// Measured on generated desktop sessions (omni-verify shotbench) and on a real laptop's
+    /// history (shotbench recode): 0.6 is 70% of 0.7's bytes for words within the reader's own
+    /// spread (docs/screenshots.md, "Storage"). Only new segments; a stored one keeps its frames.
+    public static let quality: Float = 0.6
     public static let keyInterval = 30
 
     /// A BGRA, IOSurface-backed buffer: what ScreenCaptureKit hands over and what the encoder takes.

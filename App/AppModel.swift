@@ -1523,7 +1523,9 @@ final class AppModel {
     }
 
     /// Apps never recorded, by bundle id: their windows are left out of every shot, and no shot is
-    /// taken while one of them is in front (ScreenRecorder.setExcluded).
+    /// taken while one of them is in front (ScreenRecorder.setExcluded). Omni is one of them from
+    /// the start, shown in the list like any other (Han, 2026-11-16): its own results would
+    /// otherwise be found again by the picture of them.
     var screenshotsExcludedApps: [String] = AppModel.storedExcludedApps() {
         didSet {
             guard screenshotsExcludedApps != oldValue else { return }
@@ -1533,10 +1535,22 @@ final class AppModel {
     }
 
     /// A list in the app's settings; a comma-separated argument for an isolated run.
+    /// A list saved before Omni was in it gains Omni once (`excludedAppsHasOmni`); taken out after
+    /// that, it stays out.
     private nonisolated static func storedExcludedApps() -> [String] {
-        let stored = UserDefaults.standard.object(forKey: "omni.screenshots.excludedApps")
-        if let list = stored as? [String] { return list }
-        return (stored as? String)?.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } ?? []
+        let defaults = UserDefaults.standard
+        let stored = defaults.object(forKey: "omni.screenshots.excludedApps")
+        let own = Bundle.main.bundleIdentifier ?? "io.hanxiao.omni"
+        var list = (stored as? [String])
+            ?? (stored as? String)?.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } ?? []
+        if !defaults.bool(forKey: "omni.screenshots.excludedAppsHasOmni") {
+            if !list.contains(own) { list.insert(own, at: 0) }
+            if !isolatedByLaunchArgument {
+                OmniPrefs.set(list, forKey: "omni.screenshots.excludedApps")
+                OmniPrefs.set(true, forKey: "omni.screenshots.excludedAppsHasOmni")
+            }
+        }
+        return list
     }
 
     func excludeFromScreenshots(_ app: URL) {

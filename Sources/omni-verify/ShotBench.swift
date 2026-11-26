@@ -317,7 +317,7 @@ enum ShotBench {
                           let read = ScreenText.fitted(image, long: ScreenText.readSide(width: image.width, height: image.height, dpi: 72 * Double(scale))) else { return nil }
                     return (read, true, 0)
                 }),
-            ] + [(Float(0.7), true), (0.7, false), (0.8, true), (0.8, false)].map { quality, key in
+            ] + [(Float(0.7), true), (0.7, false), (0.8, true), (0.8, false), (0.6, true), (0.6, false), (0.5, true), (0.5, false)].map { quality, key in
                 // The frame as the history gives it back: through the video codec, a key frame or
                 // the frame after a different screen (the largest delta there is), read as the
                 // frame itself is. What a history with no stills would read. Bytes: the frame's.
@@ -892,6 +892,163 @@ enum ShotBench {
         report("spread", spread, width: 4)
     }
 
+    /// `shotbench recode <Screen History> [--segments N] [--dump dir] [--model dir]`: what a history holds (per
+    /// display: size, frames, bytes, an hour's worth), then its N largest segments decoded frame by
+    /// frame and written again under each storage option, side by side: bytes against the stored
+    /// segment, and the text Vision reads on every tenth frame against what it reads on the stored
+    /// frame (the original is gone; the stored frame is the reference). --dump writes the same part
+    /// of one frame under each option as PNG, for a person to judge. SEARCH IS THE EMBEDDING: with
+    /// --model (the model the app indexes with) each sampled frame is embedded at the size the index
+    /// reads a shot (a pixel a point) under each option, against the stored frame's vector, and
+    /// asked whether it still finds its own shot first among all the sampled ones.
+    static func recode(_ args: [String]) async throws {
+        guard let dir = args.first else { print("usage: shotbench recode <Screen History> [--segments N] [--dump dir] [--model dir]"); return }
+        var count = 4, dump: String?, model: String?
+        var i = 1
+        while i + 1 < args.count {
+            if args[i] == "--segments" { count = Int(args[i + 1]) ?? 4 }
+            if args[i] == "--dump" { dump = args[i + 1] }
+            if args[i] == "--model" { model = args[i + 1] }
+            i += 2
+        }
+        var engine: OmniEngine?
+        if let model { engine = try await OmniEngine(modelDir: URL(fileURLWithPath: model), keepVision: true, keepAudio: false) }
+        let folder = URL(fileURLWithPath: dir)
+        let history = ScreenHistory(history: folder, stills: folder.deletingLastPathComponent().appendingPathComponent("no-stills-\(getpid())"))
+        let fm = FileManager.default
+        let names = ((try? fm.contentsOfDirectory(atPath: folder.path)) ?? []).filter { $0.hasSuffix("." + ScreenHistory.segmentExtension) }
+        var bytes: [String: Int] = [:]
+        for n in names { bytes[n] = (try? fm.attributesOfItem(atPath: folder.appendingPathComponent(n).path)[.size] as? Int) ?? 0 }
+        let shots = history.shots(from: 0, to: 4e9)
+        let bySegment = Dictionary(grouping: shots, by: \.segment).mapValues { $0.sorted { $0.index < $1.index } }
+
+        // What it holds, per display.
+        struct Line { var segments = 0, frames = 0, indexed = 0, bytes = 0, seconds = 0.0, size = "" }
+        var lines: [UInt32: Line] = [:]
+        for (segment, list) in bySegment {
+            guard let first = list.first, let last = list.last else { continue }
+            var l = lines[first.display] ?? Line()
+            l.segments += 1; l.frames += list.count; l.indexed += list.filter(\.indexed).count
+            l.bytes += bytes[segment] ?? 0; l.seconds += max(5, last.time - first.time)
+            if l.size.isEmpty, let p = history.picture(of: first, maxDimension: 1 << 16) { l.size = "\(p.width)x\(p.height)" }
+            lines[first.display] = l
+        }
+        let span = (shots.map(\.time).max() ?? 0) - (shots.map(\.time).min() ?? 0)
+        print(String(format: "history: %d segments, %d frames, %.1f MB, first to last %.1f days", names.count, shots.count,
+                     Double(bytes.values.reduce(0, +)) / 1e6, span / 86400))
+        for (display, l) in lines.sorted(by: { $0.value.bytes > $1.value.bytes }) {
+            print(String(format: "  display %u %@: %d segments, %d frames (%d indexed), %.1f MB, %.1f KB/frame, recorded %.1f h, %.0f frames/h, %.1f MB/h",
+                         display, l.size, l.segments, l.frames, l.indexed, Double(l.bytes) / 1e6, Double(l.bytes) / Double(max(l.frames, 1)) / 1024,
+                         l.seconds / 3600, Double(l.frames) / max(l.seconds / 3600, 0.01), Double(l.bytes) / 1e6 / max(l.seconds / 3600, 0.01)))
+        }
+
+        // The options, each its own encoder and decoder fed every frame of a segment in order.
+        struct Option { let name: String; let half: Bool; let quality: Float; let indexedOnly: Bool }
+        let options = [Option(name: "as stored: full q0.7", half: false, quality: 0.7, indexedOnly: false),
+                       Option(name: "full q0.6", half: false, quality: 0.6, indexedOnly: false),
+                       Option(name: "full q0.5", half: false, quality: 0.5, indexedOnly: false),
+                       Option(name: "half q0.7", half: true, quality: 0.7, indexedOnly: false),
+                       Option(name: "half q0.8", half: true, quality: 0.8, indexedOnly: false),
+                       Option(name: "indexed only: full q0.7", half: false, quality: 0.7, indexedOnly: true)]
+        var totals = [Int](repeating: 0, count: options.count), read = [Int](repeating: 0, count: options.count)
+        var truthTotal = [Int](repeating: 0, count: options.count), stored = 0, framesDone = 0
+        var dumped = false
+        var refs: [[Float]] = [], vecs = [[(ref: Int, vec: [Float])]](repeating: [], count: options.count)
+        let chosen = bySegment.keys.sorted { (bytes[$0] ?? 0) > (bytes[$1] ?? 0) }.prefix(count)
+        let t0 = Date()
+        for segment in chosen {
+            guard let list = bySegment[segment], let first = list.first,
+                  let probe = history.picture(of: first, maxDimension: 1 << 16) else { continue }
+            let (w, h) = (probe.width & ~1, probe.height & ~1)
+            let (hw, hh) = ((w / 2) & ~1, (h / 2) & ~1)
+            let encoders = options.map { ScreenFrameEncoder(width: $0.half ? hw : w, height: $0.half ? hh : h, quality: $0.quality) }
+            let decoders = options.map { _ in ScreenFrameDecoder() }
+            guard encoders.allSatisfy({ $0 != nil }) else { print("no encoder for \(w)x\(h)"); return }
+            stored += bytes[segment] ?? 0
+            for (k, shot) in list.enumerated() {
+                guard let got = history.picture(of: shot, maxDimension: 1 << 16), let full = pixels(got.image, w, h) else { continue }
+                let small = pixels(got.image, hw, hh)
+                let sampled = k % 10 == 0
+                // Words, not lines: one changed character failed a whole line, and a same-setting
+                // re-encode then read 72% of the stored frame's lines.
+                func words(_ p: CVPixelBuffer) -> Set<String> { Set(Self.lines(p).flatMap { $0.split(separator: " ").map(String.init) }) }
+                let truth = sampled ? words(full) : []
+                // The index reads a shot at a pixel a point: the stored frame's vector at that size.
+                let side = history.size(of: shot).map { max($0.width, $0.height) } ?? max(w, h)
+                var ref: [Float]?
+                if sampled, let engine { ref = Self.scaled(full, maxDimension: side).flatMap { engine.embedImage($0) } }
+                if let ref { refs.append(ref) }
+                for (j, o) in options.enumerated() where !o.indexedOnly || shot.indexed {
+                    guard let input = o.half ? small : full, let f = encoders[j]!.encode(input) else { continue }
+                    totals[j] += f.data.count
+                    let out = decoders[j].decode(f.data, parameterSets: f.parameterSets)
+                    if sampled, let out {
+                        let got = words(out)
+                        truthTotal[j] += truth.count; read[j] += truth.filter { got.contains($0) }.count
+                        if let engine, ref != nil, let v = Self.scaled(out, maxDimension: side).flatMap({ engine.embedImage($0) }) {
+                            vecs[j].append((refs.count - 1, v))
+                        }
+                    }
+                    if let dump, !dumped, k == min(30, list.count - 1), let out { crop(out, half: o.half, w: w, h: h, to: "\(dump)/\(j)-\(o.name.replacingOccurrences(of: ":", with: "").replacingOccurrences(of: " ", with: "-")).png") }
+                }
+                if let dump, !dumped, k == min(30, list.count - 1) { crop(full, half: false, w: w, h: h, to: "\(dump)/stored.png"); dumped = true }
+                framesDone += 1
+            }
+        }
+        print(String(format: "recoded %d segments, %d frames, stored %.1f MB, %.0f s", chosen.count, framesDone, Double(stored) / 1e6, -t0.timeIntervalSinceNow))
+        func cos(_ x: [Float], _ y: [Float]) -> Float {
+            let dot = zip(x, y).reduce(Float(0)) { $0 + $1.0 * $1.1 }
+            return dot / (x.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot() * y.reduce(Float(0)) { $0 + $1 * $1 }.squareRoot())
+        }
+        for (j, o) in options.enumerated() {
+            var embedding = ""
+            if !vecs[j].isEmpty {
+                let same = vecs[j].map { cos($0.vec, refs[$0.ref]) }
+                // Its own shot first among every sampled shot, and how far ahead of the next one.
+                let ranks = vecs[j].map { e -> (Bool, Float) in
+                    let scores = refs.indices.map { cos(e.vec, refs[$0]) }
+                    let best = scores.indices.max { scores[$0] < scores[$1] }!
+                    let other = scores.indices.filter { $0 != e.ref }.map { scores[$0] }.max() ?? -1
+                    return (best == e.ref, scores[e.ref] - other)
+                }
+                embedding = String(format: "  vector vs stored: mean %.4f min %.4f  own shot first %d of %d  margin p10 %.4f",
+                                   same.reduce(0, +) / Float(same.count), same.min()!, ranks.filter(\.0).count, ranks.count,
+                                   ranks.map(\.1).sorted()[ranks.count / 10])
+            }
+            print(String(format: "  %@ %7.1f MB  %5.1f%% of stored  words read %5.1f%%", o.name.padding(toLength: 26, withPad: " ", startingAt: 0),
+                         Double(totals[j]) / 1e6, Double(totals[j]) * 100 / Double(max(stored, 1)),
+                         truthTotal[j] == 0 ? 0 : Double(read[j]) * 100 / Double(truthTotal[j])) + embedding)
+        }
+    }
+
+    /// A picture drawn into a frame-sized buffer, as the recorder hands the encoder one.
+    private static func pixels(_ image: CGImage, _ w: Int, _ h: Int) -> CVPixelBuffer? {
+        guard let pb = ScreenCodec.makePixelBuffer(width: w, height: h) else { return nil }
+        CVPixelBufferLockBaseAddress(pb, [])
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+        guard let cg = CGContext(data: CVPixelBufferGetBaseAddress(pb), width: w, height: h, bitsPerComponent: 8,
+                                 bytesPerRow: CVPixelBufferGetBytesPerRow(pb), space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                 bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue) else { return nil }
+        cg.interpolationQuality = .high
+        cg.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return pb
+    }
+
+    /// The same part of a frame under each option, at the full frame's scale (a half frame drawn
+    /// twice as large), as PNG: 1200 x 700 frame pixels from the top left.
+    private static func crop(_ pixels: CVPixelBuffer, half: Bool, w: Int, h: Int, to path: String) {
+        guard let image = ScreenCodec.cgImage(pixels) else { return }
+        let cw = min(1200, w), ch = min(700, h), k = half ? 0.5 : 1.0
+        guard let part = image.cropping(to: CGRect(x: 0, y: 0, width: Double(cw) * k, height: Double(ch) * k)),
+              let cg = CGContext(data: nil, width: cw, height: ch, bitsPerComponent: 8, bytesPerRow: 0,
+                                 space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipFirst.rawValue) else { return }
+        cg.interpolationQuality = .high
+        cg.draw(part, in: CGRect(x: 0, y: 0, width: cw, height: ch))
+        guard let out = cg.makeImage() else { return }
+        try? FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        try? still(out, type: .png, quality: nil).write(to: URL(fileURLWithPath: path))
+    }
+
     static func run(_ args: [String]) {
         if args.first == "migrate" { migrate(Array(args.dropFirst())); return }
         if args.first == "state" { state(Array(args.dropFirst())); return }
@@ -1012,6 +1169,21 @@ enum ShotBench {
                     try? still(ScreenCodec.cgImage(decoded[k]!)!, type: .png, quality: nil).write(to: URL(fileURLWithPath: "\(dump)/hevc-\(k).png"))
                 }
             }
+        }
+
+        // At half the size: a Retina session (--scale 2) recorded at its points, read again at that size.
+        for quality in [0.7, 0.6] as [Float] {
+            let hw = (renderer.width / 2) & ~1, hh = (renderer.height / 2) & ~1
+            guard let encoder = ScreenFrameEncoder(width: hw, height: hh, quality: quality) else { break }
+            let decoder = ScreenFrameDecoder()
+            var sizes: [Int] = [], decoded: [CVPixelBuffer] = []
+            for (k, shot) in shots.enumerated() {
+                guard let image = ScreenCodec.cgImage(shot), let small = pixels(image, hw, hh), let f = encoder.encode(small),
+                      let out = decoder.decode(f.data, parameterSets: f.parameterSets) else { continue }
+                sizes.append(f.data.count)
+                if sample.contains(k) { decoded.append(out) }
+            }
+            report(String(format: "hevc half q%.1f key 30", quality), sizes: sizes, encodeMs: 0, decodeMs: 0, jumpMs: 0, psnr: 0, read: readShare(decoded))
         }
 
         // One picture at a time.

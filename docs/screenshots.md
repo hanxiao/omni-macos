@@ -42,10 +42,18 @@ That is the chain an agent follows: query -> a screenshot -> its time -> the fil
   the pointer, use the pointer to retrieve the frame and return". No folder of pictures to browse in
   the Finder; a shot becomes a file only when something that takes nothing else asks (a drag, a
   copy, Share, Quick Look, a linked Mac's fetch). "Reveal" opens the timeline at that moment. The
-  update deletes 0.20.2's picture files. The video stays as it was: HEVC quality 0.7, a key frame
-  every 30 shots.
+  update deletes 0.20.2's picture files. The video stays as it was: HEVC, a key frame every 30
+  shots; quality 0.7, 0.6 from 0.20.6 for new segments ("Storage" below).
 - Apps left out (Settings > Files > Screenshots, "Excluded apps", the group's last row): their windows are not in a
-  shot, and no shot is taken while one of them is in front.
+  shot, and no shot is taken while one of them is in front. Omni is in the list from the start and
+  shown there (Han, 2026-11-16); through 0.20.5 its windows were cut out by a rule of their own and
+  shots went on while it was in front. A list saved before gains it once
+  (`omni.screenshots.excludedAppsHasOmni`); taken out, it stays out.
+- In the results a shot is named by its moment and window, "Nov 12 at 12:01:43 PM  Field notes"
+  (time only for today), cut at its end: its path is the name 0.20.2's HEIC had, which no file
+  carries, and cut in the middle four shots of one window read the same. Its match is "Screen
+  recording" (its picture) or "Words on screen" (its text). Dragged out it is still a HEIC with the
+  full name (`ResultPath.name`).
 - Served to this Mac's agents (MCP, CLI, REST, Shortcuts) as the user's files are, and to Linked
   Macs as the rest of the index is (Han, 2026-11-10; the first build kept them back with the
   clipboard, which alone stays in `AppModel.unsharedFolders`).
@@ -54,7 +62,7 @@ That is the chain an agent follows: query -> a screenshot -> its time -> the fil
 
 1. `Sources/OmniKit/ScreenChange.swift`: `ScreenSignature` (green channel on a grid about 960
    wide, tiles of 16 x 16 samples, which tiles show something) and `ScreenGate`.
-2. `Sources/OmniKit/ScreenCodec.swift`: VideoToolbox HEVC on the hardware encoder, quality 0.7, a
+2. `Sources/OmniKit/ScreenCodec.swift`: VideoToolbox HEVC on the hardware encoder, quality 0.6, a
    key frame every 30 shots, no frame reordering; the decoder; the HEIC writer a shot leaves the
    app through.
 3. `Sources/OmniKit/ScreenHistory.swift`: one folder beside the index.
@@ -772,6 +780,66 @@ once missing a block; its own vision on the picture read them.
 - Not done: the screen text under `read_file`'s picture (it would point agents back at it).
 - Speed, 20 served searches, three interleaved rounds against 0.20.4: 692-771 ms against
   734-799 ms with shots in the answer, 461-509 against 494-536 without.
+
+## Storage: quality 0.6 (0.20.6, measured 2026-11-25)
+
+Han, 2026-11-16: a few days of history took 1.4 GB on the laptop. Measured on an APFS clone of its
+real history (15 days; the 4K display's 5.1 GB is 98% of it) with `shotbench recode`:
+
+| display | frame | share of bytes | KB a frame | frames an hour | MB an hour | indexed |
+|---|---|---|---|---|---|---|
+| external 4K @2x | 3840 x 2160 | 98% | 92 | 462 | 42.6 | 52% |
+| laptop panel @2x | 2940 x 1912 | 2% | 38 | 491 | 18.9 | 40% |
+
+About 340 MB a day: at the default 30 days the history settles near 10 GB. No key frame came early
+(the encoder never lost its reference) and key frames are 13% of the bytes; the deltas are the
+cost (median 35 KB at 4K).
+
+The 4 largest 4K segments (2,510 frames) written again under each option; words read on 64 indexed
+frames against the stored frame, by the index's reader ("search") and by Vision at the frame's own
+pixels (the "zoom" an agent's `region` gets); vectors with Nano at the size the index embeds:
+
+| option | bytes vs stored | vs the q0.7 re-encode | search read | zoom read | cosine mean / min |
+|---|---|---|---|---|---|
+| full q0.7 (control) | 95.1% | 100% | 92.7% | 93.0% | 0.9983 / 0.9938 |
+| full q0.6 | 66.7% | 70% | 90.0% | 89.0% | 0.9962 / 0.9857 |
+| full q0.5 | 46.1% | 48% | 87.3% | 86.3% | 0.9931 / 0.9787 |
+| half q0.8 | 56.9% | 60% | 88.3% | 77.7% | 0.9925 / 0.9849 |
+| half q0.7 | 42.0% | 44% | 86.5% | 77.5% | 0.9910 / 0.9811 |
+| indexed frames only | 82.5% | 87% | 92.3% | 92.2% | 0.9983 / 0.9921 |
+
+Every option still found its own shot first among the sampled ones; decode 6.1 ms a frame against
+6.0. (The laptop ran its own rewrite of the tool, which adds the search read; `shotbench recode`
+here reports the bytes, the zoom read and the vectors.) The two largest panel segments: q0.6 62% of the re-encode, q0.5 39%.
+
+- HALF SIZE LOSES TO LOWER QUALITY. The zoom read stays near 78% at any quality: the loss is the
+  pixels, not the codec. Full q0.5 is the size of half q0.7 and better on every measure.
+  VideoToolbox's scaler is poor for text: with no codec at all it already moved the vectors,
+  where CoreGraphics gave cosine 1.0000. The half rows are scaled by CoreGraphics.
+- INDEXED FRAMES ONLY saves 13%: half the frames are indexed, and they are the new pages, the
+  expensive ones. It would also empty the timeline between them.
+- THESE ARE SECOND-GENERATION ENCODES. The control, q0.7 again, reads 93% of the stored frame's
+  words: decoding and encoding again costs points by itself. First-generation frames, drawn
+  editor frames through the app's encoder and reader (`shotbench stillsize`, the frame after a
+  different screen, the largest delta there is):
+
+| desktop | quality | KB | words | lines |
+|---|---|---|---|---|
+| 1920 x 1080 @2x | 0.7 | 167 | 97.9% | 83.5% |
+| | 0.6 | 116 | 98.0% | 81.0% |
+| | 0.5 | 77 | 97.4% | 79.1% |
+| 3008 x 1692 @2x | 0.7 | 279 | 97.8% | 80.8% |
+| | 0.6 | 197 | 97.5% | 79.3% |
+| | 0.5 | 132 | 97.2% | 75.9% |
+
+  Words do not move from 0.5 to 0.8 (97.2-98.0%, key frames too); exact lines lose 1.5-2.5 points
+  at 0.6 and 4-5 at 0.5, on 4 frames a desktop.
+
+Chosen: 0.6, 70% of the bytes (the history near 7 GB at 30 days rather than 10, from the ratio, not
+measured over a month). New segments only: a quality is no part of a segment's layout, every key
+frame carries its parameter sets, and a stretch re-encoded after a delete decodes inside an older
+segment, so nothing is migrated. Retention stays 30 days (Han). `omni-verify eval` cannot see this:
+its screenshots are drawn PNG files, never through the codec.
 
 ## Isolated runs
 

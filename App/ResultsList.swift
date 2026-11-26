@@ -685,7 +685,7 @@ struct ResultRow: View {
     /// whether it is a directory, and this is read from `body` - on a row whose file lives on a
     /// network share that is a blocking round trip on the main thread (7 ms warm, seconds cold),
     /// paid again for every row on every redraw. NSString does it purely lexically.
-    private var fileName: String { (hit.path as NSString).lastPathComponent }
+    private var fileName: String { ResultPath.name(hit.path, modified: hit.modified) }
     /// Emphasized = selected AND the window is key: the state that earns the solid accent fill and
     /// white text. A non-key window falls back to the unemphasized grey, like every native list.
     private var emphasized: Bool { selected && controlActive == .key }
@@ -726,7 +726,7 @@ struct ResultRow: View {
                 .padding(.trailing, BrowserMetrics.iconGap)
                 .fileDragSource { [model, path = hit.path] in model.dragPaths(for: path) }
             HStack(spacing: 4) {
-                Text(fileName).lineLimit(1).truncationMode(.middle)
+                Text(fileName).lineLimit(1).truncationMode(ResultPath.isShot(hit.path) ? .tail : .middle)
                     .fileDragSource { [model, path = hit.path] in model.dragPaths(for: path) }
                 CloudBadge(path: hit.path)
                 if let peer = RemotePath.peer(of: hit.path) {
@@ -930,7 +930,7 @@ struct ResultGridItem: View {
     var onToggleStack: (() -> Void)? = nil
     @Environment(\.controlActiveState) private var controlActive
     /// Lexical, not filesystem - see the note on ResultRow.fileName.
-    private var fileName: String { (hit.path as NSString).lastPathComponent }
+    private var fileName: String { ResultPath.name(hit.path, modified: hit.modified) }
 
     var body: some View {
         VStack(spacing: 6) {
@@ -1396,13 +1396,16 @@ extension SearchHit {
         // "Video", not "Frame", which read as one particular frame. Longer ones match a segment.
         case FileKind.video.rawValue: return locator.isEmpty ? "Video" : "Frame" + at
         case FileKind.audio.rawValue: return (fileKind == FileKind.video.rawValue ? "Speech" : "Audio") + at
-        case FileKind.image.rawValue: return locator.isEmpty ? "Picture" : locator
+        case FileKind.image.rawValue:
+            // A shot is a frame of the screen recording, not a picture file.
+            if ResultPath.isShot(path) { return "Screen recording" }
+            return locator.isEmpty ? "Picture" : locator
         case FileKind.scan.rawValue:
             // A deck's slide or a workbook's sheet found by its picture: where, as its text says it.
             if fileKind == FileKind.text.rawValue { return locator.isEmpty ? "Page" : locator }
             return locator.isEmpty ? "Scanned page" : "Scanned " + locator.lowercased()
         default:
-            if fileKind == FileKind.image.rawValue { return "Words in the image" }
+            if fileKind == FileKind.image.rawValue { return ResultPath.isShot(path) ? "Words on screen" : "Words in the image" }
             return locator.isEmpty ? "Text" : locator
         }
     }

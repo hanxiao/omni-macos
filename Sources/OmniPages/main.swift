@@ -157,7 +157,9 @@ final class Drawer: NSObject, WKNavigationDelegate {
         c.rect = rect
         c.afterScreenUpdates = true
         let scale = min(2, maxSide / max(rect.width, rect.height, 1))
-        c.snapshotWidth = NSNumber(value: Double(rect.width * scale))
+        // In points, and the picture comes back at the window's backing scale: on a 2x screen a
+        // slide asked for at 800 pixels came back at 1600 (OfficeDocumentTests, a 4K display at 2x).
+        c.snapshotWidth = NSNumber(value: Double(rect.width * scale / max(window.backingScaleFactor, 1)))
         guard let img = try? await web.takeSnapshot(configuration: c) else { return nil }
         return img.cgImage(forProposedRect: nil, context: nil, hints: nil)
     }

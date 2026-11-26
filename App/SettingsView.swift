@@ -515,7 +515,8 @@ private struct ExcludedAppRow: View {
     let remove: () -> Void
 
     var body: some View {
-        let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
+        // Omni itself by its own bundle: by id, Launch Services may name another copy of it.
+        let app = bundleID == Bundle.main.bundleIdentifier ? Bundle.main.bundleURL : NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
         HStack(spacing: 8) {
             if let app {
                 Image(nsImage: NSWorkspace.shared.icon(forFile: app.path)).resizable().frame(width: 20, height: 20)
